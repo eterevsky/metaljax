@@ -21,6 +21,55 @@ REGISTRY: dict[str, Callable] = {}
 
 _TERMINATORS = ("func.return", "stablehlo.return")
 
+# Ops through which f64 values may flow without any arithmetic: since f64
+# device storage is f32, these are bit-identical to CPU as long as every
+# consumer eventually converts to <= f32. Anything not listed that touches
+# an f64 tensor *computes* in f64 and is rejected in strict mode.
+_F64_DATA_MOVEMENT = {
+    "func.func", "func.call", "func.return",
+    "stablehlo.return", "stablehlo.constant", "stablehlo.convert",
+    "stablehlo.reshape", "stablehlo.broadcast_in_dim", "stablehlo.transpose",
+    "stablehlo.slice", "stablehlo.dynamic_slice",
+    "stablehlo.dynamic_update_slice", "stablehlo.concatenate",
+    "stablehlo.reverse", "stablehlo.gather", "stablehlo.scatter",
+    "stablehlo.select", "stablehlo.optimization_barrier", "stablehlo.iota",
+    "stablehlo.pad", "stablehlo.while", "stablehlo.if", "stablehlo.case",
+    "stablehlo.composite", "stablehlo.custom_call",
+    "sdy.sharding_constraint", "sdy.reshard",
+}
+
+
+def _has_f64(types) -> bool:
+    for t in types:
+        try:
+            if str(ir.RankedTensorType(t).element_type) == "f64":
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _check_no_f64_compute(module_op: ir.Operation):
+    """Raise if any non-data-movement op touches an f64 tensor."""
+
+    def visit(op: ir.Operation):
+        name = op.name
+        if name not in _F64_DATA_MOVEMENT and name != "builtin.module":
+            if _has_f64(r.type for r in op.results) or _has_f64(
+                o.type for o in op.operands
+            ):
+                raise dtypes.UnsupportedDtypeError(
+                    f"program computes in float64, unsupported on Metal "
+                    f"(set METALJAX_F64=downcast to compute in float32):\n"
+                    f"  {str(op).splitlines()[0]}"
+                )
+        for region in op.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    visit(inner.operation)
+
+    visit(module_op)
+
 
 def register(*names: str):
     def deco(fn):
@@ -59,6 +108,9 @@ class Interpreter:
                     vis = "public"
                 if vis == "public":
                     public.append(o)
+        if not dtypes.F64_DOWNCAST:
+            with self.context:
+                _check_no_f64_compute(self.module.operation)
         if "main" in self.funcs:
             self.main = self.funcs["main"]
         elif len(public) == 1:

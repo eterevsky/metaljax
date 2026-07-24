@@ -7,4 +7,5 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 plugin/build/
+src/metaljax/lib/
 .DS_Store

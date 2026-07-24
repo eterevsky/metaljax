@@ -3,7 +3,7 @@ name = "metaljax"
 version = "0.0.1"
 description = "A Metal backend for JAX: PJRT plugin + StableHLO interpreter executing on MLX"
 requires-python = ">=3.11"
-dependencies = ["mlx>=0.32", "numpy", "ml_dtypes"]
+dependencies = ["jax>=0.11,<0.12", "mlx>=0.32", "numpy", "ml_dtypes"]
 
 [build-system]
 requires = ["hatchling"]
@@ -14,6 +14,8 @@ metal = "jax_plugins.metal"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/metaljax", "src/jax_plugins"]
+# Include the built plugin dylib (gitignored) if present.
+artifacts = ["src/metaljax/lib/*.dylib"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

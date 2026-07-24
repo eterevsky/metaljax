@@ -15,7 +15,15 @@ def _library_path() -> Path | None:
     env = os.environ.get("METALJAX_PLUGIN_PATH")
     if env:
         return Path(env)
-    # Editable/source layout: <root>/src/jax_plugins/metal/__init__.py
+    # Packaged location (works for wheel and editable installs alike).
+    try:
+        import metaljax
+        p = Path(metaljax.__file__).parent / "lib" / "libmetal_pjrt.dylib"
+        if p.exists():
+            return p
+    except ImportError:
+        pass
+    # Repo layout fallback: <root>/src/jax_plugins/metal/__init__.py
     root = Path(__file__).resolve().parents[3]
     p = root / "plugin" / "build" / "libmetal_pjrt.dylib"
     return p if p.exists() else None

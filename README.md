@@ -118,13 +118,52 @@ cd ~/texmo
 ~/metaljax/.venv/bin/python scripts/bench_jax.py --platform metal --mode ram --steps 8 --batch 64
 ```
 
+## Using metaljax from another project
+
+Short of publishing on PyPI, the easiest way is a **path dependency on
+this checkout**. metaljax declares `jax` as a dependency, so your project
+just needs:
+
+```toml
+# your project's pyproject.toml
+[project]
+dependencies = ["metaljax"]
+
+[tool.uv.sources]
+metaljax = { path = "/Users/oleg/metaljax", editable = true }
+```
+
+then `uv sync` (or with plain pip: `pip install -e /Users/oleg/metaljax`).
+Build the plugin once in this checkout (`./plugin/build.sh`) — the dylib is
+found automatically. Non-editable installs (`uv pip install
+/Users/oleg/metaljax`, no `[tool.uv.sources]` `editable` flag) work as
+well: the wheel bundles the dylib as long as `plugin/build.sh` was run
+before installing. After that, any JAX program in your project runs on
+Metal with `JAX_PLATFORMS=metal` (or
+`jax.config.update("jax_platforms", "metal")` before first use).
+
+Once the repo is pushed to GitHub, a git dependency also works:
+
+```toml
+[project]
+dependencies = ["metaljax"]
+
+[tool.uv.sources]
+metaljax = { git = "https://github.com/eterevsky/metaljax" }
+```
+
+with the caveat that git/PyPI installs don't include a prebuilt dylib —
+run `plugin/build.sh` from a checkout and point `METALJAX_PLUGIN_PATH` at
+the result (packaging the dylib into a wheel is supported: `build.sh`
+copies it into the package, and wheels built afterwards bundle it).
+
 ## Environment variables
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `JAX_PLATFORMS` | *(unset)* | Set to `metal` (or `metal,cpu`) to select the backend; unset keeps CPU default. |
 | `METALJAX_MATMUL_PRECISION` | `highest` | On M5-class GPUs MLX routes f32 GEMM through the neural accelerators at ~bf16 input precision (~4e-3 error). `highest` pins MLX kernels to the previous GPU generation for exact f32; set `default` to allow the fast path. |
-| `METALJAX_F64` | `downcast` | Metal has no float64. `downcast`: compute in f32 while reporting f64 shapes/dtypes to JAX (one warning). `error`: fail on any f64. |
+| `METALJAX_F64` | `error` | Metal has no float64. Default (`error`): f64 values may pass **through** the device (x64 mode wraps Python scalars as f64 buffers that programs immediately convert to f32 — stored as f32, which rounds exactly once and stays bit-identical to CPU), but any op that **computes** in f64 fails at compile time, naming the op. `downcast`: emulate all f64 in f32 (one warning). Example: under `jax_enable_x64`, optax AdamW's `beta**step` bias correction is real f64 arithmetic — strict mode rejects it, so `scripts/texmo_train.py` sets `downcast` explicitly. |
 | `METALJAX_PLUGIN_PATH` | *(auto)* | Override the path to `libmetal_pjrt.dylib`. |
 
 ## Repository layout

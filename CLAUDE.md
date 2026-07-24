@@ -63,7 +63,11 @@ executes on the Metal device through plain `jax.numpy`.
    MetalDevice(id=0); jit(grad) matches CPU ~1e-8; RNG bit-exact vs CPU;
    scan/matmul correct through the real backend.
 4. ✅ **texmo trains on Metal.** gather/scatter (incl. windowed + batching
-   dims), f64-downcast policy for x64 mode, sdy identity ops. 129 tests.
+   dims), sdy identity ops. 131 tests. f64 policy (per Oleg): STRICT by
+   default — f64 pass-through OK (stored f32, bit-identical), f64 *compute*
+   fails at compile naming the op; METALJAX_F64=downcast opts into f32
+   emulation (scripts/texmo_train.py sets it explicitly: optax AdamW's
+   beta**step is real f64 arithmetic under x64).
    Driver: scratchpad texmo_metal_train.py (imports ManagerJax directly,
    avoids texmo.py's hardcoded platforms; torch installed just for imports).
    `bench_jax.py --platform metal` works (flag committed to texmo repo).
@@ -85,6 +89,10 @@ executes on the Metal device through plain `jax.numpy`.
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
   0.11.0 / mlx 0.32 ship cp314 wheels). torch (CPU wheel) installed only so
   texmo modules import; the JAX path never calls it.
+- Consumers depend on metaljax via a path dependency (uv sources, editable
+  or not) — build.sh copies the dylib into src/metaljax/lib/ so wheels
+  bundle it; verified with a fresh-venv non-editable install. jax is a
+  declared dependency (>=0.11,<0.12 — the PJRT header pin).
 
 ## Implementation notes (hard-won)
 - Select the backend with `JAX_PLATFORMS=metal` (or `metal,cpu` to keep CPU

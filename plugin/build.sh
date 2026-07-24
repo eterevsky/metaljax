@@ -12,4 +12,7 @@ clang++ -std=c++20 -O2 -fPIC -shared \
   -I vendor -I "$PY_INCLUDE" \
   metal_pjrt.cc \
   -o build/libmetal_pjrt.dylib
-echo "built plugin/build/libmetal_pjrt.dylib"
+# Also place it inside the python package so non-repo installs find it.
+mkdir -p "$ROOT/src/metaljax/lib"
+cp build/libmetal_pjrt.dylib "$ROOT/src/metaljax/lib/"
+echo "built plugin/build/libmetal_pjrt.dylib (+ copy in src/metaljax/lib/)"

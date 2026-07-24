@@ -14,9 +14,12 @@ class UnsupportedDtypeError(TypeError):
     pass
 
 
-# Metal has no float64. Default policy: compute in f32 while reporting f64
-# avals/buffers back to JAX (texmo runs with jax_enable_x64=True).
-F64_DOWNCAST = os.environ.get("METALJAX_F64", "downcast") == "downcast"
+# Metal has no float64. Default policy (strict): f64 values may pass
+# *through* the device (jax_enable_x64 wraps python scalars as f64 buffers
+# that programs immediately convert to f32 — storing them as f32 rounds
+# exactly once, bit-identical to CPU), but any op that *computes* in f64
+# fails at compile time. METALJAX_F64=downcast opts into full f32 emulation.
+F64_DOWNCAST = os.environ.get("METALJAX_F64", "error") == "downcast"
 _warned_f64 = False
 
 
@@ -67,8 +70,6 @@ _MLIR_TO_NP = {
 def np_dtype_for_mlir(t: ir.Type) -> np.dtype:
     """The numpy dtype JAX expects for this element type (f64 reported as-is)."""
     s = str(t)
-    if s == "f64" and not F64_DOWNCAST:
-        raise UnsupportedDtypeError("float64 unsupported on Metal (METALJAX_F64=error)")
     try:
         return _MLIR_TO_NP[s]
     except KeyError:
@@ -98,10 +99,11 @@ def mx_dtype_for(t: ir.Type) -> mx.Dtype:
     """MLX dtype for an MLIR tensor *element* type."""
     s = str(t)
     if s == "f64":
+        # Storage dtype. In strict mode the interpreter's compile-time check
+        # already rejected any op that would *compute* in f64.
         if F64_DOWNCAST:
             _warn_f64()
-            return mx.float32
-        raise UnsupportedDtypeError("float64 unsupported on Metal (METALJAX_F64=error)")
+        return mx.float32
     try:
         return _MLIR_TO_MX[s]
     except KeyError:
@@ -135,9 +137,8 @@ def to_mx(arr: np.ndarray) -> mx.array:
     if arr.dtype == ml_dtypes.bfloat16:
         return mx.array(arr.astype(np.float32)).astype(mx.bfloat16)
     if arr.dtype == np.float64:
-        if not F64_DOWNCAST:
-            raise UnsupportedDtypeError("float64 unsupported on Metal")
-        _warn_f64()
+        if F64_DOWNCAST:
+            _warn_f64()
         return mx.array(arr.astype(np.float32))
     return mx.array(arr)
 

@@ -27,6 +27,12 @@ if not TEXMO.is_dir():
     sys.exit(f"texmo checkout not found at {TEXMO}; set TEXMO_DIR")
 sys.path.insert(0, str(TEXMO))
 
+# EXPLICIT precision opt-in: texmo enables jax_enable_x64, and optax's AdamW
+# bias correction (beta**step) then computes in f64 scalars, which Metal
+# cannot do. 'downcast' evaluates those in f32 — everything else in this
+# fp32/fp16/bf16 workload is unaffected.
+os.environ.setdefault("METALJAX_F64", "downcast")
+
 import jax
 
 jax.config.update("jax_enable_x64", True)  # texmo.py does the same
