@@ -80,7 +80,7 @@ class Interpreter:
         out = []
         for a in self._main_block().arguments:
             t = ir.RankedTensorType(a.type)
-            out.append((tuple(t.shape), dtypes.np_dtype_for(dtypes.mx_dtype_for(t.element_type))))
+            out.append((tuple(t.shape), dtypes.np_dtype_for_mlir(t.element_type)))
         return out
 
     @property
@@ -89,7 +89,7 @@ class Interpreter:
         out = []
         for t in ftype.results:
             rt = ir.RankedTensorType(t)
-            out.append((tuple(rt.shape), dtypes.np_dtype_for(dtypes.mx_dtype_for(rt.element_type))))
+            out.append((tuple(rt.shape), dtypes.np_dtype_for_mlir(rt.element_type)))
         return out
 
     # --- execution ---

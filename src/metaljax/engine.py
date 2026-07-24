@@ -40,6 +40,7 @@ _ENUM_TO_NP = {
     _ENUM["U64"]: np.dtype(np.uint64),
     _ENUM["F16"]: np.dtype(np.float16),
     _ENUM["F32"]: np.dtype(np.float32),
+    _ENUM["F64"]: np.dtype(np.float64),  # stored as f32 on device (downcast)
     _ENUM["BF16"]: np.dtype(ml_dtypes.bfloat16),
 }
 _NP_TO_ENUM = {v: k for k, v in _ENUM_TO_NP.items()}
@@ -79,7 +80,11 @@ def buffer_from_host(data, type_enum: int, dims, byte_strides) -> MetalBuffer:
 
 
 def to_host(buf: MetalBuffer) -> bytes:
-    return dtypes.to_np(buf.data).tobytes()
+    arr = dtypes.to_np(buf.data)
+    want = _ENUM_TO_NP[buf.type_enum]
+    if arr.dtype != want:  # e.g. f64 buffers stored as f32 on device
+        arr = arr.astype(want)
+    return arr.tobytes()
 
 
 class MetalExecutable:

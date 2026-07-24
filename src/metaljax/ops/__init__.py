@@ -3,6 +3,7 @@
 from metaljax.ops import (  # noqa: F401
     control,
     elementwise,
+    gather,
     linalg,
     reduction,
     shape,

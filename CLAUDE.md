@@ -62,11 +62,29 @@ executes on the Metal device through plain `jax.numpy`.
    build via `plugin/build.sh`): `2 * jnp.array([1,2,3])` runs on
    MetalDevice(id=0); jit(grad) matches CPU ~1e-8; RNG bit-exact vs CPU;
    scan/matmul correct through the real backend.
-4. ⬜ Op coverage driven by texmo (gather/scatter, argmax-reduce, sort,
-   dynamic gather from scan of stacked inputs, x64/f64 policy, ...).
-5. ⬜ Performance: `mx.compile` fusion, benchmarks vs CPU backend on texmo
-   workloads.
+4. ✅ **texmo trains on Metal.** gather/scatter (incl. windowed + batching
+   dims), f64-downcast policy for x64 mode, sdy identity ops. 129 tests.
+   Driver: scratchpad texmo_metal_train.py (imports ManagerJax directly,
+   avoids texmo.py's hardcoded platforms; torch installed just for imports).
+   `bench_jax.py --platform metal` works (flag committed to texmo repo).
+   Verified: `bits.1+bp|rnn.1.tanh` and `bits.1+bp|mgru.4-dense.4.gelu` train
+   end-to-end with sane losses; train_and_eval incl. recurrent eval path.
+5. ⬜ **Performance — the next big thing.** GRU.256/batch64 bench:
+   metal 502 ms/step vs cpu 110 ms/step. Cause: eager per-op dispatch
+   (thousands of MLIR-wrapper + Python + MLX calls per scan step) and a
+   .item() host sync per while iteration. Plan: (a) compile-time pass turning
+   each block into prepared closures (decode attrs once, slot-indexed SSA,
+   no MLIR objects at runtime); (b) counted-loop detection for JAX scan
+   whiles (cond `i < const`) → python for-loop, no per-iter .item();
+   (c) mx.compile cached per block for fusion; (d) whole-module mx.compile
+   when no control flow. Remaining coverage gaps to expect: argmax/argmin
+   multi-result reduce (sampling), sort, partial-window scatter.
 6. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+
+## Environment note
+- venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
+  0.11.0 / mlx 0.32 ship cp314 wheels). torch (CPU wheel) installed only so
+  texmo modules import; the JAX path never calls it.
 
 ## Implementation notes (hard-won)
 - Select the backend with `JAX_PLATFORMS=metal` (or `metal,cpu` to keep CPU
