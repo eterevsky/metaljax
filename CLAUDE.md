@@ -99,7 +99,14 @@ executes on the Metal device through plain `jax.numpy`.
    compile; hoisting loop-invariant input projections (torch's fused-GRU
    trick). Remaining coverage gaps: argmax/argmin multi-result reduce
    (sampling path), sort, partial-window scatter.
-6. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+6. ✅ PyPI release prep (v0.1.0): plugin ported to CPython **limited API**
+   (>=3.12) → single wheel py3-none-macosx_14_0_arm64 for all Pythons;
+   hatch_build.py compiles the dylib at wheel-build time. Gotcha: never use
+   '#' formats in PyObject_CallMethod (ABI differs across versions — broke
+   on 3.12). Wheel verified on fresh 3.12 venv; twine check passes.
+   LICENSE = Apache-2.0 (flagged for Oleg's confirmation). RELEASING.md has
+   the upload steps; **Oleg publishes himself** (like git pushes).
+7. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib

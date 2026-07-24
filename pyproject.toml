@@ -1,21 +1,57 @@
 [project]
 name = "metaljax"
-version = "0.0.1"
-description = "A Metal backend for JAX: PJRT plugin + StableHLO interpreter executing on MLX"
-requires-python = ">=3.11"
+version = "0.1.0"
+description = "Experimental Metal backend for JAX on Apple silicon: PJRT plugin executing StableHLO on MLX"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Oleg Eterevsky", email = "oleg@eterevsky.com" }]
+keywords = ["jax", "metal", "apple-silicon", "mlx", "pjrt", "gpu"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: GPU",
+]
 dependencies = ["jax>=0.11,<0.12", "mlx>=0.32", "numpy", "ml_dtypes"]
+
+[project.urls]
+Repository = "https://github.com/eterevsky/metaljax"
+Issues = "https://github.com/eterevsky/metaljax/issues"
+
+[project.entry-points.jax_plugins]
+metal = "jax_plugins.metal"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[project.entry-points.jax_plugins]
-metal = "jax_plugins.metal"
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/metaljax", "src/jax_plugins"]
-# Include the built plugin dylib (gitignored) if present.
+# The build hook compiles the plugin dylib into src/metaljax/lib/.
 artifacts = ["src/metaljax/lib/*.dylib"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src",
+    "plugin/metal_pjrt.cc",
+    "plugin/build.sh",
+    "plugin/vendor",
+    "tests",
+    "scripts",
+    "hatch_build.py",
+    "README.md",
+    "LICENSE",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

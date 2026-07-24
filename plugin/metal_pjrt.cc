@@ -6,6 +6,9 @@
 // Python symbols resolve at load time from the host process
 // (-undefined dynamic_lookup), so this links against nothing.
 
+// Build against CPython's limited API so one dylib serves every
+// interpreter >= 3.12 (the wheel is tagged py3-abi-agnostic).
+#define Py_LIMITED_API 0x030C0000
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
@@ -159,6 +162,24 @@ PJRT_Event* ReadyEvent(PJRT_Error* err = nullptr) {
   return ev;
 }
 
+// Limited-API-safe unicode -> std::string (PyUnicode_AsUTF8 is not in the
+// stable ABI before 3.13).
+bool UnicodeToStd(PyObject* u, std::string* out) {
+  if (u == nullptr || !PyUnicode_Check(u)) return false;
+  PyObject* b = PyUnicode_AsUTF8String(u);
+  if (b == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+  char* data = nullptr;
+  Py_ssize_t len = 0;
+  bool ok = PyBytes_AsStringAndSize(b, &data, &len) == 0;
+  if (ok) out->assign(data, static_cast<size_t>(len));
+  Py_DECREF(b);
+  if (!ok) PyErr_Clear();
+  return ok;
+}
+
 // Formats and clears the pending Python exception. Call with GIL held.
 PJRT_Error* PyErrToErr(const char* where) {
   std::string msg = std::string("metaljax: ") + where + " failed";
@@ -168,13 +189,12 @@ PJRT_Error* PyErrToErr(const char* where) {
   PyErr_NormalizeException(&ptype, &pval, &ptb);
   if (ptype != nullptr) {
     PyObject* tname = PyObject_GetAttrString(ptype, "__name__");
-    if (tname != nullptr && PyUnicode_Check(tname)) {
-      const char* n = PyUnicode_AsUTF8(tname);
-      if (n != nullptr && strstr(n, "Unsupported") != nullptr) {
-        code = PJRT_Error_Code_UNIMPLEMENTED;
-      }
+    std::string n;
+    if (UnicodeToStd(tname, &n) && n.find("Unsupported") != std::string::npos) {
+      code = PJRT_Error_Code_UNIMPLEMENTED;
     }
     Py_XDECREF(tname);
+    PyErr_Clear();
   }
   PyObject* formatted = nullptr;
   PyObject* tb_mod = PyImport_ImportModule("traceback");
@@ -186,16 +206,14 @@ PJRT_Error* PyErrToErr(const char* where) {
   if (formatted != nullptr && PyList_Check(formatted)) {
     msg += ":\n";
     for (Py_ssize_t i = 0; i < PyList_Size(formatted); ++i) {
-      const char* s = PyUnicode_AsUTF8(PyList_GetItem(formatted, i));
-      if (s != nullptr) msg += s;
+      std::string s;
+      if (UnicodeToStd(PyList_GetItem(formatted, i), &s)) msg += s;
     }
   } else if (pval != nullptr) {
     PyObject* s = PyObject_Str(pval);
-    if (s != nullptr) {
-      const char* c = PyUnicode_AsUTF8(s);
-      if (c != nullptr) (msg += ": ") += c;
-      Py_DECREF(s);
-    }
+    std::string c;
+    if (UnicodeToStd(s, &c)) (msg += ": ") += c;
+    Py_XDECREF(s);
   }
   PyErr_Clear();
   Py_XDECREF(formatted);
@@ -227,34 +245,36 @@ bool GetAttrSizeT(PyObject* obj, const char* name, size_t* out) {
 bool GetAttrString(PyObject* obj, const char* name, std::string* out) {
   PyObject* v = PyObject_GetAttrString(obj, name);
   if (v == nullptr) return false;
-  const char* s = PyUnicode_AsUTF8(v);
-  if (s == nullptr) {
-    Py_DECREF(v);
-    return false;
-  }
-  *out = s;
+  bool ok = UnicodeToStd(v, out);
   Py_DECREF(v);
-  return true;
+  return ok;
 }
 
 bool GetAttrInt64List(PyObject* obj, const char* name,
                       std::vector<int64_t>* out) {
   PyObject* v = PyObject_GetAttrString(obj, name);
   if (v == nullptr) return false;
-  PyObject* seq = PySequence_Fast(v, "expected a sequence");
-  Py_DECREF(v);
-  if (seq == nullptr) return false;
-  Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+  Py_ssize_t n = PySequence_Size(v);
+  if (n < 0) {
+    Py_DECREF(v);
+    return false;
+  }
   out->clear();
   for (Py_ssize_t i = 0; i < n; ++i) {
-    long long x = PyLong_AsLongLong(PySequence_Fast_GET_ITEM(seq, i));
+    PyObject* item = PySequence_GetItem(v, i);
+    if (item == nullptr) {
+      Py_DECREF(v);
+      return false;
+    }
+    long long x = PyLong_AsLongLong(item);
+    Py_DECREF(item);
     if (x == -1 && PyErr_Occurred()) {
-      Py_DECREF(seq);
+      Py_DECREF(v);
       return false;
     }
     out->push_back(x);
   }
-  Py_DECREF(seq);
+  Py_DECREF(v);
   return true;
 }
 
@@ -399,8 +419,8 @@ static PJRT_Error* ClientCreate(PJRT_Client_Create_Args* args) {
   if (engine == nullptr) return PyErrToErr("import metaljax.engine");
   PyObject* kind = PyObject_CallMethod(engine, "device_kind", nullptr);
   if (kind != nullptr) {
-    const char* s = PyUnicode_AsUTF8(kind);
-    if (s != nullptr) g_device_kind = s;
+    std::string s;
+    if (UnicodeToStd(kind, &s)) g_device_kind = s;
     Py_DECREF(kind);
   } else {
     PyErr_Clear();
@@ -485,10 +505,19 @@ static PJRT_Error* ClientCompile(PJRT_Client_Compile_Args* args) {
   PyObject* engine = EnsureEngine();
   if (engine == nullptr) return PyErrToErr("import metaljax.engine");
 
-  std::string fmt(args->program->format, args->program->format_size);
-  PyObject* py_exec = PyObject_CallMethod(
-      engine, "compile_program", "y#s", args->program->code,
-      static_cast<Py_ssize_t>(args->program->code_size), fmt.c_str());
+  // No '#' formats: their ABI differs across CPython versions.
+  PyObject* code_obj = PyBytes_FromStringAndSize(
+      args->program->code, static_cast<Py_ssize_t>(args->program->code_size));
+  PyObject* fmt_obj = PyUnicode_FromStringAndSize(
+      args->program->format,
+      static_cast<Py_ssize_t>(args->program->format_size));
+  PyObject* py_exec = nullptr;
+  if (code_obj != nullptr && fmt_obj != nullptr) {
+    py_exec = PyObject_CallMethod(engine, "compile_program", "OO",
+                                  code_obj, fmt_obj);
+  }
+  Py_XDECREF(code_obj);
+  Py_XDECREF(fmt_obj);
   if (py_exec == nullptr) return PyErrToErr("compile");
 
   auto* ex = new PJRT_Executable();
@@ -579,7 +608,7 @@ static PJRT_Error* ClientBufferFromHostBuffer(
   }
   PyObject* dims = PyList_New(args->num_dims);
   for (size_t i = 0; i < args->num_dims; ++i) {
-    PyList_SET_ITEM(dims, i, PyLong_FromLongLong(args->dims[i]));
+    PyList_SetItem(dims, i, PyLong_FromLongLong(args->dims[i]));
   }
   PyObject* strides;
   if (args->byte_strides == nullptr || args->num_byte_strides == 0) {
@@ -588,7 +617,7 @@ static PJRT_Error* ClientBufferFromHostBuffer(
   } else {
     strides = PyList_New(args->num_byte_strides);
     for (size_t i = 0; i < args->num_byte_strides; ++i) {
-      PyList_SET_ITEM(strides, i, PyLong_FromLongLong(args->byte_strides[i]));
+      PyList_SetItem(strides, i, PyLong_FromLongLong(args->byte_strides[i]));
     }
   }
   PyObject* py_buf = PyObject_CallMethod(
@@ -917,7 +946,7 @@ static PJRT_Error* LoadedExecutableExecute(
                  "input buffer was deleted");
     }
     Py_INCREF(b->py_buf);
-    PyList_SET_ITEM(buf_list, i, b->py_buf);
+    PyList_SetItem(buf_list, i, b->py_buf);
   }
   PyObject* outs = PyObject_CallMethod(
       engine, "execute", "OO", args->executable->exec->py_exec, buf_list);

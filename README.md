@@ -15,11 +15,30 @@ hood the compiled StableHLO programs are interpreted onto
 [MLX](https://github.com/ml-explore/mlx) arrays, which execute on the GPU
 via Metal.
 
-**Status**: correctness-first Stage 1. Real training runs work (the
-[texmo](https://github.com/eterevsky/texmo) project trains end-to-end);
-performance work (fusion via `mx.compile`, removing interpreter dispatch
-overhead) is the current focus, so small models are still slower than the
-CPU backend.
+**Status**: experimental, published as a demo. Real training runs work
+(the [texmo](https://github.com/eterevsky/texmo) project trains
+end-to-end) and transformer training steps run within a few percent of
+PyTorch's MPS backend, but expect gaps — unsupported ops fail with a
+clear `UnsupportedOpError`. If a Metal backend ever lands upstream in the
+JAX ecosystem, this package will be deprecated in its favor.
+
+## Install
+
+```bash
+pip install metaljax
+```
+
+Requirements: Apple-silicon Mac, macOS 14+, Python 3.12+, jax 0.11.x
+(installed automatically). Then select the backend per program:
+
+```bash
+JAX_PLATFORMS=metal python -c "import jax; print(jax.devices())"
+```
+
+CPU remains the default backend when `JAX_PLATFORMS` is unset, so
+installing metaljax does not change existing workflows. Installing from
+the source distribution (rather than the wheel) additionally requires the
+Xcode command-line tools, since the PJRT plugin compiles at build time.
 
 ## How it works
 
@@ -53,10 +72,10 @@ mlx.core                      ── lazy Metal arrays; unified memory
 - Python **3.14** and jax/jaxlib **0.11.x** (what the venv setup below
   installs; the vendored PJRT header matches jaxlib 0.11.0).
 
-## Setup
+## Developing from source
 
 ```bash
-cd metaljax
+git clone https://github.com/eterevsky/metaljax && cd metaljax
 uv venv --python 3.14 .venv
 uv pip install -p .venv/bin/python jax mlx numpy pytest
 uv pip install -p .venv/bin/python -e .
@@ -120,42 +139,28 @@ cd ~/texmo
 
 ## Using metaljax from another project
 
-Short of publishing on PyPI, the easiest way is a **path dependency on
-this checkout**. metaljax declares `jax` as a dependency, so your project
-just needs:
+Add `metaljax` to your dependencies (it declares `jax` itself):
 
 ```toml
-# your project's pyproject.toml
 [project]
 dependencies = ["metaljax"]
-
-[tool.uv.sources]
-metaljax = { path = "/Users/oleg/metaljax", editable = true }
 ```
 
-then `uv sync` (or with plain pip: `pip install -e /Users/oleg/metaljax`).
-Build the plugin once in this checkout (`./plugin/build.sh`) — the dylib is
-found automatically. Non-editable installs (`uv pip install
-/Users/oleg/metaljax`, no `[tool.uv.sources]` `editable` flag) work as
-well: the wheel bundles the dylib as long as `plugin/build.sh` was run
-before installing. After that, any JAX program in your project runs on
-Metal with `JAX_PLATFORMS=metal` (or
+and set `JAX_PLATFORMS=metal` (or
 `jax.config.update("jax_platforms", "metal")` before first use).
 
-Once the repo is pushed to GitHub, a git dependency also works:
+To develop against a local checkout instead, use a path source:
 
 ```toml
-[project]
-dependencies = ["metaljax"]
-
 [tool.uv.sources]
-metaljax = { git = "https://github.com/eterevsky/metaljax" }
+metaljax = { path = "../metaljax", editable = true }
 ```
 
-with the caveat that git/PyPI installs don't include a prebuilt dylib —
-run `plugin/build.sh` from a checkout and point `METALJAX_PLUGIN_PATH` at
-the result (packaging the dylib into a wheel is supported: `build.sh`
-copies it into the package, and wheels built afterwards bundle it).
+(with an editable install, build the plugin once in the checkout via
+`./plugin/build.sh`). A git source
+(`metaljax = { git = "https://github.com/eterevsky/metaljax" }`) works
+too; like sdist installs it compiles the plugin during the build, which
+needs the Xcode command-line tools.
 
 ## Environment variables
 

@@ -7,7 +7,8 @@ PY="$ROOT/.venv/bin/python"
 PY_INCLUDE=$("$PY" -c "import sysconfig; print(sysconfig.get_paths()['include'])")
 mkdir -p build
 clang++ -std=c++20 -O2 -fPIC -shared \
-  -Wall -Wno-unused-function \
+  -Wall -Wno-unused-function -Wno-deprecated-declarations \
+  -mmacosx-version-min=14.0 \
   -undefined dynamic_lookup \
   -I vendor -I "$PY_INCLUDE" \
   metal_pjrt.cc \
