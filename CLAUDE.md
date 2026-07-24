@@ -1,0 +1,96 @@
+# metaljax — a Metal backend for JAX
+
+## Goal
+Build a JAX backend that runs on Apple-silicon GPUs via Metal, on this machine
+(M5 Max, macOS 26.5, Xcode 26.6). North star: **everything the `~/texmo`
+project runs on CPU must run on Metal, preferably faster** (texmo trains many
+small language models: dense/GRU-style layers, norms, softmax/CE loss, Adam,
+`lax.scan`, RNG). Milestone zero: `a = jnp.array([1, 2, 3]); print(2 * a)`
+executes on the Metal device through plain `jax.numpy`.
+
+## Architecture decisions (agreed with Oleg)
+- **Staged integration.**
+  - *Stage 1 (current):* a real PJRT plugin — a thin native dylib implementing
+    the PJRT C API that **trampolines back into Python** (same process) for
+    compile & execute. JAX sees a genuine `METAL` device; unmodified
+    `jax.numpy` code works.
+  - *Stage 2 (after Stage 1 proves out):* migrate the engine to fully native
+    code (C++/Obj-C++, StableHLO parsed natively).
+- **Execution engine (Stage 1): MLX** (`mlx.core`). Chosen per Oleg's
+  criteria (compat with arbitrary jit'd ops + vmap/etc → performance → build
+  ease): MLX is Apple's maintained Metal array library, lazy by default, and
+  `mx.compile` lets us trace our StableHLO interpreter into a fused, cached
+  Metal graph per executable. The op layer is kept behind an internal
+  interface so hand-written Metal shaders / MPS can replace pieces later.
+- **Compile path:** PJRT hands us serialized StableHLO (MLIR bytecode). Parse
+  with `jaxlib.mlir` bindings (already shipped in jaxlib), interpret module
+  op-by-op mapping StableHLO ops → MLX ops; wrap whole executables in
+  `mx.compile` where control flow allows.
+- **Dtypes:** Metal/MLX have no float64. f32/f16/bf16/int/bool only;
+  `jax_enable_x64` stays off. f64 in programs is an expected failure, not a
+  target.
+
+## Ground rules
+- All changes live in `/Users/oleg/metaljax`. **Never modify `metaljax/jax/`**
+  or `metaljax/llvm-project/` — read-only reference clones (gitignored).
+  JAX clone HEAD ≈ 2026-07-23, matches installed jax 0.11.0.
+- Git: repo remote is git@github.com:eterevsky/metaljax.git. **Commit locally;
+  never push** — Oleg pushes himself. No PRs.
+- Python via **uv**: venv at `metaljax/.venv` (CPython 3.13.5), installed:
+  `jax 0.11.0`, `jaxlib 0.11.0`, `mlx 0.32.0`, numpy, pytest.
+  Run things with `.venv/bin/python`.
+- Correctness bar: every implemented op/feature gets a pytest comparing Metal
+  results against the CPU backend (tolerances appropriate for f32).
+- `~/texmo` is the acceptance workload (read-only; don't modify it either).
+
+## Layout (planned)
+- `CLAUDE.md` — this file.
+- `pyproject.toml`, `src/metaljax/` — Python package: StableHLO→MLX
+  interpreter, runtime glue, `jax_plugins` registration entry point.
+- `plugin/` — native PJRT plugin (C/C++/Obj-C++), built with clang from
+  Xcode; links nothing heavy, resolves Python symbols via
+  `-undefined dynamic_lookup`, vendors `pjrt_c_api.h`.
+- `tests/` — pytest suite (Metal vs CPU).
+- `notes/` — investigation notes worth keeping.
+
+## Roadmap / status
+1. ✅ Decisions above; env set up (uv venv, jax 0.11.0, mlx 0.32.0).
+2. ✅ StableHLO→MLX interpreter (`src/metaljax/`): 122 pytest cases pass vs
+   CPU — elementwise, shapes, dot_general/einsum, reductions, cumops,
+   while/if/scan, threefry RNG, gelu/composites, bf16/f16.
+3. ✅ PJRT plugin (`plugin/metal_pjrt.cc` → `plugin/build/libmetal_pjrt.dylib`,
+   build via `plugin/build.sh`): `2 * jnp.array([1,2,3])` runs on
+   MetalDevice(id=0); jit(grad) matches CPU ~1e-8; RNG bit-exact vs CPU;
+   scan/matmul correct through the real backend.
+4. ⬜ Op coverage driven by texmo (gather/scatter, argmax-reduce, sort,
+   dynamic gather from scan of stacked inputs, x64/f64 policy, ...).
+5. ⬜ Performance: `mx.compile` fusion, benchmarks vs CPU backend on texmo
+   workloads.
+6. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+
+## Implementation notes (hard-won)
+- Select the backend with `JAX_PLATFORMS=metal` (or `metal,cpu` to keep CPU
+  available for comparisons). Plugin registered at priority -1 so CPU stays
+  default otherwise. Registration: `src/jax_plugins/metal/__init__.py`
+  (namespace pkg + entry point); env override `METALJAX_PLUGIN_PATH`.
+- PJRT programs arrive as **StableHLO portable artifacts** (VHLO bytecode).
+  `ir.Module.parse` "succeeds" but yields vhlo.* ops — must
+  `stablehlo.deserialize_portable_artifact(ctx, code)` first (engine.py does).
+- The MLIR context must register **sdy** (+ mpmd) — jax 0.11 emits sdy attrs
+  and `sdy.sharding_constraint` ops even single-device (identity for us).
+- pjrt_c_api.h 0.114 defines PJRT_Error/PJRT_Memory as vtable-carrying
+  structs (new C-ABI style); we subclass/instantiate them. jaxlib **fatally
+  requires** (CHECK-fails on error): Device_GetAttributes with non-null
+  attributes_deleter, LoadedExecutable_AddressableDeviceLogicalIds, and
+  LoadedExecutable_GetDeviceAssignment (returns hand-encoded
+  DeviceAssignmentProto bytes — see metal_pjrt.cc).
+- **M5 GPU (applegpu_g17s) MLX f32 matmul is low-precision** (~4e-3, neural
+  accelerators). metaljax defaults to accuracy: sets
+  MLX_METAL_GPU_ARCH=applegpu_g16g before mlx loads; opt out with
+  METALJAX_MATMUL_PRECISION=default (see src/metaljax/__init__.py).
+- bf16 constants can't cross the MLIR python bindings as numpy — decoded via
+  attribute text (incl. hex-blob form) in `_ir.dense_to_np`.
+- Everything in the plugin is synchronous; all PJRT events are born ready.
+  Trampoline: C shim (no deps, `-undefined dynamic_lookup`) → GIL →
+  `metaljax.engine` (compile_program/execute/buffer_from_host/to_host).
+  engine.py + interpreter must import only jaxlib/mlx/numpy, never jax.
