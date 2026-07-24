@@ -104,14 +104,34 @@ class MetalExecutable:
     def runner(self):
         """The callable executing this program, mx.compile'd when possible."""
         from metaljax.interpreter import COMPILE_ENABLED
+        from metaljax.ops import control
 
+        interp = self.interpreter
         if self._can_compile is None:
-            self._can_compile = COMPILE_ENABLED and self.interpreter.main_pure
+            with interp.context:
+                self._can_compile = (
+                    COMPILE_ENABLED
+                    and interp.main_pure
+                    and control._block_cost(interp, interp._main_block())
+                    <= control._TRACE_BUDGET
+                )
+                if control._DEBUG:
+                    print(f"[metaljax] exec {self.name}: pure="
+                          f"{interp.main_pure} cost="
+                          f"{control._block_cost(interp, interp._main_block())} "
+                          f"compile={self._can_compile}", flush=True)
         if not self._can_compile:
-            return self.interpreter
+            return interp
         if self._compiled is None:
-            interp = self.interpreter
-            self._compiled = mx.compile(lambda *a: tuple(interp(*a)))
+            def traced(*a):
+                prev = interp._in_trace
+                interp._in_trace = True
+                try:
+                    return tuple(interp(*a))
+                finally:
+                    interp._in_trace = prev
+
+            self._compiled = mx.compile(traced)
         return self._compiled
 
 

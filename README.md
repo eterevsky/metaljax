@@ -202,8 +202,17 @@ Full training steps (fwd + bwd + AdamW), f32, M5 Max, via
 compiled-body loop — sequential models still pay per-timestep dispatch.
 
 How: pure programs and counted-loop (`scan`/`fori_loop`) bodies are traced
-once through `mx.compile` and replayed as fused Metal graphs
-(`METALJAX_COMPILE=0` disables, for debugging).
+once through `mx.compile` and replayed as fused Metal graphs; small
+statically-counted loops are unrolled into the enclosing trace, so e.g. a
+whole texmo training step (forward scan + backward + AdamW) becomes a
+single graph replay. `METALJAX_COMPILE=0` disables compilation,
+`METALJAX_TRACE_BUDGET` (default 20000 ops) caps trace sizes, and
+`METALJAX_DEBUG=1` logs loop/compile decisions.
+
+On texmo itself: models of texmo's typical tiny size (a handful of units)
+remain CPU territory — thousands of microscopic kernels can't beat XLA:CPU
+compiling the whole scan natively — while at `mgru.256` metal already
+edges out CPU (5.1s vs 5.3s for 64 steps, batch 64, length 256).
 
 ## Known limitations
 

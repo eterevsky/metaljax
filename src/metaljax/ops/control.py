@@ -102,9 +102,90 @@ def _analyze_counted(interp, op):
     return result
 
 
-def _body_fn(interp, body_block):
-    """Cached (compiled) executor for a while body: fn(*vals, *captures)."""
-    entry = interp._body_cache.get(body_block)
+import os
+
+# Max ops a single mx.compile trace may contain (counted loops unrolled).
+# MLX retains every intermediate of a trace, so oversized traces exhaust the
+# Metal live-buffer limit (~500k); ~20k ops is comfortably inside it.
+# Governs: which loops may unroll into an enclosing trace, which loop
+# bodies get compiled, and whether the whole program is compiled.
+_TRACE_BUDGET = int(os.environ.get("METALJAX_TRACE_BUDGET", "20000"))
+_DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
+
+
+def _static_start(op, k):
+    """Static initial counter value of a while op, else None."""
+    v = op.operands[k]
+    if isinstance(v, ir.OpResult):
+        return _splat_int(v.owner.operation)
+    return None
+
+
+def _block_cost(interp, block) -> int:
+    """Approximate op count when this block is traced (loops unrolled)."""
+    cached = interp._cost_cache.get(block)
+    if cached is not None:
+        return cached
+    interp._cost_cache[block] = 1  # break cycles defensively
+    cost = 0
+    for op in block.operations:
+        o = op.operation
+        cost += 1
+        if o.name == "stablehlo.while":
+            counted = _analyze_counted(interp, o)
+            body = o.regions[1].blocks[0]
+            trip = 1
+            if counted is not None and isinstance(counted[1], int):
+                start = _static_start(o, counted[0])
+                if start is not None:
+                    trip = max(counted[1] - start, 1)
+            cost += trip * _block_cost(interp, body)
+        elif o.name in ("func.call", "stablehlo.composite"):
+            attr = "callee" if o.name == "func.call" else "decomposition"
+            fn = interp.funcs.get(_callee_name(o, attr))
+            if fn is not None:
+                cost += _block_cost(interp, fn.regions[0].blocks[0])
+        else:
+            for region in o.regions:
+                for b in region.blocks:
+                    cost += _block_cost(interp, b)
+    interp._cost_cache[block] = cost
+    return cost
+
+
+def _while_traceable(interp, op) -> bool:
+    """True when this while can be unrolled inside an mx.compile trace:
+    statically counted, pure body, and small enough for the trace budget."""
+    body_block = op.regions[1].blocks[0]
+    cached = interp._traceable_cache.get(body_block)
+    if cached is not None:
+        return cached
+    interp._traceable_cache[body_block] = False  # break recursion
+    ok = False
+    counted = _analyze_counted(interp, op)
+    if counted is not None and isinstance(counted[1], int):
+        k, bound = counted
+        start = _static_start(op, k)
+        if start is not None:
+            trip = max(bound - start, 0)
+            if (
+                trip * _block_cost(interp, body_block) <= _TRACE_BUDGET
+                and interp.block_is_pure(body_block)
+            ):
+                ok = True
+    interp._traceable_cache[body_block] = ok
+    return ok
+
+
+# Let the interpreter's purity analysis see through unrollable loops.
+from metaljax.interpreter import Interpreter as _Interpreter
+_Interpreter.while_traceable_hook = staticmethod(_while_traceable)
+
+
+def _body_fn(interp, body_block, compile_body):
+    """Cached executor for a while body: fn(*vals, *captures)."""
+    key = (body_block, compile_body)
+    entry = interp._body_cache.get(key)
     if entry is None:
         free = free_values(body_block)
         nvals = len(list(body_block.arguments))
@@ -115,10 +196,23 @@ def _body_fn(interp, body_block):
             return tuple(interp.run_block(body_block, vals, captures))
 
         fn = raw
-        if COMPILE_ENABLED and interp.block_is_pure(body_block):
-            fn = mx.compile(raw)
+        if (
+            compile_body
+            and COMPILE_ENABLED
+            and interp.block_is_pure(body_block)
+            and _block_cost(interp, body_block) <= _TRACE_BUDGET
+        ):
+            def traced(*flat):
+                prev = interp._in_trace
+                interp._in_trace = True
+                try:
+                    return raw(*flat)
+                finally:
+                    interp._in_trace = prev
+
+            fn = mx.compile(traced)
         entry = (fn, free)
-        interp._body_cache[body_block] = entry
+        interp._body_cache[key] = entry
     return entry
 
 
@@ -133,13 +227,46 @@ def _while(interp, op, ins, env):
         n = bound if isinstance(bound, int) else int(env[bound].item())
         start = int(ins[k].item())
         trip = max(n - start, 0)
-        fn, free = _body_fn(interp, body_block)
+        if interp._in_trace:
+            # An enclosing mx.compile is tracing us (only possible for
+            # unrollable loops): inline the iterations into that graph.
+            if _DEBUG:
+                print(f"[metaljax] while(unroll-in-trace): trip={trip} "
+                      f"cost={_block_cost(interp, body_block)}", flush=True)
+            fn, free = _body_fn(interp, body_block, compile_body=False)
+            captures = [env[v] for v in free]
+            vals = list(ins)
+            for _ in range(trip):
+                vals = list(fn(*vals, *captures))
+            return vals
+        # Eager loop: prefer a compiled body (falls back to raw when the
+        # body is impure or too big to trace). Deferring all iterations can
+        # exhaust MLX's live-buffer limit (each pending replay pins its
+        # internal buffers), so flush the graph often enough that pending
+        # buffers stay bounded; not in a trace here, so eval is safe.
+        fn, free = _body_fn(interp, body_block, compile_body=True)
         captures = [env[v] for v in free]
         vals = list(ins)
-        for _ in range(trip):
+        # Each pending replay pins roughly 3-5 live buffers per traced op;
+        # keep the pending total well under Metal's ~500k buffer limit.
+        cost = _block_cost(interp, body_block)
+        period = max(1, min(64, 25_000 // max(cost, 1)))
+        if _DEBUG:
+            print(f"[metaljax] while: trip={trip} cost={cost} period={period} "
+                  f"pure={interp.block_is_pure(body_block)} "
+                  f"in_trace={interp._in_trace}", flush=True)
+        for i in range(trip):
             vals = list(fn(*vals, *captures))
+            if (i + 1) % period == 0:
+                if _DEBUG and i < 3 * period:
+                    print(f"[metaljax]   flush @{i + 1}, active="
+                          f"{mx.get_active_memory() >> 20}MB", flush=True)
+                mx.eval(*vals)
         return vals
 
+    if _DEBUG:
+        print(f"[metaljax] while(fallback-dynamic): "
+              f"cost={_block_cost(interp, body_block)}", flush=True)
     vals = list(ins)
     while True:
         (pred,) = interp.run_block(cond_block, vals, env)

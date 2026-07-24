@@ -83,10 +83,21 @@ executes on the Metal device through plain `jax.numpy`.
    for transformers). GRU.256/b256: 112 vs torch fused nn.GRU 50.7 (2.2×
    gap = per-timestep python replay); texmo bench_jax b256: 147.7 vs cpu
    273.3; b64: 133.6 vs cpu 113.7. Was 502 ms/step before this pass.
-   Future perf ideas: unroll whole counted loops into one traced graph
-   (one replay per scan, not per timestep); prepared-closure interpreter
-   rewrite (kills MLIR-wrapper overhead on eager paths); if/case branch
-   compile. Remaining coverage gaps: argmax/argmin multi-result reduce
+   Pass 2 (loop unrolling): small statically-counted loops unroll into the
+   enclosing mx.compile trace (interp._in_trace flag decides per context;
+   never nest mx.compile). METALJAX_TRACE_BUDGET (20000) caps any single
+   trace: MLX retains every intermediate while tracing AND each pending
+   replay pins its buffers → Metal's ~500k live-buffer limit; eager counted
+   loops flush (mx.eval) every ~25000/cost iterations. _block_cost must
+   traverse func.call/composite callees (undercounting made the engine
+   compile texmo's whole 256-step chunk → buffer exhaustion). Result: texmo
+   train step = ONE graph replay (~34ms for mgru.4 — kernel-launch-bound;
+   CPU wins tiny models on physics; parity at mgru.256: 5.1s vs cpu 5.3s).
+   METALJAX_DEBUG=1 logs loop/compile decisions.
+   Future perf ideas: prepared-closure interpreter rewrite (kills
+   MLIR-wrapper overhead on eager paths + trace time); if/case branch
+   compile; hoisting loop-invariant input projections (torch's fused-GRU
+   trick). Remaining coverage gaps: argmax/argmin multi-result reduce
    (sampling path), sort, partial-window scatter.
 6. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 

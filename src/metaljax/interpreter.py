@@ -118,11 +118,18 @@ class Interpreter:
     # cannot be traced through mx.compile.
     _IMPURE_OPS = ("stablehlo.while", "stablehlo.if", "stablehlo.case")
 
+    # Set by ops.control: hook(interp, while_op) -> bool, True when the loop
+    # has a small static trip count and can be unrolled inside a trace.
+    while_traceable_hook = None
+
     def __init__(self, module: bytes | str | ir.Module, context: ir.Context | None = None):
         # Caches keyed by ir.Block (pointer-stable identity across traversals).
         self._body_cache: dict = {}    # while-body block -> (fn, free_values, nvals)
         self._counted_cache: dict = {}  # while cond block -> counted-loop info | None
         self._pure_cache: dict = {}    # block -> bool
+        self._traceable_cache: dict = {}  # while body block -> bool
+        self._cost_cache: dict = {}    # block -> approx op count when traced
+        self._in_trace = False  # True while mx.compile is tracing our code
         if isinstance(module, ir.Module):
             if context is None:
                 raise ValueError("pass the ir.Context that owns the module")
@@ -194,6 +201,13 @@ class Interpreter:
             o = op.operation
             name = o.name
             if name in self._IMPURE_OPS:
+                hook = type(self).while_traceable_hook
+                if (
+                    name == "stablehlo.while"
+                    and hook is not None
+                    and hook(self, o)
+                ):
+                    continue  # statically-counted small loop: unrollable
                 pure = False
                 break
             if name in ("func.call", "stablehlo.composite"):
