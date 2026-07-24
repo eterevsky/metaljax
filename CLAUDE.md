@@ -73,16 +73,21 @@ executes on the Metal device through plain `jax.numpy`.
    `bench_jax.py --platform metal` works (flag committed to texmo repo).
    Verified: `bits.1+bp|rnn.1.tanh` and `bits.1+bp|mgru.4-dense.4.gelu` train
    end-to-end with sane losses; train_and_eval incl. recurrent eval path.
-5. ⬜ **Performance — the next big thing.** GRU.256/batch64 bench:
-   metal 502 ms/step vs cpu 110 ms/step. Cause: eager per-op dispatch
-   (thousands of MLIR-wrapper + Python + MLX calls per scan step) and a
-   .item() host sync per while iteration. Plan: (a) compile-time pass turning
-   each block into prepared closures (decode attrs once, slot-indexed SSA,
-   no MLIR objects at runtime); (b) counted-loop detection for JAX scan
-   whiles (cond `i < const`) → python for-loop, no per-iter .item();
-   (c) mx.compile cached per block for fusion; (d) whole-module mx.compile
-   when no control flow. Remaining coverage gaps to expect: argmax/argmin
-   multi-result reduce (sampling), sort, partial-window scatter.
+5. ✅ **Performance pass 1** (counted-loop detection + mx.compile): pure
+   mains and counted while bodies (scan/fori: cond `i < N`, body `i+1`)
+   trace once through mx.compile, then replay fused graphs; caches keyed by
+   ir.Block (pointer-stable across traversals). METALJAX_COMPILE=0 disables.
+   Numbers (full train steps, f32, scripts/bench_compare.py):
+   transformer d256/b32: metaljax 31.2 ms vs torch-MPS 30.1 vs jax-cpu 174;
+   d512/b64: 157.6 vs torch 154.6 (within 2% — Oleg's aspirational goal met
+   for transformers). GRU.256/b256: 112 vs torch fused nn.GRU 50.7 (2.2×
+   gap = per-timestep python replay); texmo bench_jax b256: 147.7 vs cpu
+   273.3; b64: 133.6 vs cpu 113.7. Was 502 ms/step before this pass.
+   Future perf ideas: unroll whole counted loops into one traced graph
+   (one replay per scan, not per timestep); prepared-closure interpreter
+   rewrite (kills MLIR-wrapper overhead on eager paths); if/case branch
+   compile. Remaining coverage gaps: argmax/argmin multi-result reduce
+   (sampling path), sort, partial-window scatter.
 6. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note

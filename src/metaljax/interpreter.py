@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 import mlx.core as mx
@@ -11,9 +12,37 @@ from jaxlib.mlir import ir
 
 from metaljax import _ir, dtypes
 
+# When enabled, pure programs/loop bodies are traced through mx.compile so
+# repeat executions replay a fused Metal graph instead of re-dispatching
+# op by op from Python. Disable for debugging.
+COMPILE_ENABLED = os.environ.get("METALJAX_COMPILE", "1") != "0"
+
 
 class UnsupportedOpError(NotImplementedError):
     pass
+
+
+def free_values(block: ir.Block) -> list[ir.Value]:
+    """SSA values used inside `block` but defined outside it (captures)."""
+    defined: set = set()
+    free: dict = {}
+
+    def walk(blk: ir.Block):
+        for a in blk.arguments:
+            defined.add(a)
+        for op in blk.operations:
+            o = op.operation
+            for v in o.operands:
+                if v not in defined and v not in free:
+                    free[v] = None
+            for region in o.regions:
+                for b in region.blocks:
+                    walk(b)
+            for r in o.results:
+                defined.add(r)
+
+    walk(block)
+    return list(free)
 
 
 # op name -> handler(interp, op: ir.Operation, ins: list[mx.array], env) -> list[mx.array] | mx.array
@@ -85,7 +114,15 @@ class Interpreter:
     Accepts MLIR bytecode bytes, module text, or an ir.Module.
     """
 
+    # Ops whose handlers synchronize with the host (.item()) and therefore
+    # cannot be traced through mx.compile.
+    _IMPURE_OPS = ("stablehlo.while", "stablehlo.if", "stablehlo.case")
+
     def __init__(self, module: bytes | str | ir.Module, context: ir.Context | None = None):
+        # Caches keyed by ir.Block (pointer-stable identity across traversals).
+        self._body_cache: dict = {}    # while-body block -> (fn, free_values, nvals)
+        self._counted_cache: dict = {}  # while cond block -> counted-loop info | None
+        self._pure_cache: dict = {}    # block -> bool
         if isinstance(module, ir.Module):
             if context is None:
                 raise ValueError("pass the ir.Context that owns the module")
@@ -143,6 +180,49 @@ class Interpreter:
             rt = ir.RankedTensorType(t)
             out.append((tuple(rt.shape), dtypes.np_dtype_for_mlir(rt.element_type)))
         return out
+
+    # --- purity / capture analysis (used for mx.compile) ---
+
+    def block_is_pure(self, block: ir.Block) -> bool:
+        """True if executing the block never synchronizes with the host."""
+        cached = self._pure_cache.get(block)
+        if cached is not None:
+            return cached
+        self._pure_cache[block] = True  # optimistic; no recursion in jax IR
+        pure = True
+        for op in block.operations:
+            o = op.operation
+            name = o.name
+            if name in self._IMPURE_OPS:
+                pure = False
+                break
+            if name in ("func.call", "stablehlo.composite"):
+                attr = "callee" if name == "func.call" else "decomposition"
+                callee = ir.FlatSymbolRefAttr(o.attributes[attr]).value
+                fn = self.funcs.get(callee)
+                if fn is not None and not self.block_is_pure(
+                    fn.regions[0].blocks[0]
+                ):
+                    pure = False
+                    break
+            stop = False
+            for region in o.regions:
+                for b in region.blocks:
+                    if not self.block_is_pure(b):
+                        pure = False
+                        stop = True
+                        break
+                if stop:
+                    break
+            if stop:
+                break
+        self._pure_cache[block] = pure
+        return pure
+
+    @property
+    def main_pure(self) -> bool:
+        with self.context:
+            return self.block_is_pure(self._main_block())
 
     # --- execution ---
 

@@ -98,6 +98,21 @@ class MetalExecutable:
         self.num_outputs = len(outs)
         self.out_types = [_NP_TO_ENUM[np.dtype(dt)] for _, dt in outs]
         self.out_dims = [list(shape) for shape, _ in outs]
+        self._compiled = None
+        self._can_compile = None  # resolved lazily on first execute
+
+    def runner(self):
+        """The callable executing this program, mx.compile'd when possible."""
+        from metaljax.interpreter import COMPILE_ENABLED
+
+        if self._can_compile is None:
+            self._can_compile = COMPILE_ENABLED and self.interpreter.main_pure
+        if not self._can_compile:
+            return self.interpreter
+        if self._compiled is None:
+            interp = self.interpreter
+            self._compiled = mx.compile(lambda *a: tuple(interp(*a)))
+        return self._compiled
 
 
 def compile_program(code: bytes, fmt: str) -> MetalExecutable:
@@ -129,7 +144,7 @@ def compile_program(code: bytes, fmt: str) -> MetalExecutable:
 
 
 def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
-    outs = ex.interpreter(*[b.data for b in buffers])
+    outs = list(ex.runner()(*[b.data for b in buffers]))
     if outs:
         mx.eval(*outs)
     res = []

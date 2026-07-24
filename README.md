@@ -186,12 +186,29 @@ tests/                     pytest suite (Metal vs CPU)
 scripts/texmo_train.py     texmo-on-Metal driver
 ```
 
+## Benchmarks
+
+Full training steps (fwd + bwd + AdamW), f32, M5 Max, via
+`scripts/bench_compare.py` (16 timed steps after warmup):
+
+| workload | jax CPU | **metaljax** | torch MPS | torch CPU |
+|---|---:|---:|---:|---:|
+| transformer d256 L4 T256 b32 | 174.3 | **31.2** | 30.1 | 209.3 |
+| transformer d512 L4 T256 b64 | — | **157.6** | 154.6 | — |
+| GRU.256 T256 b256 (scan) | — | **112.0** | 50.7¹ | — |
+| texmo `bench_jax.py` GRU b256 | 273.3 | **147.7** | — | — |
+
+¹ torch uses its fused `nn.GRU` kernel; metaljax runs the scan as a
+compiled-body loop — sequential models still pay per-timestep dispatch.
+
+How: pure programs and counted-loop (`scan`/`fori_loop`) bodies are traced
+once through `mx.compile` and replayed as fused Metal graphs
+(`METALJAX_COMPILE=0` disables, for debugging).
+
 ## Known limitations
 
-- **Performance**: the interpreter currently dispatches ops eagerly from
-  Python (~500 ms/step vs ~110 ms/step CPU on texmo's GRU.256 bench).
-  The planned fix: pre-compiled per-block closures, counted-loop
-  detection for `scan`, and `mx.compile` fusion.
+- Sequential (scan-heavy) models run each timestep as a compiled-graph
+  replay from Python; fused-RNN-kernel frameworks are ~2× faster there.
 - float64 is emulated in f32 (see `METALJAX_F64`); complex dtypes are
   unsupported.
 - Not yet implemented (fail with a clear `UnsupportedOpError`):
