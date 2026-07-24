@@ -274,7 +274,13 @@ def _scatter(interp, op, ins, env):
     idx_tuple = tuple(mapped[dim] for dim in indexed_dims)
     updates_t = updates_t.astype(operand_t.dtype)
     if method == "set":
-        res_t = operand_t.at[idx_tuple].set(updates_t) if idx_tuple else updates_t
+        # mx.array.at has no .set; __setitem__ is MLX's scatter-assign (it
+        # rebinds only this local array object, so no aliasing concerns).
+        if idx_tuple:
+            res_t = operand_t
+            res_t[idx_tuple] = updates_t
+        else:
+            res_t = updates_t
     else:
         res_t = getattr(operand_t.at[idx_tuple], method)(updates_t)
 

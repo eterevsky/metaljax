@@ -13,5 +13,5 @@ if _os.environ.get("METALJAX_MATMUL_PRECISION", "highest") == "highest":
 from metaljax.interpreter import Interpreter, UnsupportedOpError
 from metaljax import ops as _ops  # noqa: F401  (registers all op handlers)
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = ["Interpreter", "UnsupportedOpError"]
