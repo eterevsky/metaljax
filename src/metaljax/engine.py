@@ -139,6 +139,9 @@ class MetalExecutable:
 def compile_program(code: bytes, fmt: str) -> MetalExecutable:
     if fmt not in ("mlir",):
         raise ValueError(f"unsupported program format {fmt!r}")
+    # New program = config boundary: cached buffers from prior shapes are
+    # dead weight against the Metal buffer-count limit.
+    mx.clear_cache()
     from jaxlib.mlir.dialects import stablehlo
 
     ctx = _ir.make_context()
@@ -170,8 +173,22 @@ def compile_program(code: bytes, fmt: str) -> MetalExecutable:
 # METALJAX_SYNC=1 restores blocking eval (errors then surface at the call).
 _SYNC = os.environ.get("METALJAX_SYNC", "0") == "1"
 
+# Metal caps LIVE MTLBuffers at ~499k (device_info()["resource_limit"]) and
+# MLX's buffer cache is bounded by BYTES, not count — a long-lived process
+# compiling many programs of different shapes (a texmo worker sweeping
+# configurations) accumulates freed small buffers in the cache until the
+# count limit kills an unrelated allocation. Clearing at compile boundaries
+# (old shapes are garbage then) plus a periodic execute backstop keeps the
+# count bounded. METALJAX_CLEAR_PERIOD=0 disables the backstop.
+_CLEAR_PERIOD = int(os.environ.get("METALJAX_CLEAR_PERIOD", "50000"))
+_exec_count = 0
+
 
 def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
+    global _exec_count
+    _exec_count += 1
+    if _CLEAR_PERIOD and _exec_count % _CLEAR_PERIOD == 0:
+        mx.clear_cache()
     args = [b.data for b in buffers]
     try:
         outs = list(ex.runner()(*args))

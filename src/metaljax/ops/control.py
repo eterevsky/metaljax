@@ -247,9 +247,11 @@ def _body_fn(interp, body_block, compile_body, repeat=1):
             return tuple(vals)
 
         fn = raw
+        compiled = False
         if (
             compile_body
             and COMPILE_ENABLED
+            and body_block not in interp._no_body_compile
             and interp.block_is_pure(body_block)
             and repeat * _block_cost(interp, body_block) <= _TRACE_BUDGET
         ):
@@ -262,7 +264,8 @@ def _body_fn(interp, body_block, compile_body, repeat=1):
                     interp._in_trace = prev
 
             fn = mx.compile(traced)
-        entry = (fn, free)
+            compiled = True
+        entry = (fn, free, compiled)
         interp._body_cache[key] = entry
     return entry
 
@@ -288,7 +291,7 @@ def _while(interp, op, ins, env):
             if _DEBUG:
                 print(f"[metaljax] while(unroll-in-trace): trip={trip} "
                       f"cost={_block_cost(interp, body_block)}", flush=True)
-            fn, free = _body_fn(interp, body_block, compile_body=False)
+            fn, free, _ = _body_fn(interp, body_block, compile_body=False)
             captures = [env[v] for v in free]
             vals = list(ins)
             for _ in range(trip):
@@ -327,12 +330,31 @@ def _while(interp, op, ins, env):
                     print(f"[metaljax] chunked loop failed ({e}); "
                           f"falling back to single-step", flush=True)
                 interp._no_chunk.add(body_block)
-        fn, free = _body_fn(interp, body_block, compile_body=True)
+        fn, free, compiled = _body_fn(interp, body_block, compile_body=True)
         captures = [env[v] for v in free]
         vals = list(ins)
-        for i in range(trip):
-            vals = list(fn(*vals, *captures))
-            if (i + 1) % period == 0:
+        i = 0
+        while i < trip:
+            try:
+                vals = list(fn(*vals, *captures))
+            except (RuntimeError, IndexError, ValueError):
+                # MLX's compiled path can fail at call time (e.g.
+                # unordered_map::at on graphs with unused inputs). The body
+                # is pure and the call left `vals` untouched: redo this
+                # iteration with the uncompiled body.
+                if not compiled:
+                    raise
+                if _DEBUG:
+                    print("[metaljax] compiled while body failed; "
+                          "retrying eagerly", flush=True)
+                interp._no_body_compile.add(body_block)
+                interp._body_cache.pop((body_block, True, 1), None)
+                fn, free, compiled = _body_fn(
+                    interp, body_block, compile_body=True)
+                captures = [env[v] for v in free]
+                continue
+            i += 1
+            if i % period == 0:
                 mx.eval(*vals)
         return vals
 
@@ -349,7 +371,7 @@ def _while(interp, op, ins, env):
 
 
 def _run_chunked(interp, body_block, env, ins, trip, K, cost):
-    fn, free = _body_fn(interp, body_block, compile_body=True, repeat=K)
+    fn, free, _ = _body_fn(interp, body_block, compile_body=True, repeat=K)
     captures = [env[v] for v in free]
     vals = list(ins)
     # Async-flush each chunk (a blocking sync per chunk serializes CPU and
@@ -364,7 +386,7 @@ def _run_chunked(interp, body_block, env, ins, trip, K, cost):
             mx.async_eval(*vals)
     rem = trip % K
     if rem:
-        fn1, free1 = _body_fn(interp, body_block, compile_body=True)
+        fn1, free1, _ = _body_fn(interp, body_block, compile_body=True)
         captures1 = [env[v] for v in free1]
         for _ in range(rem):
             vals = list(fn1(*vals, *captures1))
