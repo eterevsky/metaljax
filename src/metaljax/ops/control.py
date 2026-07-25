@@ -140,6 +140,9 @@ def _block_cost(interp, block) -> int:
         o = op.operation
         cost += 1
         if o.name == "stablehlo.while":
+            if _msl_plan_for(interp, o) is not None:
+                cost += 8  # a single generated kernel
+                continue
             counted = _analyze_counted(interp, o)
             body = o.regions[1].blocks[0]
             trip = 1
@@ -161,6 +164,40 @@ def _block_cost(interp, block) -> int:
     return cost
 
 
+def _msl_plan_for(interp, op):
+    """Build (and cache) an msl_scan Plan for a statically-counted loop,
+    or None. Used by purity/cost analysis and by _while dispatch."""
+    counted = _analyze_counted(interp, op)
+    if counted is None or not isinstance(counted[1], int):
+        return None
+    k, bound = counted
+    start = _static_start(op, k)
+    if start is None:
+        return None
+    trip = bound - start
+    if trip <= 0:
+        return None
+    from metaljax import msl_scan
+    if not msl_scan.ENABLED:
+        return None
+    body = op.regions[1].blocks[0]
+    key = (body, trip, start)
+    plan = interp._msl_cache.get(key, "miss")
+    if plan == "miss":
+        try:
+            plan = msl_scan.Plan(interp, body, k, trip, start)
+            if msl_scan._DEBUG:
+                print(f"[metaljax] msl_scan: compiled plan trip={trip} "
+                      f"lanes={plan.N} states={len(plan.states)} "
+                      f"stacked={len(plan.stacked)}", flush=True)
+        except Exception as e:
+            if msl_scan._DEBUG:
+                print(f"[metaljax] msl_scan: not eligible ({e})", flush=True)
+            plan = None
+        interp._msl_cache[key] = plan
+    return plan
+
+
 def _while_traceable(interp, op) -> bool:
     """True when this while can be unrolled inside an mx.compile trace:
     statically counted, pure body, and small enough for the trace budget."""
@@ -169,6 +206,9 @@ def _while_traceable(interp, op) -> bool:
     if cached is not None:
         return cached
     interp._traceable_cache[body_block] = False  # break recursion
+    if _msl_plan_for(interp, op) is not None:
+        interp._traceable_cache[body_block] = True
+        return True
     ok = False
     counted = _analyze_counted(interp, op)
     if counted is not None and isinstance(counted[1], int):

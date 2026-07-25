@@ -99,3 +99,33 @@ def test_int_carry_data():
             return nm, nm
         return jax.lax.scan(cell, jnp.full((B, H), 100, jnp.int32), xs)
     check(f, XI)
+
+
+def test_small_matvec_cell_vector_mode():
+    W = (rng.standard_normal((H, H)) * 0.3).astype(np.float32)
+
+    def f(xs, h0, w):
+        def cell(h, x):
+            g = jax.nn.sigmoid(x + h @ w)
+            nh = (1 - g) * h + g * jnp.tanh(x)
+            return nh, nh
+        return jax.lax.scan(cell, h0, xs)
+    check(f, X, H0, W)
+    check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
+                             argnums=(0, 1, 2)), X, H0, W)
+
+
+def test_block_diagonal_cell_vector_mode():
+    K, C = 2, 4
+    W = (rng.standard_normal((K, C, C)) * 0.3).astype(np.float32)
+    Xb = (rng.standard_normal((L, B, K, C)) * 0.3).astype(np.float32)
+    hb = rng.standard_normal((B, K, C)).astype(np.float32)
+
+    def f(xs, h0, w):
+        def cell(h, x):
+            nh = jnp.tanh(jnp.einsum('bkc,kcd->bkd', h, w) + x)
+            return nh, nh
+        return jax.lax.scan(cell, h0, xs)
+    check(f, Xb, hb, W)
+    check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
+                             argnums=(0, 1, 2)), Xb, hb, W)
