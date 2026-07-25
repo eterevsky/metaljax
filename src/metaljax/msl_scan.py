@@ -29,6 +29,7 @@ _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 # bodies containing small dot_generals hold the whole block in registers and
 # unroll the matvec in-lane.
 _REG_LIMIT = int(os.environ.get("METALJAX_MSL_REG", "16"))
+_KERNEL_SEQ = 0
 
 
 class _Unsupported(Exception):
@@ -363,6 +364,17 @@ class _Analyzer:
                 raise _Unsupported("non-add reduce")
             dims = _ir.i64_list(o, "dimensions")
             out_shape = tuple(ir.RankedTensorType(o.results[0].type).shape)
+            if all(x.shape[d] == 1 for d in dims):
+                # reducing unit dims is a squeeze, not a contraction
+                if isinstance(x, (SymAccDot, SymAccRed, SymDot)):
+                    return [self._reshaped(x, out_shape)]
+                out = x
+                for d in sorted(dims, reverse=True):
+                    out = self._dropdim(out, d)
+                return [out]
+            dot = self._reduce_as_dot(x, dims, out_shape)
+            if dot is not None:
+                return [dot]
             return [SymAccRed(x, dims, out_shape, x.dtype)]
 
         if name == "stablehlo.dynamic_slice":
@@ -414,6 +426,191 @@ class _Analyzer:
             return [SymElem(name, ins, a.dtype, _bshape(a.shape, b.shape))]
 
         raise _Unsupported(f"op {name}")
+
+    def _varies(self, s, axis):
+        """Does `s` (rank-aligned to its own shape) vary along `axis`?
+        Conservative toward True for unknown node kinds."""
+        shape = getattr(s, "shape", ()) or ()
+        if axis >= len(shape) or shape[axis] == 1:
+            return False
+        if isinstance(s, (SymConst, SymCounter)):
+            return False
+        if isinstance(s, SymLeaf):
+            return s.strides[axis] != 0
+        if isinstance(s, SymElem):
+            k = len(shape)
+            for a in s.args:
+                ashape = getattr(a, "shape", ()) or ()
+                ax = axis - (k - len(ashape))
+                if ax >= 0 and self._varies(a, ax):
+                    return True
+            return False
+        return True
+
+    def _dropdim(self, s, axis):
+        """Remove a size-1 axis from a sym (leaves drop the stride entry)."""
+        shape = tuple(s.shape[:axis]) + tuple(s.shape[axis + 1:])
+        if isinstance(s, SymConst):
+            return SymConst(s.value, s.dtype, shape)
+        if isinstance(s, SymLeaf):
+            out = _clone_leafish(s)
+            out.shape = shape
+            out.strides = (tuple(s.strides[:axis])
+                           + tuple(s.strides[axis + 1:]))
+            return out
+        if isinstance(s, SymElem):
+            k = len(s.shape)
+            args = []
+            for a in s.args:
+                ashape = getattr(a, "shape", ()) or ()
+                ax = axis - (k - len(ashape))
+                if ax < 0:
+                    args.append(a)
+                elif ashape[ax] == 1:
+                    args.append(self._dropdim(a, ax))
+                else:
+                    raise _Unsupported("dropdim of varying arg")
+            return SymElem(s.op, args, s.dtype, shape, extra=s.extra)
+        raise _Unsupported(f"dropdim of {type(s).__name__}")
+
+    def _squeeze_axis(self, s, axis):
+        """Slice a non-varying axis to width 1 and drop it."""
+        starts = [0] * len(s.shape)
+        sizes = list(s.shape)
+        sizes[axis] = 1
+        return self._dropdim(self._sliced(s, starts, tuple(sizes)), axis)
+
+    def _reduce_as_dot(self, x, dims, out_shape):
+        """Recognize reduce(add, multiply(a, b), dims) as a contraction.
+
+        texmo's lrnn lowers its block matvec as broadcast-multiply +
+        reduce instead of dot_general. Two shapes come up:
+        - one side is a loop-invariant weight leaf and the reduce is over
+          the trailing register dims -> an in-lane SymDot (fwd and the
+          dh backward);
+        - both sides vary and the reduce covers lane dims -> a cross-lane
+          SymAccDot (the dW accumulator), evaluated post-kernel.
+        Returns a Sym or None.
+        """
+        if not (isinstance(x, SymElem) and x.op == "stablehlo.multiply"
+                and len(x.args) == 2):
+            return None
+        rank = len(x.shape)
+        a, b = x.args
+
+        def var_axes(s):
+            k = rank - len(getattr(s, "shape", ()) or ())
+            return {ax for ax in range(rank)
+                    if ax >= k and self._varies(s, ax - k)}
+
+        va, vb = var_axes(a), var_axes(b)
+        if _DEBUG:
+            print(f"[metaljax] reduce_as_dot: dims={dims} "
+                  f"a={_dump(a)[:120]} va={sorted(va)} "
+                  f"b={_dump(b)[:120]} vb={sorted(vb)}", flush=True)
+
+        def invariant_leaf(s):
+            return isinstance(s, SymLeaf) and s.kind in ("whole", "arg")
+
+        # Case 1: in-lane dot. Exactly one reduced dim; it and the 'd'
+        # output dim must be the two trailing dims.
+        if len(dims) == 1:
+            red = dims[0]
+            for w, d_expr in ((a, b), (b, a)):
+                if not (invariant_leaf(w) and red in var_axes(w)
+                        and red in var_axes(d_expr)):
+                    continue
+                vw, vd = var_axes(w), var_axes(d_expr)
+                d_axes = [ax for ax in range(rank)
+                          if ax != red and ax in vw and ax not in vd]
+                if len(d_axes) != 1:
+                    continue
+                d_ax = d_axes[0]
+                if {d_ax, red} != {rank - 2, rank - 1}:
+                    continue
+                if x.dtype != "f32":
+                    continue
+                csize, dsize = x.shape[red], x.shape[d_ax]
+                if csize > 4096 or dsize > 4096:
+                    continue
+                # compact weight: drop broadcast (stride-0 or size-1) dims
+                k = rank - len(w.shape)
+                wleaf = _clone_leafish(w)
+                keep = [i for i in range(len(w.shape))
+                        if (i + k) in vw]
+                wleaf.shape = tuple(w.shape[i] for i in keep)
+                wleaf.strides = tuple(w.strides[i] for i in keep)
+                widx = []
+                lane_map = {}
+                lane_axes = [ax for ax in range(rank)
+                             if ax not in (red, d_ax)]
+                for li, ax in enumerate(lane_axes):
+                    lane_map[ax] = li
+                for i in keep:
+                    ax = i + k
+                    if ax == red:
+                        widx.append(("c",))
+                    elif ax == d_ax:
+                        widx.append(("d",))
+                    else:
+                        widx.append(("data", lane_map[ax]))
+                data = self._squeeze_axis(d_expr if rank == len(
+                    getattr(d_expr, "shape", ())) else
+                    self._broadcasted(d_expr, x.shape,
+                                      list(range(rank - len(d_expr.shape),
+                                                 rank))), d_ax)
+                # data now has the reduced dim last
+                roles = []
+                for ax in range(rank):
+                    if ax == red:
+                        continue
+                    roles.append(("reg",) if ax == d_ax
+                                 else ("data", lane_map[ax]))
+                return SymDot(data, wleaf, roles, widx, csize, dsize,
+                              "f32", tuple(out_shape))
+
+        # Case 2: cross-lane contraction (weight gradients): every reduced
+        # dim varies on both sides; compact each side by squeezing its
+        # broadcast axes.
+        if all(ax in va and ax in vb for ax in dims):
+            def compact(s, own_axes):
+                k = rank - len(getattr(s, "shape", ()) or ())
+                if k:
+                    s = self._broadcasted(s, x.shape, list(range(k, rank)))
+                mapping = {}
+                out = s
+                removed = 0
+                for ax in range(rank):
+                    if ax in own_axes:
+                        mapping[ax] = ax - removed
+                    else:
+                        out = self._squeeze_axis(out, ax - removed)
+                        removed += 1
+                return out, mapping
+            try:
+                ca, ma = compact(a, va)
+                cb, mb = compact(b, vb)
+            except _Unsupported:
+                return None
+            kept = [ax for ax in range(rank) if ax not in dims]
+            if any(ax not in va and ax not in vb and x.shape[ax] != 1
+                   for ax in kept):
+                return None
+            batch = [ax for ax in kept if ax in va and ax in vb]
+            a_only = [ax for ax in kept if ax in va and ax not in vb]
+            b_only = [ax for ax in kept if ax in vb and ax not in va]
+            ones = [ax for ax in kept if ax not in va and ax not in vb]
+            if ones:
+                return None  # size-1 leftovers: rare, skip
+            lb = [ma[ax] for ax in batch]
+            rb = [mb[ax] for ax in batch]
+            lc = [ma[ax] for ax in dims]
+            rc = [mb[ax] for ax in dims]
+            einsum_order = batch + a_only + b_only
+            perm = tuple(einsum_order.index(ax) for ax in kept)
+            return SymAccDot(ca, cb, (lb, rb, lc, rc), tuple(out_shape),
+                             "f32", perm=perm)
+        return None
 
     def _dot_general(self, o, ins):
         from metaljax.ops.linalg import _dot_dims
@@ -564,6 +761,36 @@ class _Analyzer:
         if isinstance(x, SymAccDot):
             return SymAccDot(x.lhs, x.rhs, x.dims, out_shape, x.dtype,
                              perm=x.perm)
+        if isinstance(x, SymDot):
+            # unit-dim insertions/removals: rebuild roles positionally
+            roles = []
+            i = 0
+            xs = list(x.shape)
+            for d in out_shape:
+                if i < len(xs) and xs[i] == d:
+                    roles.append(x.roles[i])
+                    i += 1
+                elif d == 1:
+                    roles.append(("one",))
+                elif (i < len(xs) and xs[i] == 1
+                      and x.roles[i] == ("one",)):
+                    i += 1  # dropped unit dim; retry this out dim
+                    if i < len(xs) and xs[i] == d:
+                        roles.append(x.roles[i])
+                        i += 1
+                    else:
+                        raise _Unsupported(
+                            f"reshape {x.shape} -> {out_shape} of dot")
+                else:
+                    raise _Unsupported(
+                        f"reshape {x.shape} -> {out_shape} of dot")
+            while i < len(xs):
+                if xs[i] != 1 or x.roles[i] != ("one",):
+                    raise _Unsupported(
+                        f"reshape {x.shape} -> {out_shape} of dot")
+                i += 1
+            return SymDot(x.data, x.weight, roles, x.widx, x.csize,
+                          x.dsize, x.dtype, tuple(out_shape))
         if not isinstance(x, SymLeaf):
             raise _Unsupported(f"reshape of {type(x).__name__}")
         s = _clone_leafish(x)
@@ -1046,6 +1273,33 @@ class Plan:
         self.arg_shapes = [tuple(t.shape) for t in arg_types]
         self.arg_dtypes = [_dt(t.element_type) for t in arg_types]
 
+        # Squeeze interior unit dims out of classified values: row-major
+        # layout is unchanged by them, and the lane-space unifier expects
+        # values shaped (lane..., reg) without stray 1s (broadcast-multiply
+        # lowerings leave (B,K,1,C)-style shapes behind).
+        _squeeze_cache = {}
+
+        def _squeeze_units(sym):
+            shape = getattr(sym, "shape", ()) or ()
+            if len(shape) <= 1 or 1 not in shape[:-1]:
+                return sym
+            hit = _squeeze_cache.get(id(sym))
+            if hit is not None:
+                return hit
+            orig = sym
+            try:
+                for ax in range(len(shape) - 2, -1, -1):
+                    if sym.shape[ax] == 1:
+                        sym = an._dropdim(sym, ax)
+            except _Unsupported:
+                pass
+            _squeeze_cache[id(orig)] = sym
+            return sym
+
+        self.states = [(i, _squeeze_units(v)) for i, v in self.states]
+        self.stacked = [(i, idx, _squeeze_units(v))
+                        for i, idx, v in self.stacked]
+
         # Resolve accumulator operands: reads of existing stacks are used
         # directly (with flips for reversed indexing); loop-computed values
         # get hidden per-step stacked outputs.
@@ -1067,6 +1321,10 @@ class Plan:
                     f"acc under elementwise: {_dump(sym)[:200]}")
             if sym.dtype != "f32":
                 raise _Unsupported("non-f32 accumulator operand")
+            for hi, (hsym, _) in enumerate(self.hidden):
+                if hsym is sym:
+                    return ("hidden", sym, hi)
+            sym = _squeeze_units(sym)
             for hi, (hsym, _) in enumerate(self.hidden):
                 if hsym is sym:
                     return ("hidden", sym, hi)
@@ -1220,7 +1478,12 @@ class Plan:
         else:
             src = self._emit(counter_pos)
         self.source = src
-        name = f"mj_scan_{abs(hash((id(body_block), trip, start))) % 10**8}"
+        # NB kernel names must be process-unique: MLX caches compiled
+        # kernels and id()-based names collide once Python reuses addresses
+        # across executables (order-1 wrong results in config sweeps).
+        global _KERNEL_SEQ
+        _KERNEL_SEQ += 1
+        name = f"mj_scan_{_KERNEL_SEQ}"
         self.kernel = mx.fast.metal_kernel(
             name=name,
             input_names=[f"inp{i}" for i in range(len(self.sources))]
@@ -1416,6 +1679,11 @@ class Plan:
         reg_stride = sts[-1] if dims else 0
         lane_dims = dims[:-1] if dims else []
         lane_sts = sts[:-1] if dims else []
+        # unit dims contribute no offset and may sit anywhere (broadcast
+        # lowerings leave interior 1s); drop them before lane alignment
+        keep = [i for i, d in enumerate(lane_dims) if d != 1]
+        lane_dims = [lane_dims[i] for i in keep]
+        lane_sts = [lane_sts[i] for i in keep]
         pad = len(lane) - len(lane_dims)
         if pad < 0:
             n = len(lane_dims) - len(lane)
@@ -2048,9 +2316,13 @@ class Plan:
                 a = leaf.idx.a
                 b2 = a * self.start + leaf.idx.b
                 if a == 1:
-                    return src[b2:b2 + self.trip]
-                lo = b2 - self.trip + 1
-                return src[lo:b2 + 1][::-1]
+                    sl = src[b2:b2 + self.trip]
+                else:
+                    lo = b2 - self.trip + 1
+                    sl = src[lo:b2 + 1][::-1]
+                # the source may carry interior unit dims the compact leaf
+                # dropped; row-major layout makes the reshape free
+                return mx.reshape(sl, (self.trip,) + tuple(leaf.shape))
             if kind == "red":
                 _, inner, dims, perm, shape = spec
                 arr = mx.sum(stacked(inner), axis=tuple(d + 1 for d in dims))
@@ -2129,5 +2401,6 @@ def try_run(interp, op, ins, env, trip, start, counter_pos):
     except Exception as e:
         if _DEBUG:
             print(f"[metaljax] msl_scan: run failed ({e}); disabling", flush=True)
-        interp._msl_cache[key] = None
+        body = op.regions[1].blocks[0]
+        interp._msl_cache[(body, trip, start)] = None
         return None

@@ -186,3 +186,21 @@ def test_i64_scalar_carry():
                                        rtol=1e-5, atol=1e-6)
     finally:
         jax.config.update("jax_enable_x64", False)
+
+
+def test_mul_reduce_contraction_cell():
+    # lrnn-style: the block matvec written as broadcast-multiply + reduce
+    # (texmo's lowering) instead of einsum/dot_general.
+    K, C = 2, 4
+    W = (rng.standard_normal((K, C, C)) * 0.3).astype(np.float32)
+    Xb = (rng.standard_normal((L, B, K, C)) * 0.3).astype(np.float32)
+    hb = rng.standard_normal((B, K, C)).astype(np.float32)
+
+    def f(xs, h0, w):
+        def cell(h, x):
+            nh = jnp.tanh((h[:, :, None, :] * w[None]).sum(-1) + x)
+            return nh, nh
+        return jax.lax.scan(cell, h0, xs)
+    check(f, Xb, hb, W)
+    check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
+                             argnums=(0, 1, 2)), Xb, hb, W)
