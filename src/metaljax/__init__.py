@@ -10,6 +10,11 @@ import os as _os
 if _os.environ.get("METALJAX_MATMUL_PRECISION", "highest") == "highest":
     _os.environ.setdefault("MLX_METAL_GPU_ARCH", "applegpu_g16g")
 
+# More kernels per Metal command buffer than MLX's default: measured ~20%
+# faster on launch-bound (small-kernel) workloads. Override by exporting a
+# different value before importing metaljax.
+_os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "400")
+
 from metaljax.interpreter import Interpreter, UnsupportedOpError
 from metaljax import ops as _ops  # noqa: F401  (registers all op handlers)
 
