@@ -95,3 +95,19 @@ Remaining gap = item 3 (kernel count per timestep). db02-b4l1024 stays
 hoist loop-invariant input projections out of scan bodies (x@W over all
 timesteps as one pre-loop GEMM), then fused cell kernels (mx.fast /
 custom Metal) — that is the path to the small-model "Metal > 4090" goal.
+
+## Post-pass-3 full-suite rerun (same session, scratchpad m5-metal-opt.csv)
+
+208 configs vs stored m5-cpu/4090 CSVs. noscan median 1.43x faster than
+pre-opt metal (max 5.9x); scan median 0.93x = flat within the ~15% thermal
+drift band (same-config reruns of unchanged code drifted 90->110ms).
+
+Crossover vs CPU (scan mode): consistent metal wins from ~700k weights
+(near-universal >1M: 33/34); scattered wins from ~60k on non-recurrent
+specs; below 100k recurrent CPU is 9-25x ahead. vs 4090: scan median
+6-9x behind in every bucket; noscan median ~2.4-2.9x behind but metal
+already BEATS the 4090 on 7/24 of the tiniest noscan configs (the
+dispatch-overhead war: our 33us floor vs jax-GPU's ~4ms noscan steps).
+Worst rows remain b4l1024 recurrents (db02/03/07/08: 100-800ms vs cpu
+0.12-5ms vs 4090 13-131ms) — precisely the persistent-kernel targets;
+prototype's 17x would put db02-b4l1024 at ~6ms, under the 4090's 13.8.
