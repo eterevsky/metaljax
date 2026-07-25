@@ -121,7 +121,18 @@ executes on the Metal device through plain `jax.numpy`.
    db09-b128l128 1.00ms — beats CPU (2.2) AND 4090 (2.3). Matvec cells
    (rnn/gru/mgru) still fall back — future: cooperative threadgroup
    variant (pass C).
-8. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+8. ✅ **msl_scan vector mode**: small in-lane matvecs (rnn/gru/mgru cells,
+   block-diag einsums) via register-vector lanes; AD weight-grad
+   accumulations handled by loop fission (hidden stacked outputs + one
+   post-kernel einsum); gate-split slice/pad; stride bookkeeping; dots
+   absorb transposes (SymPerm). MSL loops count as traceable + cost ~8 so
+   training-step bodies compile around them. db02-b4l1024 72.9→0.38ms
+   (4090 13.8!); db09 0.63ms; db05 10.6. REMAINING: (a) texmo's lrnn
+   lowers block contraction as multiply+REDUCE in-cell (db07/08/10 still
+   ~600/49ms) — need SymReduce over the reg dim; (b) cooperative
+   threadgroup mode for full-width cells (gru.256-class, closes torch's
+   fused-GRU 2x); (c) db05-class outer bodies partially eager still.
+9. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
