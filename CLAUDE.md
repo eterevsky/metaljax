@@ -146,7 +146,24 @@ executes on the Metal device through plain `jax.numpy`.
    mgru.256 ~24 ms/step. MEASUREMENT TRAP: jax.block_until_ready is a
    no-op on this backend (events born ready + async_eval) — time through
    np.array() or mx.eval.
-10. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+10. ✅ **openxla/xla benchmark suite + v0.2.1** (notes/xla-benchmarks-2026-07.md):
+   HLO text → StableHLO via bazel-built xla-translate (--hlo-text-to-mlir-hlo,
+   then jaxlib mhlo_to_stablehlo; the --hlo-to-stablehlo flag wants a proto and
+   null-crashes on text) + scripts/run_stablehlo_bench.py (PJRT
+   compile_and_load on cpu/metal/cuda, seeded inputs, outputs checked vs CPU).
+   Metal beats M5 CPU 2-13x on all 6 runnable single-device benchmarks;
+   gemma3_12b (23.5GB bf16) runs on metal, doesn't fit the 4090. New ops from
+   the suite: argmax/argmin reduce (jax pattern; ties→lowest index = MLX
+   first-occurrence), reduce_precision, plain stablehlo.dot. CRITICAL FIX:
+   bf16 hex-splat constants (dense<0xFF80>) — bindings decode hex-as-float
+   (65536, not -inf) so bf16 always takes _ir.dense_to_np's text path, and
+   hex = bit pattern for all float types (ml_dtypes bf16 has np kind 'V').
+   Engine falls back to eager on mx.compile IndexError (unused inputs).
+   Benchmark traps: refs and runs need the SAME gen_inputs version (rng draw
+   order shifts invalidate refs); GPU scatter-add is order-nondeterministic
+   (like jax-CUDA); sample_loop benchmarks are vacuous under random inputs
+   (decode loop runs 0 iterations). v0.2.1 on TestPyPI, verified 3.12+3.13.
+11. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib

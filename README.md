@@ -227,6 +227,32 @@ On texmo itself: only the very tiniest models (tens of weights) remain
 CPU territory; from ~100k weights metal wins, and `mgru.256` trains at
 ~24 ms/step.
 
+### openxla/xla benchmark suite
+
+The single-device benchmarks from
+[xla/tools/benchmarks](https://github.com/openxla/xla/tree/main/xla/tools/benchmarks)
+(HLO converted to StableHLO with `xla-translate`, run via
+`scripts/run_stablehlo_bench.py`; ms per call, identical seeded inputs,
+outputs cross-checked against the CPU results):
+
+| benchmark | jax CPU (M5 Max) | **metaljax** | RTX 4090 |
+|---|---:|---:|---:|
+| gemma3_1b_flax_call | 80.1 | **42.5** | 4.0 |
+| gemma3_4b_flax_call | 666.9 | **81.5** | 11.2 |
+| gemma3_12b_flax_call | 2187.9 | **172.7** | —¹ |
+| gemma2_2b_keras_jax | 158.0 | **17.5** | 10.9 |
+| gemma4_2b_bf16 | 512.0 | **16.9** | 2.5 |
+| maxtext 2.5B train step | 101066 | **19405**² | —¹ |
+
+¹ exceeds the 4090's 24 GB VRAM; the M5's 128 GB unified memory runs
+gemma3_12b (23.5 GB of bf16 weights) where the discrete GPU cannot.
+² runs eagerly (MLX declines to compile that graph); still 5× CPU.
+
+Correctness vs CPU on identical inputs: gemma2/gemma4 outputs bit-exact;
+the gemma3 family diverges ≤3.6% in bf16 KV-cache tensors (a few bf16
+ULPs across 26+ layers) — the 4090 shows the same divergence class vs
+CPU (≤4.2%), so that's cross-backend bf16 numerics, not a backend bug.
+
 ## Known limitations
 
 - Scan bodies that don't fit the kernel-codegen patterns (in-cell
@@ -235,9 +261,8 @@ CPU territory; from ~100k weights metal wins, and `mgru.256` trains at
 - float64 is emulated in f32 (see `METALJAX_F64`); complex dtypes are
   unsupported.
 - Not yet implemented (fail with a clear `UnsupportedOpError`):
-  argmax/argmin-style multi-result `reduce`, `sort`, general
-  `reduce_window` (only cumsum/cumprod/cummax/cummin patterns),
-  partial-window scatter, send/recv, multi-device anything.
+  `sort`, general `reduce_window` (only cumsum/cumprod/cummax/cummin
+  patterns), partial-window scatter, send/recv, multi-device anything.
 - Buffer donation is ignored (correct, but no memory savings).
 
 ## License / provenance
