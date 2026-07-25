@@ -169,10 +169,15 @@ def _msl_plan_for(interp, op):
     or None. Used by purity/cost analysis and by _while dispatch."""
     counted = _analyze_counted(interp, op)
     if counted is None or not isinstance(counted[1], int):
+        if _DEBUG and counted is not None:
+            print(f"[metaljax] msl_scan: skipped (captured bound "
+                  f"{type(counted[1]).__name__})", flush=True)
         return None
     k, bound = counted
     start = _static_start(op, k)
     if start is None:
+        if _DEBUG:
+            print("[metaljax] msl_scan: skipped (dynamic start)", flush=True)
         return None
     trip = bound - start
     if trip <= 0:

@@ -204,3 +204,20 @@ def test_mul_reduce_contraction_cell():
     check(f, Xb, hb, W)
     check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
                              argnums=(0, 1, 2)), Xb, hb, W)
+
+
+def test_register_reduce_readout():
+    # lrnn-style readout: contraction of register-resident products via
+    # reduce over the register dim (no stored weight on the reduce path).
+    W = (rng.standard_normal((H, H)) * 0.3).astype(np.float32)
+
+    def f(xs, h0, w):
+        def cell(h, x):
+            d = h @ w
+            y = (d * x).sum(-1)          # in-lane register reduce
+            nh = jnp.tanh(d + y[..., None] * 0.1)
+            return nh, y
+        return jax.lax.scan(cell, h0, xs)
+    check(f, X, H0, W)
+    check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
+                             argnums=(0, 1, 2)), X, H0, W)

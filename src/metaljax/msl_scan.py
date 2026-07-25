@@ -122,6 +122,27 @@ class SymPad(Sym):
         self.shape, self.dtype = shape, inner.dtype
 
 
+class SymIota(Sym):
+    """Coordinate ramp along one axis (loop-invariant): value = coord+start.
+    axis indexes .shape; the emitters map it to the register index (last
+    axis) or a lane coordinate."""
+    __slots__ = ("axis", "start")
+
+    def __init__(self, axis, start, shape, dtype):
+        self.axis, self.start = axis, start
+        self.shape, self.dtype = tuple(shape), dtype
+
+
+class SymRedReg(Sym):
+    """In-lane reduction (add) over the register (last) dim of a
+    register-resident expression; value has register width 1."""
+    __slots__ = ("inner",)
+
+    def __init__(self, inner, shape, dtype):
+        self.inner = inner
+        self.shape, self.dtype = tuple(shape), dtype
+
+
 class SymAccRed(Sym):
     """Cross-lane reduce-sum (e.g. bias-gradient accumulation): hoisted out
     of the kernel as a post-kernel sum over the stacked operand."""
@@ -212,6 +233,9 @@ class _Analyzer:
         self.counter_pos = counter_pos
         self.args = list(body_block.arguments)
         self.reads = []          # SymLeaf('read'/'whole') in discovery order
+        self.hoist_ok = set()    # ir results representable via hoisting
+        self.hoisted_read_srcs = set()  # carries read at fixed index by hoists
+        self.invariant_vals = set()
         self.updates = {}        # carry pos -> (idx SymCounter, value Sym)
         self.free = []           # captured ir.Values used as whole tensors
 
@@ -255,18 +279,112 @@ class _Analyzer:
             env[v] = s
         return s
 
+    def _op_invariant(self, o, block_args):
+        """True when every transitive input of `o` within the body comes
+        from captures or other invariant ops (never a block argument), so
+        its value is identical on every iteration."""
+        if o.regions or o.name in ("func.call", "stablehlo.composite"):
+            return False
+        for v in o.operands:
+            if v in block_args:
+                return False
+            if isinstance(v, ir.OpResult) and v.owner.operation.parent is not None:
+                if v in self.invariant_vals:
+                    continue
+                # defined inside the body by a non-invariant op?
+                owner_blk = v.owner.operation.parent
+                if owner_blk == self._cur_block_op:
+                    return False
+            # captures (defined outside) are invariant
+        return True
+
     def eval_block(self, block, env):
         result = None
+        block_args = set(block.arguments)
+        self._cur_block_op = getattr(block.owner, "operation", None)
         for op in block.operations:
             o = op.operation
             name = o.name
             if name in ("func.return", "stablehlo.return"):
                 result = [self.lookup(env, v) for v in o.operands]
                 break
-            outs = self.eval_op(o, env)
+            try:
+                outs = self.eval_op(o, env)
+            except _Unsupported:
+                outs = self._try_hoist(o, env, block_args)
+                if outs is None:
+                    raise
             for r, s in zip(o.results, outs):
                 env[r] = s
         return result
+
+    def _try_hoist(self, o, env, block_args):
+        """Represent a loop-invariant op we can't symify as a 'whole'
+        input: the plan evaluates its IR subgraph once per call through
+        the regular interpreter and feeds the result as a buffer."""
+        if o.regions:
+            return None
+
+        def sym_invariant(sym):
+            if isinstance(sym, (SymConst, SymIota)):
+                return True
+            if isinstance(sym, SymLeaf):
+                if sym.kind == "whole":
+                    return True
+                if sym.kind == "read" and getattr(sym.idx, "a", 1) == 0:
+                    # fixed-index slice: constant across iterations as long
+                    # as the source carry is never mutated (checked at Plan
+                    # classification via hoisted_read_srcs)
+                    if sym.source[0] == "carry":
+                        self.hoisted_read_srcs.add(sym.source[1])
+                    return True
+                return False
+            if isinstance(sym, SymElem):
+                return all(sym_invariant(a) for a in sym.args)
+            if isinstance(sym, (SymPad, SymPerm, SymRedReg)):
+                return sym_invariant(sym.inner)
+            if isinstance(sym, SymDot):
+                return sym_invariant(sym.data)  # weights are whole leaves
+            return False
+
+        def val_invariant(v):
+            if v in block_args:
+                return False
+            sym = env.get(v)
+            if sym is not None:
+                return v in self.hoist_ok or sym_invariant(sym)
+            return True  # capture from an enclosing scope
+
+        if not all(val_invariant(v) for v in o.operands):
+            if _DEBUG:
+                def why(sym, d=0):
+                    if d > 6 or sym_invariant(sym):
+                        return None
+                    if isinstance(sym, SymElem):
+                        for a in sym.args:
+                            w = why(a, d + 1)
+                            if w:
+                                return w
+                        return f"elem {sym.op}"
+                    if isinstance(sym, SymLeaf):
+                        return (f"leaf kind={sym.kind} idx={type(sym.idx).__name__}"
+                                f" a={getattr(sym.idx, 'a', '?')} src={sym.source[0]}")
+                    return type(sym).__name__
+                det = [why(env.get(v)) for v in o.operands
+                       if env.get(v) is not None and not val_invariant(v)]
+                print(f"[metaljax] hoist refused {o.name}: {det}", flush=True)
+            return None
+        from metaljax.interpreter import REGISTRY
+        if o.name not in REGISTRY:
+            return None
+        outs = []
+        for r in o.results:
+            t = ir.RankedTensorType(r.type)
+            leaf = SymLeaf("whole", tuple(t.shape), _dt(t.element_type),
+                           source=("hoist", r))
+            self.hoist_ok.add(r)
+            outs.append(leaf)
+        return outs
 
     def eval_op(self, o, env):
         name = o.name
@@ -310,11 +428,52 @@ class _Analyzer:
             dims = _ir.i64_list(o, "broadcast_dimensions")
             return [self._broadcasted(x, out_shape, dims)]
 
+        if name == "stablehlo.while":
+            # Symbolically unroll small statically-counted nested loops
+            # (lrnn's rank recursion nests a tiny scan inside the sequence
+            # scan). The inner counter becomes a constant per iteration.
+            from metaljax.ops.control import _analyze_counted, _static_start
+            counted = _analyze_counted(self.interp, o)
+            if counted is None or not isinstance(counted[1], int):
+                raise _Unsupported("op stablehlo.while (dynamic nested)")
+            k, bound = counted
+            start = _static_start(o, k)
+            if start is None:
+                st_sym = ins[k]
+                if isinstance(st_sym, SymConst):
+                    start = int(st_sym.value)
+                elif isinstance(st_sym, SymCounter) and st_sym.a == 0:
+                    start = int(st_sym.b)
+            if start is None:
+                raise _Unsupported("op stablehlo.while (dynamic nested start)")
+            trip = bound - start
+            if trip <= 0 or trip > 64:
+                raise _Unsupported(f"op stablehlo.while (nested trip {trip})")
+            body = o.regions[1].blocks[0]
+            bargs = list(body.arguments)
+            vals = list(ins)
+            for it in range(trip):
+                env2 = dict(env)
+                for a, v in zip(bargs, vals):
+                    env2[a] = v
+                env2[bargs[k]] = SymConst(start + it, "i32")
+                vals = self.eval_block(body, env2)
+            return vals
+
+        if name == "stablehlo.iota":
+            t = ir.RankedTensorType(o.results[0].type)
+            out_shape = tuple(t.shape)
+            d = int(ir.IntegerAttr(o.attributes["iota_dimension"]).value)
+            return [SymIota(d, 0, out_shape, _dt(t.element_type))]
+
         if name == "stablehlo.concatenate":
             dim = _ir.int_attr(o, "dimension")
             out_shape = tuple(ir.RankedTensorType(o.results[0].type).shape)
             if dim != len(out_shape) - 1:
-                raise _Unsupported("concat on non-feature dim")
+                raise _Unsupported(
+                    f"concat on non-feature dim {dim} of {out_shape}: "
+                    + "; ".join(f"{type(x).__name__}{getattr(x,'shape',())}"
+                                for x in ins))
             total = out_shape[-1]
             acc = None
             off = 0
@@ -375,6 +534,10 @@ class _Analyzer:
             dot = self._reduce_as_dot(x, dims, out_shape)
             if dot is not None:
                 return [dot]
+            if list(dims) == [len(x.shape) - 1]:
+                # in-lane: reduce over the register dim (texmo's lrnn
+                # readout contracts register-resident products)
+                return [SymRedReg(x, out_shape, x.dtype)]
             return [SymAccRed(x, dims, out_shape, x.dtype)]
 
         if name == "stablehlo.dynamic_slice":
@@ -435,6 +598,8 @@ class _Analyzer:
             return False
         if isinstance(s, (SymConst, SymCounter)):
             return False
+        if isinstance(s, SymIota):
+            return axis == s.axis
         if isinstance(s, SymLeaf):
             return s.strides[axis] != 0
         if isinstance(s, SymElem):
@@ -471,6 +636,13 @@ class _Analyzer:
                 else:
                     raise _Unsupported("dropdim of varying arg")
             return SymElem(s.op, args, s.dtype, shape, extra=s.extra)
+        if isinstance(s, SymRedReg):
+            return SymRedReg(s.inner, shape, s.dtype)
+        if isinstance(s, SymIota):
+            if axis == s.axis:
+                raise _Unsupported("dropdim of iota axis")
+            na = s.axis - (1 if axis < s.axis else 0)
+            return SymIota(na, s.start, shape, s.dtype)
         raise _Unsupported(f"dropdim of {type(s).__name__}")
 
     def _squeeze_axis(self, s, axis):
@@ -570,9 +742,10 @@ class _Analyzer:
                               "f32", tuple(out_shape))
 
         # Case 2: cross-lane contraction (weight gradients): every reduced
-        # dim varies on both sides; compact each side by squeezing its
-        # broadcast axes.
-        if all(ax in va and ax in vb for ax in dims):
+        # dim varies on both sides and none is the register (last) dim;
+        # compact each side by squeezing its broadcast axes.
+        if (all(ax in va and ax in vb for ax in dims)
+                and all(ax != rank - 1 for ax in dims)):
             def compact(s, own_axes):
                 k = rank - len(getattr(s, "shape", ()) or ())
                 if k:
@@ -723,6 +896,8 @@ class _Analyzer:
                        for z, d in zip(sizes[k:], a.shape)]
                 args.append(self._sliced(a, asub, tuple(asz)))
             return SymElem(x.op, args, x.dtype, sizes, extra=x.extra)
+        if isinstance(x, SymIota):
+            return SymIota(x.axis, x.start + starts[x.axis], sizes, x.dtype)
         if isinstance(x, SymDot):
             reg_axis = next(
                 (i for i, r in enumerate(x.roles) if r[0] == "reg"), None)
@@ -761,6 +936,8 @@ class _Analyzer:
         if isinstance(x, SymAccDot):
             return SymAccDot(x.lhs, x.rhs, x.dims, out_shape, x.dtype,
                              perm=x.perm)
+        if isinstance(x, SymRedReg):
+            return SymRedReg(x.inner, out_shape, x.dtype)
         if isinstance(x, SymDot):
             # unit-dim insertions/removals: rebuild roles positionally
             roles = []
@@ -831,6 +1008,11 @@ class _Analyzer:
                 roles[d] = x.roles[i]
             return SymDot(x.data, x.weight, roles, x.widx,
                           x.csize, x.dsize, x.dtype, tuple(out_shape))
+        if isinstance(x, SymRedReg):
+            # width-1 value: broadcasting is free at emission
+            return SymRedReg(x.inner, out_shape, x.dtype)
+        if isinstance(x, SymIota):
+            return SymIota(dims[x.axis], x.start, out_shape, x.dtype)
         if isinstance(x, SymPad):
             # The pad window lives on the last dim; a broadcast that keeps
             # the last dim mapped last commutes with it.
@@ -1037,6 +1219,8 @@ def _contains_accdot(root):
             stack.extend(s.args)
         elif isinstance(s, SymDot):
             stack.append(s.data)
+        elif isinstance(s, (SymPad, SymPerm, SymRedReg)):
+            stack.append(s.inner)
     return False
 
 
@@ -1182,6 +1366,11 @@ def _canonicalizer():
             elif isinstance(s, SymAccRed):
                 s.inner = canon(s.inner)
                 key = ("accred", id(s.inner), s.dims, s.perm, tuple(s.shape))
+            elif isinstance(s, SymRedReg):
+                s.inner = canon(s.inner)
+                key = ("redreg", id(s.inner), tuple(s.shape))
+            elif isinstance(s, SymIota):
+                key = ("iota", s.axis, s.start, tuple(s.shape), s.dtype)
             elif isinstance(s, SymConst):
                 key = ("c", s.dtype, tuple(s.shape), s.value)
             elif isinstance(s, SymCounter):
@@ -1341,8 +1530,10 @@ class Plan:
                   + [v for _, _, v in self.stacked]
                   + [h for h, _ in self.hidden])
         dots = _collect_dots(exprs0)
-        if dots and all(d.csize <= _REG_LIMIT and d.dsize <= _REG_LIMIT
+        if dots and all(d.csize <= _REG_LIMIT and d.dsize <= 4 * _REG_LIMIT
                         for d in dots):
+            # dsize (output features of the in-lane matvec) costs registers
+            # but no extra serial work per element beyond the unrolled loop
             self.mode = "vector"
         elif dots or self.accums:
             self.mode = "coop"
@@ -1402,7 +1593,12 @@ class Plan:
         self._source_ids = {}
 
         def source_id(src):
-            key = src if src[0] == "carry" else ("free", id(src[1]), src[1])
+            if src[0] == "carry":
+                key = src
+            elif src[0] == "hoist":
+                key = ("hoist", src[1])
+            else:
+                key = ("free", id(src[1]), src[1])
             if key not in self._source_ids:
                 self._source_ids[key] = len(self.sources)
                 self.sources.append(src)
@@ -1428,6 +1624,8 @@ class Plan:
         for src in self.sources:
             if src[0] == "carry" and src[1] in mutated:
                 raise _Unsupported("read of a mutated carry")
+        if an.hoisted_read_srcs & mutated:
+            raise _Unsupported("hoisted read of a mutated carry")
 
         # Canonicalize weight layout to (data..., c, d): the output-feature
         # dim at unit stride makes threadgroup dot reads coalesced (the AD
@@ -1507,6 +1705,8 @@ class Plan:
                 for a in s.args:
                     walk(a)
             elif isinstance(s, SymPad):
+                walk(s.inner)
+            elif isinstance(s, SymRedReg):
                 walk(s.inner)
             elif isinstance(s, SymDot):
                 walk(s.data)
@@ -1811,6 +2011,37 @@ class Plan:
                     f"(r >= {s.lo} && r < {s.lo + s.n}) ? "
                     f"({src}) : ({T(s.dtype)})0;")
                 v = (name, R)
+            elif isinstance(s, SymRedReg):
+                inm, iR = emit(s.inner)
+                name = f"v{tmp[0]}"
+                tmp[0] += 1
+                body.append(f"  {T(s.dtype)} {name};")
+                if iR == 1:
+                    body.append(f"  {name} = {inm};")
+                else:
+                    body.append(
+                        f"  {{ {T(s.dtype)} _s = ({T(s.dtype)})0; "
+                        f"for (int r = 0; r < {iR}; r++) _s += {inm}[r]; "
+                        f"{name} = _s; }}")
+                v = (name, 1)
+            elif isinstance(s, SymIota):
+                name = f"v{tmp[0]}"
+                tmp[0] += 1
+                if s.axis == len(s.shape) - 1 and s.shape[-1] > 1:
+                    R = s.shape[-1]
+                    body.append(f"  {T(s.dtype)} {name}[{R}];")
+                    body.append(f"  for (int r = 0; r < {R}; r++) "
+                                f"{name}[r] = ({T(s.dtype)})(r + {s.start});")
+                    v = (name, R)
+                else:
+                    # lane-coordinate ramp (or size-1 axis: constant)
+                    if s.shape[s.axis] == 1:
+                        expr = f"({T(s.dtype)}){s.start}"
+                    else:
+                        pad = len(self.lane_shape) - (len(s.shape) - 1)
+                        expr = f"({T(s.dtype)})(c{s.axis + pad} + {s.start})"
+                    body.append(f"  {T(s.dtype)} {name} = {expr};")
+                    v = (name, 1)
             elif isinstance(s, SymDot):
                 v = emit_dot(s)
             elif isinstance(s, SymElem):
@@ -1845,7 +2076,7 @@ class Plan:
                     body.append(f"  {name} = {e};")
                 v = (name, R)
             else:
-                raise _Unsupported("vec emit type")
+                raise _Unsupported(f"vec emit type {type(s).__name__} {_dump(s)[:80]}")
             memo[id(s)] = v
             return v
 
@@ -1900,9 +2131,18 @@ class Plan:
         for q, (pos, idx, val) in enumerate(self.stacked):
             nm, R = emit(val)
             inner = _numel(self.arg_shapes[pos][1:])
-            off = self._vec_off(tuple(self.arg_shapes[pos][1:]))
+            per = tuple(self.arg_shapes[pos][1:])
             ii = f"((int)t + {self.start}) * {idx.a} + {idx.b}"
-            tgt_R = self.arg_shapes[pos][-1] if len(self.arg_shapes[pos]) > 1 else 1
+            if R == 1 and per and _numel(per) == _numel(lane):
+                # width-1 value (e.g. a register reduce): every target dim
+                # is a lane dim — append a fake unit register dim so the
+                # offset maps all of them to lane coordinates.
+                off = self._vec_off(per + (1,))
+                tgt_R = 1
+            else:
+                off = self._vec_off(per)
+                tgt_R = self.arg_shapes[pos][-1] \
+                    if len(self.arg_shapes[pos]) > 1 else 1
             src = f"{nm}[r]" if R > 1 else nm
             if tgt_R > 1:
                 writes.append(f"  for (int r = 0; r < {tgt_R}; r++) "
@@ -2262,9 +2502,36 @@ class Plan:
     # ---- runtime
 
     def run(self, interp, ins, env):
+        from metaljax.interpreter import REGISTRY
+
+        hoist_cache = {}
+
+        def hoisted(v):
+            got = hoist_cache.get(v)
+            if got is not None:
+                return got
+            if v in env:
+                out = env[v]
+            else:
+                o = v.owner.operation
+                ins_ = [hoisted(x) for x in o.operands]
+                res = REGISTRY[o.name](interp, o, ins_, env)
+                if isinstance(res, mx.array):
+                    res = [res]
+                for r, x in zip(list(o.results), res or []):
+                    hoist_cache[r] = x
+                out = hoist_cache[v]
+            hoist_cache[v] = out
+            return out
+
         bufs = []
         for sid, src in enumerate(self.sources):
-            buf = ins[src[1]] if src[0] == "carry" else env[src[1]]
+            if src[0] == "carry":
+                buf = ins[src[1]]
+            elif src[0] == "hoist":
+                buf = hoisted(src[1])
+            else:
+                buf = env[src[1]]
             norm = self._weight_norms.get(sid)
             if norm is not None:
                 shape, strides, offset, perm = norm

@@ -4,3 +4,4 @@
 {"time": "2026-07-25T22:20:52", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.8|split.add(lrnn.4.2-rmsnorm-split.add(mingru.8, pass), pass)", "lr": 0.01, "steps": 256, "x": 8, "y": 0.6786940097808838, "scale": 1.9713015498191029, "loss": 3.7575660377349855}
 {"time": "2026-07-25T23:55:09", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 4, "x": 4, "y": 0.6620020270347595, "scale": 1.9386697209834467, "loss": 5.8154390483703615}
 {"time": "2026-07-25T23:56:26", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 128, "x": 4, "y": 0.3456987738609314, "scale": 1.4129769261224154, "loss": 4.401370826324463}
+{"time": "2026-07-26T00:24:44", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 128, "x": 4, "y": 0.40776073932647705, "scale": 1.5034474022956732, "loss": 4.411327186187744}
