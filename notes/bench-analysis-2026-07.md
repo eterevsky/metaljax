@@ -173,6 +173,38 @@ the hand-written kernel (was 112 pre-coop, 214 mid-regression). texmo
 bench_jax: 66.5 ms/step, ~2x better than pre-coop, now beats CPU on
 b64 too. mgru.256 training: ~24 ms/step (was ~80).
 
+## Post-coop full-suite results (v0.2.0, m5-metal-coop{,2}.csv best-of-two)
+
+Suite-run trap first: a full 208-config pass inflates late rows badly
+(mid13 measured 72ms in-suite vs 6.2ms isolated — accumulated thermal +
+allocator state). Run 2 on a cooler machine was faster on 90% of rows
+(median 0.94, p10 0.57); per-row best-of-two is the honest number, and
+single-run cross-suite comparisons under ~1.5x are noise. For A/B claims
+interleave the two systems.
+
+scan mode vs CPU (median ratio, metal wins): >=3M 0.39 (14/14);
+700k-3M 0.57 (23/24); 100k-700k 0.58 (14/18); 10k-100k 1.30 (4/12);
+1k-10k 0.97 (7/12); <1k 1.62 (7/24). The original "parity from ~100k
+weights" goal is met with margin — median ~1.7x FASTER than CPU from
+100k up, and even the 1k-10k band is at parity now. vs the 4090:
+scan-mode median 6-8x behind above 100k (bigger GPU), but metal wins
+11/24 of the sub-1k scan rows and 17/24 of the tiniest noscan rows.
+
+Movement vs the pre-optimization suite: median 0.90, 29/104 scan rows
+>1.5x faster, only 2 rows >1.3x slower. Coop-family movers:
+rnn.128 (mid02) 12.5-25 -> 1.0-1.3ms; db13 125 -> 0.95ms; db14 19.6 ->
+1.4ms; mgru.256 (mid08) 47.9 -> 27.6; mgru.512 (big00) 27.8 -> 15.0;
+db11 31.7 -> 7.6. Real (small) regressions: lstm.1024/gru.1024-class
+b32 rows (big14 18.6->26.8, big16 60->78) — F=1024 coop kernels run at
+1024 threads/threadgroup (occupancy) and lose ~30% to the replay path
+they displaced; still 3x faster than CPU there. Future: profitability
+gate or two-groups-per-element split for F=1024.
+
+Remaining scan holdouts vs CPU: the lrnn family (db07/08/10/12,
+13-119x — in-cell multiply+reduce needs SymReduce over the reg dim),
+db05 mgru.4 outer-body eagerness (21-34x), mixed stacks db17-db19
+(7-20x), and sub-1k physics rows. That's the whole list.
+
 ## Post-msl_scan full-suite rerun (m5-metal-msl.csv)
 
 208 configs: median 1.35x vs original metal (max 16x). Scan-mode vs CPU

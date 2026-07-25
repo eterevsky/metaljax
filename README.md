@@ -200,29 +200,38 @@ Full training steps (fwd + bwd + AdamW), f32, M5 Max, via
 |---|---:|---:|---:|---:|
 | transformer d256 L4 T256 b32 | 174.3 | **31.2** | 30.1 | 209.3 |
 | transformer d512 L4 T256 b64 | — | **157.6** | 154.6 | — |
-| GRU.256 T256 b256 (scan) | — | **112.0** | 50.7¹ | — |
-| texmo `bench_jax.py` GRU b256 | 273.3 | **147.7** | — | — |
+| GRU.256 T256 b256 (scan) | — | **51.6** | 47.1¹ | — |
+| texmo `bench_jax.py` GRU b256 | 273.3 | **66.5** | — | — |
 
-¹ torch uses its fused `nn.GRU` kernel; metaljax runs the scan as a
-compiled-body loop — sequential models still pay per-timestep dispatch.
+¹ torch uses its hand-fused `nn.GRU` kernel; metaljax generates its
+kernel from the StableHLO loop body and lands within 10%.
 
 How: pure programs and counted-loop (`scan`/`fori_loop`) bodies are traced
 once through `mx.compile` and replayed as fused Metal graphs; small
 statically-counted loops are unrolled into the enclosing trace, so e.g. a
 whole texmo training step (forward scan + backward + AdamW) becomes a
-single graph replay. `METALJAX_COMPILE=0` disables compilation,
-`METALJAX_TRACE_BUDGET` (default 20000 ops) caps trace sizes, and
-`METALJAX_DEBUG=1` logs loop/compile decisions.
+single graph replay. On top of that, recurrent scan bodies that
+pattern-match as elementwise/matvec cells (rnn/gru/mgru/lrnn/rglru
+family — forward *and* the AD-generated backward loop) compile to a
+single generated persistent Metal kernel: the whole scan is one kernel
+launch, with state in registers (small cells), register-block lanes
+(small block matvecs), or one threadgroup per batch element with the
+feature dim as the thread axis (full-width cells like `gru.256`).
+Weight-gradient accumulations are handled by loop fission: the kernel
+stacks per-step operands and the einsum runs as one batched matmul
+after it. `METALJAX_COMPILE=0` disables compilation, `METALJAX_MSL=0`
+disables kernel codegen, `METALJAX_TRACE_BUDGET` (default 20000 ops)
+caps trace sizes, and `METALJAX_DEBUG=1` logs loop/compile decisions.
 
-On texmo itself: models of texmo's typical tiny size (a handful of units)
-remain CPU territory — thousands of microscopic kernels can't beat XLA:CPU
-compiling the whole scan natively — while at `mgru.256` metal already
-edges out CPU (5.1s vs 5.3s for 64 steps, batch 64, length 256).
+On texmo itself: only the very tiniest models (tens of weights) remain
+CPU territory; from ~100k weights metal wins, and `mgru.256` trains at
+~24 ms/step.
 
 ## Known limitations
 
-- Sequential (scan-heavy) models run each timestep as a compiled-graph
-  replay from Python; fused-RNN-kernel frameworks are ~2× faster there.
+- Scan bodies that don't fit the kernel-codegen patterns (in-cell
+  reductions, gather/scatter in the loop, non-affine indexing) fall back
+  to per-timestep compiled-graph replay, which pays per-step dispatch.
 - float64 is emulated in f32 (see `METALJAX_F64`); complex dtypes are
   unsupported.
 - Not yet implemented (fail with a clear `UnsupportedOpError`):
