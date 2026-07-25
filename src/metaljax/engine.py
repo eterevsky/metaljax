@@ -180,9 +180,10 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
                 mx.eval(*outs)
             else:
                 mx.async_eval(*outs)
-    except RuntimeError:
-        # MLX's compiler can reject certain traces (e.g. fused-kernel
-        # argument-buffer exhaustion). Retry this executable eagerly.
+    except (RuntimeError, IndexError, ValueError):
+        # MLX's compiler can reject certain traces (fused-kernel
+        # argument-buffer exhaustion; unordered_map::at on graphs with
+        # unused inputs surfaces as IndexError). Retry eagerly.
         if not ex._can_compile:
             raise
         ex._can_compile = False

@@ -60,3 +60,25 @@ def test_mixed_precision_matmul():
     b = rng.standard_normal((5, 6)).astype(jnp.bfloat16)
     check(lambda x, y: jnp.matmul(x, y, preferred_element_type=jnp.float32),
           a, b, rtol=2e-2, atol=2e-2)
+
+
+def test_plain_stablehlo_dot():
+    # stablehlo.dot never comes out of jax; feed the interpreter a module
+    # directly (HLO-imported benchmarks contain it).
+    from metaljax import _ir
+    from metaljax.interpreter import Interpreter
+    import mlx.core as mx
+
+    mod = """
+module {
+  func.func @main(%a: tensor<3x4xf32>, %b: tensor<4x5xf32>) -> tensor<3x5xf32> {
+    %0 = stablehlo.dot %a, %b : (tensor<3x4xf32>, tensor<4x5xf32>) -> tensor<3x5xf32>
+    return %0 : tensor<3x5xf32>
+  }
+}
+"""
+    interp = Interpreter(mod)
+    a = np.random.default_rng(0).standard_normal((3, 4)).astype(np.float32)
+    b = np.random.default_rng(1).standard_normal((4, 5)).astype(np.float32)
+    (out,) = interp(mx.array(a), mx.array(b))
+    np.testing.assert_allclose(np.array(out), a @ b, rtol=1e-5, atol=1e-6)

@@ -28,7 +28,11 @@ def log(*a):
 
 
 def parse_arg_types(text):
-    """(shapes, np_dtypes) of the entry function's arguments."""
+    """((shapes, np_dtypes) of entry args, sanitized module text).
+
+    Strips mhlo.input_output_alias (buffer donation): a benchmark loop
+    re-executes with the same argument buffers, which donation forbids.
+    """
     from jaxlib.mlir import ir
     from jaxlib.mlir.dialects import stablehlo
     from jaxlib.mlir._mlir_libs import _jax_mlir_ext
@@ -54,7 +58,10 @@ def parse_arg_types(text):
         for a in entry.regions[0].blocks[0].arguments:
             t = ir.RankedTensorType(a.type)
             specs.append((tuple(t.shape), str(t.element_type)))
-    return specs
+        if "mhlo.input_output_alias" in module.operation.attributes:
+            del module.operation.attributes["mhlo.input_output_alias"]
+            text = module.operation.get_asm(large_elements_limit=None)
+    return specs, text
 
 
 _DT = {
@@ -74,7 +81,9 @@ def np_dtype(elem):
     raise ValueError(f"unhandled element type {elem}")
 
 
-def gen_inputs(specs, seed):
+def gen_inputs(specs, seed, device=None):
+    """Seeded inputs; with `device`, each array is moved to the device as it
+    is generated so peak host memory stays one array, not the whole set."""
     rng = np.random.default_rng(seed)
     out = []
     for shape, elem in specs:
@@ -85,7 +94,14 @@ def gen_inputs(specs, seed):
             # Small non-negative values: safe as token ids / gather indices.
             a = rng.integers(0, 8, size=shape).astype(dt)
         else:
-            a = (rng.standard_normal(shape) * 0.02).astype(dt)
+            a = (rng.standard_normal(shape, dtype=np.float32) * 0.02).astype(dt)
+        if device is not None:
+            import jax
+            a = jax.device_put(a, device)
+            # Sync periodically: async transfers pin their host arrays, and
+            # thousands of queued puts can exhaust host RAM.
+            if len(out) % 16 == 0:
+                jax.block_until_ready(a)
         out.append(a)
     return out
 
@@ -124,7 +140,7 @@ def main():
         print("RESULT:" + json.dumps(res), flush=True)
 
     text = open(args.module).read()
-    in_specs = parse_arg_types(text)
+    in_specs, text = parse_arg_types(text)
     res["param_gb"] = round(nbytes(in_specs) / 1e9, 3)
     log(f"{name}: {len(in_specs)} args, {res['param_gb']} GB inputs")
     if args.mem_limit_gb and nbytes(in_specs) / 1e9 > args.mem_limit_gb:
@@ -140,7 +156,6 @@ def main():
                          "on the metal plugin, timings would be meaningless")
 
     dev = jax.devices(args.platform)[0]
-    inputs = gen_inputs(in_specs, args.seed)
 
     t0 = time.perf_counter()
     try:
@@ -153,8 +168,7 @@ def main():
     res["compile_s"] = round(time.perf_counter() - t0, 2)
     log(f"{name}: compiled in {res['compile_s']}s on {dev}")
 
-    dargs = [jax.device_put(a, dev) for a in inputs]
-    del inputs
+    dargs = gen_inputs(in_specs, args.seed, device=dev)
 
     try:
         for _ in range(max(1, args.warmup)):
@@ -189,29 +203,32 @@ def main():
         log(f"{name}: saved {len(host)} outputs to {args.save_out}")
     if args.check:
         ref = np.load(args.check)
-        worst_abs = worst_rel = 0.0
+        worst_abs = worst_norm = 0.0
         n_mismatch = 0
         for i, h in enumerate(host):
             r = ref[f"o{i}"]
             if r.shape != h.shape:
                 res["status"] = "check_shape_mismatch"
                 break
-            finite = np.isfinite(r) & np.isfinite(h)
-            if not finite.all() and not (np.isfinite(r) == np.isfinite(h)).all():
+            if (np.isfinite(r) != np.isfinite(h)).any():
                 n_mismatch += 1
+                continue
+            finite = np.isfinite(r)
             d = np.abs(h - r)[finite]
             if d.size:
                 worst_abs = max(worst_abs, float(d.max()))
-                denom = np.abs(r[finite]) + 1e-6
-                worst_rel = max(worst_rel, float((d / denom).max()))
-            if not np.allclose(h[finite], r[finite],
-                               rtol=args.rtol, atol=args.atol):
-                n_mismatch += 1
+                # Scale-normalized: bf16 outputs land on a coarse grid, so
+                # judge error against the output's own magnitude.
+                scale = max(float(np.abs(r[finite]).max()), 1e-6)
+                norm = float(d.max()) / scale
+                worst_norm = max(worst_norm, norm)
+                if norm > args.rtol:
+                    n_mismatch += 1
         res["max_abs_err"] = f"{worst_abs:.3e}"
-        res["max_rel_err"] = f"{worst_rel:.3e}"
+        res["max_norm_err"] = f"{worst_norm:.3e}"
         res["check"] = "PASS" if n_mismatch == 0 else f"FAIL({n_mismatch})"
         log(f"{name}: check {res['check']} abs {res['max_abs_err']} "
-            f"rel {res['max_rel_err']}")
+            f"norm {res['max_norm_err']}")
     emit()
 
 

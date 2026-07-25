@@ -104,3 +104,23 @@ def test_scalar_promotion():
 def test_half_precision(dt):
     x = np.linspace(-2, 2, 8).astype(np.float32)
     check(lambda a: jnp.tanh(a) * a + 1, x.astype(dt), rtol=2e-2, atol=2e-2)
+
+
+def test_bf16_hex_splat_constant():
+    # xla-translate emits bf16 specials as hex splats (dense<0xFF80> = -inf);
+    # the MLIR bindings mis-decode those as float(hex) if allowed to.
+    import mlx.core as mx
+    from metaljax.interpreter import Interpreter
+
+    mod = """
+module {
+  func.func @main() -> (tensor<2xbf16>, tensor<bf16>) {
+    %c = stablehlo.constant dense<0xFF80> : tensor<2xbf16>
+    %s = stablehlo.constant dense<0x3F80> : tensor<bf16>
+    return %c, %s : tensor<2xbf16>, tensor<bf16>
+  }
+}
+"""
+    a, b = Interpreter(mod)()
+    assert np.all(np.isneginf(np.array(a.astype(mx.float32))))
+    assert float(np.array(b.astype(mx.float32))) == 1.0

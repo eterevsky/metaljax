@@ -74,3 +74,10 @@ def _dot_general(interp, op, ins, env):
         o3 = mx.matmul(l3, r3)
 
     return mx.reshape(o3, batch + m + n)
+
+
+@register("stablehlo.dot")
+def _dot(interp, op, ins, env):
+    # Plain rank<=2 dot (HLO-imported modules; jax itself emits dot_general):
+    # contracts the last dim of lhs with the first dim of rhs, numpy-style.
+    return mx.matmul(ins[0], ins[1])

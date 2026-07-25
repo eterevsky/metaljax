@@ -66,17 +66,22 @@ def dense_to_np(attr, ttype: ir.RankedTensorType):
     import numpy as np
 
     shape = tuple(ttype.shape)
-    try:
-        arr = np.array(ir.DenseElementsAttr(attr))
-        if arr.dtype != object:
-            if arr.shape != shape:
-                arr = np.broadcast_to(arr, shape)
-            return arr
-    except Exception:
-        pass
+    el = str(ttype.element_type)
+    # bf16 must NOT go through the buffer-protocol branch: the bindings
+    # "succeed" on hex-form attrs (dense<0xFF80>) by converting the hex
+    # integer to float instead of reinterpreting the bits (-inf became
+    # 65536.0). The text fallback decodes both forms correctly.
+    if el != "bf16":
+        try:
+            arr = np.array(ir.DenseElementsAttr(attr))
+            if arr.dtype != object:
+                if arr.shape != shape:
+                    arr = np.broadcast_to(arr, shape)
+                return arr
+        except Exception:
+            pass
 
     import ml_dtypes
-    el = str(ttype.element_type)
     name = _TEXT_NP_DTYPES.get(el)
     if name is None:
         raise TypeError(f"cannot decode dense constant of element type {el}")
@@ -102,7 +107,9 @@ def dense_to_np(attr, ttype: ir.RankedTensorType):
         if tok.startswith("0x") or tok.startswith("-0x"):
             neg = tok.startswith("-")
             bits = int(tok.lstrip("-"), 16)
-            if np_dtype.kind == "f":
+            # Hex float literals are bit patterns. NB ml_dtypes' bfloat16
+            # has dtype kind 'V', so test the MLIR type, not np_dtype.kind.
+            if el.startswith("f") or el == "bf16":
                 v = np.array([bits], dtype=f"u{np_dtype.itemsize}").view(np_dtype)[0]
                 return -v if neg else v
             return -bits if neg else bits
