@@ -125,3 +125,18 @@ Isolated affine scan H256/B16/L256: 5.35 -> 0.08ms (cpu 0.22); fwd+grad
 rglru texmo training converges (loss 5.18 vs cpu 5.03, different seeds).
 Remaining for pass C: matvec cells (rnn/gru/mgru/lstm) need the
 cooperative threadgroup-per-batch-element variant.
+
+## Post-msl_scan full-suite rerun (m5-metal-msl.csv)
+
+208 configs: median 1.35x vs original metal (max 16x). Scan-mode vs CPU
+by weights: 100k-700k band median 0.76, METAL WINS 13/18 (was 0/18 at
+the analysis start); >700k: 37/38. Eligible-family rows moved 10-19x:
+db03-b4l1024 108.7->5.6ms, db03-b128l128 16.1->1.06ms and db09-b128l128
+14.0->1.12ms (both now fastest of all three systems, beating the 4090),
+db06-b64l256 24.7->2.4ms. Remaining scan-mode holdouts are exactly the
+matvec-recurrence cells: db02 (rnn.1.tanh) 590x vs cpu, db07/db08
+(lrnn.4.4) ~120x, db05 (mgru.4) 75x, db10 (lrnn.8.2) 65x. Pass C: these
+have tiny per-block matrices (4x4, 8x8) — a lane could hold the whole
+block state in registers and do the matvec in-lane (extend the codegen
+to allow dot_general with contraction dim <= ~8 inside a lane), covering
+lrnn/mgru/rnn small blocks without threadgroup cooperation.
