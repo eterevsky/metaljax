@@ -35,6 +35,21 @@ def _reduce(interp, op, ins, env):
             out = fn(x, axis=tuple(dims)) if dims else x
             return [combine(out, inits[0])]
 
+    if n == 2 and len(dims) == 1 and not dtypes.is_bool(inputs[0].dtype):
+        # (values, indices) reduce as lowered by jax argmax/argmin: the first
+        # value comparison's direction identifies max vs min; ties resolve to
+        # the lowest index, matching MLX's first-occurrence argmax/argmin.
+        from metaljax.ops.elementwise import _comparison_direction
+        first = next((_comparison_direction(o) for o in body_ops
+                      if o.name == "stablehlo.compare"), None)
+        if first in ("GT", "GE", "LT", "LE"):
+            d = dims[0]
+            is_max = first in ("GT", "GE")
+            val = (mx.max if is_max else mx.min)(inputs[0], axis=d)
+            arg = (mx.argmax if is_max else mx.argmin)(inputs[0], axis=d)
+            idx = mx.take_along_axis(inputs[1], mx.expand_dims(arg, d), axis=d)
+            return [val, mx.squeeze(idx, axis=d)]
+
     raise UnsupportedOpError(
         f"stablehlo.reduce with body {[o.name for o in body_ops]} "
         f"({n} inputs) not implemented"

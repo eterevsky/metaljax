@@ -205,3 +205,28 @@ def _iota(interp, op, ins, env):
     view[dim] = shape[dim]
     out = mx.broadcast_to(mx.reshape(ramp, view), shape)
     return out.astype(dtype)
+
+
+@register("stablehlo.reduce_precision")
+def _reduce_precision(interp, op, ins, env):
+    from metaljax import _ir
+    exp = _ir.int_attr(op, "exponent_bits")
+    man = _ir.int_attr(op, "mantissa_bits")
+    x = ins[0]
+    if exp >= 8 and man >= 23:
+        return x  # no-op for f32-or-narrower storage
+    if (exp, man) == (8, 7):
+        return x.astype(mx.bfloat16).astype(x.dtype)
+    if (exp, man) == (5, 10):
+        return x.astype(mx.float16).astype(x.dtype)
+    if exp == 8 and 0 < man < 23 and x.dtype == mx.float32:
+        # Round f32 mantissa to `man` bits (round-to-nearest-even).
+        u = mx.view(x, mx.uint32)
+        shift = 23 - man
+        half = mx.array((1 << (shift - 1)) - 1, dtype=mx.uint32)
+        lsb = (u >> shift) & mx.array(1, dtype=mx.uint32)
+        u = (u + half + lsb) & mx.array(~((1 << shift) - 1) & 0xFFFFFFFF,
+                                        dtype=mx.uint32)
+        return mx.view(u, mx.float32)
+    raise UnsupportedOpError(
+        f"reduce_precision e{exp}m{man} on {x.dtype} not implemented")

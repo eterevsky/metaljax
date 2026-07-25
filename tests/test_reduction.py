@@ -39,3 +39,24 @@ def test_norm():
 
 def test_var_std():
     check(lambda x: jnp.var(x, axis=0), X, rtol=1e-4, atol=1e-5)
+
+
+def test_argmax_argmin():
+    check(lambda x: jnp.argmax(x, axis=1), X)
+    check(lambda x: jnp.argmin(x, axis=0), X)
+    check(lambda x: jnp.argmax(x, axis=-1), X)
+    # ties resolve to the lowest index
+    T = np.zeros((4, 6), np.float32)
+    T[:, 2] = T[:, 4] = 7.0
+    check(lambda x: jnp.argmax(x, axis=1), T)
+    check(lambda x: jnp.argmin(x, axis=1), T)
+    XI = (X * 100).astype(np.int32)
+    check(lambda x: jnp.argmax(x, axis=2), XI)
+    # max+argmax pair as sampling code uses it
+    check(lambda x: (jnp.max(x, axis=1), jnp.argmax(x, axis=1)), X)
+
+
+def test_reduce_precision():
+    check(lambda x: jax.lax.reduce_precision(x, 8, 7), X)     # bf16 grid
+    check(lambda x: jax.lax.reduce_precision(x, 5, 10), X)    # f16 grid
+    check(lambda x: jax.lax.reduce_precision(x, 8, 12), X)    # generic f32
