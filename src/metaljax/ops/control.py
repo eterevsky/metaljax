@@ -238,6 +238,10 @@ def _while(interp, op, ins, env):
         n = bound if isinstance(bound, int) else int(env[bound].item())
         start = int(ins[k].item())
         trip = max(n - start, 0)
+        from metaljax import msl_scan
+        res = msl_scan.try_run(interp, op, ins, env, trip, start, k)
+        if res is not None:
+            return res
         if interp._in_trace:
             # An enclosing mx.compile is tracing us (only possible for
             # unrollable loops): inline the iterations into that graph.
