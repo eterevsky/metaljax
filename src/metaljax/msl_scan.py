@@ -121,6 +121,17 @@ class SymPad(Sym):
         self.shape, self.dtype = shape, inner.dtype
 
 
+class SymAccRed(Sym):
+    """Cross-lane reduce-sum (e.g. bias-gradient accumulation): hoisted out
+    of the kernel as a post-kernel sum over the stacked operand."""
+    __slots__ = ("inner", "dims", "perm")
+
+    def __init__(self, inner, dims, shape, dtype, perm=None):
+        self.inner, self.dims = inner, tuple(dims)
+        self.shape, self.dtype = shape, dtype
+        self.perm = perm or tuple(range(len(shape)))
+
+
 class SymAccDot(Sym):
     """Cross-lane dot (e.g. per-step weight-gradient contributions): cannot
     run per-lane; hoisted out of the kernel as one einsum over stacked
@@ -320,6 +331,20 @@ class _Analyzer:
                 return [x]
             return [SymPad(x, low[-1], x.shape[-1], out_shape)]
 
+        if name == "stablehlo.reduce":
+            if len(ins) != 2:
+                raise _Unsupported("variadic reduce")
+            x, init = ins
+            if not (isinstance(init, SymConst) and float(init.value) == 0.0):
+                raise _Unsupported("reduce with non-zero init")
+            body_ops = [b.operation
+                        for b in o.regions[0].blocks[0].operations]
+            if len(body_ops) != 2 or body_ops[0].name != "stablehlo.add":
+                raise _Unsupported("non-add reduce")
+            dims = _ir.i64_list(o, "dimensions")
+            out_shape = tuple(ir.RankedTensorType(o.results[0].type).shape)
+            return [SymAccRed(x, dims, out_shape, x.dtype)]
+
         if name == "stablehlo.dynamic_slice":
             return [self._dynamic_slice(o, ins)]
 
@@ -404,7 +429,7 @@ class _Analyzer:
             if len(wfree) != 1:
                 return None
             dsize = w.shape[wfree[0]]
-            if csize > _REG_LIMIT or dsize > _REG_LIMIT:
+            if csize > 4096 or dsize > 4096:
                 return None
             if w.dtype != "f32" or data.dtype != "f32":
                 return None
@@ -495,6 +520,11 @@ class _Analyzer:
             args = [a if isinstance(a, (SymConst, SymCounter))
                     else self._reshaped(a, out_shape) for a in x.args]
             return SymElem(x.op, args, x.dtype, out_shape, extra=x.extra)
+        if isinstance(x, SymAccRed):
+            return SymAccRed(x.inner, x.dims, out_shape, x.dtype, perm=x.perm)
+        if isinstance(x, SymAccDot):
+            return SymAccDot(x.lhs, x.rhs, x.dims, out_shape, x.dtype,
+                             perm=x.perm)
         if not isinstance(x, SymLeaf):
             raise _Unsupported(f"reshape of {type(x).__name__}")
         s = _clone_leafish(x)
@@ -654,6 +684,10 @@ def _rowmajor(shape):
 
 def _transpose_sym(x, perm):
     """Transpose commutes with elementwise ops: push it down to the leaves."""
+    if isinstance(x, SymAccRed):
+        return SymAccRed(x.inner, x.dims,
+                         tuple(x.shape[p] for p in perm), x.dtype,
+                         perm=tuple(x.perm[p] for p in perm))
     if isinstance(x, SymAccDot):
         return SymAccDot(x.lhs, x.rhs, x.dims,
                          tuple(x.shape[p] for p in perm), x.dtype,
@@ -680,6 +714,10 @@ def _transpose_sym(x, perm):
 
 
 def _dump(s, d=0):
+    if isinstance(s, SymAccRed):
+        return f"ACCRED[dims={list(s.dims)}]({_dump(s.inner)})"
+    if isinstance(s, SymPerm):
+        return f"PERM{list(s.perm)}({_dump(s.inner)})"
     if isinstance(s, SymElem):
         return (f"{s.op.split('.')[-1]}{list(s.shape)}("
                 + ",".join(_dump(a) for a in s.args) + ")")
@@ -704,7 +742,7 @@ def _match_accum(s, pos, _unused):
         if (isinstance(x, SymLeaf) and x.kind == "arg"
                 and x.source == ("carry", pos)
                 and x.strides == _rowmajor(x.shape)
-                and isinstance(y, SymAccDot)):
+                and isinstance(y, (SymAccDot, SymAccRed))):
             return y
     return None
 
@@ -717,13 +755,32 @@ def _contains_accdot(root):
         if id(s) in seen:
             continue
         seen.add(id(s))
-        if isinstance(s, SymAccDot):
+        if isinstance(s, (SymAccDot, SymAccRed)):
             return True
         if isinstance(s, SymElem):
             stack.extend(s.args)
         elif isinstance(s, SymDot):
             stack.append(s.data)
     return False
+
+
+def _collect_dots(roots):
+    seen = set()
+    stack = list(roots)
+    out = []
+    while stack:
+        s = stack.pop()
+        if id(s) in seen:
+            continue
+        seen.add(id(s))
+        if isinstance(s, SymDot):
+            out.append(s)
+            stack.append(s.data)
+        elif isinstance(s, SymElem):
+            stack.extend(s.args)
+        elif isinstance(s, SymPad):
+            stack.append(s.inner)
+    return out
 
 
 def _has_dot(roots):
@@ -806,6 +863,73 @@ _MX_DTYPE = {"f32": mx.float32, "f16": mx.float16, "i32": mx.int32,
              "i1": mx.bool_}
 
 
+def _canonicalizer():
+    """Structural hash-consing over the Sym DAG (CSE).
+
+    jax's AD-generated loops recompute gate subexpressions once per residual
+    (CSE is normally XLA's job), so identical subtrees arrive as distinct
+    ops. Interning by structure collapses them so each dot/activation is
+    emitted once; emitter memoization by id() then works structurally.
+    """
+    table: dict = {}
+    memo: dict = {}
+
+    def canon(s):
+        if s is None:
+            return None
+        got = memo.get(id(s))
+        if got is not None:
+            return got
+        try:
+            if isinstance(s, SymElem):
+                s.args = tuple(canon(a) for a in s.args)
+                key = ("e", s.op, s.extra, s.dtype, tuple(s.shape),
+                       tuple(id(a) for a in s.args))
+            elif isinstance(s, SymPad):
+                s.inner = canon(s.inner)
+                key = ("pad", id(s.inner), s.lo, s.n, tuple(s.shape))
+            elif isinstance(s, SymPerm):
+                s.inner = canon(s.inner)
+                key = ("perm", id(s.inner), s.perm)
+            elif isinstance(s, SymDot):
+                s.data = canon(s.data)
+                s.weight = canon(s.weight)
+                key = ("dot", id(s.data), id(s.weight), tuple(s.roles),
+                       tuple(s.widx), tuple(s.shape))
+            elif isinstance(s, SymAccDot):
+                s.lhs = canon(s.lhs)
+                s.rhs = canon(s.rhs)
+                key = ("accdot", id(s.lhs), id(s.rhs), s.dims, s.perm,
+                       tuple(s.shape))
+            elif isinstance(s, SymAccRed):
+                s.inner = canon(s.inner)
+                key = ("accred", id(s.inner), s.dims, s.perm, tuple(s.shape))
+            elif isinstance(s, SymConst):
+                key = ("c", s.dtype, tuple(s.shape), s.value)
+            elif isinstance(s, SymCounter):
+                key = ("t", s.a, s.b, s.base)
+            elif isinstance(s, SymLeaf):
+                # s.source may hold an ir.Value; those hash/compare by the
+                # underlying MLIR value, not the Python wrapper.
+                src = s.source
+                idx = s.idx
+                if idx is not None:
+                    idx = canon(idx)
+                    s.idx = idx
+                key = ("l", s.kind, src, id(idx) if idx is not None else None,
+                       tuple(s.shape), tuple(s.strides), s.offset,
+                       s.state_pos)
+            else:
+                key = ("?", id(s))
+            out = table.setdefault(key, s)
+        except TypeError:  # unhashable field: keep the node as-is
+            out = s
+        memo[id(s)] = out
+        return out
+
+    return canon
+
+
 class Plan:
     """A compiled persistent-kernel execution plan for one loop body."""
 
@@ -816,6 +940,17 @@ class Plan:
         rets = an.analyze()
         if rets is None or len(rets) != len(args):
             raise _Unsupported("terminator mismatch")
+
+        # Re-key stacked-update info by carry position, then intern the DAG.
+        upd = {}
+        for i, s in enumerate(rets):
+            if isinstance(s, SymLeaf) and s.kind == "updated":
+                info = an.updates.get(id(s))
+                if info is not None:
+                    upd[i] = info
+        canon = _canonicalizer()
+        rets = [canon(s) for s in rets]
+        upd = {i: (canon(ix), canon(v)) for i, (ix, v) in upd.items()}
 
         self.passthrough = []      # positions
         self.counters = []         # (pos, per-iter delta)
@@ -835,7 +970,10 @@ class Plan:
             elif isinstance(s, SymLeaf) and s.kind == "updated":
                 if s.source != ("carry", i):
                     raise _Unsupported("update aliasing")
-                idx, val = an.updates[id(s)]
+                idx, val = upd[i]
+                if _contains_accdot(val):
+                    raise _Unsupported(
+                        f"acc in stacked write: {_dump(val)[:300]}")
                 self.stacked.append((i, idx, val))
             else:
                 if i in an.counter_seeded:
@@ -861,33 +999,79 @@ class Plan:
         # directly (with flips for reversed indexing); loop-computed values
         # get hidden per-step stacked outputs.
         self.acc_plans = []       # (pos, spec) resolved in run()
+
+        def resolve(sym):
+            if (isinstance(sym, SymLeaf) and sym.kind == "read"
+                    and sym.strides == _rowmajor(sym.shape)
+                    and sym.idx.a in (1, -1)):
+                return ("buffer", sym)
+            if isinstance(sym, SymAccRed):
+                return ("red", resolve(sym.inner), sym.dims, sym.perm,
+                        tuple(sym.shape))
+            if isinstance(sym, SymAccDot):
+                return ("dot", resolve(sym.lhs), resolve(sym.rhs), sym.dims,
+                        sym.perm, len(sym.lhs.shape), len(sym.rhs.shape))
+            if _contains_accdot(sym):
+                raise _Unsupported(
+                    f"acc under elementwise: {_dump(sym)[:200]}")
+            if sym.dtype != "f32":
+                raise _Unsupported("non-f32 accumulator operand")
+            for hi, (hsym, _) in enumerate(self.hidden):
+                if hsym is sym:
+                    return ("hidden", sym, hi)
+            name = f"hid{len(self.hidden)}"
+            self.hidden.append((sym, name))
+            return ("hidden", sym, len(self.hidden) - 1)
+
         for pos, acc in self.accums:
-            ops = []
-            for side in (acc.lhs, acc.rhs):
-                if (isinstance(side, SymLeaf) and side.kind == "read"
-                        and side.strides == _rowmajor(side.shape)
-                        and side.idx.a in (1, -1)):
-                    ops.append(("buffer", side))
-                else:
-                    if side.dtype != "f32":
-                        raise _Unsupported("non-f32 accumulator operand")
-                    name = f"hid{len(self.hidden)}"
-                    self.hidden.append((side, name))
-                    ops.append(("hidden", side, len(self.hidden) - 1))
-            self.acc_plans.append((pos, acc, ops))
+            self.acc_plans.append((pos, resolve(acc)))
 
         # Vector mode: bodies with small in-lane matvecs hold the trailing
         # (feature/block) dim of every tensor in registers.
         exprs0 = ([s for _, s in self.states]
                   + [v for _, _, v in self.stacked]
                   + [h for h, _ in self.hidden])
-        self.vector = _has_dot(exprs0)
-        if self.accums and not self.vector:
-            raise _Unsupported("accumulators outside vector mode")
+        dots = _collect_dots(exprs0)
+        if dots and all(d.csize <= _REG_LIMIT and d.dsize <= _REG_LIMIT
+                        for d in dots):
+            self.mode = "vector"
+        elif dots or self.accums:
+            self.mode = "coop"
+        else:
+            self.mode = "scalar"
+        self.vector = self.mode == "vector"
+        if self.mode == "coop":
+            widths = {sh[-1] for _, sh in
+                      ((p_, self.arg_shapes[p_]) for p_, _ in self.states)
+                      if sh}
+            if len(widths) != 1:
+                raise _Unsupported(f"coop: mixed state widths {widths}")
+            self.F = widths.pop()
+            if not (16 < self.F <= 1024) and dots:
+                if self.F > 1024:
+                    raise _Unsupported(f"coop: width {self.F} > 1024")
+            for d in dots:
+                if d.csize != self.F or d.dsize != self.F:
+                    raise _Unsupported(
+                        f"coop: non-square dot {d.csize}x{d.dsize} vs F={self.F}")
+                if any(r[0] == "data" for r in d.widx):
+                    raise _Unsupported("coop: batched dot")
 
         # Lane space
         lane = ()
-        if self.vector:
+        if self.mode == "coop":
+            for i, st_ in self.states:
+                lane = _bshape(lane, self.arg_shapes[i][:-1] if
+                               self.arg_shapes[i] else ())
+            for i, idx, val in self.stacked:
+                w = self.arg_shapes[i][-1]
+                if w % self.F:
+                    raise _Unsupported("coop: width not multiple of F")
+                lane = _bshape(lane, tuple(val.shape[1:-1]))
+            for h, _ in self.hidden:
+                lane = _bshape(lane, h.shape[:-1] if h.shape else ())
+            lane = lane + (self.F,)
+        elif self.vector:
             for i, s in self.states:
                 lane = _bshape(lane, s.shape[:-1] if s.shape else ())
             for i, idx, val in self.stacked:
@@ -922,6 +1106,7 @@ class Plan:
         self.start = start
 
         self._weights = {}         # srcid -> weight leaf (indexed in-loop)
+        self._weight_dots = {}     # srcid -> [SymDot] using that weight
         exprs = exprs0
         self._collect(exprs, source_id)
         if set(self._weights) & set(self._wholes):
@@ -935,7 +1120,45 @@ class Plan:
             if src[0] == "carry" and src[1] in mutated:
                 raise _Unsupported("read of a mutated carry")
 
-        src = self._emit_vector() if self.vector else self._emit(counter_pos)
+        # Canonicalize weight layout to (data..., c, d): the output-feature
+        # dim at unit stride makes threadgroup dot reads coalesced (the AD
+        # backward pass contracts against W^T, which would otherwise read
+        # stride-F apart across adjacent threads — ~100x slower in coop mode).
+        # Non-canonical weights are materialized contiguous once per call.
+        self._weight_norms = {}
+        if os.environ.get("METALJAX_MSL_WNORM", "1") != "0":
+            for sid, wleaf in list(self._weights.items()):
+                dots = self._weight_dots.get(sid, [])
+                if not dots:
+                    continue
+                widx0 = tuple(dots[0].widx)
+                if any(tuple(d.widx) != widx0 for d in dots[1:]):
+                    continue
+                nd = len(wleaf.shape)
+                perm = tuple(
+                    [i for i in range(nd) if widx0[i][0] == "data"]
+                    + [i for i in range(nd) if widx0[i][0] == "c"]
+                    + [i for i in range(nd) if widx0[i][0] == "d"])
+                if (perm == tuple(range(nd))
+                        and tuple(wleaf.strides) == _rowmajor(wleaf.shape)
+                        and not wleaf.offset):
+                    continue
+                self._weight_norms[sid] = (tuple(wleaf.shape),
+                                           tuple(wleaf.strides),
+                                           wleaf.offset, perm)
+                new_shape = tuple(wleaf.shape[p] for p in perm)
+                wleaf.shape = new_shape
+                wleaf.strides = _rowmajor(new_shape)
+                wleaf.offset = 0
+                new_widx = tuple(widx0[p] for p in perm)
+                for d in dots:
+                    d.widx = new_widx
+        if self.mode == "coop":
+            src = self._emit_coop()
+        elif self.mode == "vector":
+            src = self._emit_vector()
+        else:
+            src = self._emit(counter_pos)
         self.source = src
         name = f"mj_scan_{abs(hash((id(body_block), trip, start))) % 10**8}"
         self.kernel = mx.fast.metal_kernel(
@@ -966,10 +1189,11 @@ class Plan:
                 walk(s.data)
                 sid = source_id(s.weight.source)
                 self._weights[sid] = s.weight
+                self._weight_dots.setdefault(sid, []).append(s)
             elif isinstance(s, SymLeaf):
                 if s.kind == "read":
                     sid = source_id(s.source)
-                    key = (sid, s.idx.a, s.idx.b)
+                    key = (sid, s.idx.a, s.idx.b, s.shape, s.strides, s.offset)
                     self._reads.setdefault(key, (s, f"r{len(self._reads)}"))
                 elif s.kind == "arg":
                     pos = s.source[1]
@@ -1028,7 +1252,7 @@ class Plan:
         L.append(f"for (uint t = 0; t < {self.trip}u; t++) {{")
 
         # per-iteration reads
-        for (sid, a, b), (leaf, name) in self._reads.items():
+        for (sid, a, b, *_), (leaf, name) in self._reads.items():
             inner = _numel(leaf.inner_shape)
             off = _off_strided(leaf.shape, leaf.strides, lane, leaf.offset)
             idx = f"((int)t + {self.start}) * {a} + {b}" if a != 1 or b != 0 or self.start \
@@ -1052,7 +1276,8 @@ class Plan:
             elif isinstance(s, SymLeaf):
                 if s.kind == "read":
                     sid = self._source_key(s.source)
-                    v = self._reads[(sid, s.idx.a, s.idx.b)][1]
+                    v = self._reads[
+                        (sid, s.idx.a, s.idx.b, s.shape, s.strides, s.offset)][1]
                 elif s.kind == "arg":
                     pos = s.source[1]
                     if pos in self._state_args:
@@ -1199,7 +1424,7 @@ class Plan:
         out.append(f"for (uint t = 0; t < {self.trip}u; t++) {{")
 
         # reads
-        for (sid, a, b), (leaf, name) in self._reads.items():
+        for (sid, a, b, *_), (leaf, name) in self._reads.items():
             R = self._R(leaf)
             inner = _numel(leaf.inner_shape)
             idx = (f"((int)t + {self.start}) * {a} + {b}"
@@ -1228,7 +1453,8 @@ class Plan:
             elif isinstance(s, SymLeaf):
                 if s.kind == "read":
                     sid = self._source_key(s.source)
-                    leaf, nm = self._reads[(sid, s.idx.a, s.idx.b)]
+                    leaf, nm = self._reads[
+                        (sid, s.idx.a, s.idx.b, s.shape, s.strides, s.offset)]
                     v = (nm, self._R(leaf))
                 elif s.kind == "arg":
                     pos = s.source[1]
@@ -1393,6 +1619,306 @@ class Plan:
                 out.append(f"fin{j}[{self._vec_off(shape)}] = st{j};")
         return "\n".join(out)
 
+    # ---- cooperative emission (threadgroup per batch element)
+
+    def _coop_R(self, s):
+        if isinstance(s, (SymConst, SymCounter)):
+            return 1
+        if isinstance(s, SymDot):
+            return 1  # output width == F, one feature per thread
+        if isinstance(s, SymPad):
+            w = s.shape[-1]
+        else:
+            w = s.shape[-1] if s.shape else 1
+        if w == 1:
+            return 1
+        if w % self.F:
+            raise _Unsupported(f"coop width {w} not multiple of F={self.F}")
+        return w // self.F
+
+    def _coop_off(self, shape, strides=None, base=0):
+        """Offset for a tensor whose feature (last) dim is chunked: thread f
+        owns feature g*F + f for component g (loop var `r`)."""
+        lane = self.lane_shape          # (..., F); feature coord = last
+        fcoord = f"c{len(lane) - 1}"
+        dims = list(shape)
+        sts = list(strides) if strides is not None else list(_rowmajor(shape))
+        w = dims[-1] if dims else 1
+        fst = sts[-1] if dims else 0
+        lane_dims = dims[:-1] if dims else []
+        lane_sts = sts[:-1] if dims else []
+        pad = (len(lane) - 1) - len(lane_dims)
+        if pad < 0:
+            n = -pad
+            if any(d != 1 for d in lane_dims[:n]):
+                raise _Unsupported(f"coop shape {shape} vs lane {lane}")
+            lane_dims, lane_sts = lane_dims[n:], lane_sts[n:]
+            pad = 0
+        terms = [f"{base}u"] if base else []
+        for i, (d, st) in enumerate(zip(lane_dims, lane_sts)):
+            if d == 1 or st == 0:
+                continue
+            if d != lane[i + pad]:
+                raise _Unsupported(f"coop shape {shape} vs lane {lane}")
+            terms.append(f"c{i + pad} * {st}u")
+        expr = " + ".join(terms) if terms else "0u"
+        if w > 1 and fst != 0:
+            if w == self.F:
+                return f"{expr} + {fcoord} * {fst}u"
+            return f"{expr} + (r * {self.F}u + {fcoord}) * {fst}u"
+        return expr
+
+    def _emit_coop(self):
+        lane = self.lane_shape
+        F = self.F
+        fcoord = f"c{len(lane) - 1}"
+        out = []
+        out.append("uint lane = thread_position_in_grid.x;")
+        out.append(f"if (lane >= {self.N}u) return;")
+        tail = _numel(lane)
+        for i, d in enumerate(lane):
+            tail //= d
+            out.append(f"uint c{i} = (lane / {tail}u) % {d}u;")
+
+        T = lambda dt: _MSL_DTYPE[dt]
+
+        def declare(name, dtype, R):
+            return (f"{T(dtype)} {name}[{R}];" if R > 1 else f"{T(dtype)} {name};")
+
+        def load(dst, dtype, R, buf, off, indent=""):
+            if R > 1:
+                return [f"{indent}for (int r = 0; r < {R}; r++) "
+                        f"{dst}[r] = {buf}[{off}];"]
+            return [f"{indent}{dst} = {buf}[{off}];"]
+
+        # threadgroup mirrors for dot data (one per distinct data sym)
+        self._shared = {}
+        for d in _collect_dots(
+            [s for _, s in self.states] + [v for _, _, v in self.stacked]
+            + [h for h, _ in self.hidden]
+        ):
+            if id(d.data) not in self._shared:
+                self._shared[id(d.data)] = f"sh{len(self._shared)}"
+        for nm in self._shared.values():
+            out.append(f"threadgroup float {nm}[{F}];")
+
+        for sid, (leaf, name) in sorted(self._wholes.items()):
+            R = self._coop_R(leaf)
+            bshape = self._buffer_shape(leaf)
+            out.append(declare(name, leaf.dtype, R))
+            if len(bshape) == 0:
+                out.append(f"{name} = inp{sid};")
+            else:
+                out.extend(load(name, leaf.dtype, R, f"inp{sid}",
+                                self._coop_off(leaf.shape, leaf.strides,
+                                               leaf.offset)))
+        for j, (pos, expr) in enumerate(self.states):
+            shape = self.arg_shapes[pos]
+            R = self._coop_R_shape(shape)
+            out.append(declare(f"st{j}", self.arg_dtypes[pos], R))
+            if len(shape) == 0:
+                out.append(f"st{j} = init{j};")
+            else:
+                out.extend(load(f"st{j}", self.arg_dtypes[pos], R,
+                                f"init{j}", self._coop_off(shape)))
+
+        out.append(f"for (uint t = 0; t < {self.trip}u; t++) {{")
+
+        for (sid, a, b, *_), (leaf, name) in self._reads.items():
+            R = self._coop_R(leaf)
+            inner = _numel(leaf.inner_shape)
+            idx = (f"((int)t + {self.start}) * {a} + {b}"
+                   if a != 1 or b != 0 or self.start else "(int)t")
+            off = self._coop_off(leaf.shape, leaf.strides, leaf.offset)
+            out.append("  " + declare(name, leaf.dtype, R))
+            out.extend(load(name, leaf.dtype, R, f"inp{sid}",
+                            f"(uint)({idx}) * {inner}u + ({off})", "  "))
+
+        memo = {}
+        tmp = [0]
+        body = []
+
+        def scalarize(s, val):
+            name, R = val
+            return f"{name}[r]" if R > 1 else name
+
+        def emit(s):
+            if id(s) in memo:
+                return memo[id(s)]
+            if isinstance(s, SymConst):
+                v = (_literal(s), 1)
+            elif isinstance(s, SymCounter):
+                v = (f"({s.a} * ((int)t + {self.start}) + {s.b})", 1)
+            elif isinstance(s, SymLeaf):
+                if s.kind == "read":
+                    sid = self._source_key(s.source)
+                    leaf, nm = self._reads[
+                        (sid, s.idx.a, s.idx.b, s.shape, s.strides, s.offset)]
+                    v = (nm, self._coop_R(leaf))
+                elif s.kind == "arg":
+                    pos = s.source[1]
+                    if pos in self._state_args:
+                        v = (f"st{self._state_args[pos]}",
+                             self._coop_R_shape(self.arg_shapes[pos]))
+                    else:
+                        leaf, nm = self._wholes[self._source_key(s.source)]
+                        v = (nm, self._coop_R(leaf))
+                elif s.kind == "whole":
+                    leaf, nm = self._wholes[self._source_key(s.source)]
+                    v = (nm, self._coop_R(leaf))
+                else:
+                    raise _Unsupported("coop leaf kind")
+            elif isinstance(s, SymPad):
+                iv = emit(s.inner)
+                inm, iR = iv
+                # pad on the feature axis: component/feature-window shift
+                R = self._coop_R(s)
+                if s.lo % F or s.n % F:
+                    raise _Unsupported("coop pad not F-aligned")
+                glo, gn = s.lo // F, s.n // F
+                name = f"v{tmp[0]}"; tmp[0] += 1
+                body.append("  " + declare(name, s.dtype, R))
+                src = f"{inm}[r - {glo}]" if iR > 1 else inm
+                if R > 1:
+                    body.append(
+                        f"  for (int r = 0; r < {R}; r++) {name}[r] = "
+                        f"(r >= {glo} && r < {glo + gn}) ? ({src}) "
+                        f": ({T(s.dtype)})0;")
+                else:
+                    body.append(f"  {name} = {src};")
+                v = (name, R)
+            elif isinstance(s, SymDot):
+                # Structural CSE: the same dot may appear once per residual
+                # stack differing only in unit dims; the per-thread scalar
+                # value is identical.
+                wsid = self._source_key(s.weight.source)
+                dkey = ("dotval", id(s.data), wsid,
+                        tuple(tuple(r) for r in s.widx))
+                if dkey in memo:
+                    return memo[dkey]
+                shname = self._shared[id(s.data)]
+                dv, dR = emit(s.data)
+                if dR != 1:
+                    raise _Unsupported("coop dot data must be width F")
+                key = ("shared_written", id(s.data))
+                if key not in memo:
+                    body.append("  threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+                    body.append(f"  {shname}[{fcoord}] = {dv};")
+                    body.append("  threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
+                    memo[key] = True
+                wst = list(s.weight.strides)
+                terms = []
+                for wdim, role in enumerate(s.widx):
+                    st = wst[wdim]
+                    if role[0] == "c":
+                        terms.append(f"(uint)cc * {st}u")
+                    elif role[0] == "d":
+                        terms.append(f"{fcoord} * {st}u")
+                if s.weight.offset:
+                    terms.insert(0, f"{s.weight.offset}u")
+                woff = " + ".join(terms) if terms else "0u"
+                name = f"v{tmp[0]}"; tmp[0] += 1
+                body.append(f"  float {name};")
+                body.append(
+                    f"  {{ float _a = 0.0f; for (int cc = 0; cc < {F}; cc++) "
+                    f"_a += {shname}[cc] * inp{wsid}[{woff}]; {name} = _a; }}")
+                v = (name, 1)
+                memo[dkey] = v
+            elif isinstance(s, SymElem):
+                args = [emit(a) for a in s.args]
+                R = max([r for _, r in args] + [self._coop_R(s)])
+                for _, r in args:
+                    if r not in (1, R):
+                        raise _Unsupported("coop width mismatch")
+                name = f"v{tmp[0]}"; tmp[0] += 1
+                body.append("  " + declare(name, s.dtype, R))
+                acc = [scalarize(s, a) for a in args]
+                if s.op == "convert":
+                    e = f"(({_MSL_DTYPE[s.extra]})({acc[0]}))"
+                elif s.op == "compare":
+                    e = f"({acc[0]} {_COMPARE[s.extra]} {acc[1]})"
+                elif s.op == "select":
+                    e = f"({acc[0]} ? {acc[1]} : {acc[2]})"
+                elif s.op == "clamp":
+                    e = f"metal::min(metal::max({acc[1]}, {acc[0]}), {acc[2]})"
+                elif s.op in _UNARY:
+                    e = _UNARY[s.op].format(*acc)
+                elif s.op in _BINARY:
+                    e = _BINARY[s.op].format(*acc)
+                else:
+                    raise _Unsupported(f"coop emit {s.op}")
+                if R > 1:
+                    body.append(f"  for (int r = 0; r < {R}; r++) "
+                                f"{name}[r] = {e};")
+                else:
+                    body.append(f"  {name} = {e};")
+                v = (name, R)
+            else:
+                raise _Unsupported(f"coop emit type {_dump(s)[:200]}")
+            memo[id(s)] = v
+            return v
+
+        writes = []
+        for q, (pos, idx, val) in enumerate(self.stacked):
+            nm, R = emit(val)
+            inner = _numel(self.arg_shapes[pos][1:])
+            off = self._coop_off(tuple(self.arg_shapes[pos][1:]))
+            ii = f"((int)t + {self.start}) * {idx.a} + {idx.b}"
+            tgt_R = self._coop_R_shape(tuple(self.arg_shapes[pos][1:]))
+            src = f"{nm}[r]" if R > 1 else nm
+            if tgt_R > 1:
+                writes.append(f"  for (int r = 0; r < {tgt_R}; r++) "
+                              f"out{q}[(uint)({ii}) * {inner}u + ({off})] = {src};")
+            else:
+                writes.append(f"  out{q}[(uint)({ii}) * {inner}u + ({off})] = {src};")
+        for q, (sym, hname) in enumerate(self.hidden):
+            if _DEBUG:
+                print(f"[metaljax] hidden {hname}: {_dump(sym)[:220]}",
+                      flush=True)
+            nm, R = emit(sym)
+            numel = _numel(sym.shape)
+            off = self._coop_off(sym.shape)
+            tgt_R = self._coop_R_shape(tuple(sym.shape))
+            src = f"{nm}[r]" if R > 1 else nm
+            if tgt_R > 1:
+                writes.append(f"  for (int r = 0; r < {tgt_R}; r++) "
+                              f"{hname}[t * {numel}u + ({off})] = {src};")
+            else:
+                writes.append(f"  {hname}[t * {numel}u + ({off})] = {src};")
+        news = []
+        for j, (pos, expr) in enumerate(self.states):
+            nm, R = emit(expr)
+            sR = self._coop_R_shape(self.arg_shapes[pos])
+            news.append((j, nm, R, sR))
+        out.extend(body)
+        out.extend(writes)
+        for j, nm, R, sR in news:
+            src = f"{nm}[r]" if R > 1 else nm
+            if sR > 1:
+                out.append(f"  for (int r = 0; r < {sR}; r++) st{j}[r] = {src};")
+            else:
+                out.append(f"  st{j} = {src};")
+        out.append("}")
+        for j, (pos, expr) in enumerate(self.states):
+            shape = self.arg_shapes[pos]
+            sR = self._coop_R_shape(shape)
+            if len(shape) == 0:
+                out.append(f"fin{j}[0u] = st{j};")
+            elif sR > 1:
+                out.append(f"for (int r = 0; r < {sR}; r++) "
+                           f"fin{j}[{self._coop_off(shape)}] = st{j}[r];")
+            else:
+                out.append(f"fin{j}[{self._coop_off(shape)}] = st{j};")
+        return "\n".join(out)
+
+    def _coop_R_shape(self, shape):
+        w = shape[-1] if shape else 1
+        if w == 1:
+            return 1
+        if w % self.F:
+            raise _Unsupported(f"coop width {w} not multiple of F={self.F}")
+        return w // self.F
+
     def _source_key(self, src):
         key = src if src[0] == "carry" else ("free", id(src[1]), src[1])
         return self._source_ids[key]
@@ -1408,11 +1934,14 @@ class Plan:
 
     def run(self, interp, ins, env):
         bufs = []
-        for src in self.sources:
-            if src[0] == "carry":
-                bufs.append(ins[src[1]])
-            else:
-                bufs.append(env[src[1]])
+        for sid, src in enumerate(self.sources):
+            buf = ins[src[1]] if src[0] == "carry" else env[src[1]]
+            norm = self._weight_norms.get(sid)
+            if norm is not None:
+                shape, strides, offset, perm = norm
+                buf = mx.as_strided(buf, shape, strides, offset)
+                buf = mx.contiguous(mx.transpose(buf, perm))
+            bufs.append(buf)
         for pos, _ in self.states:
             bufs.append(ins[pos])
         out_shapes = ([self.arg_shapes[pos] for pos, _, _ in self.stacked]
@@ -1421,10 +1950,11 @@ class Plan:
         out_dtypes = ([_MX_DTYPE[self.arg_dtypes[pos]] for pos, _, _ in self.stacked]
                       + [mx.float32 for _ in self.hidden]
                       + [_MX_DTYPE[self.arg_dtypes[pos]] for pos, _ in self.states])
+        tg = (self.F if self.mode == "coop" else min(self.N, 256), 1, 1)
         outs = self.kernel(
             inputs=bufs,
             grid=(self.N, 1, 1),
-            threadgroup=(min(self.N, 256), 1, 1),
+            threadgroup=tg,
             output_shapes=out_shapes,
             output_dtypes=out_dtypes,
         )
@@ -1445,51 +1975,63 @@ class Plan:
             vals[pos] = outs[q]
         for j, (pos, _) in enumerate(self.states):
             vals[pos] = outs[ns + nh + j]
-        for pos, acc, ops in self.acc_plans:
-            arrs = []
-            for op in ops:
-                if op[0] == "hidden":
-                    arrs.append(outs[ns + op[2]])
-                else:
-                    leaf = op[1]
-                    src = (ins[leaf.source[1]] if leaf.source[0] == "carry"
-                           else env[leaf.source[1]])
-                    a = leaf.idx.a
-                    b2 = a * self.start + leaf.idx.b
-                    if a == 1:
-                        arr = src[b2:b2 + self.trip]
-                    else:  # a == -1: rows b2, b2-1, ..., b2-trip+1
-                        lo = b2 - self.trip + 1
-                        arr = src[lo:b2 + 1][::-1]
-                    arrs.append(arr)
-            lb, rb, lc, rc = acc.dims
-            lrank, rrank = len(acc.lhs.shape), len(acc.rhs.shape)
-            pool = iter("abcdefghijklmnopqrstuvwxy")
-            lsub = [None] * lrank
-            rsub = [None] * rrank
-            batch_letters = []
-            for li, ri in zip(lb, rb):
-                c = next(pool)
-                lsub[li] = rsub[ri] = c
-                batch_letters.append(c)
-            for li, ri in zip(lc, rc):
-                c = next(pool)
-                lsub[li] = rsub[ri] = c
-            lfree, rfree = [], []
-            for i in range(lrank):
-                if lsub[i] is None:
-                    lsub[i] = next(pool)
-                    lfree.append(lsub[i])
-            for i in range(rrank):
-                if rsub[i] is None:
-                    rsub[i] = next(pool)
-                    rfree.append(rsub[i])
-            sub = (f"z{''.join(lsub)},z{''.join(rsub)}->"
-                   f"{''.join(batch_letters + lfree + rfree)}")
-            raw = mx.einsum(sub, arrs[0], arrs[1])
-            if tuple(acc.perm) != tuple(range(len(acc.perm))):
-                raw = mx.transpose(raw, acc.perm)
-            vals[pos] = ins[pos] + raw
+        def stacked(spec):
+            """(L, *per_step_shape) array for a resolved accumulator node."""
+            kind = spec[0]
+            if kind == "hidden":
+                return outs[ns + spec[2]]
+            if kind == "buffer":
+                leaf = spec[1]
+                src = (ins[leaf.source[1]] if leaf.source[0] == "carry"
+                       else env[leaf.source[1]])
+                a = leaf.idx.a
+                b2 = a * self.start + leaf.idx.b
+                if a == 1:
+                    return src[b2:b2 + self.trip]
+                lo = b2 - self.trip + 1
+                return src[lo:b2 + 1][::-1]
+            if kind == "red":
+                _, inner, dims, perm, shape = spec
+                arr = mx.sum(stacked(inner), axis=tuple(d + 1 for d in dims))
+                if tuple(perm) != tuple(range(len(perm))):
+                    arr = mx.transpose(arr, (0,) + tuple(p + 1 for p in perm))
+                return mx.reshape(arr, (self.trip,) + shape)
+            # dot, keeping the time axis: batched matmul with z as batch
+            _, lspec, rspec, dims, perm, lrank, rrank = spec
+            lb, rb, lc, rc = dims
+            A, Bv = stacked(lspec), stacked(rspec)
+            zb_l = [0] + [d + 1 for d in lb]
+            zb_r = [0] + [d + 1 for d in rb]
+            c_l = [d + 1 for d in lc]
+            c_r = [d + 1 for d in rc]
+            f_l = [i for i in range(lrank + 1) if i not in zb_l and i not in c_l]
+            f_r = [i for i in range(rrank + 1) if i not in zb_r and i not in c_r]
+
+            def prod(xs):
+                p_ = 1
+                for x in xs:
+                    p_ *= x
+                return p_
+
+            At = mx.transpose(A, zb_l + f_l + c_l)
+            Bt = mx.transpose(Bv, zb_r + c_r + f_r)
+            bsz = prod([A.shape[i] for i in zb_l])
+            m = prod([A.shape[i] for i in f_l])
+            kk = prod([A.shape[i] for i in c_l])
+            n2 = prod([Bv.shape[i] for i in f_r])
+            out = mx.matmul(mx.reshape(At, (bsz, m, kk)),
+                            mx.reshape(Bt, (bsz, kk, n2)))
+            out_shape = ([A.shape[i] for i in zb_l]
+                         + [A.shape[i] for i in f_l]
+                         + [Bv.shape[i] for i in f_r])
+            arr = mx.reshape(out, out_shape)
+            if tuple(perm) != tuple(range(len(perm))):
+                arr = mx.transpose(arr, (0,) + tuple(p + 1 for p in perm))
+            return arr
+
+        for pos, spec in self.acc_plans:
+            total = mx.sum(stacked(spec), axis=0)
+            vals[pos] = ins[pos] + mx.reshape(total, ins[pos].shape)
         return vals
 
 

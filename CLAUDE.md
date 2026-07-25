@@ -129,10 +129,24 @@ executes on the Metal device through plain `jax.numpy`.
    training-step bodies compile around them. db02-b4l1024 72.9→0.38ms
    (4090 13.8!); db09 0.63ms; db05 10.6. REMAINING: (a) texmo's lrnn
    lowers block contraction as multiply+REDUCE in-cell (db07/08/10 still
-   ~600/49ms) — need SymReduce over the reg dim; (b) cooperative
-   threadgroup mode for full-width cells (gru.256-class, closes torch's
-   fused-GRU 2x); (c) db05-class outer bodies partially eager still.
-9. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+   ~600/49ms) — need SymReduce over the reg dim; (c) db05-class outer
+   bodies partially eager still.
+9. ✅ **msl_scan coop mode** (v0.2.0): full-width matvec cells — one
+   threadgroup per batch element, feature dim = thread axis, dot data via
+   threadgroup shared array + barriers. Square dots == state width F only,
+   F ≤ 1024, no batching dims. Three things made it fast (see notes/):
+   structural CSE (hash-consing `_canonicalizer` — AD residual outputs
+   duplicate whole gate subtrees; ir.Value hashes by MLIR value, id() of
+   the wrapper is NOT stable) + emitter-level dot CSE (residual dot copies
+   differ by a leading unit dim); dW einsums as explicit batched matmul
+   (mx.einsum was the +120ms); weight-layout canonicalization (bwd W^T
+   dots read uncoalesced otherwise; materialized transposed per call).
+   GRU.256/b256 full train step 51.6 ms vs torch fused nn.GRU 47.1
+   (within 10%); texmo bench_jax 66.5 ms/step (beats CPU everywhere now);
+   mgru.256 ~24 ms/step. MEASUREMENT TRAP: jax.block_until_ready is a
+   no-op on this backend (events born ready + async_eval) — time through
+   np.array() or mx.eval.
+10. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib

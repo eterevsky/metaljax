@@ -126,6 +126,53 @@ rglru texmo training converges (loss 5.18 vs cpu 5.03, different seeds).
 Remaining for pass C: matvec cells (rnn/gru/mgru/lstm) need the
 cooperative threadgroup-per-batch-element variant.
 
+## Cooperative threadgroup mode (pass C part 2, same month)
+
+Full-width matvec cells (gru.256/mgru.256/rnn.256 class): one threadgroup
+per batch element, feature axis = thread axis, state in registers; dot
+data goes through `threadgroup float sh[F]` + barriers, each thread
+computes one output feature. Works for fwd AND the AD backward loop.
+
+What it took to make fast (in order of impact):
+
+1. **Structural CSE over the Sym DAG** (the big one). jax's AD fwd loop
+   recomputes gate subexpressions once per stacked residual (CSE is
+   XLA's job normally), so the naive emit did each gate dot 2-5x. Two
+   layers of fix: hash-consing interner (`_canonicalizer`) run on the
+   analyzer output — NB ir.Value keys hash by underlying MLIR value, id()
+   of the Python wrapper is NOT stable — plus emitter-level dot CSE
+   keyed on (data, weight, widx) because residual variants of one dot
+   differ by a leading unit dim (roles ('one',)). grad-fwd kernel went
+   101 -> 17 ms.
+2. **dW accumulators via loop fission**: cross-lane einsums (SymAccDot/
+   SymAccRed) can't run in-kernel; the kernel stacks per-step operands as
+   hidden outputs and run() contracts them post-kernel. Evaluating those
+   contractions with explicit batched matmul (transpose+reshape+matmul,
+   z = time as batch dim) instead of mx.einsum, and deduplicating hidden
+   stacks by interned identity, took grad-weights from +120ms over
+   grad-h0 to +10ms.
+3. **Weight layout canonicalization**: backward dots contract against
+   W^T; reading `w[f*F + cc]` puts adjacent threads 256 floats apart
+   (uncoalesced). Weights whose unit-stride dim is not the output-feature
+   dim are materialized transposed once per call (as_strided +
+   contiguous) so every dot reads `w[cc*F + f]` coalesced. Small effect
+   at F=256 on M5 (L1 absorbs most of it) but structurally right.
+
+Measurement traps hit: `jax.block_until_ready` is a NO-OP for this
+backend (all PJRT events born ready + async_eval) — the "0.2ms full
+fwd scan" seen earlier was dispatch time only. Time through np.array()
+or an instrumented mx.eval. Kernel-source microbenches (scratchpad
+kernel_micro.py) gave the real floors: 3 serial F=256 dots = 13.5ms per
+65536-lane scan of 256 steps; stacked-output writes are free (9 stacks
+= 1 stack); elementwise-only = 1.9ms.
+
+Results (B=256 L=256 H=256 f32): value_and_grad GRU eager total 41.5ms
+(fwd 17.2 + bwd/accums 23.6). bench_compare gru.256 b256 full train
+step: **51.6 ms/step vs torch-MPS fused nn.GRU 47.1** — within 10% of
+the hand-written kernel (was 112 pre-coop, 214 mid-regression). texmo
+bench_jax: 66.5 ms/step, ~2x better than pre-coop, now beats CPU on
+b64 too. mgru.256 training: ~24 ms/step (was ~80).
+
 ## Post-msl_scan full-suite rerun (m5-metal-msl.csv)
 
 208 configs: median 1.35x vs original metal (max 16x). Scan-mode vs CPU
