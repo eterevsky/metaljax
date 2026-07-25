@@ -129,3 +129,60 @@ def test_block_diagonal_cell_vector_mode():
     check(f, Xb, hb, W)
     check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
                              argnums=(0, 1, 2)), Xb, hb, W)
+
+
+def test_concat_cell():
+    # split.cat-style composition: two sub-cells concatenated on features
+    # (concat lowers to summed zero-pads; the AD reverse loop broadcasts
+    # through the pads).
+    def f(xs, h0):
+        def cell(h, x):
+            a = jnp.tanh(h[..., :3] + x[..., :3])
+            b = jax.nn.sigmoid(h[..., 3:] * x[..., 3:])
+            nh = jnp.concatenate([a, b], axis=-1)
+            return nh, nh
+        return jax.lax.scan(cell, h0, xs)
+    check(f, X, H0)
+    check(jax.value_and_grad(lambda a, b: f(a, b)[1].sum(), argnums=(0, 1)),
+          X, H0)
+
+
+def test_sliced_fused_dot_gates():
+    # One fused matvec whose output is gate-split by slicing (slice of a
+    # SymDot shifts the weight window).
+    W = (rng.standard_normal((H, 2 * H)) * 0.3).astype(np.float32)
+
+    def f(xs, h0, w):
+        def cell(h, x):
+            d = h @ w
+            z = jax.nn.sigmoid(d[..., :H] + x)
+            n = jnp.tanh(d[..., H:])
+            nh = (1 - z) * h + z * n
+            return nh, nh
+        return jax.lax.scan(cell, h0, xs)
+    check(f, X, H0, W)
+    check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
+                             argnums=(0, 1, 2)), X, H0, W)
+
+
+def test_i64_scalar_carry():
+    # texmo runs under jax_enable_x64: position/suffix indices are i64
+    # scalars carried through the scan (msl counters must accept them).
+    jax.config.update("jax_enable_x64", True)
+    try:
+        def f(xs):
+            def cell(c, x):
+                h, k = c
+                return (h * 0.9 + x.astype(h.dtype).sum() * 0.01, k + 1), k
+            (h, k), ks = jax.lax.scan(
+                cell, (jnp.float32(1.0), jnp.int64(3)), xs)
+            return h, k, ks
+
+        xs = np.ones((32, 4), np.float32)
+        got = jax.jit(f, backend="metal")(jnp.array(xs))
+        want = jax.jit(f, backend="cpu")(jnp.array(xs))
+        for g, w in zip(got, want):
+            np.testing.assert_allclose(np.array(g), np.array(w),
+                                       rtol=1e-5, atol=1e-6)
+    finally:
+        jax.config.update("jax_enable_x64", False)

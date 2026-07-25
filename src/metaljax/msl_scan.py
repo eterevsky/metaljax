@@ -145,11 +145,16 @@ class SymAccDot(Sym):
         self.perm = perm or tuple(range(len(shape)))
 
 
-_MSL_DTYPE = {"f32": "float", "f16": "half", "i32": "int", "i1": "bool"}
+_MSL_DTYPE = {"f32": "float", "f16": "half", "i32": "int", "i1": "bool",
+              "i64": "long", "i16": "short", "i8": "char",
+              "ui64": "ulong", "ui32": "uint", "ui16": "ushort",
+              "ui8": "uchar"}
 
 
 def _dt(t: ir.Type) -> str:
     s = str(t)
+    if s == "f64" and dtypes.F64_DOWNCAST:
+        return "f32"  # engine stores f64 as f32 device-wide in downcast mode
     if s in _MSL_DTYPE:
         return s
     raise _Unsupported(f"dtype {s}")
@@ -216,7 +221,7 @@ class _Analyzer:
             t = _ttype(a)
             shape = tuple(t.shape)
             el = str(t.element_type)
-            if i == self.counter_pos or (el == "i32" and shape == ()):
+            if i == self.counter_pos or (el in ("i32", "i64") and shape == ()):
                 env[a] = SymCounter(1, 0, i)
                 self.counter_seeded.add(i)
             else:
@@ -286,7 +291,7 @@ class _Analyzer:
         if name in ("stablehlo.add", "stablehlo.subtract", "stablehlo.multiply"):
             a, b = ins
             if isinstance(a, (SymCounter, SymConst)) and isinstance(b, (SymCounter, SymConst)) \
-               and a.shape == () and b.shape == () and {a.dtype, b.dtype} <= {"int", "i32"}:
+               and a.shape == () and b.shape == () and {a.dtype, b.dtype} <= {"int", "i32", "i64"}:
                 return [self._counter_arith(name, a, b)]
             if _DEBUG and any(isinstance(x, SymCounter) for x in ins):
                 print(f"[metaljax] msl_scan: counter arith missed: "
@@ -303,6 +308,21 @@ class _Analyzer:
             out_shape = tuple(ir.RankedTensorType(o.results[0].type).shape)
             dims = _ir.i64_list(o, "broadcast_dimensions")
             return [self._broadcasted(x, out_shape, dims)]
+
+        if name == "stablehlo.concatenate":
+            dim = _ir.int_attr(o, "dimension")
+            out_shape = tuple(ir.RankedTensorType(o.results[0].type).shape)
+            if dim != len(out_shape) - 1:
+                raise _Unsupported("concat on non-feature dim")
+            total = out_shape[-1]
+            acc = None
+            off = 0
+            for x in ins:
+                part = SymPad(x, off, total, out_shape)
+                off += x.shape[-1]
+                acc = part if acc is None else SymElem(
+                    "stablehlo.add", [acc, part], x.dtype, out_shape)
+            return [acc]
 
         if name == "stablehlo.slice":
             (x,) = ins
@@ -506,6 +526,25 @@ class _Analyzer:
                        for z, d in zip(sizes[k:], a.shape)]
                 args.append(self._sliced(a, asub, tuple(asz)))
             return SymElem(x.op, args, x.dtype, sizes, extra=x.extra)
+        if isinstance(x, SymDot):
+            reg_axis = next(
+                (i for i, r in enumerate(x.roles) if r[0] == "reg"), None)
+            if reg_axis is not None and all(
+                    a == 0 and z == d
+                    for i, (a, z, d) in enumerate(zip(starts, sizes, x.shape))
+                    if i != reg_axis):
+                lo = starts[reg_axis]
+                nsize = sizes[reg_axis]
+                wd = next(i for i, r in enumerate(x.widx) if r[0] == "d")
+                w = _clone_leafish(x.weight)
+                w.offset = x.weight.offset + lo * x.weight.strides[wd]
+                wshape = list(w.shape)
+                wshape[wd] = nsize
+                w.shape = tuple(wshape)
+                nshape = list(x.shape)
+                nshape[reg_axis] = nsize
+                return SymDot(x.data, w, x.roles, x.widx, x.csize, nsize,
+                              x.dtype, tuple(nshape))
         raise _Unsupported(f"slice of {type(x).__name__}")
 
     def _reshaped(self, x, out_shape):
@@ -565,8 +604,18 @@ class _Analyzer:
                 roles[d] = x.roles[i]
             return SymDot(x.data, x.weight, roles, x.widx,
                           x.csize, x.dsize, x.dtype, tuple(out_shape))
+        if isinstance(x, SymPad):
+            # The pad window lives on the last dim; a broadcast that keeps
+            # the last dim mapped last commutes with it.
+            if dims and dims[-1] == len(out_shape) - 1 \
+                    and x.shape[-1] == out_shape[-1]:
+                inner = self._broadcasted(
+                    x.inner, tuple(out_shape[:-1]) + (x.inner.shape[-1],),
+                    dims)
+                return SymPad(inner, x.lo, x.n, tuple(out_shape))
+            raise _Unsupported("broadcast reshaping a pad window")
         if not isinstance(x, SymLeaf):
-            raise _Unsupported("broadcast of unsupported value")
+            raise _Unsupported(f"broadcast of {type(x).__name__}")
         s = _clone_leafish(x)
         new_strides = [0] * len(out_shape)
         for i, d in enumerate(dims):
@@ -860,7 +909,9 @@ def _lane_offset(shape, lane_shape):
 
 
 _MX_DTYPE = {"f32": mx.float32, "f16": mx.float16, "i32": mx.int32,
-             "i1": mx.bool_}
+             "i1": mx.bool_, "i64": mx.int64, "i16": mx.int16,
+             "i8": mx.int8, "ui64": mx.uint64, "ui32": mx.uint32,
+             "ui16": mx.uint16, "ui8": mx.uint8}
 
 
 def _canonicalizer():
@@ -1133,6 +1184,15 @@ class Plan:
                     continue
                 widx0 = tuple(dots[0].widx)
                 if any(tuple(d.widx) != widx0 for d in dots[1:]):
+                    continue
+                # All dots must read the SAME window of this source: the
+                # normalization materializes one transformed buffer per
+                # source, which cannot serve two different slices (gate
+                # splits of a fused weight index distinct windows).
+                w0 = dots[0].weight
+                if any(d.weight.shape != w0.shape
+                       or tuple(d.weight.strides) != tuple(w0.strides)
+                       or d.weight.offset != w0.offset for d in dots[1:]):
                     continue
                 nd = len(wleaf.shape)
                 perm = tuple(
@@ -1793,7 +1853,8 @@ class Plan:
                 # value is identical.
                 wsid = self._source_key(s.weight.source)
                 dkey = ("dotval", id(s.data), wsid,
-                        tuple(tuple(r) for r in s.widx))
+                        tuple(tuple(r) for r in s.widx),
+                        s.weight.offset, tuple(s.weight.shape))
                 if dkey in memo:
                     return memo[dkey]
                 shname = self._shared[id(s.data)]
@@ -2038,8 +2099,10 @@ class Plan:
 def _literal(s: SymConst):
     if s.dtype == "i1":
         return "true" if s.value else "false"
-    if s.dtype == "i32" or s.dtype == "int":
-        return f"{int(s.value)}"
+    if s.dtype == "int" or (s.dtype.lstrip("u").startswith("i")
+                            and s.dtype != "i1"):
+        v = int(s.value)
+        return f"{v}ull" if v > 2**63 - 1 else f"{v}"
     v = float(s.value)
     if v != v:
         return "NAN"
