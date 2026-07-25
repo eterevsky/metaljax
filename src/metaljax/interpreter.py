@@ -129,6 +129,7 @@ class Interpreter:
         self._pure_cache: dict = {}    # block -> bool
         self._traceable_cache: dict = {}  # while body block -> bool
         self._cost_cache: dict = {}    # block -> approx op count when traced
+        self._no_chunk: set = set()    # body blocks where chunking failed
         self._in_trace = False  # True while mx.compile is tracing our code
         if isinstance(module, ir.Module):
             if context is None:

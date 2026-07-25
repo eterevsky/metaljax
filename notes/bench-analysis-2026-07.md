@@ -69,3 +69,29 @@ overhead, (c) 25us vs ~13us per-step launch floor.
 
 Items 1-2 are interpreter/engine changes; item 3 starts pattern-matching
 (loop-invariant hoisting) and shades into Stage 2.
+
+## Outcome of implementing 1-2 (same session)
+
+async_eval (1) delivered as measured: dispatch floor 199 -> 33us/call;
+noscan rows 1.4-5.8x faster (db00 9.26 -> 1.85ms, db01-b256l512 17.5 ->
+3.0ms, db09 39.7 -> 20.0, big16 80.9 -> 54.5); bench_compare transformer
+31.2 -> 29.9ms (== torch-MPS), GRU 112 -> 95ms; texmo mgru.4 chunk 8.7 ->
+7.8s, mgru.256 5.1 -> 4.1s.
+
+Chunked unrolling (2) was ~neutral on real recurrent cells: they are
+kernel-launch-bound (matmuls break MLX fusion), not chain-overhead-bound —
+the microbench body over-fused vs reality. Kept (small wins on fusible
+bodies) but restricted to cost <= METALJAX_CHUNK_MAX_COST (1500) and
+K <= METALJAX_CHUNK_MAX (16): big-body chunking inflates traces, loosens
+flush cadence (GPU fault via pending-buffer overrun: "command buffer
+Ignored" — much nastier than the old clean malloc error), and can hit
+MLX's fused-kernel argument-buffer limit on long elementwise chains
+(linear RNNs like db07/lrnn: "Too many inputs/outputs fused"). Both
+failure modes now have graceful fallbacks (chunk -> single-step; engine
+compiled -> eager).
+
+Remaining gap = item 3 (kernel count per timestep). db02-b4l1024 stays
+~100ms vs cpu 0.12ms vs 4090 13.8ms: ~30k launches x 4.5us. Next lever:
+hoist loop-invariant input projections out of scan bodies (x@W over all
+timesteps as one pre-loop GEMM), then fused cell kernels (mx.fast /
+custom Metal) — that is the path to the small-model "Metal > 4090" goal.

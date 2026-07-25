@@ -8,6 +8,7 @@ since these run while jax may still be mid-initialization.
 from __future__ import annotations
 
 import hashlib
+import os
 
 import ml_dtypes
 import mlx.core as mx
@@ -163,10 +164,32 @@ def compile_program(code: bytes, fmt: str) -> MetalExecutable:
     return MetalExecutable(interp, name, fingerprint)
 
 
+# Blocking eval costs a full Metal command-buffer roundtrip (~190us) per
+# execute — ruinous for eager per-primitive dispatch. async_eval submits the
+# work (~17us) and lets device->host reads synchronize on demand.
+# METALJAX_SYNC=1 restores blocking eval (errors then surface at the call).
+_SYNC = os.environ.get("METALJAX_SYNC", "0") == "1"
+
+
 def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
-    outs = list(ex.runner()(*[b.data for b in buffers]))
-    if outs:
-        mx.eval(*outs)
+    args = [b.data for b in buffers]
+    try:
+        outs = list(ex.runner()(*args))
+        if outs:
+            if _SYNC:
+                mx.eval(*outs)
+            else:
+                mx.async_eval(*outs)
+    except RuntimeError:
+        # MLX's compiler can reject certain traces (e.g. fused-kernel
+        # argument-buffer exhaustion). Retry this executable eagerly.
+        if not ex._can_compile:
+            raise
+        ex._can_compile = False
+        ex._compiled = None
+        outs = list(ex.interpreter(*args))
+        if outs:
+            mx.eval(*outs)
     res = []
     for arr, type_enum, dims in zip(outs, ex.out_types, ex.out_dims):
         res.append(MetalBuffer(arr, type_enum, dims))

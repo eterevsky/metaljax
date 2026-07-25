@@ -110,6 +110,14 @@ import os
 # Governs: which loops may unroll into an enclosing trace, which loop
 # bodies get compiled, and whether the whole program is compiled.
 _TRACE_BUDGET = int(os.environ.get("METALJAX_TRACE_BUDGET", "20000"))
+# Max loop iterations unrolled per compiled chunk in the eager-loop path.
+# Bounds both trace time and MLX's fused-kernel argument count (long
+# unrolled elementwise chains can exhaust Metal kernel argument buffers).
+_CHUNK_MAX = int(os.environ.get("METALJAX_CHUNK_MAX", "16"))
+# Only chunk small bodies: chunking amortizes the ~50us per-replay input
+# evaluation, which is irrelevant for big bodies — while inflating trace
+# size and loosening the flush cadence that keeps pending buffers bounded.
+_CHUNK_MAX_COST = int(os.environ.get("METALJAX_CHUNK_MAX_COST", "1500"))
 _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 
 
@@ -182,9 +190,10 @@ from metaljax.interpreter import Interpreter as _Interpreter
 _Interpreter.while_traceable_hook = staticmethod(_while_traceable)
 
 
-def _body_fn(interp, body_block, compile_body):
-    """Cached executor for a while body: fn(*vals, *captures)."""
-    key = (body_block, compile_body)
+def _body_fn(interp, body_block, compile_body, repeat=1):
+    """Cached executor for `repeat` iterations of a while body:
+    fn(*vals, *captures) -> vals."""
+    key = (body_block, compile_body, repeat)
     entry = interp._body_cache.get(key)
     if entry is None:
         free = free_values(body_block)
@@ -193,14 +202,16 @@ def _body_fn(interp, body_block, compile_body):
         def raw(*flat):
             vals = list(flat[:nvals])
             captures = dict(zip(free, flat[nvals:]))
-            return tuple(interp.run_block(body_block, vals, captures))
+            for _ in range(repeat):
+                vals = interp.run_block(body_block, vals, captures)
+            return tuple(vals)
 
         fn = raw
         if (
             compile_body
             and COMPILE_ENABLED
             and interp.block_is_pure(body_block)
-            and _block_cost(interp, body_block) <= _TRACE_BUDGET
+            and repeat * _block_cost(interp, body_block) <= _TRACE_BUDGET
         ):
             def traced(*flat):
                 prev = interp._in_trace
@@ -239,31 +250,49 @@ def _while(interp, op, ins, env):
             for _ in range(trip):
                 vals = list(fn(*vals, *captures))
             return vals
-        # Eager loop: prefer a compiled body (falls back to raw when the
-        # body is impure or too big to trace). Deferring all iterations can
+        # Eager loop. Chained replays are expensive (~50us each: a compiled
+        # call evaluates its inputs), so unroll as many iterations as the
+        # trace budget allows into each compiled chunk, replaying trip/K
+        # chunks instead of trip single steps. Deferring too much work can
         # exhaust MLX's live-buffer limit (each pending replay pins its
         # internal buffers), so flush the graph often enough that pending
         # buffers stay bounded; not in a trace here, so eval is safe.
+        cost = _block_cost(interp, body_block)
+        chunkable = (
+            COMPILE_ENABLED
+            and cost <= _CHUNK_MAX_COST
+            and interp.block_is_pure(body_block)
+            and body_block not in interp._no_chunk
+        )
+        K = 1
+        if chunkable:
+            K = max(1, min(trip, _TRACE_BUDGET // max(cost, 1), _CHUNK_MAX))
+        period = max(1, min(64, 25_000 // max(cost, 1)))
+        if _DEBUG:
+            print(f"[metaljax] while: trip={trip} cost={cost} K={K} "
+                  f"period={period} pure={interp.block_is_pure(body_block)}",
+                  flush=True)
+        if K > 1:
+            try:
+                return _run_chunked(interp, body_block, env, ins, trip, K, cost)
+            except RuntimeError as e:
+                # MLX's compiler can reject big fused traces (e.g. "Too many
+                # inputs/outputs fused..." on long elementwise chains from
+                # linear recurrences). Fall back to single-step replays.
+                if _DEBUG:
+                    print(f"[metaljax] chunked loop failed ({e}); "
+                          f"falling back to single-step", flush=True)
+                interp._no_chunk.add(body_block)
         fn, free = _body_fn(interp, body_block, compile_body=True)
         captures = [env[v] for v in free]
         vals = list(ins)
-        # Each pending replay pins roughly 3-5 live buffers per traced op;
-        # keep the pending total well under Metal's ~500k buffer limit.
-        cost = _block_cost(interp, body_block)
-        period = max(1, min(64, 25_000 // max(cost, 1)))
-        if _DEBUG:
-            print(f"[metaljax] while: trip={trip} cost={cost} period={period} "
-                  f"pure={interp.block_is_pure(body_block)} "
-                  f"in_trace={interp._in_trace}", flush=True)
         for i in range(trip):
             vals = list(fn(*vals, *captures))
             if (i + 1) % period == 0:
-                if _DEBUG and i < 3 * period:
-                    print(f"[metaljax]   flush @{i + 1}, active="
-                          f"{mx.get_active_memory() >> 20}MB", flush=True)
                 mx.eval(*vals)
         return vals
 
+    # Dynamic (non-counted) loop: evaluate the condition each iteration.
     if _DEBUG:
         print(f"[metaljax] while(fallback-dynamic): "
               f"cost={_block_cost(interp, body_block)}", flush=True)
@@ -273,6 +302,30 @@ def _while(interp, op, ins, env):
         if not bool(pred.item()):
             return vals
         vals = interp.run_block(body_block, vals, env)
+
+
+def _run_chunked(interp, body_block, env, ins, trip, K, cost):
+    fn, free = _body_fn(interp, body_block, compile_body=True, repeat=K)
+    captures = [env[v] for v in free]
+    vals = list(ins)
+    # Async-flush each chunk (a blocking sync per chunk serializes CPU and
+    # GPU); block only often enough to bound pending buffers (~4-5 live
+    # buffers per traced op, keep well under Metal's ~500k cap).
+    sync_every = max(1, 75_000 // max(K * cost, 1))
+    for i in range(trip // K):
+        vals = list(fn(*vals, *captures))
+        if (i + 1) % sync_every == 0:
+            mx.eval(*vals)
+        else:
+            mx.async_eval(*vals)
+    rem = trip % K
+    if rem:
+        fn1, free1 = _body_fn(interp, body_block, compile_body=True)
+        captures1 = [env[v] for v in free1]
+        for _ in range(rem):
+            vals = list(fn1(*vals, *captures1))
+    mx.eval(*vals)
+    return vals
 
 
 @register("stablehlo.if")
