@@ -66,8 +66,9 @@ executes on the Metal device through plain `jax.numpy`.
    dims), sdy identity ops. 131 tests. f64 policy (per Oleg): STRICT by
    default — f64 pass-through OK (stored f32, bit-identical), f64 *compute*
    fails at compile naming the op; METALJAX_F64=downcast opts into f32
-   emulation (scripts/texmo_train.py sets it explicitly: optax AdamW's
-   beta**step is real f64 arithmetic under x64).
+   emulation (needed only under jax_enable_x64, e.g. optax AdamW's
+   beta**step; NB texmo.py sets x64 FALSE — scripts/texmo_train.py must
+   match it, an earlier x64=True copy skewed repro perf/dtype profiles).
    Driver: scratchpad texmo_metal_train.py (imports ManagerJax directly,
    avoids texmo.py's hardcoded platforms; torch installed just for imports).
    `bench_jax.py --platform metal` works (flag committed to texmo repo).
