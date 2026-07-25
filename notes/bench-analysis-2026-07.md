@@ -219,3 +219,36 @@ have tiny per-block matrices (4x4, 8x8) — a lane could hold the whole
 block state in registers and do the matvec in-lane (extend the codegen
 to allow dot_general with contraction dim <= ~8 inside a lane), covering
 lrnn/mgru/rnn small blocks without threadgroup cooperation.
+
+## Post-48f2e14 suite rerun (m5-metal-023.csv) + tail taxonomy
+
+Clean single run vs the coop best-of-two baseline: median 0.95, zero
+regressions >1.3x, 10 rows >1.5x faster. The slice-of-dot fix cleared
+the gated-small-cell holdouts as predicted: db05 mgru.4 24->0.58ms
+(41.6x, now BEATS cpu 1.16), db16 mgru.32 26.4->1.21 (21.8x, beats cpu
+7x), mid08 mgru.256 3-4x, db17 1.5x, big00 mgru.512 1.7x.
+
+Bottom-of-table taxonomy by metal/cpu ratio (scan), fully diagnosed:
+
+1-6. ALL lrnn rows (db08 121x, db07 117x, db10 67x/26x, db12 36x,
+  db08-b128 25x): texmo's lrnn lowers its block contraction as
+  broadcast-multiply + stablehlo.reduce over the last dim IN-CELL.
+  The analyzer matches that reduce as a cross-lane accumulator
+  (SymAccRed) and then rejects "broadcast of SymAccRed" — what's
+  needed is an in-lane SymReduce over the register dim (unrolled sum
+  in vector mode). One family, one missing feature.
+
+7,9. db18 mullstm.32 (19x), db17 gru.16-mgru.32 mixes (13x): NEW
+  finding — coop mode requires SQUARE dots (csize == dsize == F).
+  Fused-gate cells at width >16 have rectangular dots (mullstm.32:
+  32x96 gates, 128x32 input proj) -> whole loop rejected, vector mode
+  can't take them either (width > register limit 16). Future: coop
+  rectangular dots (dsize = k*F -> k outputs per thread; csize != F
+  via strided shared reads).
+
+10. db00 (5 weights): 0.19ms vs cpu 0.02 — pure dispatch floor,
+  physics, not fixable by codegen.
+
+The remaining scan-mode gap vs CPU is therefore exactly TWO codegen
+features: in-lane reduce (lrnn family) and rectangular coop dots
+(wide fused-gate cells). Everything else at parity or better.
