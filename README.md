@@ -242,11 +242,12 @@ outputs cross-checked against the CPU results):
 | gemma3_12b_flax_call | 2187.9 | **172.7** | —¹ |
 | gemma2_2b_keras_jax | 158.0 | **17.5** | 10.9 |
 | gemma4_2b_bf16 | 512.0 | **16.9** | 2.5 |
-| maxtext 2.5B train step | 101066 | **19405**² | —¹ |
+| maxtext 2.5B train step | 101066 | **10618**² | —¹ |
 
 ¹ exceeds the 4090's 24 GB VRAM; the M5's 128 GB unified memory runs
 gemma3_12b (23.5 GB of bf16 weights) where the discrete GPU cannot.
-² runs eagerly (MLX declines to compile that graph); still 5× CPU.
+² compiled whole-graph after working around an MLX limitation (equal
+constant-valued outputs break `mx.compile`); ~10× CPU.
 
 Correctness vs CPU on identical inputs: gemma2/gemma4 outputs bit-exact;
 the gemma3 family diverges ≤3.6% in bf16 KV-cache tensors (a few bf16

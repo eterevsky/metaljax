@@ -230,6 +230,51 @@ from metaljax.interpreter import Interpreter as _Interpreter
 _Interpreter.while_traceable_hook = staticmethod(_while_traceable)
 
 
+def _underived_outputs(block, free):
+    """Indices of terminator operands with NO data path from any block arg
+    or capture. When traced, such outputs are baked by MLX's compiler into
+    a constants table KEYED BY VALUE — two equal-valued constant outputs
+    collide and the compiled call dies with unordered_map::at. (Repro:
+    mx.compile(lambda x: (x+1, mx.array(.9), mx.array(.9))) fails.)"""
+    ops = [o.operation for o in block.operations]
+    derived = set(block.arguments) | set(free)
+    for o in ops[:-1]:
+        dep = any(v in derived for v in o.operands)
+        if not dep:
+            for region in o.regions:
+                for b in region.blocks:
+                    if any(v in derived for v in free_values(b)):
+                        dep = True
+                        break
+                if dep:
+                    break
+        if dep:
+            for r in o.results:
+                derived.add(r)
+    return [i for i, v in enumerate(ops[-1].operands) if v not in derived]
+
+
+def _anchor_outputs(outs, args, underived):
+    """Give constant outputs a bitwise-exact data dependency on an input:
+    where(x==x, out, out) == out for every bit pattern (both branches are
+    `out`; a NaN anchor merely flips which identical branch is taken), but
+    the result is a computed node, not a bakeable constant."""
+    if not underived or not args:
+        return outs
+    anchor = None
+    for a in args:
+        if a.size:
+            anchor = mx.reshape(a, (-1,))[:1] == mx.reshape(a, (-1,))[:1]
+            break
+    if anchor is None:
+        return outs
+    outs = list(outs)
+    for i in underived:
+        if i < len(outs):
+            outs[i] = mx.where(mx.reshape(anchor, ()), outs[i], outs[i])
+    return tuple(outs)
+
+
 def _body_fn(interp, body_block, compile_body, repeat=1):
     """Cached executor for `repeat` iterations of a while body:
     fn(*vals, *captures) -> vals."""
@@ -255,11 +300,13 @@ def _body_fn(interp, body_block, compile_body, repeat=1):
             and interp.block_is_pure(body_block)
             and repeat * _block_cost(interp, body_block) <= _TRACE_BUDGET
         ):
+            underived = _underived_outputs(body_block, free)
+
             def traced(*flat):
                 prev = interp._in_trace
                 interp._in_trace = True
                 try:
-                    return raw(*flat)
+                    return _anchor_outputs(raw(*flat), flat, underived)
                 finally:
                     interp._in_trace = prev
 

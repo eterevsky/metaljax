@@ -30,13 +30,16 @@ null-crashes on parse failure) — hence the two-step conversion.
 | gemma3_12b_flax_call       |   2187.9 |    172.7 | skip¹ | — |
 | gemma2_2b_keras_jax        |    158.0 |     17.5 | 10.94 | B200 100, L4 1000, x86-CI wall 14000 |
 | hlo_gemma4_2b_bf16         |    512.0 |     16.9 |  2.53 | (registry lists B200; no baseline yet) |
-| nv_maxtext_1n1g train step |   101066 |   19405² | OOM³  | B200 302.2 (device) |
+| nv_maxtext_1n1g train step |   101066 |   10618² | OOM³  | B200 302.2 (device) |
 
 ¹ 23.5 GB bf16 params > 24 GB VRAM (user rule: only what fits in 24G).
-² metal runs this EAGERLY: mx.compile rejects the traced graph
-  (unordered_map::at — unused inputs); engine falls back per the new
-  broadened catch. Still 5.2x faster than CPU. Compiling around that
-  is future work.
+² updated post-0.2.2: 10618ms, whole-graph compiled. The mx.compile
+  failure was NOT unused inputs (MLX tolerates those) but equal
+  constant-VALUED outputs: MLX bakes non-input-derived outputs into a
+  value-keyed constants map, and two equal ones collide
+  (unordered_map::at). metaljax now anchors such outputs with a
+  bitwise-exact input dependency (where(x==x, out, out)). First
+  measured eager at 19405ms.
 ³ 18.2 GiB allocation on top of 8 GB params exceeds 24 GB VRAM.
 
 sample_loop variants (1b/2.9ms-class on GPU vs 218-1778ms CPU) are

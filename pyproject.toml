@@ -1,6 +1,6 @@
 [project]
 name = "metaljax"
-version = "0.2.1"
+version = "0.2.2"
 description = "Experimental Metal backend for JAX on Apple silicon: PJRT plugin executing StableHLO on MLX"
 readme = "README.md"
 requires-python = ">=3.12"

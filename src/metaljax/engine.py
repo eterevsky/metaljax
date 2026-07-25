@@ -124,11 +124,16 @@ class MetalExecutable:
         if not self._can_compile:
             return interp
         if self._compiled is None:
+            with interp.context:
+                underived = control._underived_outputs(
+                    interp._main_block(), [])
+
             def traced(*a):
                 prev = interp._in_trace
                 interp._in_trace = True
                 try:
-                    return tuple(interp(*a))
+                    outs = tuple(interp(*a))
+                    return control._anchor_outputs(outs, a, underived)
                 finally:
                     interp._in_trace = prev
 

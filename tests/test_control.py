@@ -62,3 +62,45 @@ def test_nested_jit():
 def test_remat():
     f = jax.checkpoint(lambda x: jnp.sin(x) * jnp.cos(x))
     check(f, rng.standard_normal(8).astype(np.float32))
+
+
+def test_equal_constant_outputs_compile():
+    # mx.compile dies (unordered_map::at) when two outputs bake to equal
+    # constants; the engine anchors non-input-derived outputs so the whole
+    # executable still compiles. Exercise the real runner path.
+    import mlx.core as mx
+    from metaljax import engine
+
+    mod = """
+module {
+  func.func @main(%x: tensor<2xf32>) -> (tensor<2xf32>, tensor<f32>, tensor<f32>) {
+    %a = stablehlo.constant dense<9.990000e-01> : tensor<f32>
+    %b = stablehlo.constant dense<9.990000e-01> : tensor<f32>
+    %y = stablehlo.add %x, %x : tensor<2xf32>
+    return %y, %a, %b : tensor<2xf32>, tensor<f32>, tensor<f32>
+  }
+}
+"""
+    ex = engine.compile_program(mod.encode(), "mlir")
+    x = mx.array(np.array([1.0, 2.0], np.float32))
+    outs = list(ex.runner()(x))
+    mx.eval(*outs)
+    assert ex._can_compile  # must have taken the compiled path
+    np.testing.assert_array_equal(np.array(outs[0]), [2.0, 4.0])
+    assert float(outs[1].item()) == float(np.float32(0.999))
+    assert float(outs[2].item()) == float(np.float32(0.999))
+
+
+def test_scan_carrying_equal_constants():
+    # A scan whose carries include two equal scalar constants each step —
+    # the compiled-body path must not trip MLX's equal-constant folding.
+    def f(x):
+        def cell(c, xt):
+            h, u, v = c
+            return (jnp.tanh(h + xt), jnp.float32(0.999) * 1.0,
+                    jnp.float32(0.999) * 1.0), h
+        (h, u, v), ys = jax.lax.scan(
+            cell, (x, jnp.float32(0.0), jnp.float32(0.0)),
+            jnp.ones((70, 4), jnp.float32))
+        return h + u + v, ys
+    check(f, np.ones((4,), np.float32))

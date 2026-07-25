@@ -163,7 +163,27 @@ executes on the Metal device through plain `jax.numpy`.
    order shifts invalidate refs); GPU scatter-add is order-nondeterministic
    (like jax-CUDA); sample_loop benchmarks are vacuous under random inputs
    (decode loop runs 0 iterations). v0.2.1 on TestPyPI, verified 3.12+3.13.
-11. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+11. ✅ **v0.2.2: long-run worker fixes** (from Oleg's errors.txt after
+   hundreds of training cycles). (a) Metal caps LIVE buffers at ~499k
+   (device_info resource_limit) while MLX's cache is bounded by BYTES —
+   config-sweeping workers accumulate freed small buffers forever;
+   engine now mx.clear_cache()s at every compile boundary + every 50k
+   executes (METALJAX_CLEAR_PERIOD). (b) mx.compile dies
+   (unordered_map::at) when two OUTPUTS bake to equal constant values
+   (minimal: mx.compile(lambda x: (x+1, mx.array(.9), mx.array(.9)));
+   unused inputs are NOT the problem — tolerated fine). Fix: statically
+   find non-input-derived outputs (_underived_outputs) and anchor them
+   with where(x==x, out, out) — bitwise exact, kills constant baking.
+   This got maxtext's whole-main compiling (19.4s→10.6s/step eager→
+   compiled). (c) Compiled while BODIES can still fail at call time on a
+   deeper variant of the same MLX bug (equal constants colliding
+   somewhere inside the tape — anchoring all outputs does NOT cure the
+   lrnn.8.2 S512 chunk body); such bodies now fall back to the
+   uncompiled body (blacklisted per process, iteration retried — safe:
+   pure body, carries untouched). Manifests as per-op dispatch overhead
+   for the affected loop level only (inner scans keep MSL/compiled
+   paths); METALJAX_DEBUG=1 prints "compiled while body failed".
+12. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
