@@ -106,7 +106,22 @@ executes on the Metal device through plain `jax.numpy`.
    on 3.12). Wheel verified on fresh 3.12 venv; twine check passes.
    LICENSE = Apache-2.0 (flagged for Oleg's confirmation). RELEASING.md has
    the upload steps; **Oleg publishes himself** (like git pushes).
-7. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+7. ✅ **msl_scan: persistent-kernel codegen** (src/metaljax/msl_scan.py) —
+   counted loops with pure elementwise bodies (mingru/rglru/lrnn family,
+   fwd AND AD-generated bwd) compile to ONE generated Metal kernel
+   (mx.fast.metal_kernel, thread per batch×feature lane, state in
+   registers). Generic IR pattern-matching, no layer-specific code (Oleg's
+   requirement: nothing texmo-specific, transferable to future layers).
+   Gotchas: jax hoists the loop-increment constant OUT of the body (fold
+   free splat-constant captures or the counter looks non-affine); MLX
+   passes 0-dim inputs by value (no subscript); first run must eval
+   synchronously (Metal build errors in async workers abort the process);
+   kernels ARE traceable into enclosing mx.compile graphs. METALJAX_MSL=0
+   disables. Affine H256/B16/L256: fwd+grad 15.4→0.07ms (CPU 0.73).
+   db09-b128l128 1.00ms — beats CPU (2.2) AND 4090 (2.3). Matvec cells
+   (rnn/gru/mgru) still fall back — future: cooperative threadgroup
+   variant (pass C).
+8. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib

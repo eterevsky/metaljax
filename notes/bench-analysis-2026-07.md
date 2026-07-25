@@ -111,3 +111,17 @@ dispatch-overhead war: our 33us floor vs jax-GPU's ~4ms noscan steps).
 Worst rows remain b4l1024 recurrents (db02/03/07/08: 100-800ms vs cpu
 0.12-5ms vs 4090 13-131ms) — precisely the persistent-kernel targets;
 prototype's 17x would put db02-b4l1024 at ~6ms, under the 4090's 13.8.
+
+## msl_scan persistent-kernel codegen (implemented same session)
+
+Generic recognizer+codegen (src/metaljax/msl_scan.py): counted loops with
+elementwise bodies -> one generated Metal kernel, thread per lane, state
+in registers. Handles fwd and AD-generated bwd loops (reverse affine
+indexing), scalar bool carries, broadcasts, hoisted-constant folding.
+Isolated affine scan H256/B16/L256: 5.35 -> 0.08ms (cpu 0.22); fwd+grad
+15.4 -> 0.07ms (cpu 0.73). Suite: db03-b4l1024 108.7 -> 4.8ms (beats
+4090's 13.6; cpu 0.44 still ahead at 33 weights), db09-b128l128 12.1 ->
+1.00ms (fastest of all three systems), db06-b64l256 19.4 -> 2.1ms.
+rglru texmo training converges (loss 5.18 vs cpu 5.03, different seeds).
+Remaining for pass C: matvec cells (rnn/gru/mgru/lstm) need the
+cooperative threadgroup-per-batch-element variant.
