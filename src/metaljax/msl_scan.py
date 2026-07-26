@@ -29,6 +29,14 @@ _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 # bodies containing small dot_generals hold the whole block in registers and
 # unroll the matvec in-lane.
 _REG_LIMIT = int(os.environ.get("METALJAX_MSL_REG", "16"))
+_COOP_WORK_CAP = int(os.environ.get("METALJAX_MSL_COOP_CAP", "2200000"))
+# WORKAROUND for a Metal shader-compiler bug: multi-iteration kernel loops
+# illegally cache t-derived reads across iterations (see notes 2026-07).
+# volatile on the loop counter forces re-evaluation, bit-exact. Off switch
+# is for testing whether a future macOS/Metal update fixed the bug.
+_T_DECL = ("  uint t = t_;"
+           if os.environ.get("METALJAX_MSL_VOLATILE", "1") == "0"
+           else "  volatile uint t = t_;")
 _KERNEL_SEQ = 0
 
 
@@ -1696,6 +1704,20 @@ class Plan:
             if shared_bytes > 32768:
                 raise _Unsupported(
                     f"coop: threadgroup memory {shared_bytes}B > 32KB")
+            # Every threadgroup (one per batch lane) streams each dot's
+            # weight matrix from device memory every timestep; MLX's batched
+            # matmul reads it once for the whole batch. Beyond ~2M weight
+            # elements per step the redundant traffic loses to the compiled
+            # matmul path (measured: gru.512 coop wins, lstm.512 ties,
+            # gru/lstm.1024 lose 2-2.5x).
+            work = sum(d.csize * d.dsize
+                       for d in {id(d): d for d in dots}.values())
+            if _DEBUG:
+                print(f"[metaljax] coop dot work/lane/step: {work}")
+            if work > _COOP_WORK_CAP:
+                raise _Unsupported(
+                    f"coop: dot work {work} elems/step > "
+                    f"{_COOP_WORK_CAP} (matmul path wins)")
 
         # Lane space
         lane = ()
@@ -1917,7 +1939,7 @@ class Plan:
         # iteration loops here, illegally caching t-derived reads
         # across iterations (verified vs a numpy emulation of the
         # emitted source; volatile forces re-evaluation, bit-exact).
-        L.append("  volatile uint t = t_;")
+        L.append(_T_DECL)
 
         # per-iteration reads
         for (sid, a, b, *_), (leaf, name) in self._reads.items():
@@ -2095,7 +2117,7 @@ class Plan:
                                 f"init{j}", self._vec_off(shape)))
 
         out.append(f"for (uint t_ = 0; t_ < {self.trip}u; t_++) {{")
-        out.append("  volatile uint t = t_;")
+        out.append(_T_DECL)
 
         # reads
         for (sid, a, b, *_), (leaf, name) in self._reads.items():
@@ -2484,7 +2506,7 @@ class Plan:
                                 f"init{j}", self._coop_off(shape)))
 
         out.append(f"for (uint t_ = 0; t_ < {self.trip}u; t_++) {{")
-        out.append("  volatile uint t = t_;")
+        out.append(_T_DECL)
 
         for (sid, a, b, *_), (leaf, name) in self._reads.items():
             R = self._coop_R(leaf)
