@@ -7,3 +7,4 @@
 {"time": "2026-07-26T00:24:44", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 128, "x": 4, "y": 0.40776073932647705, "scale": 1.5034474022956732, "loss": 4.411327186187744}
 {"time": "2026-07-26T19:32:43", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 256, "x": 4, "y": 0.18178243935108185, "scale": 1.1993532334257886, "loss": 4.300908389648438}
 {"time": "2026-07-26T19:37:35", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 512, "x": 4, "y": -0.22659531235694885, "scale": 0.7972433515487173, "loss": 4.15884453352356}
+{"time": "2026-07-26T23:00:40", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.1|dense.1.gelu-rglru.1-slstm.1", "lr": 0.01, "steps": 8, "x": 1, "y": 0.022670701146125793, "scale": 1.0229296345228003, "loss": 5.350915732940674}

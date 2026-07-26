@@ -1863,6 +1863,17 @@ class Plan:
         else:
             src = self._emit(counter_pos)
         self.source = src
+        # Metal caps kernel buffer bindings at 31 (indices 0-30); MLX
+        # assigns them sequentially to inputs then outputs. Deep fused
+        # bodies (e.g. AD residuals of stacked-cell chains) can exceed it
+        # — reject so the loop takes the compiled-graph path instead of
+        # dying at kernel build. One slot of slack for MLX internals.
+        n_bind = (len(self.sources) + 2 * len(self.states)
+                  + (1 if _VOLATILE == "tmap" else 0)
+                  + len(self.stacked) + len(self.hidden))
+        if n_bind > 30:
+            raise _Unsupported(
+                f"kernel needs {n_bind} buffer bindings (Metal limit 31)")
         # NB kernel names must be process-unique: MLX caches compiled
         # kernels and id()-based names collide once Python reuses addresses
         # across executables (order-1 wrong results in config sweeps).

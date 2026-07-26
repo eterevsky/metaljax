@@ -211,7 +211,12 @@ executes on the Metal device through plain `jax.numpy`.
    Suite-context trap: sub-ms configs measure ~2x slower inside a
    104-config sweep than standalone (kernel-cache/buffer-pool growth) —
    verify regressions standalone before believing them.
-13. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+13. ✅ v0.3.1: msl_scan rejects plans needing >30 buffer bindings (Metal
+   caps kernels at 31; deep fused bodies like dense+rglru+slstm AD
+   residuals exceeded it → "Unable to build metal library" at execute
+   time, from Oleg's live sweeps). Falls back to compiled-graph path;
+   spec verified vs CPU. Also 0.3.0→Beta classifier + texmo-free README.
+14. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
