@@ -322,7 +322,7 @@ class _Analyzer:
         """Represent a loop-invariant op we can't symify as a 'whole'
         input: the plan evaluates its IR subgraph once per call through
         the regular interpreter and feeds the result as a buffer."""
-        if o.regions:
+        if o.regions or os.environ.get("MJDBG_NOHOIST"):
             return None
 
         def sym_invariant(sym):
@@ -429,6 +429,8 @@ class _Analyzer:
             return [self._broadcasted(x, out_shape, dims)]
 
         if name == "stablehlo.while":
+            if os.environ.get("MJDBG_NONESTED"):
+                raise _Unsupported("op stablehlo.while (disabled)")
             # Symbolically unroll small statically-counted nested loops
             # (lrnn's rank recursion nests a tiny scan inside the sequence
             # scan). The inner counter becomes a constant per iteration.
@@ -534,7 +536,8 @@ class _Analyzer:
             dot = self._reduce_as_dot(x, dims, out_shape)
             if dot is not None:
                 return [dot]
-            if list(dims) == [len(x.shape) - 1]:
+            if (list(dims) == [len(x.shape) - 1]
+                    and not os.environ.get("MJDBG_NOREDREG")):
                 # in-lane: reduce over the register dim (texmo's lrnn
                 # readout contracts register-resident products)
                 return [SymRedReg(x, out_shape, x.dtype)]
@@ -1530,7 +1533,8 @@ class Plan:
                   + [v for _, _, v in self.stacked]
                   + [h for h, _ in self.hidden])
         dots = _collect_dots(exprs0)
-        if dots and all(d.csize <= _REG_LIMIT and d.dsize <= 4 * _REG_LIMIT
+        _dcap = _REG_LIMIT if os.environ.get("MJDBG_NODSIZE") else 4 * _REG_LIMIT
+        if dots and all(d.csize <= _REG_LIMIT and d.dsize <= _dcap
                         for d in dots):
             # dsize (output features of the in-lane matvec) costs registers
             # but no extra serial work per element beyond the unrolled loop
@@ -1772,7 +1776,12 @@ class Plan:
                 off = _lane_offset(self.arg_shapes[pos], lane)
                 L.append(f"{mslt(self.arg_dtypes[pos])} st{j} = init{j}[{off}];")
 
-        L.append(f"for (uint t = 0; t < {self.trip}u; t++) {{")
+        L.append(f"for (uint t_ = 0; t_ < {self.trip}u; t_++) {{")
+        # WORKAROUND: the Metal shader compiler miscompiles multi-
+        # iteration loops here, illegally caching t-derived reads
+        # across iterations (verified vs a numpy emulation of the
+        # emitted source; volatile forces re-evaluation, bit-exact).
+        L.append("  volatile uint t = t_;")
 
         # per-iteration reads
         for (sid, a, b, *_), (leaf, name) in self._reads.items():
@@ -1949,7 +1958,8 @@ class Plan:
                 out.extend(load(f"st{j}", self.arg_dtypes[pos], R,
                                 f"init{j}", self._vec_off(shape)))
 
-        out.append(f"for (uint t = 0; t < {self.trip}u; t++) {{")
+        out.append(f"for (uint t_ = 0; t_ < {self.trip}u; t_++) {{")
+        out.append("  volatile uint t = t_;")
 
         # reads
         for (sid, a, b, *_), (leaf, name) in self._reads.items():
@@ -2013,6 +2023,11 @@ class Plan:
                 v = (name, R)
             elif isinstance(s, SymRedReg):
                 inm, iR = emit(s.inner)
+                true_w = s.inner.shape[-1] if s.inner.shape else 1
+                if iR != true_w:
+                    # the reduced dim is not (fully) register-resident:
+                    # summing registers would silently skip lane elements
+                    raise _Unsupported("register reduce over non-register dim")
                 name = f"v{tmp[0]}"
                 tmp[0] += 1
                 body.append(f"  {T(s.dtype)} {name};")
@@ -2290,7 +2305,8 @@ class Plan:
                 out.extend(load(f"st{j}", self.arg_dtypes[pos], R,
                                 f"init{j}", self._coop_off(shape)))
 
-        out.append(f"for (uint t = 0; t < {self.trip}u; t++) {{")
+        out.append(f"for (uint t_ = 0; t_ < {self.trip}u; t_++) {{")
+        out.append("  volatile uint t = t_;")
 
         for (sid, a, b, *_), (leaf, name) in self._reads.items():
             R = self._coop_R(leaf)
@@ -2546,6 +2562,7 @@ class Plan:
         out_dtypes = ([_MX_DTYPE[self.arg_dtypes[pos]] for pos, _, _ in self.stacked]
                       + [mx.float32 for _ in self.hidden]
                       + [_MX_DTYPE[self.arg_dtypes[pos]] for pos, _ in self.states])
+        self._last_bufs = bufs
         tg = (self.F if self.mode == "coop" else min(self.N, 256), 1, 1)
         outs = self.kernel(
             inputs=bufs,
@@ -2664,7 +2681,139 @@ def try_run(interp, op, ins, env, trip, start, counter_pos):
     if plan is None:
         return None
     try:
-        return plan.run(interp, ins, env)
+        res = plan.run(interp, ins, env)
+        if os.environ.get("MJDBG_VERIFY_MSL"):
+          try:
+            from metaljax.ops import control as _c
+            fn, free, _ = _c._body_fn(interp, op.regions[1].blocks[0],
+                                      compile_body=False)
+            caps = [env[v] for v in free]
+            ref = list(ins)
+            for _ in range(trip):
+                ref = list(fn(*ref, *caps))
+            import numpy as _np
+            mx.eval(*[x for x in res if x is not None])
+            mx.eval(*ref)
+            worst, wi = 0.0, -1
+            for i, (a, b) in enumerate(zip(res, ref)):
+                if a is None:
+                    continue
+                da = _np.array(a, copy=False).astype(_np.float64)
+                db_ = _np.array(b, copy=False).astype(_np.float64)
+                d = float(_np.abs(da - db_).max()) if da.size else 0.0
+                sc = max(float(_np.abs(db_).max()), 1e-6) if db_.size else 1.0
+                if d / sc > worst:
+                    worst, wi = d / sc, i
+            if worst > 1e-4:
+                cls = "?"
+                if any(p_ == wi for p_, _ in plan.states):
+                    cls = "state"
+                elif any(p_ == wi for p_, _, _ in plan.stacked):
+                    cls = "stacked"
+                elif any(p_ == wi for p_, _ in plan.acc_plans):
+                    cls = "accum"
+                elif wi in plan.passthrough:
+                    cls = "passthrough"
+                elif any(p_ == wi for p_, _ in plan.counters):
+                    cls = "counter"
+                print(f"[metaljax] MSL PLAN WRONG: trip={trip} mode={plan.mode} "
+                      f"lanes={plan.N} stacked={len(plan.stacked)} "
+                      f"hidden={len(plan.hidden)} worst={worst:.3e} "
+                      f"out[{wi}]={cls}", flush=True)
+                import pathlib
+                pathlib.Path("/tmp/mj_wrong_plan.metal").write_text(plan.source)
+                a = _np.array(res[wi], copy=False)
+                b = _np.array(ref[wi], copy=False)
+                print(f"  plan[{wi}][:2]: {a.reshape(-1)[:6]}", flush=True)
+                print(f"  raw [{wi}][:2]: {b.reshape(-1)[:6]}", flush=True)
+                d = _np.abs(a - b)
+                print(f"  wrong elems: {(d > 1e-4 * max(float(_np.abs(b).max()), 1e-6)).sum()}"
+                      f"/{d.size} shape={a.shape}", flush=True)
+                # 1-trip discriminator: single-iteration miscompile vs
+                # cross-iteration state handling
+                try:
+                    from metaljax.ops.control import _analyze_counted, _static_start
+                    k1, _b1 = _analyze_counted(interp, op)
+                    st1 = _static_start(op, k1)
+                    p1 = Plan(interp, op.regions[1].blocks[0], k1, 1, st1)
+                    r1p = p1.run(interp, ins, env)
+                    r1r = list(fn(*ins, *caps))
+                    mx.eval(*[x for x in r1p if x is not None]); mx.eval(*r1r)
+                    w1 = 0.0
+                    for i2, (x2, y2) in enumerate(zip(r1p, r1r)):
+                        if x2 is None:
+                            continue
+                        dx = _np.array(x2, copy=False).astype(_np.float64)
+                        dy = _np.array(y2, copy=False).astype(_np.float64)
+                        dd = float(_np.abs(dx - dy).max()) if dx.size else 0
+                        sc2 = max(float(_np.abs(dy).max()), 1e-6)
+                        w1 = max(w1, dd / sc2)
+                    print(f"  1-trip plan vs 1-iter raw: worst={w1:.3e}", flush=True)
+                except Exception as e1:
+                    print(f"  1-trip probe failed: {e1}", flush=True)
+                try:
+                    # two 1-trip plans composed vs the 2-trip plan
+                    p1b = Plan(interp, op.regions[1].blocks[0], k1, 1, st1)
+                    mid = p1b.run(interp, ins, env)
+                    p1c = Plan(interp, op.regions[1].blocks[0], k1, 1,
+                               st1 + 1)
+                    fin2 = p1c.run(interp, mid, env)
+                    mx.eval(*[x for x in fin2 if x is not None])
+                    w2 = 0.0
+                    for i3, (x3, y3) in enumerate(zip(fin2, ref)):
+                        if x3 is None:
+                            continue
+                        dx = _np.array(x3, copy=False).astype(_np.float64)
+                        dy = _np.array(y3, copy=False).astype(_np.float64)
+                        dd = float(_np.abs(dx - dy).max()) if dx.size else 0
+                        sc3 = max(float(_np.abs(dy).max()), 1e-6)
+                        w2 = max(w2, dd / sc3)
+                    print(f"  composed 2x1-trip vs raw: worst={w2:.3e}", flush=True)
+                    import pathlib
+                    pathlib.Path("/tmp/mj_plan1.metal").write_text(p1b.source)
+                    # determinism + input-aliasing probes on the 2-trip plan
+                    resB = plan.run(interp, ins, env)
+                    mx.eval(*[x for x in resB if x is not None])
+                    dAB = max(float(_np.abs(_np.array(a2, copy=False).astype(_np.float64)
+                                    - _np.array(b2, copy=False).astype(_np.float64)).max())
+                              for a2, b2 in zip(res, resB)
+                              if a2 is not None and _np.array(a2).size)
+                    print(f"  rerun determinism: max abs diff {dAB:.3e}", flush=True)
+                    ins_c = [mx.contiguous(x) + 0 for x in ins]
+                    env_keys = list(env)
+                    resC = plan.run(interp, ins_c, env)
+                    mx.eval(*[x for x in resC if x is not None])
+                    wC = 0.0
+                    for x4, y4 in zip(resC, ref):
+                        if x4 is None:
+                            continue
+                        dx = _np.array(x4, copy=False).astype(_np.float64)
+                        dy = _np.array(y4, copy=False).astype(_np.float64)
+                        if dx.size:
+                            wC = max(wC, float(_np.abs(dx - dy).max())
+                                     / max(float(_np.abs(dy).max()), 1e-6))
+                    print(f"  fresh-copied inputs vs raw: worst={wC:.3e}", flush=True)
+                    import pathlib as _pl
+                    if not _pl.Path("/tmp/mj_dump.npz").exists():
+                        _pl.Path("/tmp/mj_dump_src.metal").write_text(plan.source)
+                        dump = {}
+                        for si, bx in enumerate(plan._last_bufs):
+                            dump[f"inp{si}"] = _np.array(bx, copy=False)
+                        for sj, (pos_, _e) in enumerate(plan.states):
+                            dump[f"init{sj}"] = _np.array(ins[pos_], copy=False)
+                        for oi, x5 in enumerate(res):
+                            if x5 is not None:
+                                dump[f"res{oi}"] = _np.array(x5, copy=False)
+                        for oi, y5 in enumerate(ref):
+                            dump[f"ref{oi}"] = _np.array(y5, copy=False)
+                        dump["state_pos"] = _np.array([p_ for p_, _ in plan.states])
+                        _np.savez("/tmp/mj_dump.npz", **dump)
+                        print("  dumped buffers to /tmp/mj_dump.npz", flush=True)
+                except Exception as e2:
+                    print(f"  composed probe failed: {e2}", flush=True)
+          except Exception as ve:
+            print(f"[metaljax] MSL VERIFY ERROR: {ve}", flush=True)
+        return res
     except Exception as e:
         if _DEBUG:
             print(f"[metaljax] msl_scan: run failed ({e}); disabling", flush=True)
