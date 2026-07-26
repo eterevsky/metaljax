@@ -1654,7 +1654,12 @@ class Plan:
                   + [h for h, _ in self.hidden])
         dots = _collect_dots(exprs0)
         _dcap = _REG_LIMIT if os.environ.get("MJDBG_NODSIZE") else 4 * _REG_LIMIT
-        if dots and all(d.csize <= _dcap and d.dsize <= _dcap
+        # vector mode holds both dot operands in registers: one dimension
+        # may be wide (lrnn's 4->32 readout / its 32->4 backward), but if
+        # BOTH are wide the register tails collapse occupancy — those dots
+        # belong in coop mode (db13's rnn.32 regressed 13x when stolen).
+        if dots and all(min(d.csize, d.dsize) <= _REG_LIMIT
+                        and max(d.csize, d.dsize) <= _dcap
                         for d in dots):
             # dsize (output features of the in-lane matvec) costs registers
             # but no extra serial work per element beyond the unrolled loop
