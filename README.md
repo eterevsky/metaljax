@@ -15,12 +15,14 @@ hood the compiled StableHLO programs are interpreted onto
 [MLX](https://github.com/ml-explore/mlx) arrays, which execute on the GPU
 via Metal.
 
-**Status**: experimental, published as a demo. Real training runs work
-(the [texmo](https://github.com/eterevsky/texmo) project trains
-end-to-end) and transformer training steps run within a few percent of
-PyTorch's MPS backend, but expect gaps — unsupported ops fail with a
-clear `UnsupportedOpError`. If a Metal backend ever lands upstream in the
-JAX ecosystem, this package will be deprecated in its favor.
+**Status**: beta. Real training runs work end-to-end (transformer and
+recurrent language models with optax, including long `lax.scan`
+training loops), transformer training steps run within a few percent of
+PyTorch's MPS backend, and every release is gated by a whole-model
+correctness sweep against the CPU backend. Coverage gaps remain —
+unsupported ops fail with a clear `UnsupportedOpError`. If a Metal
+backend ever lands upstream in the JAX ecosystem, this package will be
+deprecated in its favor.
 
 ## Install
 
@@ -116,27 +118,6 @@ g = jax.jit(jax.grad(lambda x: jnp.sum(jnp.tanh(x) ** 2)))(jnp.arange(4.0))
 print(g, g.device)"
 ```
 
-## Running texmo on Metal
-
-texmo pins its platform in its own `config.py`, so use the bundled driver,
-which imports texmo's `ManagerJax` directly (set `TEXMO_DIR` if your
-checkout is not `~/texmo`):
-
-```bash
-# extra deps texmo imports at module level (torch is never executed by JAX)
-uv pip install -p .venv/bin/python optax safetensors regex scipy scikit-learn torch
-
-# platform spec steps batch length precision
-.venv/bin/python scripts/texmo_train.py metal,cpu 'bits.1+bp|mgru.4-dense.4.gelu' 64 16 64 fp32
-```
-
-texmo's own GRU benchmark accepts a platform flag:
-
-```bash
-cd ~/texmo
-~/metaljax/.venv/bin/python scripts/bench_jax.py --platform metal --mode ram --steps 8 --batch 64
-```
-
 ## Using metaljax from another project
 
 Add `metaljax` to your dependencies (it declares `jax` itself):
@@ -168,7 +149,7 @@ needs the Xcode command-line tools.
 |---|---|---|
 | `JAX_PLATFORMS` | *(unset)* | Set to `metal` (or `metal,cpu`) to select the backend; unset keeps CPU default. |
 | `METALJAX_MATMUL_PRECISION` | `highest` | On M5-class GPUs MLX routes f32 GEMM through the neural accelerators at ~bf16 input precision (~4e-3 error). `highest` pins MLX kernels to the previous GPU generation for exact f32; set `default` to allow the fast path. |
-| `METALJAX_F64` | `error` | Metal has no float64. Default (`error`): f64 values may pass **through** the device (x64 mode wraps Python scalars as f64 buffers that programs immediately convert to f32 — stored as f32, which rounds exactly once and stays bit-identical to CPU), but any op that **computes** in f64 fails at compile time, naming the op. `downcast`: emulate all f64 in f32 (one warning). Example: under `jax_enable_x64`, optax AdamW's `beta**step` bias correction is real f64 arithmetic — strict mode rejects it, so `scripts/texmo_train.py` sets `downcast` explicitly. |
+| `METALJAX_F64` | `error` | Metal has no float64. Default (`error`): f64 values may pass **through** the device (x64 mode wraps Python scalars as f64 buffers that programs immediately convert to f32 — stored as f32, which rounds exactly once and stays bit-identical to CPU), but any op that **computes** in f64 fails at compile time, naming the op. `downcast`: emulate all f64 in f32 (one warning). Example: under `jax_enable_x64`, optax AdamW's `beta**step` bias correction is real f64 arithmetic — strict mode rejects it, and `downcast` is the opt-in for such workloads. |
 | `METALJAX_PLUGIN_PATH` | *(auto)* | Override the path to `libmetal_pjrt.dylib`. |
 
 ## Repository layout
@@ -188,7 +169,7 @@ plugin/
   vendor/pjrt_c_api.h      vendored PJRT header (API 0.114)
   build.sh                 clang build → plugin/build/libmetal_pjrt.dylib
 tests/                     pytest suite (Metal vs CPU)
-scripts/texmo_train.py     texmo-on-Metal driver
+scripts/                   benchmark & training drivers
 ```
 
 ## Benchmarks
@@ -200,8 +181,7 @@ Full training steps (fwd + bwd + AdamW), f32, M5 Max, via
 |---|---:|---:|---:|---:|
 | transformer d256 L4 T256 b32 | 174.3 | **30.2** | 30.0 | 209.3 |
 | transformer d512 L4 T256 b64 | — | **153.9** | 151.7 | — |
-| GRU.256 T256 b256 (scan) | — | **53.5** | 48.2¹ | — |
-| texmo `bench_jax.py` GRU b256 | 273.3 | **59.2** | — | — |
+| GRU.256 T256 b256 (scan) | 256.6 | **53.5** | 48.2¹ | — |
 
 ¹ torch uses its hand-fused `nn.GRU` kernel; metaljax generates its
 kernel from the StableHLO loop body and lands within 10%.
@@ -209,8 +189,8 @@ kernel from the StableHLO loop body and lands within 10%.
 How: pure programs and counted-loop (`scan`/`fori_loop`) bodies are traced
 once through `mx.compile` and replayed as fused Metal graphs; small
 statically-counted loops are unrolled into the enclosing trace, so e.g. a
-whole texmo training step (forward scan + backward + AdamW) becomes a
-single graph replay. On top of that, recurrent scan bodies that
+whole recurrent-model training step (forward scan + backward + AdamW)
+becomes a single graph replay. On top of that, recurrent scan bodies that
 pattern-match as elementwise/matvec cells (rnn/gru/mgru/lrnn/rglru
 family — forward *and* the AD-generated backward loop) compile to a
 single generated persistent Metal kernel: the whole scan is one kernel
@@ -227,13 +207,15 @@ after it. `METALJAX_COMPILE=0` disables compilation, `METALJAX_MSL=0`
 disables kernel codegen, `METALJAX_TRACE_BUDGET` (default 20000 ops)
 caps trace sizes, and `METALJAX_DEBUG=1` logs loop/compile decisions.
 
-On texmo's own 104-config benchmark suite (0.3): 84 configs train
-faster on metal than on the M5's CPU cores; **every** config above 10k
-weights wins (median 3–6.6x faster), and 41 of 104 outpace an RTX 4090
-running jax-CUDA. Only sub-10k-weight models remain CPU territory
-(kernel-dispatch floor). Every optimization is gated by a whole-model
-correctness sweep: one jitted training chunk per suite config executed
-on both backends from identical inputs, every output leaf compared.
+On a 104-config language-model training suite (dense, GRU/LSTM-family,
+and linear-RNN cells from tens of weights to several million), 84
+configs train faster on metal than on the M5's CPU cores; **every**
+config above 10k weights wins (median 3–6.6x faster), and 41 of 104
+outpace an RTX 4090 running jax-CUDA. Only sub-10k-weight models remain
+CPU territory (kernel-dispatch floor). Every optimization is gated by a
+whole-model correctness sweep: one jitted training chunk per suite
+config executed on both backends from identical inputs, every output
+leaf compared.
 
 ### openxla/xla benchmark suite
 
