@@ -122,6 +122,18 @@ class SymPad(Sym):
         self.shape, self.dtype = shape, inner.dtype
 
 
+class SymStack(Sym):
+    """A small tensor assembled by static-index dynamic_update_slices
+    (the unrolled form of an inner scan's output stack). Never emitted:
+    static dynamic_slices read parts back out and the node dissolves."""
+    __slots__ = ("base", "parts", "axis")
+
+    def __init__(self, base, parts, shape, dtype, axis=0):
+        self.base, self.parts = base, parts
+        self.axis = axis
+        self.shape, self.dtype = tuple(shape), dtype
+
+
 class SymIota(Sym):
     """Coordinate ramp along one axis (loop-invariant): value = coord+start.
     axis indexes .shape; the emitters map it to the register index (last
@@ -646,6 +658,17 @@ class _Analyzer:
                 raise _Unsupported("dropdim of iota axis")
             na = s.axis - (1 if axis < s.axis else 0)
             return SymIota(na, s.start, shape, s.dtype)
+        if isinstance(s, SymStack):
+            if axis == s.axis:
+                if s.shape[axis] == 1 and 0 in s.parts:
+                    # a one-slot stack IS its single part
+                    return self._dropdim(s.parts[0], axis)
+                raise _Unsupported("dropdim of stack axis")
+            na = s.axis - (1 if axis < s.axis else 0)
+            return SymStack(self._dropdim(s.base, axis),
+                            {k2: self._dropdim(v2, axis)
+                             for k2, v2 in s.parts.items()},
+                            shape, s.dtype, axis=na)
         raise _Unsupported(f"dropdim of {type(s).__name__}")
 
     def _squeeze_axis(self, s, axis):
@@ -1016,6 +1039,12 @@ class _Analyzer:
             return SymRedReg(x.inner, out_shape, x.dtype)
         if isinstance(x, SymIota):
             return SymIota(dims[x.axis], x.start, out_shape, x.dtype)
+        if isinstance(x, SymStack):
+            if all(x.shape[i] == out_shape[d] for i, d in enumerate(dims)):
+                base = self._broadcasted(x.base, out_shape, dims)
+                return SymStack(base, x.parts, out_shape, x.dtype,
+                                axis=dims[x.axis])
+            raise _Unsupported("size-changing broadcast of a stack")
         if isinstance(x, SymPad):
             # The pad window lives on the last dim; a broadcast that keeps
             # the last dim mapped last commutes with it.
@@ -1027,7 +1056,8 @@ class _Analyzer:
                 return SymPad(inner, x.lo, x.n, tuple(out_shape))
             raise _Unsupported("broadcast reshaping a pad window")
         if not isinstance(x, SymLeaf):
-            raise _Unsupported(f"broadcast of {type(x).__name__}")
+            raise _Unsupported(f"broadcast of {type(x).__name__} "
+                               f"{x.shape}->{tuple(out_shape)} dims={list(dims)}")
         s = _clone_leafish(x)
         new_strides = [0] * len(out_shape)
         for i, d in enumerate(dims):
@@ -1039,12 +1069,38 @@ class _Analyzer:
         s.strides = tuple(new_strides)
         return s
 
+    @staticmethod
+    def _static_index(sym):
+        if isinstance(sym, SymConst):
+            return int(sym.value)
+        if isinstance(sym, SymCounter) and sym.a == 0:
+            return int(sym.b)
+        return None
+
     def _dynamic_slice(self, o, ins):
         x = ins[0]
         starts = ins[1:]
         sizes = _ir.i64_list(o, "slice_sizes")
+        static = [self._static_index(st) for st in starts]
+        if all(st is not None for st in static):
+            # all-static dynamic_slice is a plain slice (nested-loop
+            # unrolling turns inner-counter indices into constants)
+            if isinstance(x, SymStack):
+                ax = x.axis
+                full_rest = all(
+                    (d == ax and sizes[d] == 1)
+                    or (d != ax and static[d] == 0 and sizes[d] == x.shape[d])
+                    for d in range(len(x.shape)))
+                if full_rest and static[ax] in x.parts:
+                    part = x.parts[static[ax]]
+                    want = tuple(sizes)
+                    if tuple(part.shape) != want:
+                        part = self._reshaped(part, want)
+                    return part
+                x = x.base
+            return self._sliced(x, static, tuple(sizes))
         if not isinstance(x, SymLeaf) or x.kind not in ("arg", "whole"):
-            raise _Unsupported("dynamic_slice of computed value")
+            raise _Unsupported(f"dynamic_slice of computed value: {type(x).__name__} {_dump(x)[:90]}")
         shape = x.shape
         if len(shape) < 1 or sizes[0] != 1:
             raise _Unsupported("dynamic_slice shape")
@@ -1070,9 +1126,23 @@ class _Analyzer:
     def _dynamic_update(self, o, ins):
         x, upd = ins[0], ins[1]
         starts = ins[2:]
+        static = [self._static_index(st) for st in starts]
+        if (all(st is not None for st in static)
+                and all(st == 0 for st in static[1:])
+                and isinstance(x, (SymConst, SymStack))
+                and upd.shape and upd.shape[0] == 1
+                and tuple(upd.shape[1:]) == tuple(x.shape[1:])):
+            if isinstance(x, SymStack):
+                parts = dict(x.parts)
+                base = x.base
+            else:
+                parts = {}
+                base = x
+            parts[static[0]] = upd
+            return SymStack(base, parts, x.shape, x.dtype)
         if not (isinstance(x, SymLeaf) and x.kind == "arg"
                 and x.source[0] == "carry"):
-            raise _Unsupported("dynamic_update_slice target")
+            raise _Unsupported(f"dynamic_update_slice target: {type(x).__name__} {_dump(x)[:90]}")
         shape = x.shape
         if upd.shape[0] != 1 or tuple(upd.shape[1:]) != tuple(shape[1:]):
             raise _Unsupported("dus update shape")
@@ -1169,9 +1239,34 @@ def _transpose_sym(x, perm):
         return x
     if isinstance(x, SymPerm):
         return SymPerm(x.inner, tuple(x.perm[p] for p in perm))
+    if isinstance(x, SymRedReg):
+        return SymRedReg(x.inner, tuple(x.shape[p] for p in perm), x.dtype)
     if isinstance(x, SymElem):
-        return SymPerm(x, perm)
-    raise _Unsupported("transpose of unsupported value")
+        n = len(x.shape)
+        args = []
+        for a in x.args:
+            ashape = tuple(getattr(a, "shape", ()) or ())
+            if not ashape or all(d == 1 for d in ashape):
+                args.append(a)
+                continue
+            k = n - len(ashape)
+            if k:
+                # expand right-aligned args to full rank so the perm applies
+                if isinstance(a, SymLeaf):
+                    a = _clone_leafish(a)
+                    a.shape = (1,) * k + ashape
+                    a.strides = (0,) * k + tuple(a.strides)
+                elif isinstance(a, SymConst):
+                    a = SymConst(a.value, a.dtype, (1,) * k + ashape)
+                elif isinstance(a, SymIota):
+                    a = SymIota(a.axis + k, a.start, (1,) * k + ashape,
+                                a.dtype)
+                else:
+                    return SymPerm(x, perm)
+            args.append(_transpose_sym(a, perm))
+        return SymElem(x.op, args, x.dtype,
+                       tuple(x.shape[p] for p in perm), extra=x.extra)
+    return SymPerm(x, perm)
 
 
 def _dump(s, d=0):
@@ -1194,17 +1289,29 @@ def _dump(s, d=0):
 
 
 def _match_accum(s, pos, _unused):
-    """state' = state + cross_lane_dot -> the SymAccDot, else None."""
-    if not (isinstance(s, SymElem) and s.op == "stablehlo.add"
-            and len(s.args) == 2):
-        return None
-    a, b = s.args
-    for x, y in ((a, b), (b, a)):
-        if (isinstance(x, SymLeaf) and x.kind == "arg"
-                and x.source == ("carry", pos)
-                and x.strides == _rowmajor(x.shape)
-                and isinstance(y, (SymAccDot, SymAccRed))):
-            return y
+    """state' = state + sum of cross-lane accumulators -> [acc syms].
+
+    Unrolled nested loops produce sums: carry + (0 + ACC1 + ACC2 + ...);
+    flatten the add tree, require exactly one occurrence of the carry,
+    tolerate zero constants, and collect every AccDot/AccRed term."""
+    terms = []
+    def flatten(x):
+        if (isinstance(x, SymElem) and x.op == "stablehlo.add"):
+            for a in x.args:
+                flatten(a)
+        else:
+            terms.append(x)
+    flatten(s)
+    carry = [t for t in terms
+             if isinstance(t, SymLeaf) and t.kind == "arg"
+             and t.source == ("carry", pos)
+             and t.strides == _rowmajor(t.shape)]
+    accs = [t for t in terms if isinstance(t, (SymAccDot, SymAccRed))]
+    rest = [t for t in terms
+            if t not in carry and t not in accs
+            and not (isinstance(t, SymConst) and float(t.value) == 0.0)]
+    if len(carry) == 1 and accs and not rest:
+        return accs
     return None
 
 
@@ -1374,6 +1481,13 @@ def _canonicalizer():
                 key = ("redreg", id(s.inner), tuple(s.shape))
             elif isinstance(s, SymIota):
                 key = ("iota", s.axis, s.start, tuple(s.shape), s.dtype)
+            elif isinstance(s, SymStack):
+                s.base = canon(s.base)
+                s.parts = {k2: canon(v2) for k2, v2 in s.parts.items()}
+                key = ("stack", id(s.base), s.axis,
+                       tuple(sorted((k2, id(v2))
+                                    for k2, v2 in s.parts.items())),
+                       tuple(s.shape))
             elif isinstance(s, SymConst):
                 key = ("c", s.dtype, tuple(s.shape), s.value)
             elif isinstance(s, SymCounter):
@@ -1451,9 +1565,9 @@ class Plan:
                         f"i32 scalar carry {i} with non-affine update: "
                         f"{type(s).__name__} "
                         f"{getattr(s, 'op', getattr(s, 'kind', ''))}")
-                acc = _match_accum(s, i, self.arg_shapes if False else None)
-                if acc is not None:
-                    self.accums.append((i, acc))
+                accs = _match_accum(s, i, None)
+                if accs is not None:
+                    self.accums.append((i, accs))
                     continue
                 if _contains_accdot(s):
                     raise _Unsupported(
@@ -1500,7 +1614,13 @@ class Plan:
         def resolve(sym):
             if (isinstance(sym, SymLeaf) and sym.kind == "read"
                     and sym.strides == _rowmajor(sym.shape)
-                    and sym.idx.a in (1, -1)):
+                    and sym.idx.a in (1, -1)
+                    and sym.offset == 0
+                    and (sym.inner_shape is None
+                         or _numel(sym.shape)
+                         == _numel((1,) + tuple(sym.inner_shape)))):
+                # only a FULL per-step block can be consumed directly as a
+                # buffer slice; offset sub-windows need a hidden stack
                 return ("buffer", sym)
             if isinstance(sym, SymAccRed):
                 return ("red", resolve(sym.inner), sym.dims, sym.perm,
@@ -1524,8 +1644,8 @@ class Plan:
             self.hidden.append((sym, name))
             return ("hidden", sym, len(self.hidden) - 1)
 
-        for pos, acc in self.accums:
-            self.acc_plans.append((pos, resolve(acc)))
+        for pos, accs in self.accums:
+            self.acc_plans.append((pos, [resolve(a) for a in accs]))
 
         # Vector mode: bodies with small in-lane matvecs hold the trailing
         # (feature/block) dim of every tensor in registers.
@@ -1534,7 +1654,7 @@ class Plan:
                   + [h for h, _ in self.hidden])
         dots = _collect_dots(exprs0)
         _dcap = _REG_LIMIT if os.environ.get("MJDBG_NODSIZE") else 4 * _REG_LIMIT
-        if dots and all(d.csize <= _REG_LIMIT and d.dsize <= _dcap
+        if dots and all(d.csize <= _dcap and d.dsize <= _dcap
                         for d in dots):
             # dsize (output features of the in-lane matvec) costs registers
             # but no extra serial work per element beyond the unrolled loop
@@ -2142,39 +2262,78 @@ class Plan:
                     f"_a += {dacc} * inp{wsid}[{woff}]; {name} = _a; }}")
             return (name, s.dsize)
 
+        def emit_write(val, per_shape, dest_expr):
+            """Emit writes of `val` into a buffer whose per-step layout is
+            row-major `per_shape`; absorbs top-level transposes into the
+            write strides and materializes SymStacks part by part."""
+            if isinstance(val, SymStack):
+                extra = len(val.shape) - len(per_shape)
+                if (extra > 0 and val.axis >= extra
+                        and all(d == 1 for d in val.shape[:extra])):
+                    val = SymStack(val.base, val.parts, val.shape[extra:],
+                                   val.dtype, axis=val.axis - extra)
+                if len(val.shape) != len(per_shape):
+                    raise _Unsupported(
+                        f"stack rank vs write target mismatch: "
+                        f"stack{val.shape} axis={val.axis} vs per{per_shape}")
+                st_t = _rowmajor(per_shape)
+                ax_stride = st_t[val.axis]
+                if set(val.parts) != set(range(val.shape[val.axis])):
+                    raise _Unsupported("partial stack write")
+                st_sub = [d for i2, d in enumerate(st_t) if i2 != val.axis]
+                for idx0, part in sorted(val.parts.items()):
+                    nm2, R2 = emit(part)
+                    st_al = list(st_sub)
+                    while len(st_al) < len(part.shape):
+                        st_al.insert(0, 0)
+                    st_al = st_al[len(st_al) - len(part.shape):]
+                    off2 = self._vec_off(tuple(part.shape), tuple(st_al))
+                    base_off = idx0 * ax_stride
+                    if R2 > 1:
+                        writes.append(
+                            f"  for (int r = 0; r < {R2}; r++) "
+                            f"{dest_expr}({off2}) + {base_off}u] = {nm2}[r];")
+                    else:
+                        writes.append(
+                            f"  {dest_expr}({off2}) + {base_off}u] = {nm2};")
+                return
+            wr_strides2 = None
+            if isinstance(val, SymPerm):
+                st_t = _rowmajor(per_shape)
+                wr_strides2 = tuple(st_t[val.perm.index(i)]
+                                    for i in range(len(val.perm)))
+                val = val.inner
+            nm2, R2 = emit(val)
+            if wr_strides2 is not None:
+                off2 = self._vec_off(tuple(val.shape), wr_strides2)
+                tgt_R2 = val.shape[-1] if val.shape else 1
+            elif (R2 == 1 and per_shape
+                    and _numel(per_shape) == _numel(self.lane_shape)):
+                # width-1 value: every target dim is a lane dim; a fake
+                # unit register dim maps them all to lane coordinates
+                off2 = self._vec_off(tuple(per_shape) + (1,))
+                tgt_R2 = 1
+            else:
+                off2 = self._vec_off(tuple(val.shape)
+                                     if val.shape else per_shape)
+                tgt_R2 = val.shape[-1] if val.shape else 1
+            src2 = f"{nm2}[r]" if R2 > 1 else nm2
+            if tgt_R2 > 1:
+                writes.append(f"  for (int r = 0; r < {tgt_R2}; r++) "
+                              f"{dest_expr}({off2})] = {src2};")
+            else:
+                writes.append(f"  {dest_expr}({off2})] = {src2};")
+
         writes = []
         for q, (pos, idx, val) in enumerate(self.stacked):
-            nm, R = emit(val)
             inner = _numel(self.arg_shapes[pos][1:])
             per = tuple(self.arg_shapes[pos][1:])
             ii = f"((int)t + {self.start}) * {idx.a} + {idx.b}"
-            if R == 1 and per and _numel(per) == _numel(lane):
-                # width-1 value (e.g. a register reduce): every target dim
-                # is a lane dim — append a fake unit register dim so the
-                # offset maps all of them to lane coordinates.
-                off = self._vec_off(per + (1,))
-                tgt_R = 1
-            else:
-                off = self._vec_off(per)
-                tgt_R = self.arg_shapes[pos][-1] \
-                    if len(self.arg_shapes[pos]) > 1 else 1
-            src = f"{nm}[r]" if R > 1 else nm
-            if tgt_R > 1:
-                writes.append(f"  for (int r = 0; r < {tgt_R}; r++) "
-                              f"out{q}[(uint)({ii}) * {inner}u + ({off})] = {src};")
-            else:
-                writes.append(f"  out{q}[(uint)({ii}) * {inner}u + ({off})] = {src};")
+            emit_write(val, per, f"out{q}[(uint)({ii}) * {inner}u + ")
         for q, (sym, hname) in enumerate(self.hidden):
-            nm, R = emit(sym)
             numel = _numel(sym.shape)
-            off = self._vec_off(sym.shape)
-            tgt_R = sym.shape[-1] if sym.shape else 1
-            src = f"{nm}[r]" if R > 1 else nm
-            if tgt_R > 1:
-                writes.append(f"  for (int r = 0; r < {tgt_R}; r++) "
-                              f"{hname}[t * {numel}u + ({off})] = {src};")
-            else:
-                writes.append(f"  {hname}[t * {numel}u + ({off})] = {src};")
+            emit_write(sym, tuple(sym.shape),
+                       f"{hname}[t * {numel}u + ")
         news = []
         for j, (pos, expr) in enumerate(self.states):
             nm, R = emit(expr)
@@ -2646,9 +2805,13 @@ class Plan:
                 arr = mx.transpose(arr, (0,) + tuple(p + 1 for p in perm))
             return arr
 
-        for pos, spec in self.acc_plans:
-            total = mx.sum(stacked(spec), axis=0)
-            vals[pos] = ins[pos] + mx.reshape(total, ins[pos].shape)
+        for pos, specs in self.acc_plans:
+            total = None
+            for spec in specs:
+                t_ = mx.sum(stacked(spec), axis=0)
+                t_ = mx.reshape(t_, ins[pos].shape)
+                total = t_ if total is None else total + t_
+            vals[pos] = ins[pos] + total
         return vals
 
 

@@ -5,3 +5,5 @@
 {"time": "2026-07-25T23:55:09", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 4, "x": 4, "y": 0.6620020270347595, "scale": 1.9386697209834467, "loss": 5.8154390483703615}
 {"time": "2026-07-25T23:56:26", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 128, "x": 4, "y": 0.3456987738609314, "scale": 1.4129769261224154, "loss": 4.401370826324463}
 {"time": "2026-07-26T00:24:44", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 128, "x": 4, "y": 0.40776073932647705, "scale": 1.5034474022956732, "loss": 4.411327186187744}
+{"time": "2026-07-26T19:32:43", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 256, "x": 4, "y": 0.18178243935108185, "scale": 1.1993532334257886, "loss": 4.300908389648438}
+{"time": "2026-07-26T19:37:35", "system": "metaljax", "spec": "tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)", "lr": 0.01, "steps": 512, "x": 4, "y": -0.22659531235694885, "scale": 0.7972433515487173, "loss": 4.15884453352356}
