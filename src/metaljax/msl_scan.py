@@ -1674,12 +1674,23 @@ class Plan:
             if not (16 < self.F <= 1024) and dots:
                 if self.F > 1024:
                     raise _Unsupported(f"coop: width {self.F} > 1024")
+            shared_bytes = 0
+            seen_data = set()
             for d in dots:
-                if d.csize != self.F or d.dsize != self.F:
+                if d.csize % self.F or d.dsize % self.F:
                     raise _Unsupported(
-                        f"coop: non-square dot {d.csize}x{d.dsize} vs F={self.F}")
+                        f"coop: dot {d.csize}x{d.dsize} not a multiple "
+                        f"of F={self.F}")
+                if d.csize > 4096 or d.dsize > 4096:
+                    raise _Unsupported("coop: dot too large")
+                if id(d.data) not in seen_data:
+                    seen_data.add(id(d.data))
+                    shared_bytes += 4 * d.csize
                 if any(r[0] == "data" for r in d.widx):
                     raise _Unsupported("coop: batched dot")
+            if shared_bytes > 32768:
+                raise _Unsupported(
+                    f"coop: threadgroup memory {shared_bytes}B > 32KB")
 
         # Lane space
         lane = ()
@@ -2367,7 +2378,7 @@ class Plan:
         if isinstance(s, (SymConst, SymCounter)):
             return 1
         if isinstance(s, SymDot):
-            return 1  # output width == F, one feature per thread
+            return s.dsize // self.F  # output chunks per thread
         if isinstance(s, SymPad):
             w = s.shape[-1]
         else:
@@ -2435,14 +2446,17 @@ class Plan:
 
         # threadgroup mirrors for dot data (one per distinct data sym)
         self._shared = {}
+        shared_sizes = {}
         for d in _collect_dots(
             [s for _, s in self.states] + [v for _, _, v in self.stacked]
             + [h for h, _ in self.hidden]
         ):
             if id(d.data) not in self._shared:
-                self._shared[id(d.data)] = f"sh{len(self._shared)}"
-        for nm in self._shared.values():
-            out.append(f"threadgroup float {nm}[{F}];")
+                nm = f"sh{len(self._shared)}"
+                self._shared[id(d.data)] = nm
+                shared_sizes[nm] = d.csize
+        for nm, sz in shared_sizes.items():
+            out.append(f"threadgroup float {nm}[{sz}];")
 
         for sid, (leaf, name) in sorted(self._wholes.items()):
             R = self._coop_R(leaf)
@@ -2542,31 +2556,48 @@ class Plan:
                     return memo[dkey]
                 shname = self._shared[id(s.data)]
                 dv, dR = emit(s.data)
-                if dR != 1:
-                    raise _Unsupported("coop dot data must be width F")
+                if dR * F != s.csize:
+                    raise _Unsupported("coop dot data width mismatch")
                 key = ("shared_written", id(s.data))
                 if key not in memo:
                     body.append("  threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
-                    body.append(f"  {shname}[{fcoord}] = {dv};")
+                    if dR > 1:
+                        body.append(
+                            f"  for (int r = 0; r < {dR}; r++) "
+                            f"{shname}[r * {F}u + {fcoord}] = {dv}[r];")
+                    else:
+                        body.append(f"  {shname}[{fcoord}] = {dv};")
                     body.append("  threadgroup_barrier(metal::mem_flags::mem_threadgroup);")
                     memo[key] = True
                 wst = list(s.weight.strides)
+                k_out = s.dsize // F
                 terms = []
                 for wdim, role in enumerate(s.widx):
                     st = wst[wdim]
                     if role[0] == "c":
                         terms.append(f"(uint)cc * {st}u")
                     elif role[0] == "d":
-                        terms.append(f"{fcoord} * {st}u")
+                        if k_out > 1:
+                            terms.append(
+                                f"((uint)g * {F}u + {fcoord}) * {st}u")
+                        else:
+                            terms.append(f"{fcoord} * {st}u")
                 if s.weight.offset:
                     terms.insert(0, f"{s.weight.offset}u")
                 woff = " + ".join(terms) if terms else "0u"
                 name = f"v{tmp[0]}"; tmp[0] += 1
-                body.append(f"  float {name};")
-                body.append(
-                    f"  {{ float _a = 0.0f; for (int cc = 0; cc < {F}; cc++) "
-                    f"_a += {shname}[cc] * inp{wsid}[{woff}]; {name} = _a; }}")
-                v = (name, 1)
+                if k_out > 1:
+                    body.append(f"  float {name}[{k_out}];")
+                    body.append(
+                        f"  for (int g = 0; g < {k_out}; g++) "
+                        f"{{ float _a = 0.0f; for (int cc = 0; cc < {s.csize}; cc++) "
+                        f"_a += {shname}[cc] * inp{wsid}[{woff}]; {name}[g] = _a; }}")
+                else:
+                    body.append(f"  float {name};")
+                    body.append(
+                        f"  {{ float _a = 0.0f; for (int cc = 0; cc < {s.csize}; cc++) "
+                        f"_a += {shname}[cc] * inp{wsid}[{woff}]; {name} = _a; }}")
+                v = (name, k_out)
                 memo[dkey] = v
             elif isinstance(s, SymElem):
                 args = [emit(a) for a in s.args]

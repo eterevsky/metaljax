@@ -221,3 +221,28 @@ def test_register_reduce_readout():
     check(f, X, H0, W)
     check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
                              argnums=(0, 1, 2)), X, H0, W)
+
+
+def test_rectangular_coop_dots():
+    # mullstm-class cell at full width: fused 3-gate weights (F x 3F) and
+    # a wide input projection (4F -> F) force rectangular coop dots.
+    F = 32
+    Wg = (rng.standard_normal((F, 3 * F)) * 0.1).astype(np.float32)
+    Wp = (rng.standard_normal((4 * F, F)) * 0.1).astype(np.float32)
+    Xw = (rng.standard_normal((10, 3, 4 * F)) * 0.3).astype(np.float32)
+    h0w = rng.standard_normal((3, F)).astype(np.float32)
+
+    def f(xs, h0, wg, wp):
+        def cell(h, x):
+            xp = x @ wp                     # (B, 4F) @ (4F, F)
+            g = h @ wg                      # (B, F) @ (F, 3F)
+            i = jax.nn.sigmoid(g[..., :F] + xp)
+            o = jax.nn.sigmoid(g[..., F:2 * F])
+            c = jnp.tanh(g[..., 2 * F:])
+            nh = o * jnp.tanh(i * c + (1 - i) * h)
+            return nh, nh
+        return jax.lax.scan(cell, h0, xs)
+    check(f, Xw, h0w, Wg, Wp, rtol=1e-4, atol=1e-5)
+    check(jax.value_and_grad(lambda a, b, c, d: f(a, b, c, d)[1].sum(),
+                             argnums=(0, 1, 2, 3)), Xw, h0w, Wg, Wp,
+          rtol=1e-3, atol=1e-4)
