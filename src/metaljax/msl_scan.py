@@ -30,13 +30,38 @@ _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 # unroll the matvec in-lane.
 _REG_LIMIT = int(os.environ.get("METALJAX_MSL_REG", "16"))
 _COOP_WORK_CAP = int(os.environ.get("METALJAX_MSL_COOP_CAP", "2200000"))
-# WORKAROUND for a Metal shader-compiler bug: multi-iteration kernel loops
-# illegally cache t-derived reads across iterations (see notes 2026-07).
-# volatile on the loop counter forces re-evaluation, bit-exact. Off switch
-# is for testing whether a future macOS/Metal update fixed the bug.
-_T_DECL = ("  uint t = t_;"
-           if os.environ.get("METALJAX_MSL_VOLATILE", "1") == "0"
-           else "  volatile uint t = t_;")
+# WORKAROUND for a Metal shader-compiler bug: multi-iteration kernel time
+# loops are miscompiled (see notes 2026-07). Only a fully volatile loop
+# counter — a volatile access at EVERY use of t — produces correct code
+# (default "t"; costs ~1.4-1.7x on small-F kernels, db11/db14/db15: the
+# price of correctness, db10/db12 were order-1 wrong without it). Weaker
+# variants were tried and are all INSUFFICIENT, kept only for reproducing
+# the analysis and retesting future macOS/Metal updates: "tmap" (t read
+# from a runtime identity table — opaque value, still miscompiles), "tv"
+# (single volatile access copied to a plain register — still miscompiles),
+# "load" (volatile per-iteration input loads only — still miscompiles),
+# "0" (no workaround).
+_VOLATILE = os.environ.get("METALJAX_MSL_VOLATILE", "t")
+if _VOLATILE == "1":  # historical alias for the counter variant
+    _VOLATILE = "t"
+_T_DECL = {"t": "  volatile uint t = t_;",
+           "tv": "  volatile uint t__ = t_; uint t = t__;",
+           "tmap": "  uint t = tmap[t_];"}.get(_VOLATILE, "  uint t = t_;")
+_TMAPS = {}
+
+
+def _tmap(trip):
+    m = _TMAPS.get(trip)
+    if m is None:
+        m = _TMAPS[trip] = mx.arange(trip, dtype=mx.uint32)
+    return m
+
+
+def _vol_load(msl_type, buf, off):
+    """A load the shader compiler must not cache across loop iterations."""
+    if _VOLATILE == "load":
+        return f"(*(volatile device const {msl_type}*)&{buf}[{off}])"
+    return f"{buf}[{off}]"
 _KERNEL_SEQ = 0
 
 
@@ -1847,7 +1872,8 @@ class Plan:
         self.kernel = mx.fast.metal_kernel(
             name=name,
             input_names=[f"inp{i}" for i in range(len(self.sources))]
-            + [f"init{j}" for j in range(len(self.states))],
+            + [f"init{j}" for j in range(len(self.states))]
+            + (["tmap"] if _VOLATILE == "tmap" else []),
             output_names=[f"out{q}" for q in range(len(self.stacked))]
             + [nm for _, nm in self.hidden]
             + [f"fin{j}" for j in range(len(self.states))],
@@ -1948,7 +1974,9 @@ class Plan:
             idx = f"((int)t + {self.start}) * {a} + {b}" if a != 1 or b != 0 or self.start \
                 else "(int)t"
             L.append(f"  {mslt(leaf.dtype)} {name} = "
-                     f"inp{sid}[(uint)({idx}) * {inner}u + ({off})];")
+                     + _vol_load(mslt(leaf.dtype), f"inp{sid}",
+                                 f"(uint)({idx}) * {inner}u + ({off})")
+                     + ";")
 
         # expression emission with memo
         memo = {}
@@ -2085,13 +2113,15 @@ class Plan:
         def declare(name, dtype, R):
             return (f"{T(dtype)} {name}[{R}];" if R > 1 else f"{T(dtype)} {name};")
 
-        def load(dst, dtype, R, buf, off, indent=""):
+        def load(dst, dtype, R, buf, off, indent="", vol=False):
+            rd = (_vol_load(T(dtype), buf, off) if vol
+                  else f"{buf}[{off}]")
             ls = []
             if R > 1:
                 ls.append(f"{indent}for (int r = 0; r < {R}; r++) "
-                          f"{dst}[r] = {buf}[{off}];")
+                          f"{dst}[r] = {rd};")
             else:
-                ls.append(f"{indent}{dst} = {buf}[{off}];")
+                ls.append(f"{indent}{dst} = {rd};")
             return ls
 
         # invariant tensors (not weights): preload
@@ -2128,7 +2158,8 @@ class Plan:
             off = self._vec_off(leaf.shape, leaf.strides, leaf.offset)
             out.append("  " + declare(name, leaf.dtype, R))
             out.extend(load(name, leaf.dtype, R, f"inp{sid}",
-                            f"(uint)({idx}) * {inner}u + ({off})", "  "))
+                            f"(uint)({idx}) * {inner}u + ({off})", "  ",
+                            vol=True))
 
         memo = {}
         tmp = [0]
@@ -2465,11 +2496,13 @@ class Plan:
         def declare(name, dtype, R):
             return (f"{T(dtype)} {name}[{R}];" if R > 1 else f"{T(dtype)} {name};")
 
-        def load(dst, dtype, R, buf, off, indent=""):
+        def load(dst, dtype, R, buf, off, indent="", vol=False):
+            rd = (_vol_load(T(dtype), buf, off) if vol
+                  else f"{buf}[{off}]")
             if R > 1:
                 return [f"{indent}for (int r = 0; r < {R}; r++) "
-                        f"{dst}[r] = {buf}[{off}];"]
-            return [f"{indent}{dst} = {buf}[{off}];"]
+                        f"{dst}[r] = {rd};"]
+            return [f"{indent}{dst} = {rd};"]
 
         # threadgroup mirrors for dot data (one per distinct data sym)
         self._shared = {}
@@ -2516,7 +2549,8 @@ class Plan:
             off = self._coop_off(leaf.shape, leaf.strides, leaf.offset)
             out.append("  " + declare(name, leaf.dtype, R))
             out.extend(load(name, leaf.dtype, R, f"inp{sid}",
-                            f"(uint)({idx}) * {inner}u + ({off})", "  "))
+                            f"(uint)({idx}) * {inner}u + ({off})", "  ",
+                            vol=True))
 
         memo = {}
         tmp = [0]
@@ -2773,6 +2807,8 @@ class Plan:
             bufs.append(buf)
         for pos, _ in self.states:
             bufs.append(ins[pos])
+        if _VOLATILE == "tmap":
+            bufs.append(_tmap(self.trip))
         out_shapes = ([self.arg_shapes[pos] for pos, _, _ in self.stacked]
                       + [(self.trip,) + tuple(h.shape) for h, _ in self.hidden]
                       + [self.arg_shapes[pos] for pos, _ in self.states])

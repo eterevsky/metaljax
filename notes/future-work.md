@@ -16,6 +16,18 @@ Collected during the lrnn/mullstm passes; each is concrete and scoped.
 - **Batch-packing for small-F coop kernels**: at F=32/b4 a coop kernel
   occupies 128 threads; pack multiple batch elements per threadgroup
   (grid z) to fill the GPU.
+- **Weight tiling for big-F coop kernels**: coop currently loses to the
+  compiled matmul path above ~2.2M dot elements/step (each threadgroup
+  re-streams the whole fused-gate weight matrix every timestep — gru/
+  lstm.1024 measured 2-2.5x slower; hence METALJAX_MSL_COOP_CAP).
+  Threadgroup-tiled weight reuse or simdgroup_matrix ops could push the
+  crossover up and reclaim F>=1024 cells for the single-kernel path.
+- **Suite-context timing noise for sub-ms models**: in a full-suite
+  process, tiny configs (db03/db05 class, ~0.6 ms/step standalone) can
+  measure ~2x slower after a hundred prior configs have run; standalone
+  reruns match baseline. Suspects: kernel-cache growth (process-unique
+  kernel names), buffer-pool state after clear_cache. Harmless for
+  training, but worth understanding before trusting suite deltas <1 ms.
 - **Hoisted-subgraph caching**: plan.run re-evaluates hoisted invariant
   IR per call; when the hoisted values depend only on weights (not on
   per-chunk inputs), cache by input buffer identity across calls.
@@ -34,9 +46,23 @@ Collected during the lrnn/mullstm passes; each is concrete and scoped.
 ## Known upstream issues to track
 
 - **Apple Metal shader compiler miscompiles multi-iteration loops**
-  (worked around with a volatile loop counter, see notes 2026-07): if a
-  future macOS/Metal update fixes it, drop the volatile (small perf
-  upside, esp. big register-tail kernels).
+  (worked around with a volatile loop counter, see notes 2026-07). The
+  workaround costs ~1.4-1.7x on small-F kernels (db11/db14/db15 pay it;
+  at coop F=1024 it is ~free) — the price of correctness, db10/db12 were
+  order-1 wrong without it. Cheaper variants were tried and ALL still
+  miscompile (verified with MJDBG_VERIFY_MSL): volatile per-iteration
+  input loads only; t from a runtime identity table (opaque value); one
+  volatile access copied to a plain register. Only a volatile access at
+  every USE of t is correct — the bug is not (just) value-provenance
+  reasoning. All variants remain selectable via METALJAX_MSL_VOLATILE
+  (t/tmap/tv/load/0) for retesting on macOS/Metal updates.
+- **Per-plan auto-verification to drop the volatile selectively**: build
+  each kernel without the workaround, compare against the raw body on
+  the first eager call (infrastructure exists in the MJDBG_VERIFY_MSL
+  hook), and rebuild with volatile only on mismatch. Would reclaim the
+  1.4x on the (majority of) bodies the compiler bug does not bite.
+  Complication: plans first built inside an mx.compile trace cannot
+  eval, so verification must defer to the first eager opportunity.
 - **MLX mx.compile equal-constant-output collision** (worked around with
   where(x==x) anchoring): report upstream; minimal repro:
   `mx.compile(lambda x: (x+1, mx.array(.9), mx.array(.9)))`.
