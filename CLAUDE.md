@@ -184,7 +184,34 @@ executes on the Metal device through plain `jax.numpy`.
    pure body, carries untouched). Manifests as per-op dispatch overhead
    for the affected loop level only (inner scans keep MSL/compiled
    paths); METALJAX_DEBUG=1 prints "compiled while body failed".
-12. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+12. ✅ **v0.3.0: lrnn + rectangular coop dots + CRITICAL Metal compiler
+   workaround.** (a) In-lane register reduces (SymRedReg), iota,
+   invariant hoisting ('hoist' leaves eval IR subgraphs per call),
+   nested statically-counted unroll (trip<=64): texmo's lrnn family
+   compiles fwd+bwd (db08 100x, db07 40x). (b) Rectangular coop dots
+   (csize/dsize multiples of F, g-loop, chunked sh writes): mullstm/
+   fused-gate cells (db18 47x). (c) CRITICAL: Apple's Metal shader
+   compiler miscompiles multi-iteration kernel time loops (db10/db12
+   were order-1 WRONG since 0.2.0; found by whole-model gate). Only a
+   fully-volatile loop counter fixes it — volatile-loads-only, opaque
+   table-read counter, and single-volatile-copy ALL still miscompile
+   (METALJAX_MSL_VOLATILE=t/tmap/tv/load/0 to retest on OS updates);
+   costs ~1.4x on small-F kernels (db11/14/15). (d) Mode policy: vector
+   needs min(csize,dsize)<=16 (widened caps stole square 32-wide dots
+   from coop: db13/db16 regressed 46x/23x, caught by suite rerun).
+   (e) Coop work cap 2.2M dot-elems/step (METALJAX_MSL_COOP_CAP):
+   rectangular support captured gru/lstm.1024 where per-threadgroup
+   weight re-streaming loses 2-2.5x to compiled matmul; measured
+   crossover gru.512 wins / lstm.512 ties / F=1024 loses. Correctness
+   gate scripts/texmo_check.py (whole-model vs jax-CPU, 1-ULP
+   sensitivity-scaled tol): 104/104 x3 runs. Suite: 2.97x faster than
+   0.2.3 total; 84/104 beat CPU (all >=10k weights; sub-ms rows are
+   dispatch-floor); 41/104 beat the 4090. vs torch MPS: transformer
+   d256/d512 within 1.5%, GRU.256 within 11%, bench_jax b256 59.2ms.
+   Suite-context trap: sub-ms configs measure ~2x slower inside a
+   104-config sweep than standalone (kernel-cache/buffer-pool growth) —
+   verify regressions standalone before believing them.
+13. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib

@@ -252,3 +252,41 @@ Bottom-of-table taxonomy by metal/cpu ratio (scan), fully diagnosed:
 The remaining scan-mode gap vs CPU is therefore exactly TWO codegen
 features: in-lane reduce (lrnn family) and rectangular coop dots
 (wide fused-gate cells). Everything else at parity or better.
+
+## 0.3 final results (2026-07-26, m5-metal-030c vs 0.2.3 baseline 023)
+
+Both features above landed (SymRedReg in-lane reduces; rectangular coop
+dots), plus two policy fixes found by the full-suite rerun and one
+CRITICAL correctness fix:
+
+- **Metal compiler miscompile** (commit 2875fa4): all multi-iteration
+  generated kernels since 0.2.0 were exposed; db10/db12 order-1 wrong.
+  Only a fully-volatile loop counter fixes it; every cheaper variant
+  (volatile loads only / opaque table-read counter / single volatile
+  copy) still miscompiles — verified plan-vs-raw with MJDBG_VERIFY_MSL.
+  Costs ~1.4x on the small-F rnn.16/32 class (db11/db14/db15) — the
+  price of correct results.
+- **Mode policy**: vector mode requires min(csize,dsize) <= 16 — the
+  register-cap widening for lrnn had stolen square 32-wide dots from
+  coop (db13/db16 regressed 46x/23x mid-development; caught pre-release).
+- **Coop work cap** (2.2M dot elems/step): rectangular support made coop
+  capture gru/lstm.1024 fused-gate cells where every threadgroup
+  re-streams the whole weight matrix per timestep; the compiled matmul
+  path is 2-2.5x faster there. Measured crossover: gru.512 coop wins,
+  lstm.512 ties, F=1024 loses.
+
+Suite (104 scan configs, fastest-per-config, vs m5-cpu / 4090 / 0.2.3):
+- vs CPU: 84/104 faster; median ratio 0.294. Every config >= 10k
+  weights beats CPU (medians: 0.152 / 0.159 / 0.298 for 10k-100k /
+  100k-1M / >1M). Sub-10k: 16/36 (dispatch floor, db00 0.19ms vs 0.02).
+- vs 0.2.3: total suite ms/step 5845 -> 1965 (2.97x); 46 rows >1.5x
+  faster (db08 lrnn 100x, db18 mullstm 47x, db19 gru.64 36x); remaining
+  regressions all diagnosed (volatile-workaround class ~1.4x + sub-ms
+  suite-context noise, standalone reruns match baseline).
+- vs 4090 (CUDA): 41/104 faster on the M5.
+- Correctness gate: 104/104 whole-model checks vs jax-CPU, three runs.
+
+vs PyTorch MPS (bench_compare, full train steps, clean single runs):
+transformer d256 30.2 vs 30.0; d512 153.9 vs 151.7; GRU.256 b256 53.5
+vs 48.2 (torch's hand-fused nn.GRU; 11% gap). texmo bench_jax.py b256:
+59.2 ms/step (cpu 273.3).

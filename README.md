@@ -198,10 +198,10 @@ Full training steps (fwd + bwd + AdamW), f32, M5 Max, via
 
 | workload | jax CPU | **metaljax** | torch MPS | torch CPU |
 |---|---:|---:|---:|---:|
-| transformer d256 L4 T256 b32 | 174.3 | **31.2** | 30.1 | 209.3 |
-| transformer d512 L4 T256 b64 | — | **157.6** | 154.6 | — |
-| GRU.256 T256 b256 (scan) | — | **51.6** | 47.1¹ | — |
-| texmo `bench_jax.py` GRU b256 | 273.3 | **66.5** | — | — |
+| transformer d256 L4 T256 b32 | 174.3 | **30.2** | 30.0 | 209.3 |
+| transformer d512 L4 T256 b64 | — | **153.9** | 151.7 | — |
+| GRU.256 T256 b256 (scan) | — | **53.5** | 48.2¹ | — |
+| texmo `bench_jax.py` GRU b256 | 273.3 | **59.2** | — | — |
 
 ¹ torch uses its hand-fused `nn.GRU` kernel; metaljax generates its
 kernel from the StableHLO loop body and lands within 10%.
@@ -215,17 +215,25 @@ pattern-match as elementwise/matvec cells (rnn/gru/mgru/lrnn/rglru
 family — forward *and* the AD-generated backward loop) compile to a
 single generated persistent Metal kernel: the whole scan is one kernel
 launch, with state in registers (small cells), register-block lanes
-(small block matvecs), or one threadgroup per batch element with the
-feature dim as the thread axis (full-width cells like `gru.256`).
+(small block matvecs, in-lane reductions, and narrow rectangular
+readouts — the lrnn family), or one threadgroup per batch element with
+the feature dim as the thread axis (full-width cells like `gru.256`,
+including rectangular fused-gate dots like `mullstm.32`). Very wide
+cells (`gru.1024`-class) deliberately stay on the compiled-graph path,
+where batched matmul wins.
 Weight-gradient accumulations are handled by loop fission: the kernel
 stacks per-step operands and the einsum runs as one batched matmul
 after it. `METALJAX_COMPILE=0` disables compilation, `METALJAX_MSL=0`
 disables kernel codegen, `METALJAX_TRACE_BUDGET` (default 20000 ops)
 caps trace sizes, and `METALJAX_DEBUG=1` logs loop/compile decisions.
 
-On texmo itself: only the very tiniest models (tens of weights) remain
-CPU territory; from ~100k weights metal wins, and `mgru.256` trains at
-~24 ms/step.
+On texmo's own 104-config benchmark suite (0.3): 84 configs train
+faster on metal than on the M5's CPU cores; **every** config above 10k
+weights wins (median 3–6.6x faster), and 41 of 104 outpace an RTX 4090
+running jax-CUDA. Only sub-10k-weight models remain CPU territory
+(kernel-dispatch floor). Every optimization is gated by a whole-model
+correctness sweep: one jitted training chunk per suite config executed
+on both backends from identical inputs, every output leaf compared.
 
 ### openxla/xla benchmark suite
 
