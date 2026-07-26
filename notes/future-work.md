@@ -74,3 +74,13 @@ Collected during the lrnn/mullstm passes; each is concrete and scoped.
 - Stage 2: native engine (C++/Obj-C++, StableHLO parsed natively).
 - sort, general reduce_window, partial-window scatter coverage.
 - bf16 msl kernels (currently f32/f16/int only in generated kernels).
+
+## Robustness
+
+- **Kernel-build-failure fallback at run time**: the 31-binding limit is
+  now guarded statically, but any *other* future "Unable to build metal
+  library" error from a generated kernel inside an mx.compile'd main
+  still surfaces only at execute time, where there is no fallback (the
+  0.3.1 crash class). A catch there could blacklist the plan and
+  re-trace the executable without it, like the compiled-while-body
+  fallback.
