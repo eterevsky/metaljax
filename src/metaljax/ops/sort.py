@@ -126,3 +126,14 @@ def _sort(interp, op, ins, env):
     idx = mx.argsort(key, axis=dim)
     outs = [mx.take_along_axis(x, idx, axis=dim) for x in ins]
     return outs if len(outs) > 1 else outs[0]
+
+
+@register("chlo.top_k")
+def _top_k(interp, op, ins, env):
+    (x,) = ins
+    k = _ir.int_attr(op, "k")
+    key = dtypes.total_order_key(x) if dtypes.is_float(x.dtype) else x
+    if dtypes.is_bool(key.dtype):
+        key = key.astype(mx.uint8)
+    idx = mx.argsort(~key, axis=-1)[..., :k]  # stable descending
+    return [mx.take_along_axis(x, idx, axis=-1), idx.astype(mx.int32)]
