@@ -82,3 +82,26 @@ reduce/gather guards (3,4) — cheap, kill ~50 failures. Then the small
 crashes (7,8) and NaN semantics (5,6). Complex dtype support is the
 single biggest pass-rate lever (+~1,600) if ever worth doing; sort via
 mx.sort/argsort covers another ~675.
+
+## Follow-up fixes and features (same date, post-report)
+
+Bugs fixed (order of severity, all with regression tests):
+1. Scatter OOB drop semantics (the nonzero/bincount/sparse cluster).
+   Arithmetic combiners neutralize dropped updates with the combiner
+   identity; scatter-set redirects to a dummy slot (write-back-current
+   would race genuine duplicate writes at the clamped slot).
+2. Zero-size reduce -> init value; zero-size gather/scatter
+   short-circuits.
+3. bitcast_convert size-changing/rank-0; reverse rank-0/empty dims.
+4. argmax/argmin NaN-wins (first-NaN index); TOTALORDER compare via
+   radix key (fixes searchsorted with NaNs).
+5. Plugin accepts negative-stride host buffers (flipped numpy views).
+
+Features added:
+- stablehlo.sort: generic comparator recognizer (key-chain evaluation +
+  structural symmetry check) -> stable mx.argsort on a total-order key.
+  chlo.top_k too.
+- stablehlo.convolution -> mx.conv_general (all layouts, groups, batch
+  groups, dilations, flip; float only).
+- Scatter windows on indexed dims via index expansion (unique/polyadd/
+  dus-style patterns; partial windows on free dims).

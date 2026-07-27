@@ -139,11 +139,17 @@ Running the entire upstream `jax/tests` suite against metaljax executes
 full taxonomy):**
 
 - complex dtypes (the largest single gap — fft, complex linalg)
-- `stablehlo.sort` beyond the argmin/argmax patterns; general
-  `reduce_window` and exotic reduce bodies; windowed scatter variants
+- general `reduce_window` (pooling) and exotic reduce bodies;
+  integer/bool convolutions (MLX conv is float-only)
 - LAPACK-family custom calls (QR, eigh, SVD, LU, triangular_solve,
   ApproxTopK); `rng_bit_generator`
 - `popcnt` / `count_leading_zeros`
+
+Sorting (`jnp.sort`/`argsort`/`top_k`/`median`/`percentile`/`unique`,
+key-value sorts, IEEE total-order NaN handling), float convolutions
+(1/2/3-D, strided, dilated, grouped, transposed, and their gradients),
+and the full scatter family (windowed, out-of-bounds-dropping) are
+supported.
 
 **Behavioral differences under investigation** are tracked in the notes
 file above. Unsupported constructs fail loudly at compile time with the
