@@ -121,7 +121,9 @@ print(g, g.device)"
 ## Coverage and known gaps
 
 Running the entire upstream `jax/tests` suite against metaljax executes
-~28,300 tests with ~80% passing. The gaps fall into three groups:
+~28,200 tests with **95.4% passing** (26,937 passed / 1,266 failed;
+the remainder is dominated by multi-device tests, `rbg`-PRNG streams,
+version skew against the test checkout, and int4/float8 dtypes). The gaps fall into three groups:
 
 **Intentional (platform constraints, will not change):**
 

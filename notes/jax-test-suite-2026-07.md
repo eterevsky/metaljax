@@ -105,3 +105,18 @@ Features added:
   groups, dilations, flip; float only).
 - Scatter windows on indexed dims via index expansion (unique/polyadd/
   dus-style patterns; partial windows on free dims).
+
+## 0.4.0 final (2026-07-27 evening)
+
+Full 164-file rerun after the feature push:
+**26,937 passed / 1,266 failed / 6,957 skipped -> 95.4% of executed**
+(from 19,228/4,244 = 79.6% at the first run, 83.7% after the bug batch).
+texmo gate 104/104; mid08/big15 perf at 0.3 baseline.
+
+Remaining 1,266 by bucket: multi-device/pmap (~150), rng_bit_generator
++ rbg PRNG streams (~140), sparse deep semantics (~145), version-skew
++ export harnesses (~160), shape_poly symbolic harness residue (~114),
+dtypes i4/f8 (~67), Schur/Hessenberg/tridiagonal + complex128 (~46),
+misc exotics (>3-D convs, variadic corner cases). Everything above was
+either declared out of scope (platform constraints) or measured as
+poor ROI; nothing known-fixable remains at meaningful count.
