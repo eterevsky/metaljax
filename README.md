@@ -121,42 +121,48 @@ print(g, g.device)"
 ## Coverage and known gaps
 
 Running the entire upstream `jax/tests` suite against metaljax executes
-~28,200 tests with **95.4% passing** (26,937 passed / 1,266 failed;
-the remainder is dominated by multi-device tests, `rbg`-PRNG streams,
-version skew against the test checkout, and int4/float8 dtypes). The gaps fall into three groups:
+~28,200 tests with **96.7% passing** (27,304 passed / 898 failed as of
+v0.4.1; the remainder is dominated by `rbg`-PRNG bit-streams,
+int4/float8 dtypes, host callbacks, and version skew against the test
+checkout — see the notes for per-category plans). The gaps fall into three groups:
 
 **Intentional (platform constraints, will not change):**
 
 - **No float64.** Metal GPUs have no f64 ALUs. f64 values may pass
   *through* the device (stored as f32), but f64 *compute* fails at
   compile time naming the op; `METALJAX_F64=downcast` opts into f32
-  emulation. Keep `jax_enable_x64` off.
-- **Single device.** No sharding, no collectives, no multi-process —
-  `psum`/`shard_map`/`pjit`-across-devices programs are out of scope.
-- **int4 / float8 dtypes** — no MLX support.
+  emulation. Keep `jax_enable_x64` off. Same policy for complex128.
+- **One physical device.** `pmap`/`shard_map`/collectives **work on a
+  single device** (replica groups of size 1); actual multi-device
+  sharding has no hardware to run on.
 - **Denormals flush to zero** on the GPU (hardware behavior); tests
   asserting subnormal outputs (e.g. `jnp.spacing`) differ from CPU.
 
 **Not yet implemented (see `notes/jax-test-suite-2026-07.md` for the
-full taxonomy):**
+full taxonomy and per-item plans):**
 
 - `rng_bit_generator` (the `rbg` PRNG implementation; the default
   threefry PRNG is fully supported and bit-exact vs CPU)
-- `ApproxTopK` (exact `top_k` works), >3-D convolutions,
-  Schur/Hessenberg decompositions, complex128
+- int4 / float8 dtypes (emulation planned; no MLX storage today)
+- `debug_print`/host callbacks, >3-D convolutions
 
 **Supported** (each verified against the CPU backend): sorting
-(`sort`/`argsort`/`top_k`/`median`/`percentile`/`unique`, key-value
-sorts, IEEE total-order NaN handling, complex lexicographic order);
-convolutions (1/2/3-D float, integer — exact, and complex; strided,
-dilated, grouped, transposed, and their gradients); the full scatter
-family (windowed, out-of-bounds-dropping, arbitrary elementwise
-bodies); general `reduce`/`reduce_window` bodies and pooling with
-gradients (`select_and_scatter`, `select_and_gather_add`); complex64
-end-to-end (arithmetic, FFT, linalg); linear algebra via LAPACK
-semantics on the host (QR, eigh, eig, SVD, LU, Cholesky,
-triangular_solve — CPU-bound in every backend, free on unified
-memory); `popcnt`/`count_leading_zeros`.
+(`sort`/`argsort`/`top_k`/`approx_top_k`/`median`/`percentile`/
+`unique`, key-value and **multi-key lexicographic** sorts —
+`jnp.lexsort`, `unique(axis=)`, set operations — IEEE total-order NaN
+handling, complex lexicographic order); convolutions (1/2/3-D float,
+integer — exact, and complex; strided, dilated, grouped, transposed,
+and their gradients); the full scatter family (windowed,
+out-of-bounds-dropping, arbitrary elementwise bodies); general
+`reduce`/`reduce_window` bodies and pooling with gradients
+(`select_and_scatter`, `select_and_gather_add`); complex64 end-to-end
+(arithmetic, FFT, linalg); linear algebra via LAPACK semantics on the
+host (QR, eigh, eig, SVD, LU, Cholesky, triangular_solve, Schur,
+Hessenberg — CPU-bound in every backend, free on unified memory) —
+**including bfloat16/float16 inputs, which jax's CPU backend itself
+rejects** (computed in f32, results in the requested dtype);
+single-device `pmap`/`shard_map` with the full collective set;
+`popcnt`/`count_leading_zeros`; sparse (BCOO/BCSR) workloads.
 
 **Behavioral differences under investigation** are tracked in the notes
 file above. Unsupported constructs fail loudly at compile time with the

@@ -143,3 +143,13 @@ was rerun on the CPU backend (scratchpad jaxtests/cpu_parity.json):
   export/shape_poly residue: parity targets, in the 0.5 campaign.
 - The 87 cpu-fail tests (mostly random_lax distribution exactness,
   api_test internals): best effort / wontfix.
+
+## 0.4.1 final (2026-07-28)
+
+Full 164-file rerun: **27,304 passed / 898 failed / 6,191 skipped ->
+96.7%** (0.4.0: 95.4%; first run: 79.6%). texmo gate 104/104;
+mid08/big15 perf at baseline. Parity batch 1 zeroed the sparse family,
+ann_test, array_extensibility, lax_scipy; pmap 53->3, setops 38->1.
+Remaining ~898: rng_bit_generator/rbg (~190), i4/f8 dtypes (~100),
+callbacks/tokens (~82), lax_test exotics (~137), eigh/lobpcg/
+scipy_signal pockets (~65), export/version-skew/multi-device tails.

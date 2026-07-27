@@ -254,7 +254,28 @@ executes on the Metal device through plain `jax.numpy`.
    Known-unfixable: version skew (~330), rng_bit_generator, ApproxTopK,
    i4/f8, multi-device, denormal FTZ. Suite gains recorded in
    notes/jax-test-suite-2026-07.md.
-16. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+16. ✅ **v0.4.1: crash fixes + CPU-parity batch 1** (policy: JAX-CPU
+   parity is the bar — every metal-failing test rerun on CPU;
+   cpu_parity.json: 1,094 targets / 87 best-effort). Crash fixes over
+   released 0.4.0: windowed-scatter size-1-window transpose (vmapped
+   scatters/dus — expand must include ALL mapped dims owning a uwd);
+   reduce_window as_strided contiguity + zero-size guards; complex
+   iota. Parity batch 1: single-device collectives (all_reduce/gather/
+   to_all/permute/broadcast identities, replica_id=0 → pmap+shard_map
+   work); multi-key lexicographic sort (successive stable argsorts,
+   -0/NaN canonicalized keys; cleared the ENTIRE sparse family —
+   BCOO lexsorts internally); ApproxTopK = exact top-k; schur/
+   hessenberg/tridiagonal host targets. bf16/f16 linalg EXCEEDS CPU:
+   own metal lowerings (metaljax_eigh/svd/eig custom calls) accept all
+   dtypes, host handlers upcast halves to f32 (jax's CPU rules reject
+   bf16 in jaxlib LAPACK tables). GOTCHA (2nd occurrence): never key
+   seen-sets by id() of transient MLIR wrappers — CPython reuses freed
+   addresses (truncated sort-comparator dep walks this time; kernel
+   names in 0.2.0 before). Remaining parity backlog: i4/f8 emulation
+   (CPU supports create/add/convert+f8 matmul), Philox
+   rng_bit_generator, debug callbacks, eigh_test/lobpcg/scipy_signal
+   pockets, lax_test exotics tail.
+17. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
