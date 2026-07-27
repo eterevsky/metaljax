@@ -267,6 +267,7 @@ def _reduce_window(interp, op, ins, env):
         widths = [(int(lo), int(hi)) for lo, hi in pad]
         x = mx.pad(x, widths, constant_values=init.astype(x.dtype))
 
+    x = mx.contiguous(x)
     out_sizes = []
     for i in range(rank):
         span = (wd[i] - 1) * wdil[i] + 1
@@ -291,6 +292,8 @@ def _reduce_window(interp, op, ins, env):
     for w_ in wd:
         wflat *= int(w_)
     win = mx.reshape(win, tuple(out_sizes) + (wflat,))
+    if any(o == 0 for o in out_sizes) or wflat == 0:
+        return [mx.broadcast_to(init.astype(x.dtype), tuple(out_sizes))]
 
     if len(body_ops) == 2:
         table = _BOOL_REDUCERS if dtypes.is_bool(win.dtype) else _REDUCERS

@@ -313,7 +313,9 @@ def _scatter(interp, op, ins, env):
 
     # Windowed dims that carry an index expand into explicit per-element
     # indices: one new batch axis per such dim, index = start + arange(w).
-    expand = sorted(dim for dim in mapped if wsize.get(dim, 1) > 1)
+    # Size-1 windows on indexed dims must be included too — they still
+    # own an update-window axis that the transpose below has to place.
+    expand = sorted(dim for dim in mapped if dim in uwd_of)
     E = len(expand)
     nb = len(batch_shape)
     exp_sizes = [wsize[dim] for dim in expand]

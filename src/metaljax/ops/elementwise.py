@@ -297,7 +297,10 @@ def _iota(interp, op, ins, env):
     shape = list(t.shape)
     dim = ir.IntegerAttr(op.attributes["iota_dimension"]).value
     dtype = dtypes.mx_dtype_for(t.element_type)
-    ramp = mx.arange(shape[dim], dtype=dtype if dtype != mx.bool_ else mx.int32)
+    # MLX has no complex/bool arange kernels: ramp in a real dtype, cast.
+    ramp_dt = (mx.int32 if dtype in (mx.bool_, mx.complex64)
+               else dtype)
+    ramp = mx.arange(shape[dim], dtype=ramp_dt)
     view = [1] * len(shape)
     view[dim] = shape[dim]
     out = mx.broadcast_to(mx.reshape(ramp, view), shape)
