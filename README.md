@@ -138,18 +138,23 @@ Running the entire upstream `jax/tests` suite against metaljax executes
 **Not yet implemented (see `notes/jax-test-suite-2026-07.md` for the
 full taxonomy):**
 
-- complex dtypes (the largest single gap — fft, complex linalg)
-- general `reduce_window` (pooling) and exotic reduce bodies;
-  integer/bool convolutions (MLX conv is float-only)
-- LAPACK-family custom calls (QR, eigh, SVD, LU, triangular_solve,
-  ApproxTopK); `rng_bit_generator`
-- `popcnt` / `count_leading_zeros`
+- `rng_bit_generator` (the `rbg` PRNG implementation; the default
+  threefry PRNG is fully supported and bit-exact vs CPU)
+- `ApproxTopK` (exact `top_k` works), >3-D convolutions,
+  Schur/Hessenberg decompositions, complex128
 
-Sorting (`jnp.sort`/`argsort`/`top_k`/`median`/`percentile`/`unique`,
-key-value sorts, IEEE total-order NaN handling), float convolutions
-(1/2/3-D, strided, dilated, grouped, transposed, and their gradients),
-and the full scatter family (windowed, out-of-bounds-dropping) are
-supported.
+**Supported** (each verified against the CPU backend): sorting
+(`sort`/`argsort`/`top_k`/`median`/`percentile`/`unique`, key-value
+sorts, IEEE total-order NaN handling, complex lexicographic order);
+convolutions (1/2/3-D float, integer — exact, and complex; strided,
+dilated, grouped, transposed, and their gradients); the full scatter
+family (windowed, out-of-bounds-dropping, arbitrary elementwise
+bodies); general `reduce`/`reduce_window` bodies and pooling with
+gradients (`select_and_scatter`, `select_and_gather_add`); complex64
+end-to-end (arithmetic, FFT, linalg); linear algebra via LAPACK
+semantics on the host (QR, eigh, eig, SVD, LU, Cholesky,
+triangular_solve — CPU-bound in every backend, free on unified
+memory); `popcnt`/`count_leading_zeros`.
 
 **Behavioral differences under investigation** are tracked in the notes
 file above. Unsupported constructs fail loudly at compile time with the

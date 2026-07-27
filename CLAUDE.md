@@ -227,7 +227,34 @@ executes on the Metal device through plain `jax.numpy`.
    same retry in the while body-failure handler and engine.execute
    (programs pure → rerun safe). Verified: both crashing specs train
    past their death points, perf unchanged (db11/mid08 match 030c).
-15. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+15. ✅ **v0.4.0: close the jax/tests gap** (per Oleg's plan: document
+   gaps → fix bugs by severity → add features by closeness → dtypes).
+   Bugs: scatter OOB DROP semantics (jnp.nonzero/bincount/sparse
+   clusters + the gather-VJP mystery — arithmetic combiners neutralize,
+   set uses a dummy slot; drop strategy picked by operand-vs-updates
+   size); empty reduce->init / empty gather/scatter; bitcast size-
+   change/rank-0; reverse rank-0; argmax NaN-wins; TOTALORDER compare;
+   negative-stride host buffers (plugin passes base offset). Features:
+   sort (generic comparator recognizer: key-chain eval + structural
+   symmetry -> stable argsort on total-order keys; complex lexico-
+   graphic; chlo.top_k); convolution (mx.conv_general all layouts +
+   batch groups; int conv exact via im2col+int64; complex via 4 real
+   convs; 0-spatial as matmul); windowed scatter via index expansion;
+   general reduce bodies (pairwise halving, any monoid, variadic);
+   general reduce_window (as_strided windows) + select_and_scatter +
+   select_and_gather_add; scatter apply-bodies (unique_indices);
+   popcnt/clz (SWAR); sign(NaN); complex64 END-TO-END (dtype plumbing
+   incl. PJRT C64, text-parsed constants — the bindings can't cast
+   complex dense attrs, real/imag/complex/fft ops, complex scatter by
+   parts, expm1=exp-1); LAPACK on host (Qr/orgqr/syevd/gesdd/geev
+   FFI targets s+c variants via numpy/scipy; eigh/svd/eig lowerings
+   registered for platform 'metal' in the plugin, cholesky/
+   triangular_solve as impure host ops). Purity: custom_call_host_hook
+   + host ops in _IMPURE_OPS keep host compute out of mx.compile.
+   Known-unfixable: version skew (~330), rng_bit_generator, ApproxTopK,
+   i4/f8, multi-device, denormal FTZ. Suite gains recorded in
+   notes/jax-test-suite-2026-07.md.
+16. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
