@@ -60,7 +60,7 @@ def _batch_apply(fn, args, batch_shape, out_specs):
             for o, spec in zip(flat_outs, out_specs)]
 
 
-@_target("Qr")
+@_target("Qr", "lapack_sgeqrf_ffi", "lapack_dgeqrf_ffi")
 def _qr(op, ins):
     from scipy.linalg import lapack
     (a,) = [_np_in(x) for x in ins]
@@ -73,7 +73,8 @@ def _qr(op, ins):
     return _batch_apply(one, [a], batch, specs)
 
 
-@_target("ProductOfElementaryHouseholderReflectors")
+@_target("ProductOfElementaryHouseholderReflectors",
+         "lapack_sorgqr_ffi", "lapack_dorgqr_ffi")
 def _householder_product(op, ins):
     from scipy.linalg import lapack
     a, taus = (_np_in(x) for x in ins)
