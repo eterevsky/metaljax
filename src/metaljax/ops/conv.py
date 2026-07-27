@@ -81,8 +81,11 @@ def _convolution(interp, op, ins, env):
            if "batch_group_count" in op.attributes else 1)
     flip = False
     if "window_reversal" in op.attributes:
-        rev = [bool(b) for b in
-               np.array(ir.DenseElementsAttr(op.attributes["window_reversal"]))]
+        a = op.attributes["window_reversal"]
+        try:
+            rev = [bool(b) for b in ir.DenseBoolArrayAttr(a)]
+        except Exception:
+            rev = [bool(b) for b in np.array(ir.DenseElementsAttr(a))]
         if any(rev):
             if not all(rev):
                 raise UnsupportedOpError("conv: mixed window_reversal")
