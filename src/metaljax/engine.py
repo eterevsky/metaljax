@@ -202,17 +202,26 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
                 mx.eval(*outs)
             else:
                 mx.async_eval(*outs)
-    except (RuntimeError, IndexError, ValueError):
-        # MLX's compiler can reject certain traces (fused-kernel
-        # argument-buffer exhaustion; unordered_map::at on graphs with
-        # unused inputs surfaces as IndexError). Retry eagerly.
-        if not ex._can_compile:
-            raise
-        ex._can_compile = False
-        ex._compiled = None
-        outs = list(ex.interpreter(*args))
-        if outs:
-            mx.eval(*outs)
+    except (RuntimeError, IndexError, ValueError) as e:
+        if isinstance(e, RuntimeError) and "Resource limit" in str(e):
+            # Metal buffer-handle exhaustion, not a graph problem: purge
+            # MLX's cache and retry the same path once (programs are pure,
+            # so re-running from unchanged inputs is safe).
+            mx.clear_cache()
+            outs = list(ex.runner()(*args))
+            if outs:
+                mx.eval(*outs)
+        else:
+            # MLX's compiler can reject certain traces (fused-kernel
+            # argument-buffer exhaustion; unordered_map::at on graphs with
+            # unused inputs surfaces as IndexError). Retry eagerly.
+            if not ex._can_compile:
+                raise
+            ex._can_compile = False
+            ex._compiled = None
+            outs = list(ex.interpreter(*args))
+            if outs:
+                mx.eval(*outs)
     res = []
     for arr, type_enum, dims in zip(outs, ex.out_types, ex.out_dims):
         res.append(MetalBuffer(arr, type_enum, dims))

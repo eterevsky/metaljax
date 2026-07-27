@@ -18,5 +18,5 @@ _os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "400")
 from metaljax.interpreter import Interpreter, UnsupportedOpError
 from metaljax import ops as _ops  # noqa: F401  (registers all op handlers)
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 __all__ = ["Interpreter", "UnsupportedOpError"]

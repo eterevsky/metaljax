@@ -119,6 +119,35 @@ _CHUNK_MAX = int(os.environ.get("METALJAX_CHUNK_MAX", "16"))
 # size and loosening the flush cadence that keeps pending buffers bounded.
 _CHUNK_MAX_COST = int(os.environ.get("METALJAX_CHUNK_MAX_COST", "1500"))
 _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
+# Metal caps LIVE buffers per device at ~499k while MLX's buffer cache is
+# bounded by BYTES only — long-running loops over small models accumulate
+# tiny cached buffers until metal::malloc dies mid-training (seen after
+# ~5k steps of an S32768 run). Clear the cache after roughly this many
+# op-units of loop work have been flushed; the engine-level clears (compile
+# boundaries / 50k executes) are far too coarse for multi-hour single
+# executes.
+_LOOP_CLEAR_COST = int(os.environ.get("METALJAX_LOOP_CLEAR_COST", "100000"))
+_flushed_cost = 0
+
+
+def _loop_flush(arrays, cost_units):
+    """Sync point inside a loop: evaluate pending work, keep the Metal
+    buffer count bounded, and recover once if the limit is hit anyway."""
+    global _flushed_cost
+    try:
+        mx.eval(*arrays)
+    except RuntimeError as e:
+        if "Resource limit" not in str(e):
+            raise
+        if _DEBUG:
+            print("[metaljax] Metal buffer limit hit at loop flush; "
+                  "clearing cache and retrying", flush=True)
+        mx.clear_cache()
+        mx.eval(*arrays)
+    _flushed_cost += cost_units
+    if _flushed_cost >= _LOOP_CLEAR_COST:
+        _flushed_cost = 0
+        mx.clear_cache()
 
 
 def _static_start(op, k):
@@ -389,7 +418,16 @@ def _while(interp, op, ins, env):
         while i < trip:
             try:
                 vals = list(fn(*vals, *captures))
-            except (RuntimeError, IndexError, ValueError):
+            except (RuntimeError, IndexError, ValueError) as e:
+                if isinstance(e, RuntimeError) and "Resource limit" in str(e):
+                    # Metal ran out of buffer handles mid-body; `vals` is
+                    # only rebound on success, so purge the cache and redo
+                    # the iteration on the same path.
+                    if _DEBUG:
+                        print("[metaljax] Metal buffer limit hit in while "
+                              "body; clearing cache and retrying", flush=True)
+                    mx.clear_cache()
+                    continue
                 # MLX's compiled path can fail at call time (e.g.
                 # unordered_map::at on graphs with unused inputs). The body
                 # is pure and the call left `vals` untouched: redo this
@@ -407,19 +445,21 @@ def _while(interp, op, ins, env):
                 continue
             i += 1
             if i % period == 0:
-                mx.eval(*vals)
+                _loop_flush(vals, period * cost)
         return vals
 
     # Dynamic (non-counted) loop: evaluate the condition each iteration.
+    dyn_cost = _block_cost(interp, body_block)
     if _DEBUG:
-        print(f"[metaljax] while(fallback-dynamic): "
-              f"cost={_block_cost(interp, body_block)}", flush=True)
+        print(f"[metaljax] while(fallback-dynamic): cost={dyn_cost}",
+              flush=True)
     vals = list(ins)
     while True:
         (pred,) = interp.run_block(cond_block, vals, env)
         if not bool(pred.item()):
             return vals
         vals = interp.run_block(body_block, vals, env)
+        _loop_flush((), dyn_cost)
 
 
 def _run_chunked(interp, body_block, env, ins, trip, K, cost):
@@ -433,7 +473,7 @@ def _run_chunked(interp, body_block, env, ins, trip, K, cost):
     for i in range(trip // K):
         vals = list(fn(*vals, *captures))
         if (i + 1) % sync_every == 0:
-            mx.eval(*vals)
+            _loop_flush(vals, sync_every * K * cost)
         else:
             mx.async_eval(*vals)
     rem = trip % K
@@ -442,7 +482,7 @@ def _run_chunked(interp, body_block, env, ins, trip, K, cost):
         captures1 = [env[v] for v in free1]
         for _ in range(rem):
             vals = list(fn1(*vals, *captures1))
-    mx.eval(*vals)
+    _loop_flush(vals, (trip % max(sync_every * K, 1)) * cost)
     return vals
 
 

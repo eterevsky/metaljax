@@ -216,7 +216,18 @@ executes on the Metal device through plain `jax.numpy`.
    residuals exceeded it → "Unable to build metal library" at execute
    time, from Oleg's live sweeps). Falls back to compiled-graph path;
    spec verified vs CPU. Also 0.3.0→Beta classifier + texmo-free README.
-14. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+14. ✅ v0.3.2: Metal buffer-count exhaustion INSIDE one execute (from
+   Oleg's live sweeps: "[metal::malloc] Resource limit (499000)" at the
+   eager while-loop flush, e.g. S32768 runs dying after ~5k steps —
+   the 0.2.2 engine-level clears are per-execute, far too coarse for
+   multi-hour single executes). control._loop_flush: all loop sync
+   points (eager counted flush, chunked-replay sync, dynamic fallback)
+   now clear MLX's cache every ~100k flushed op-units
+   (METALJAX_LOOP_CLEAR_COST) + clear-and-retry once on the limit;
+   same retry in the while body-failure handler and engine.execute
+   (programs pure → rerun safe). Verified: both crashing specs train
+   past their death points, perf unchanged (db11/mid08 match 030c).
+15. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
