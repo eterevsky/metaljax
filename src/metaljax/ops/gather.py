@@ -7,8 +7,30 @@ import mlx.core as mx
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import stablehlo
 
-from metaljax import _ir
+import numpy as np
+
+from metaljax import _ir, dtypes
 from metaljax.interpreter import register, UnsupportedOpError
+
+
+def _combiner_neutral(method, dtype):
+    """Update value that makes the combiner a no-op (for dropped updates)."""
+    if method in ("add", "subtract"):
+        return mx.array(0, dtype=dtype)
+    if method == "multiply":
+        return mx.array(1, dtype=dtype)
+    npdt = dtypes._MX_TO_NP[dtype]
+    if method == "maximum":
+        if dtype == mx.bool_:
+            return mx.array(False)
+        v = -np.inf if npdt.kind == "f" else np.iinfo(npdt).min
+        return mx.array(v, dtype=dtype)
+    if method == "minimum":
+        if dtype == mx.bool_:
+            return mx.array(True)
+        v = np.inf if npdt.kind == "f" else np.iinfo(npdt).max
+        return mx.array(v, dtype=dtype)
+    raise UnsupportedOpError(f"no neutral for scatter method {method}")
 
 
 def _gather_dims(op):
@@ -227,9 +249,13 @@ def _scatter(interp, op, ins, env):
             index_arrays.append(scatter_indices[tuple(sl)])
 
     mapped = {}
+    oob = None
     for j, dim in enumerate(d["scatter_dims_to_operand_dims"]):
+        raw = index_arrays[j].astype(mx.int32)
         limit = op_shape[dim] - 1
-        mapped[dim] = mx.clip(index_arrays[j].astype(mx.int32), 0, max(limit, 0))
+        bad = (raw < 0) | (raw > limit)
+        oob = bad if oob is None else (oob | bad)
+        mapped[dim] = mx.clip(raw, 0, max(limit, 0))
     for op_dim, idx_dim in zip(d["operand_batching_dims"],
                                d["scatter_indices_batching_dims"]):
         pos = batch_dims_idx.index(idx_dim)
@@ -273,10 +299,35 @@ def _scatter(interp, op, ins, env):
     operand_t = mx.transpose(operand, indexed_dims + free_dims)
     idx_tuple = tuple(mapped[dim] for dim in indexed_dims)
     updates_t = updates_t.astype(operand_t.dtype)
+    # XLA semantics: an update whose index has any out-of-bounds component
+    # is DROPPED. Clamping alone clobbers real data at the boundary
+    # (jnp.nonzero/where pad with fill_value == size, bincount overflow
+    # slots, sparse fill indices).
+    if oob is not None and method != "set":
+        # Arithmetic combiners: write the combiner's identity instead —
+        # order/duplicate-safe by construction.
+        mask = mx.reshape(oob, batch_shape + [1] * len(free_dims))
+        updates_t = mx.where(
+            mask, _combiner_neutral(method, operand_t.dtype), updates_t)
     if method == "set":
         # mx.array.at has no .set; __setitem__ is MLX's scatter-assign (it
         # rebinds only this local array object, so no aliasing concerns).
-        if idx_tuple:
+        if oob is not None and idx_tuple:
+            # Redirect dropped updates to a dummy slot appended along the
+            # first indexed axis. (Writing back the current value at the
+            # clamped position instead would race a genuine duplicate
+            # write there — fill_value == size clamps onto the last real
+            # slot, a systematic collision.)
+            ext = mx.concatenate(
+                [operand_t,
+                 mx.zeros((1,) + operand_t.shape[1:], dtype=operand_t.dtype)],
+                axis=0)
+            idx0 = mx.where(
+                oob, mx.array(operand_t.shape[0], dtype=mx.int32),
+                idx_tuple[0])
+            ext[(idx0,) + idx_tuple[1:]] = updates_t
+            res_t = ext[: operand_t.shape[0]]
+        elif idx_tuple:
             res_t = operand_t
             res_t[idx_tuple] = updates_t
         else:

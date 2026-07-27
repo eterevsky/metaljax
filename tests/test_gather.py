@@ -94,3 +94,22 @@ def test_one_hot_indexing_grad():
     def loss(t):
         return jnp.sum(t[ids] ** 2)
     check(jax.grad(loss), table, rtol=1e-5, atol=1e-6)
+
+def test_scatter_oob_dropped():
+    # XLA semantics: out-of-bounds scatter updates are DROPPED, not
+    # clamped. jnp.nonzero/where pad with fill_value == size (clamps onto
+    # the last real slot), bincount overflows, place fills.
+    i_oob = np.array([2, 5], np.int32)
+    v = np.array([8.0, 9.0], np.float32)
+    check(lambda x, i, v: x.at[i].set(v, mode="drop"), np.zeros(3, np.float32),
+          i_oob, v)
+    check(lambda x, i, v: x.at[i].add(v, mode="drop"), np.zeros(3, np.float32),
+          i_oob, v)
+    check(lambda x, i, v: x.at[i].max(v, mode="drop"), np.zeros(3, np.float32),
+          i_oob, v)
+    check(lambda i: jnp.bincount(i, length=3), np.array([0, 1, 9], np.int32))
+    check(lambda m: jnp.nonzero(m, size=3, fill_value=3)[0],
+          np.array([0.0, 1.0, 0.0, 1.0, 1.0], np.float32))
+    check(lambda a, m, v: jnp.place(a, m, v, inplace=False),
+          np.zeros(3, np.float32), np.array([True, False, True]),
+          np.array([7.0, 8.0], np.float32))

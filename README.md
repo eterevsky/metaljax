@@ -118,6 +118,37 @@ g = jax.jit(jax.grad(lambda x: jnp.sum(jnp.tanh(x) ** 2)))(jnp.arange(4.0))
 print(g, g.device)"
 ```
 
+## Coverage and known gaps
+
+Running the entire upstream `jax/tests` suite against metaljax executes
+~28,300 tests with ~80% passing. The gaps fall into three groups:
+
+**Intentional (platform constraints, will not change):**
+
+- **No float64.** Metal GPUs have no f64 ALUs. f64 values may pass
+  *through* the device (stored as f32), but f64 *compute* fails at
+  compile time naming the op; `METALJAX_F64=downcast` opts into f32
+  emulation. Keep `jax_enable_x64` off.
+- **Single device.** No sharding, no collectives, no multi-process —
+  `psum`/`shard_map`/`pjit`-across-devices programs are out of scope.
+- **int4 / float8 dtypes** — no MLX support.
+- **Denormals flush to zero** on the GPU (hardware behavior); tests
+  asserting subnormal outputs (e.g. `jnp.spacing`) differ from CPU.
+
+**Not yet implemented (see `notes/jax-test-suite-2026-07.md` for the
+full taxonomy):**
+
+- complex dtypes (the largest single gap — fft, complex linalg)
+- `stablehlo.sort` beyond the argmin/argmax patterns; general
+  `reduce_window` and exotic reduce bodies; windowed scatter variants
+- LAPACK-family custom calls (QR, eigh, SVD, LU, triangular_solve,
+  ApproxTopK); `rng_bit_generator`
+- `popcnt` / `count_leading_zeros`
+
+**Behavioral differences under investigation** are tracked in the notes
+file above. Unsupported constructs fail loudly at compile time with the
+op named — nothing silently falls back to CPU or returns wrong dtypes.
+
 ## Using metaljax from another project
 
 Add `metaljax` to your dependencies (it declares `jax` itself):
