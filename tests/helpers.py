@@ -37,7 +37,7 @@ def check(f, *args, rtol=1e-5, atol=1e-6):
         if g.dtype == ml_dtypes.bfloat16:
             g = g.astype(np.float32)
             w = w.astype(np.float32)
-        if np.issubdtype(g.dtype, np.floating):
+        if np.issubdtype(g.dtype, np.inexact):
             np.testing.assert_allclose(g, w, rtol=rtol, atol=atol)
         else:
             np.testing.assert_array_equal(g, w)

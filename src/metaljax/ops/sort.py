@@ -67,7 +67,19 @@ def _sort(interp, op, ins, env):
     if isinstance(cmp_val, ir.BlockArgument):
         raise UnsupportedOpError("sort: comparator returns an argument")
     cmp = cmp_val.owner.operation
+    args = list(block.arguments)
+    local = {r for o in body for r in o.results}
+
     if cmp.name != "stablehlo.compare":
+        # Complex lexicographic comparator: a compare/select tree over a
+        # single (lhs, rhs) pair of a complex operand. jax only emits the
+        # ascending (re, im) form for complex sorts.
+        deps = _arg_deps(cmp_val, args, local)
+        ks = {d // 2 for d in deps}
+        if len(ks) == 1:
+            k = ks.pop()
+            if k < len(ins) and ins[k].dtype == mx.complex64:
+                return _gather_sorted(ins, ins[k], False, dim)
         raise UnsupportedOpError(
             f"sort: comparator ends in {cmp.name}, not compare")
     direction = str(cmp.attributes["comparison_direction"])
@@ -78,8 +90,6 @@ def _sort(interp, op, ins, env):
     else:
         raise UnsupportedOpError(f"sort: non-strict compare {direction}")
 
-    args = list(block.arguments)
-    local = {r for o in body for r in o.results}
     lhs, rhs = cmp.operands
     ldeps = _arg_deps(lhs, args, local)
     rdeps = _arg_deps(rhs, args, local)
@@ -116,8 +126,18 @@ def _sort(interp, op, ins, env):
         for r, v in zip(o.results, res or []):
             benv[r] = v
     key = benv[lhs] if not isinstance(lhs, ir.BlockArgument) else ins[k]
+    return _gather_sorted(ins, key, descending, dim)
 
-    if dtypes.is_float(key.dtype):
+
+def _gather_sorted(ins, key, descending, dim):
+
+    if key.dtype == mx.complex64:
+        # numpy/XLA order complex lexicographically by (real, imag):
+        # pack both 32-bit total-order keys into one u64.
+        re_k = dtypes.total_order_key(mx.real(key)).astype(mx.uint64)
+        im_k = dtypes.total_order_key(mx.imag(key)).astype(mx.uint64)
+        key = (re_k << 32) | im_k
+    elif dtypes.is_float(key.dtype):
         key = dtypes.total_order_key(key)
     elif dtypes.is_bool(key.dtype):
         key = key.astype(mx.uint8)

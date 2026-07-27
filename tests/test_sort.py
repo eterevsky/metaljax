@@ -47,3 +47,8 @@ def test_searchsorted_nan_total_order():
     a = np.array([1.0, 2.0, np.nan], np.float32)
     v = np.array([2.0, np.nan, 3.0], np.float32)
     check(lambda a, v: jnp.searchsorted(a, v), a, v)
+
+
+def test_sort_complex_lexicographic():
+    z = np.array([3 + 1j, 1 + 5j, 1 + 2j, 3 - 1j], np.complex64)
+    check(lambda z: jnp.sort(z), z)
