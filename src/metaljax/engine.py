@@ -43,6 +43,7 @@ _ENUM_TO_NP = {
     _ENUM["F32"]: np.dtype(np.float32),
     _ENUM["F64"]: np.dtype(np.float64),  # stored as f32 on device (downcast)
     _ENUM["BF16"]: np.dtype(ml_dtypes.bfloat16),
+    _ENUM["C64"]: np.dtype(np.complex64),
 }
 _NP_TO_ENUM = {v: k for k, v in _ENUM_TO_NP.items()}
 

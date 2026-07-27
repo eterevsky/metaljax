@@ -81,6 +81,9 @@ def dense_to_np(attr, ttype: ir.RankedTensorType):
         except Exception:
             pass
 
+    if el.startswith("complex"):
+        return complex_dense_from_text(str(attr), shape)
+
     import ml_dtypes
     name = _TEXT_NP_DTYPES.get(el)
     if name is None:
@@ -121,3 +124,34 @@ def dense_to_np(attr, ttype: ir.RankedTensorType):
     if len(vals) == 1:
         return np.broadcast_to(np.array(vals[0], dtype=np_dtype), shape)
     return np.array(vals, dtype=np_dtype).reshape(shape)
+
+
+def complex_dense_from_text(text: str, shape: tuple) -> "np.ndarray":
+    """Decode a complex dense constant from MLIR text: dense<(re,im)>,
+    dense<[(re,im), ...]>, or the hex-blob form. Needed because the
+    python bindings cannot even *cast* complex dense attributes
+    (op.attributes["value"] raises)."""
+    import re
+
+    import numpy as np
+
+    m = re.search(r"dense<(.*)> : ", text, re.S)
+    if not m:
+        raise TypeError(f"no dense constant in: {text[:80]}")
+    body = m.group(1)
+    if body.startswith('"0x'):
+        return np.frombuffer(
+            bytes.fromhex(body[3:-1]), np.complex64).reshape(shape)
+
+    def num(tok):
+        tok = tok.strip()
+        if tok.startswith("0x"):
+            import struct
+            return struct.unpack("<f", int(tok, 16).to_bytes(4, "little"))[0]
+        return float(tok)
+
+    pairs = re.findall(r"\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)", body)
+    arr = np.array([complex(num(a), num(b)) for a, b in pairs], np.complex64)
+    if arr.size == 1 and shape != (1,) * len(shape or (1,)):
+        return np.broadcast_to(arr.reshape(()), shape).copy()
+    return arr.reshape(shape)

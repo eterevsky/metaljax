@@ -63,7 +63,11 @@ def _concatenate(interp, op, ins, env):
 
 @register("stablehlo.convert")
 def _convert(interp, op, ins, env):
-    return ins[0].astype(dtypes.mx_result_dtype(op.results[0]))
+    dt = dtypes.mx_result_dtype(op.results[0])
+    x = ins[0]
+    if x.dtype == mx.complex64 and dt != mx.complex64:
+        x = mx.real(x)  # XLA convert complex->real keeps the real part
+    return x.astype(dt)
 
 
 @register("stablehlo.bitcast_convert")

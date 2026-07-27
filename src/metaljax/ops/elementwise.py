@@ -7,7 +7,7 @@ import numpy as np
 
 from jaxlib.mlir import ir
 
-from metaljax import dtypes
+from metaljax import _ir, dtypes
 from metaljax.interpreter import register, UnsupportedOpError
 
 
@@ -115,6 +115,41 @@ def _clz(interp, op, ins, env):
         u = u | (u >> s)
         s *= 2
     return (w - _popcount(u)).astype(x.dtype)
+
+
+@register("stablehlo.real")
+def _real(interp, op, ins, env):
+    return mx.real(ins[0])
+
+
+@register("stablehlo.imag")
+def _imag(interp, op, ins, env):
+    x = ins[0]
+    if x.dtype != mx.complex64:
+        return mx.zeros_like(x)
+    return mx.imag(x)
+
+
+@register("stablehlo.complex")
+def _complex(interp, op, ins, env):
+    re, im = ins
+    return re.astype(mx.complex64) + im.astype(mx.complex64) * mx.array(1j)
+
+
+@register("stablehlo.fft")
+def _fft(interp, op, ins, env):
+    (x,) = ins
+    kind = str(op.attributes["fft_type"])
+    length = _ir.i64_list(op, "fft_length")
+    axes = list(range(len(x.shape) - len(length), len(x.shape)))
+    s = [int(v) for v in length]
+    if "IRFFT" in kind:
+        return mx.fft.irfftn(x, s=s, axes=axes)
+    if "RFFT" in kind:
+        return mx.fft.rfftn(x, s=s, axes=axes)
+    if "IFFT" in kind:
+        return mx.fft.ifftn(x, s=s, axes=axes)
+    return mx.fft.fftn(x, s=s, axes=axes)
 
 
 @register("stablehlo.not")
@@ -241,6 +276,12 @@ def _clamp(interp, op, ins, env):
 def _constant(interp, op, ins, env):
     from metaljax import _ir
     t = ir.RankedTensorType(op.results[0].type)
+    if str(t.element_type).startswith("complex"):
+        # op.attributes["value"] itself raises for complex dense attrs
+        # (the bindings can't cast DenseTypedElementsAttr): parse the
+        # op's text form instead.
+        arr = _ir.complex_dense_from_text(str(op), tuple(t.shape))
+        return dtypes.to_mx(arr)
     arr = _ir.dense_to_np(op.attributes["value"], t)
     out = dtypes.to_mx(arr)
     want = dtypes.mx_dtype_for(t.element_type)

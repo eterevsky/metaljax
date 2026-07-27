@@ -315,6 +315,7 @@ size_t ItemSize(PJRT_Buffer_Type t) {
     case PJRT_Buffer_Type_S64:
     case PJRT_Buffer_Type_U64:
     case PJRT_Buffer_Type_F64:
+    case PJRT_Buffer_Type_C64:
       return 8;
     default:
       return 0;

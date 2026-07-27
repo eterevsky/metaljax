@@ -35,6 +35,7 @@ def _warn_f64():
 
 
 _MLIR_TO_MX = {
+    "complex<f32>": mx.complex64,
     "f16": mx.float16,
     "f32": mx.float32,
     "bf16": mx.bfloat16,
@@ -51,6 +52,7 @@ _MLIR_TO_MX = {
 
 # numpy dtypes as JAX should see them (f64 stays f64 in metadata).
 _MLIR_TO_NP = {
+    "complex<f32>": np.dtype(np.complex64),
     "f16": np.dtype(np.float16),
     "f32": np.dtype(np.float32),
     "f64": np.dtype(np.float64),
@@ -78,6 +80,7 @@ def np_dtype_for_mlir(t: ir.Type) -> np.dtype:
         ) from None
 
 _MX_TO_NP = {
+    mx.complex64: np.dtype(np.complex64),
     mx.float16: np.dtype(np.float16),
     mx.float32: np.dtype(np.float32),
     mx.bfloat16: np.dtype(ml_dtypes.bfloat16),
@@ -109,7 +112,7 @@ def mx_dtype_for(t: ir.Type) -> mx.Dtype:
     except KeyError:
         raise UnsupportedDtypeError(
             f"MLIR element type '{s}' is not supported on Metal "
-            f"(no float64/complex on this backend)"
+            f"(no float64/complex128 on this backend)"
         ) from None
 
 
