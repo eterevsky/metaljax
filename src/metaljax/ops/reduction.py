@@ -32,6 +32,16 @@ def _reduce(interp, op, ins, env):
         if body_name in table:
             fn, combine = table[body_name]
             x = inputs[0]
+            if any(s == 0 for s in x.shape):
+                # MLX reducers crash on zero-size inputs (mx.max raises;
+                # zero-size uint32 sum aborts in a missing Metal kernel).
+                # An empty fold is well-defined: the init value.
+                out_shape = [s for i, s in enumerate(x.shape)
+                             if i not in dims]
+                if any(x.shape[d] == 0 for d in dims):
+                    return [mx.broadcast_to(inits[0].astype(x.dtype),
+                                            out_shape)]
+                return [mx.zeros(out_shape, dtype=x.dtype)]
             out = fn(x, axis=tuple(dims)) if dims else x
             return [combine(out, inits[0])]
 
@@ -47,6 +57,15 @@ def _reduce(interp, op, ins, env):
             is_max = first in ("GT", "GE")
             val = (mx.max if is_max else mx.min)(inputs[0], axis=d)
             arg = (mx.argmax if is_max else mx.argmin)(inputs[0], axis=d)
+            if dtypes.is_float(inputs[0].dtype):
+                # XLA/numpy semantics: NaN wins argmax/argmin, first NaN's
+                # index is returned (MLX skips NaNs).
+                isnan = mx.isnan(inputs[0])
+                has_nan = mx.any(isnan, axis=d)
+                first_nan = mx.argmax(isnan, axis=d)
+                arg = mx.where(has_nan, first_nan, arg)
+                val = mx.where(
+                    has_nan, mx.array(float("nan"), dtype=val.dtype), val)
             idx = mx.take_along_axis(inputs[1], mx.expand_dims(arg, d), axis=d)
             return [val, mx.squeeze(idx, axis=d)]
 

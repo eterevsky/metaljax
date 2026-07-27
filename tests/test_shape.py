@@ -87,3 +87,30 @@ def test_bitcast():
 
 def test_one_hot():
     check(lambda i: jax.nn.one_hot(i, 8), np.array([0, 3, 7, 2], np.int32))
+
+
+def test_bitcast_convert_size_changing():
+    # Size-changing bitcasts add/remove a trailing ratio dim (StableHLO);
+    # jnp.byteswap exercises narrow->reverse->widen incl. rank-0.
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.uint8),
+          np.arange(4, dtype=np.uint32))
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.uint32),
+          np.arange(8, dtype=np.uint8).reshape(2, 4))
+    check(lambda x: x.byteswap(), np.array([1, 256], np.int32))
+    check(lambda x: x.byteswap(), np.int32(7))
+
+
+def test_reverse_degenerate_dims():
+    check(lambda x: jnp.flip(x, axis=1), np.zeros((2, 0), np.float32))
+    check(lambda x: jnp.flip(x, axis=0), np.ones((1, 3), np.float32))
+
+
+def test_empty_gather_result():
+    # jnp folds empty takes at trace time; go through lax.gather directly
+    # so the interpreter actually sees an empty-batch gather.
+    dn = jax.lax.GatherDimensionNumbers(
+        offset_dims=(1,), collapsed_slice_dims=(0,),
+        start_index_map=(0,))
+    check(lambda x, i: jax.lax.gather(x, i, dn, slice_sizes=(1, 2)),
+          np.arange(8, dtype=np.float32).reshape(4, 2),
+          np.zeros((0, 1), np.int32))

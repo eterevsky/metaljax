@@ -60,3 +60,22 @@ def test_reduce_precision():
     check(lambda x: jax.lax.reduce_precision(x, 8, 7), X)     # bf16 grid
     check(lambda x: jax.lax.reduce_precision(x, 5, 10), X)    # f16 grid
     check(lambda x: jax.lax.reduce_precision(x, 8, 12), X)    # generic f32
+
+
+def test_empty_axis_reduce_returns_init():
+    # MLX reducers crash on zero-size inputs; an empty fold = init value.
+    check(lambda x: jnp.max(x, axis=1, initial=-1.0),
+          np.zeros((3, 0), np.float32))
+    check(lambda x: jnp.min(x, axis=1, initial=5.0),
+          np.zeros((2, 0), np.float32))
+    check(lambda x: jnp.sum(x, axis=0), np.zeros((3, 0), np.uint32))
+    check(lambda x: jax.nn.softmax(x, axis=-1), np.zeros((2, 0), np.float32))
+
+
+def test_argmax_argmin_nan_wins():
+    # XLA/numpy: NaN wins argmax/argmin; first NaN's index is returned.
+    x = np.array([0.0, np.nan], np.float32)
+    check(lambda x: jnp.argmax(x), x)
+    check(lambda x: jnp.argmin(x), np.array([3.0, np.nan, 1.0], np.float32))
+    check(lambda x: (jnp.argmax(x, axis=1), jnp.argmin(x, axis=1)),
+          np.array([[1.0, np.nan, 0.5], [2.0, 1.0, 3.0]], np.float32))

@@ -576,19 +576,22 @@ static PJRT_Error* ClientBufferFromHostBuffer(
   for (size_t i = 0; i < args->num_dims; ++i) nelems *= args->dims[i];
 
   size_t span = 0;
+  long long neg_off = 0;  // most negative byte offset (flipped views)
   if (nelems > 0) {
     if (args->byte_strides == nullptr || args->num_byte_strides == 0) {
       span = static_cast<size_t>(nelems) * itemsize;
     } else {
       span = itemsize;
       for (size_t i = 0; i < args->num_byte_strides; ++i) {
-        int64_t s = args->byte_strides[i];
-        if (s < 0) {
-          return Err(PJRT_Error_Code_UNIMPLEMENTED,
-                     "metaljax: negative byte strides not supported");
-        }
-        span += static_cast<size_t>(args->dims[i] - 1) * s;
+        long long extent =
+            static_cast<long long>(args->dims[i] - 1) * args->byte_strides[i];
+        if (extent >= 0) {
+          span += static_cast<size_t>(extent);
+        } else {
+          neg_off += extent;  // data points at the logical first element;
+        }                     // memory extends backwards from it
       }
+      span += static_cast<size_t>(-neg_off);
     }
   }
 
@@ -602,7 +605,7 @@ static PJRT_Error* ClientBufferFromHostBuffer(
     Py_INCREF(mv);
   } else {
     mv = PyMemoryView_FromMemory(
-        const_cast<char*>(static_cast<const char*>(args->data)),
+        const_cast<char*>(static_cast<const char*>(args->data) + neg_off),
         static_cast<Py_ssize_t>(span), PyBUF_READ);
     if (mv == nullptr) return PyErrToErr("wrap host memory");
   }
@@ -621,8 +624,8 @@ static PJRT_Error* ClientBufferFromHostBuffer(
     }
   }
   PyObject* py_buf = PyObject_CallMethod(
-      engine, "buffer_from_host", "OiOO", mv, static_cast<int>(args->type),
-      dims, strides);
+      engine, "buffer_from_host", "OiOOL", mv, static_cast<int>(args->type),
+      dims, strides, static_cast<long long>(-neg_off));
   Py_DECREF(mv);
   Py_DECREF(dims);
   Py_DECREF(strides);

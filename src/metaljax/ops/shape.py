@@ -51,7 +51,8 @@ def _reverse(interp, op, ins, env):
     (x,) = ins
     for d in _ir.i64_list(op, "dimensions"):
         n = x.shape[d]
-        x = mx.take(x, mx.arange(n - 1, -1, -1), axis=d)
+        if n > 1:  # size 0/1 dims: identity (mx.take chokes on empties)
+            x = mx.take(x, mx.arange(n - 1, -1, -1), axis=d)
     return x
 
 
@@ -68,7 +69,17 @@ def _convert(interp, op, ins, env):
 @register("stablehlo.bitcast_convert")
 def _bitcast_convert(interp, op, ins, env):
     t = ir.RankedTensorType(op.results[0].type)
-    return mx.view(ins[0], dtypes.mx_dtype_for(t.element_type))
+    dt = dtypes.mx_dtype_for(t.element_type)
+    x = ins[0]
+    if dt.size == x.dtype.size:
+        return mx.view(x, dt)
+    if dt.size < x.dtype.size:
+        # Narrowing: the result gains a trailing dim of ratio; mx.view
+        # rescales the LAST axis, so give it a fresh unit axis to split
+        # (also makes rank-0 inputs legal).
+        return mx.view(mx.expand_dims(x, -1), dt)
+    # Widening: the input's trailing ratio-sized dim collapses to 1.
+    return mx.squeeze(mx.view(x, dt), axis=-1)
 
 
 @register("stablehlo.pad")

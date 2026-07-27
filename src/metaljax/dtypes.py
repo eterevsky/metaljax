@@ -158,6 +158,10 @@ def is_bool(d: mx.Dtype) -> bool:
     return d == mx.bool_
 
 
+def is_float(d: mx.Dtype) -> bool:
+    return d in (mx.float32, mx.float16, mx.bfloat16)
+
+
 def is_int(d: mx.Dtype) -> bool:
     return d in (
         mx.int8, mx.int16, mx.int32, mx.int64,

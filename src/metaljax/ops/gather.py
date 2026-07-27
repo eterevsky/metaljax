@@ -74,7 +74,12 @@ def _gather(interp, op, ins, env):
     op_shape = list(operand.shape)
     idx_shape = list(start_indices.shape)
     ivd = d["index_vector_dim"]
-    out_rank = len(ir.RankedTensorType(op.results[0].type).shape)
+    out_t = ir.RankedTensorType(op.results[0].type)
+    out_rank = len(out_t.shape)
+    if any(s == 0 for s in out_t.shape):
+        # Zero-size result: nothing to gather (and the decomposition below
+        # mis-shapes empty batches). Semantically exact short-circuit.
+        return mx.zeros(list(out_t.shape), dtype=operand.dtype)
 
     # Batch shape of the indices (everything except the index vector dim).
     batch_dims_idx = [i for i in range(len(idx_shape)) if i != ivd]
@@ -229,6 +234,10 @@ def _scatter(interp, op, ins, env):
     if len(ins) != 3:
         raise UnsupportedOpError("variadic scatter not implemented")
     operand, scatter_indices, updates = ins
+    if any(s == 0 for s in updates.shape) or any(s == 0 for s in operand.shape):
+        # No updates to apply (empty updates), or every update is
+        # necessarily out of bounds (zero-size operand) and thus dropped.
+        return operand
     d = _scatter_dims(op)
     method = _scatter_combiner(op)
     op_shape = list(operand.shape)

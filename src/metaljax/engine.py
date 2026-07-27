@@ -62,7 +62,8 @@ class MetalBuffer:
         self.nbytes = n * _ENUM_TO_NP[self.type_enum].itemsize
 
 
-def buffer_from_host(data, type_enum: int, dims, byte_strides) -> MetalBuffer:
+def buffer_from_host(data, type_enum: int, dims, byte_strides,
+                     offset: int = 0) -> MetalBuffer:
     dims = list(dims)
     np_dtype = _ENUM_TO_NP.get(type_enum)
     if np_dtype is None:
@@ -74,8 +75,10 @@ def buffer_from_host(data, type_enum: int, dims, byte_strides) -> MetalBuffer:
     elif byte_strides is None:
         arr = np.frombuffer(data, np_dtype).reshape(dims)
     else:
+        # offset: byte position of the logical [0, 0, ...] element within
+        # `data` — nonzero when some stride is negative (flipped views).
         arr = np.ndarray(shape=dims, dtype=np_dtype, buffer=data,
-                         strides=list(byte_strides))
+                         offset=offset, strides=list(byte_strides))
         arr = np.ascontiguousarray(arr).reshape(dims)
     return MetalBuffer(dtypes.to_mx(arr), type_enum, dims)
 
