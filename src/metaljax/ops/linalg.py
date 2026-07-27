@@ -60,6 +60,12 @@ def _dot_general(interp, op, ins, env):
     l3 = mx.reshape(l, (prod(batch), prod(m), prod(k)))
     r3 = mx.reshape(r, (prod(batch), prod(k), prod(n)))
 
+    if prod(batch) * prod(m) * prod(n) == 0:
+        # mx.matmul with an empty M/N output yields an array whose host
+        # conversion segfaults (null data pointer, MLX 0.32); the result
+        # carries no data anyway, so construct it directly.
+        return mx.zeros(batch + m + n, dtype=out_dtype)
+
     if dtypes.is_int(out_dtype) or dtypes.is_bool(out_dtype):
         # MLX matmul is float-only; do an explicit multiply-accumulate.
         acc = l3.astype(mx.int64) if not dtypes.is_bool(out_dtype) else l3
@@ -80,4 +86,9 @@ def _dot_general(interp, op, ins, env):
 def _dot(interp, op, ins, env):
     # Plain rank<=2 dot (HLO-imported modules; jax itself emits dot_general):
     # contracts the last dim of lhs with the first dim of rhs, numpy-style.
+    t = ir.RankedTensorType(op.results[0].type)
+    if any(d == 0 for d in t.shape):
+        # see _dot_general: empty matmul outputs segfault on host copy
+        return mx.zeros(list(t.shape),
+                        dtype=dtypes.mx_result_dtype(op.results[0]))
     return mx.matmul(ins[0], ins[1])

@@ -84,3 +84,7 @@ Collected during the lrnn/mullstm passes; each is concrete and scoped.
   0.3.1 crash class). A catch there could blacklist the plan and
   re-trace the executable without it, like the compiled-while-body
   fallback.
+- **MLX empty-matmul segfault** (worked around in linalg + to_np guards):
+  `np.array(mx.matmul(mx.zeros((0,4)), mx.ones((4,2))))` segfaults on a
+  null data pointer after successful eval (MLX 0.32; M=0 or N=0 outputs;
+  zero-K is fine). Report upstream; found by jax/tests lax_numpy suite.

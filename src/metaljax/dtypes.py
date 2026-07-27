@@ -144,6 +144,11 @@ def to_mx(arr: np.ndarray) -> mx.array:
 
 
 def to_np(arr: mx.array) -> np.ndarray:
+    if arr.size == 0:
+        # Never touch an empty array's buffer: some MLX ops (matmul with
+        # an empty output dim, MLX 0.32) produce 0-size arrays whose host
+        # conversion segfaults on a null data pointer.
+        return np.empty(arr.shape, dtype=_MX_TO_NP[arr.dtype])
     if arr.dtype == mx.bfloat16:
         return np.array(arr.astype(mx.float32)).astype(ml_dtypes.bfloat16)
     return np.array(arr)

@@ -78,7 +78,17 @@ def _analyze_counted(interp, op):
                         if n is not None:
                             bound = n
                     if bound is None and not isinstance(rhs, ir.OpResult):
-                        bound = rhs  # captured from an enclosing scope
+                        if rhs in args:
+                            # Bound carried in the loop state (e.g. lbfgs
+                            # carries maxiter): counted iff the body
+                            # forwards it unchanged.
+                            j = args.index(rhs)
+                            body_blk = op.regions[1].blocks[0]
+                            fwd = list(body_blk.operations)[-1].operation
+                            if fwd.operands[j] == list(body_blk.arguments)[j]:
+                                bound = ("carry", j)
+                        else:
+                            bound = rhs  # captured from an enclosing scope
                     if bound is not None:
                         # body must return arg_k + 1 at position k
                         body_block = op.regions[1].blocks[0]
@@ -359,7 +369,17 @@ def _while(interp, op, ins, env):
     counted = _analyze_counted(interp, op)
     if counted is not None:
         k, bound = counted
-        n = bound if isinstance(bound, int) else int(env[bound].item())
+        if isinstance(bound, int):
+            n = bound
+        elif isinstance(bound, tuple):  # ("carry", j): invariant loop state
+            n = int(ins[bound[1]].item())
+        elif bound in env:
+            n = int(env[bound].item())
+        else:
+            # Bound defined beyond our capture scope (deeply nested
+            # regions): treat as a dynamic loop rather than KeyError.
+            counted = None
+    if counted is not None:
         start = int(ins[k].item())
         trip = max(n - start, 0)
         from metaljax import msl_scan
