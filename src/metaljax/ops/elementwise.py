@@ -49,7 +49,10 @@ _UNARY = {
     "round_nearest_afz": _round_afz,
     "round_nearest_even": _round_even,
     "rsqrt": mx.rsqrt,
-    "sign": mx.sign,
+    # mx.sign returns 0 for NaN; stablehlo.sign must propagate it
+    "sign": lambda x: (mx.where(mx.isnan(x), x, mx.sign(x))
+                       if x.dtype in (mx.float32, mx.float16, mx.bfloat16)
+                       else mx.sign(x)),
     "sine": mx.sin,
     "sqrt": mx.sqrt,
     "tan": mx.tan,
@@ -66,6 +69,52 @@ register("chlo.erf_inv")(lambda i, o, ins, e: mx.erfinv(ins[0]))
 register("chlo.square")(lambda i, o, ins, e: mx.square(ins[0]))
 register("chlo.erfc")(lambda i, o, ins, e: 1.0 - mx.erf(ins[0]))
 register("stablehlo.erfc")(lambda i, o, ins, e: 1.0 - mx.erf(ins[0]))
+
+
+_UNSIGNED_VIEW = {mx.int8: mx.uint8, mx.int16: mx.uint16,
+                  mx.int32: mx.uint32, mx.int64: mx.uint64}
+
+
+def _as_unsigned(x):
+    if dtypes.is_bool(x.dtype):
+        return x.astype(mx.uint8)
+    if x.dtype in _UNSIGNED_VIEW:
+        return mx.view(x, _UNSIGNED_VIEW[x.dtype])
+    return x
+
+
+def _popcount(u):
+    """SWAR popcount on an unsigned array (any width, computed in u32/u64)."""
+    if u.dtype == mx.uint64:
+        c1, c2, c4, m = (0x5555555555555555, 0x3333333333333333,
+                         0x0F0F0F0F0F0F0F0F, 0x0101010101010101)
+        shift = 56
+    else:
+        u = u.astype(mx.uint32)
+        c1, c2, c4, m = 0x55555555, 0x33333333, 0x0F0F0F0F, 0x01010101
+        shift = 24
+    u = u - ((u >> 1) & c1)
+    u = (u & c2) + ((u >> 2) & c2)
+    u = (u + (u >> 4)) & c4
+    return (u * m) >> shift
+
+
+@register("stablehlo.popcnt")
+def _popcnt(interp, op, ins, env):
+    (x,) = ins
+    return _popcount(_as_unsigned(x)).astype(x.dtype)
+
+
+@register("stablehlo.count_leading_zeros")
+def _clz(interp, op, ins, env):
+    (x,) = ins
+    w = x.dtype.size * 8
+    u = _as_unsigned(x)
+    s = 1
+    while s < w:
+        u = u | (u >> s)
+        s *= 2
+    return (w - _popcount(u)).astype(x.dtype)
 
 
 @register("stablehlo.not")
