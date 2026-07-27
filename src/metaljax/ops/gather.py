@@ -259,9 +259,22 @@ def _scatter(interp, op, ins, env):
 
     mapped = {}
     oob = None
+    inserted = set(d["inserted_window_dims"]) | set(d["operand_batching_dims"])
+    uwd = d["update_window_dims"]
+    # Operand dims not inserted carry an update window dim, in order.
+    window_dims = [i for i in range(len(op_shape)) if i not in inserted]
+    if len(uwd) != len(window_dims):
+        raise UnsupportedOpError(
+            f"scatter window rank mismatch: dims={d}, op_shape={op_shape}, "
+            f"upd_shape={upd_shape}")
+    wsize = {dim: upd_shape[w] for w, dim in zip(uwd, window_dims)}
+    uwd_of = {dim: w for w, dim in zip(uwd, window_dims)}
+
+    # Start position per operand dim. XLA drops an update if the whole
+    # window doesn't fit: 0 <= idx <= extent - window.
     for j, dim in enumerate(d["scatter_dims_to_operand_dims"]):
         raw = index_arrays[j].astype(mx.int32)
-        limit = op_shape[dim] - 1
+        limit = op_shape[dim] - wsize.get(dim, 1)
         bad = (raw < 0) | (raw > limit)
         oob = bad if oob is None else (oob | bad)
         mapped[dim] = mx.clip(raw, 0, max(limit, 0))
@@ -272,42 +285,49 @@ def _scatter(interp, op, ins, env):
         view = [1] * len(batch_shape)
         view[pos] = idx_shape[idx_dim]
         mapped[op_dim] = mx.broadcast_to(mx.reshape(ramp, view), batch_shape)
+    # Unindexed dims whose window doesn't span the full extent start at 0
+    # (inserted-but-unindexed dims have an implicit size-1 window; partial
+    # windows on free dims write to [0:w]).
+    zero = mx.zeros(batch_shape, dtype=mx.int32)
+    for dim in range(len(op_shape)):
+        if dim not in mapped and (dim in inserted
+                                  or wsize[dim] != op_shape[dim]):
+            mapped[dim] = zero
+
+    # Windowed dims that carry an index expand into explicit per-element
+    # indices: one new batch axis per such dim, index = start + arange(w).
+    expand = sorted(dim for dim in mapped if wsize.get(dim, 1) > 1)
+    E = len(expand)
+    nb = len(batch_shape)
+    exp_sizes = [wsize[dim] for dim in expand]
 
     indexed_dims = sorted(mapped)
-    inserted = set(d["inserted_window_dims"]) | set(d["operand_batching_dims"])
-    if not set(indexed_dims) <= inserted:
-        raise UnsupportedOpError(
-            f"scatter with window on indexed dims (indexed={indexed_dims}, "
-            f"inserted={sorted(inserted)}) not implemented")
     free_dims = [i for i in range(len(op_shape)) if i not in indexed_dims]
-    windowed_free = [f for f in free_dims if f not in inserted]
-    inserted_free = [f for f in free_dims if f in inserted]
-    for f in inserted_free:
-        # Window of size 1 at offset 0 on an unindexed dim: only correct when
-        # the dim itself has extent 1.
-        if op_shape[f] != 1:
-            raise UnsupportedOpError(
-                f"scatter inserted window on dim {f} of size {op_shape[f]}")
 
-    uwd = d["update_window_dims"]
-    if len(uwd) != len(windowed_free):
-        raise UnsupportedOpError(
-            f"scatter window rank mismatch: dims={d}, op_shape={op_shape}, "
-            f"upd_shape={upd_shape}, windowed_free={windowed_free}")
-    for w, f in zip(uwd, windowed_free):
-        if upd_shape[w] != op_shape[f]:
-            raise UnsupportedOpError(
-                f"scatter partial window {upd_shape[w]} != {op_shape[f]}")
-
+    # updates axes: batch positions, then the expanded windows (sorted by
+    # operand dim, matching the new index axes), then the full free windows.
     upd_batch_positions = [i for i in range(len(upd_shape)) if i not in uwd]
-    updates_t = mx.transpose(updates, upd_batch_positions + uwd)
-    # Re-insert the size-1 free dims so updates rank matches batch + free dims.
-    full_shape = batch_shape + [op_shape[f] for f in free_dims]
+    updates_t = mx.transpose(
+        updates, upd_batch_positions + [uwd_of[dim] for dim in expand]
+        + [uwd_of[f] for f in free_dims])
+    full_shape = batch_shape + exp_sizes + [op_shape[f] for f in free_dims]
     updates_t = mx.reshape(updates_t, full_shape)
 
     operand_t = mx.transpose(operand, indexed_dims + free_dims)
-    idx_tuple = tuple(mapped[dim] for dim in indexed_dims)
+    idx_list = []
+    for dim in indexed_dims:
+        base = mx.reshape(mapped[dim], batch_shape + [1] * E)
+        if dim in expand:
+            k = expand.index(dim)
+            view = [1] * (nb + E)
+            view[nb + k] = wsize[dim]
+            base = base + mx.reshape(
+                mx.arange(wsize[dim], dtype=mx.int32), view)
+        idx_list.append(base)
+    idx_tuple = tuple(idx_list)
     updates_t = updates_t.astype(operand_t.dtype)
+    if oob is not None:
+        oob = mx.reshape(oob, batch_shape + [1] * E)
     # XLA semantics: an update whose index has any out-of-bounds component
     # is DROPPED. Clamping alone clobbers real data at the boundary
     # (jnp.nonzero/where pad with fill_value == size, bincount overflow
@@ -315,7 +335,7 @@ def _scatter(interp, op, ins, env):
     if oob is not None and method != "set":
         # Arithmetic combiners: write the combiner's identity instead —
         # order/duplicate-safe by construction.
-        mask = mx.reshape(oob, batch_shape + [1] * len(free_dims))
+        mask = mx.reshape(oob, batch_shape + [1] * (E + len(free_dims)))
         updates_t = mx.where(
             mask, _combiner_neutral(method, operand_t.dtype), updates_t)
     if method == "set":

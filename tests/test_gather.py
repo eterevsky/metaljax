@@ -113,3 +113,19 @@ def test_scatter_oob_dropped():
     check(lambda a, m, v: jnp.place(a, m, v, inplace=False),
           np.zeros(3, np.float32), np.array([True, False, True]),
           np.array([7.0, 8.0], np.float32))
+
+
+def test_scatter_windowed_indexed():
+    # Windows on indexed dims (dynamic-update-slice-style scatters,
+    # jnp.unique's mask scatter, polyadd's prefix write).
+    check(lambda x, v: x.at[2:5].set(v), np.zeros(6, np.float32),
+          np.array([1.0, 2.0, 3.0], np.float32))
+    check(lambda x, v: x.at[1:4].add(v), np.zeros(6, np.float32),
+          np.array([1.0, 1.0, 1.0], np.float32))
+    check(lambda x, r: x.at[1].set(r), np.zeros((3, 4), np.float32),
+          np.arange(4, dtype=np.float32))
+    check(lambda x: jnp.unique(x, size=3), np.array([3, 1, 3, 2], np.int32))
+    check(lambda a, b: jnp.polyadd(a, b), np.array([1.0, 2.0], np.float32),
+          np.array([1.0, 2.0, 3.0], np.float32))
+    check(lambda x: jnp.pad(x, 1, mode="linear_ramp"),
+          np.array([1.0, 2.0], np.float32))
