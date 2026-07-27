@@ -162,6 +162,21 @@ def is_float(d: mx.Dtype) -> bool:
     return d in (mx.float32, mx.float16, mx.bfloat16)
 
 
+_TO_UINT = {mx.float32: (mx.uint32, mx.int32),
+            mx.float16: (mx.uint16, mx.int16),
+            mx.bfloat16: (mx.uint16, mx.int16)}
+
+
+def total_order_key(x: mx.array) -> mx.array:
+    """Unsigned-int key whose ascending order is IEEE-754 totalOrder
+    (-NaN < -inf < ... < -0 < +0 < ... < +inf < +NaN)."""
+    ut, it = _TO_UINT[x.dtype]
+    u = mx.view(x, ut)
+    neg = mx.view(x, it) < 0
+    top = mx.array(1 << (u.dtype.size * 8 - 1), dtype=ut)
+    return mx.where(neg, ~u, u | top)
+
+
 def is_int(d: mx.Dtype) -> bool:
     return d in (
         mx.int8, mx.int16, mx.int32, mx.int64,

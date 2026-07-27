@@ -7,4 +7,5 @@ from metaljax.ops import (  # noqa: F401
     linalg,
     reduction,
     shape,
+    sort,
 )

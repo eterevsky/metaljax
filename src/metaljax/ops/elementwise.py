@@ -167,6 +167,12 @@ def _compare(interp, op, ins, env):
         fn = _COMPARE[direction]
     except KeyError:
         raise UnsupportedOpError(f"compare direction {direction!r}") from None
+    if ("compare_type" in op.attributes
+            and "TOTALORDER" in str(op.attributes["compare_type"])
+            and dtypes.is_float(a.dtype)):
+        # IEEE totalOrder (searchsorted/sort NaN handling): compare the
+        # order-preserving integer keys instead of the raw floats.
+        return fn(dtypes.total_order_key(a), dtypes.total_order_key(b))
     return fn(a, b)
 
 
