@@ -44,20 +44,42 @@ def initialize():
 
 
 def _register_linalg_lowerings():
-    """eigh/svd have no generic StableHLO lowering — jax only registers
-    per-platform rules. Reuse the CPU rules for platform 'metal': they
-    emit lapack_*_ffi custom_calls, which metaljax's interpreter
-    implements on the host (metaljax.ops.lapack)."""
+    """eigh/svd/eig have no generic StableHLO lowering — jax only
+    registers per-platform rules, and those reject bf16/f16 outright
+    (LAPACK routine tables). Emit our own custom_calls instead, with the
+    primitive's declared result types; metaljax.ops.lapack implements
+    them on the host (upcasting halves to f32)."""
     try:
-        from functools import partial
         from jax._src.interpreters import mlir
         from jax._src.lax import linalg as ll
-        for prim, rule in ((ll.eigh_p, ll._eigh_cpu_gpu_lowering),
-                           (ll.svd_p, ll._svd_cpu_gpu_lowering)):
-            mlir.register_lowering(
-                prim, partial(rule, target_name_prefix="cpu"),
-                platform="metal")
-        mlir.register_lowering(ll.eig_p, ll._eig_cpu_lowering,
-                               platform="metal")
+
+        def emit(ctx, target, operands, config=""):
+            out_types = [mlir.aval_to_ir_type(ctx.module_context, a)
+                         for a in ctx.avals_out]
+            op = mlir.custom_call(
+                target, result_types=out_types, operands=operands,
+                backend_config=config)
+            return op.results
+
+        def eigh_rule(ctx, operand, *, lower, sort_eigenvalues,
+                      subset_by_index, algorithm=None, **_):
+            n = ctx.avals_in[0].shape[-1]
+            if not (subset_by_index is None or subset_by_index == (0, n)):
+                raise NotImplementedError("eigh subset_by_index on metal")
+            return emit(ctx, "metaljax_eigh", [operand],
+                        "L" if lower else "U")
+
+        def svd_rule(ctx, operand, *, full_matrices, compute_uv, **_):
+            return emit(ctx, "metaljax_svd", [operand])
+
+        def eig_rule(ctx, operand, *, compute_left_eigenvectors,
+                     compute_right_eigenvectors, **_):
+            cfg = ("L" if compute_left_eigenvectors else "") + \
+                  ("R" if compute_right_eigenvectors else "")
+            return emit(ctx, "metaljax_eig", [operand], cfg)
+
+        mlir.register_lowering(ll.eigh_p, eigh_rule, platform="metal")
+        mlir.register_lowering(ll.svd_p, svd_rule, platform="metal")
+        mlir.register_lowering(ll.eig_p, eig_rule, platform="metal")
     except Exception as e:  # jax internals moved; degrade to unsupported
         logger.warning("metaljax: linalg lowering registration failed: %s", e)

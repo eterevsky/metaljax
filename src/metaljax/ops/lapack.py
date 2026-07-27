@@ -31,7 +31,15 @@ def _target(*names):
 
 
 def _np_in(x):
-    return np.asarray(dtypes.to_np(x))
+    """Device array -> numpy, upcasting half precisions to f32: LAPACK
+    (and scipy/numpy linalg) has no bf16/f16 routines, but per policy we
+    support them by computing in f32 — _batch_apply casts results back
+    to the op's declared (half) result dtypes."""
+    import ml_dtypes
+    a = np.asarray(dtypes.to_np(x))
+    if a.dtype in (np.dtype(ml_dtypes.bfloat16), np.dtype(np.float16)):
+        a = a.astype(np.float32)
+    return a
 
 
 def _result_specs(op):
@@ -164,6 +172,76 @@ def _eig(op, ins):
         vl = np.zeros(specs[1][0][nb:], dtype=specs[1][1])
         return (w, vl, vr,
                 np.zeros(specs[3][0][nb:], dtype=specs[3][1]))
+    return _batch_apply(one, [a], batch, specs)
+
+
+@_target("metaljax_eigh")
+def _metal_eigh(op, ins):
+    # our own lowering: results (v, w); backend_config "L"/"U"
+    a = _np_in(ins[0])
+    try:
+        lower = "L" in _ir.str_attr(op, "backend_config")
+    except Exception:
+        lower = True
+    specs = _result_specs(op)
+    batch = a.shape[:-2]
+
+    def one(x):
+        x = (np.tril(x) + np.tril(x, -1).conj().T if lower
+             else np.triu(x) + np.triu(x, 1).conj().T)
+        w, v = np.linalg.eigh(x)
+        return (v, w)
+    return _batch_apply(one, [a], batch, specs)
+
+
+@_target("metaljax_svd")
+def _metal_svd(op, ins):
+    # our own lowering: results (s,) or (s, u, vt) per jax svd_p order
+    a = _np_in(ins[0])
+    specs = _result_specs(op)
+    batch = a.shape[:-2]
+    nb = len(batch)
+    compute_uv = len(specs) > 1
+
+    def one(x):
+        m, n = x.shape
+        if not compute_uv:
+            return (np.linalg.svd(x, compute_uv=False),)
+        u_cols = specs[1][0][nb:][1]
+        vt_rows = specs[2][0][nb:][0]
+        u, s, vt = np.linalg.svd(
+            x, full_matrices=(u_cols == m and vt_rows == n))
+        return (s, u[:, :u_cols], vt[:vt_rows, :])
+    return _batch_apply(one, [a], batch, specs)
+
+
+@_target("metaljax_eig")
+def _metal_eig(op, ins):
+    # our own lowering: results (w[, vl][, vr]) per backend_config "LR"
+    a = _np_in(ins[0])
+    try:
+        cfg = _ir.str_attr(op, "backend_config")
+    except Exception:
+        cfg = "R"
+    specs = _result_specs(op)
+    batch = a.shape[:-2]
+    nb = len(batch)
+
+    def one(x):
+        w, vr = np.linalg.eig(x)
+        res = [w]
+        if "L" in cfg:
+            # left eigenvectors: eig of the adjoint, matched by order of
+            # conj eigenvalues (numpy returns them consistently ordered
+            # for the adjoint in conj pairs; recompute directly instead)
+            wl, vl = np.linalg.eig(x.conj().T)
+            # reorder columns of vl to match conj(w)
+            order = np.argmin(
+                np.abs(wl[None, :] - np.conj(w)[:, None]), axis=1)
+            res.append(vl[:, order])
+        if "R" in cfg:
+            res.append(vr)
+        return tuple(res)
     return _batch_apply(one, [a], batch, specs)
 
 

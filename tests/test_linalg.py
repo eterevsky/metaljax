@@ -1,3 +1,4 @@
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -101,3 +102,22 @@ def test_lapack_qr_eigh_svd():
     check(lambda x: jnp.linalg.pinv(x), x, rtol=1e-3, atol=1e-4)
     check(lambda r: jnp.linalg.lstsq(r, jnp.ones(5))[0], r53,
           rtol=1e-3, atol=1e-4)
+
+
+def test_linalg_half_precision():
+    # bf16/f16 factorizations upcast to f32 on the host — these FAIL on
+    # jax-CPU (LAPACK has no half routines); compare against the f32
+    # factorization of the same values instead.
+    rng3 = np.random.default_rng(6)
+    x = rng3.standard_normal((4, 4)).astype(np.float32)
+    sym = x + x.T
+    for dt in (jnp.bfloat16, jnp.float16):
+        w16, v16 = jax.jit(jnp.linalg.eigh)(jnp.asarray(sym, dt))
+        w32, v32 = jax.jit(jnp.linalg.eigh)(sym)
+        np.testing.assert_allclose(np.asarray(w16, np.float32),
+                                   np.asarray(w32), rtol=2e-2, atol=2e-2)
+        s16 = jax.jit(lambda a: jnp.linalg.svd(a, compute_uv=False))(
+            jnp.asarray(x, dt))
+        s32 = jnp.linalg.svd(x, compute_uv=False)
+        np.testing.assert_allclose(np.asarray(s16, np.float32),
+                                   np.asarray(s32), rtol=2e-2, atol=2e-2)
