@@ -544,6 +544,9 @@ def _custom_call(interp, op, ins, env):
         return list(ins)
     if target == "shape_assertion":
         return []
+    if target == "ApproxTopK":
+        from metaljax.ops import sort as _sort_mod
+        return _sort_mod.approx_top_k(op, ins)
     from metaljax.ops import lapack
     res = lapack.run_target(interp, op, ins, env)
     if res is not None:

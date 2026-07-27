@@ -315,3 +315,49 @@ def run_target(interp, op, ins, env):
         return None
     outs = fn(op, ins)
     return [dtypes.to_mx(np.ascontiguousarray(o)) for o in outs]
+
+
+@_target("metaljax_schur")
+def _metal_schur(op, ins):
+    from scipy.linalg import schur
+    a = _np_in(ins[0])
+    specs = _result_specs(op)
+    batch = a.shape[:-2]
+
+    def one(x):
+        kind = "complex" if np.iscomplexobj(x) else "real"
+        t, z = schur(x, output=kind)
+        return (t, z)[: len(specs)]
+    return _batch_apply(one, [a], batch, specs)
+
+
+@_target("metaljax_hessenberg")
+def _metal_hessenberg(op, ins):
+    from scipy.linalg import lapack
+    a = _np_in(ins[0])
+    specs = _result_specs(op)
+    batch = a.shape[:-2]
+    gehrd = lapack.cgehrd if np.iscomplexobj(a) else lapack.sgehrd
+
+    def one(x):
+        ht, tau, info = gehrd(x)
+        return ht, tau
+    return _batch_apply(one, [a], batch, specs)
+
+
+@_target("metaljax_tridiagonal")
+def _metal_tridiagonal(op, ins):
+    from scipy.linalg import lapack
+    a = _np_in(ins[0])
+    try:
+        lower = "L" in _ir.str_attr(op, "backend_config")
+    except Exception:
+        lower = True
+    specs = _result_specs(op)
+    batch = a.shape[:-2]
+    sytrd = lapack.chetrd if np.iscomplexobj(a) else lapack.ssytrd
+
+    def one(x):
+        c, d, e, tau, info = sytrd(x, lower=int(lower))
+        return c, d, e, tau
+    return _batch_apply(one, [a], batch, specs)

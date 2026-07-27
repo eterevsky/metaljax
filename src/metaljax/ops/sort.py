@@ -26,6 +26,9 @@ def _arg_deps(val, args, local):
     """Transitive comparator-block-argument dependencies of an SSA value.
     Values defined outside the comparator block (hoisted constants) are
     opaque leaves."""
+    # NB dedup by the ir.Value (stable hash), never by id() of the
+    # transient .owner wrapper — CPython reuses freed wrapper addresses,
+    # which silently truncated the walk.
     seen, deps, stack = set(), set(), [val]
     while stack:
         v = stack.pop()
@@ -33,13 +36,10 @@ def _arg_deps(val, args, local):
             if v in args:
                 deps.add(args.index(v))
             continue
-        if v not in local:
+        if v in seen or v not in local:
             continue
-        o = v.owner.operation
-        if id(o) in seen:
-            continue
-        seen.add(id(o))
-        stack.extend(o.operands)
+        seen.add(v)
+        stack.extend(v.owner.operation.operands)
     return deps
 
 
@@ -71,15 +71,19 @@ def _sort(interp, op, ins, env):
     local = {r for o in body for r in o.results}
 
     if cmp.name != "stablehlo.compare":
-        # Complex lexicographic comparator: a compare/select tree over a
-        # single (lhs, rhs) pair of a complex operand. jax only emits the
-        # ascending (re, im) form for complex sorts.
+        # Compare/select trees: jax emits exactly two shapes here — the
+        # complex lexicographic (re, im) comparator over ONE operand
+        # pair, and the multi-key lexicographic comparator over the
+        # first num_keys operand pairs (lax.sort num_keys > 1, lexsort,
+        # unique over rows). Both are ascending.
         deps = _arg_deps(cmp_val, args, local)
         ks = {d // 2 for d in deps}
         if len(ks) == 1:
             k = ks.pop()
             if k < len(ins) and ins[k].dtype == mx.complex64:
                 return _gather_sorted(ins, ins[k], False, dim)
+        if ks and ks == set(range(len(ks))) and len(ks) <= len(ins):
+            return _lex_sorted(ins, len(ks), dim)
         raise UnsupportedOpError(
             f"sort: comparator ends in {cmp.name}, not compare")
     direction = str(cmp.attributes["comparison_direction"])
@@ -129,6 +133,42 @@ def _sort(interp, op, ins, env):
     return _gather_sorted(ins, key, descending, dim)
 
 
+def _sort_key(x):
+    """Ascending sort key with jax's canonicalization: -0 == +0, all
+    NaNs equal and largest; complex lexicographic by (re, im)."""
+    if x.dtype == mx.complex64:
+        re_k = dtypes.total_order_key(_canon_float(mx.real(x))).astype(
+            mx.uint64)
+        im_k = dtypes.total_order_key(_canon_float(mx.imag(x))).astype(
+            mx.uint64)
+        return (re_k << 32) | im_k
+    if dtypes.is_float(x.dtype):
+        return dtypes.total_order_key(_canon_float(x))
+    if dtypes.is_bool(x.dtype):
+        return x.astype(mx.uint8)
+    return x
+
+
+def _canon_float(x):
+    x = x + mx.array(0, dtype=x.dtype)  # -0 + +0 == +0
+    return mx.where(mx.isnan(x), mx.array(float("nan"), dtype=x.dtype), x)
+
+
+def _lex_sorted(ins, num_keys, dim):
+    """Stable lexicographic sort by operands[0..num_keys-1], ascending:
+    successive stable argsorts from the last key to the first."""
+    perm = None
+    for j in reversed(range(num_keys)):
+        key = _sort_key(ins[j])
+        if perm is not None:
+            key = mx.take_along_axis(key, perm, axis=dim)
+        idx = mx.argsort(key, axis=dim)
+        perm = idx if perm is None else mx.take_along_axis(perm, idx,
+                                                           axis=dim)
+    outs = [mx.take_along_axis(x, perm, axis=dim) for x in ins]
+    return outs if len(outs) > 1 else outs[0]
+
+
 def _gather_sorted(ins, key, descending, dim):
 
     if key.dtype == mx.complex64:
@@ -157,3 +197,26 @@ def _top_k(interp, op, ins, env):
         key = key.astype(mx.uint8)
     idx = mx.argsort(~key, axis=-1)[..., :k]  # stable descending
     return [mx.take_along_axis(x, idx, axis=-1), idx.astype(mx.int32)]
+
+
+def approx_top_k(op, ins):
+    """ApproxTopK custom call: exact top-k is a valid implementation
+    (recall 1.0 >= any recall_target). Operands (values, indices,
+    init_val, init_idx); results (values, indices) with top_k along
+    reduction_dim."""
+    import re as _re
+    cfg = str(op.attributes["mhlo.backend_config"])
+    k = int(_re.search(r"top_k = (\d+)", cfg).group(1))
+    dim = int(_re.search(r"reduction_dim = (\d+)", cfg).group(1))
+    comp = str(op.attributes["called_computations"])
+    is_max = "_gt_" in comp or "_ge_" in comp
+    vals, idxs = ins[0], ins[1]
+    key = _sort_key(vals)
+    if is_max:
+        key = ~key
+    order = mx.argsort(key, axis=dim)
+    sl = [slice(None)] * len(vals.shape)
+    sl[dim] = slice(0, k)
+    top = order[tuple(sl)]
+    return [mx.take_along_axis(vals, top, axis=dim),
+            mx.take_along_axis(idxs, top, axis=dim)]

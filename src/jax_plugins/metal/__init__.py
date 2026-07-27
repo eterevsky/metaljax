@@ -78,6 +78,21 @@ def _register_linalg_lowerings():
                   ("R" if compute_right_eigenvectors else "")
             return emit(ctx, "metaljax_eig", [operand], cfg)
 
+        def schur_rule(ctx, operand, **_):
+            return emit(ctx, "metaljax_schur", [operand])
+
+        def hessenberg_rule(ctx, operand, **_):
+            return emit(ctx, "metaljax_hessenberg", [operand])
+
+        def tridiagonal_rule(ctx, operand, *, lower=True, **_):
+            return emit(ctx, "metaljax_tridiagonal", [operand],
+                        "L" if lower else "U")
+
+        mlir.register_lowering(ll.schur_p, schur_rule, platform="metal")
+        mlir.register_lowering(ll.hessenberg_p, hessenberg_rule,
+                               platform="metal")
+        mlir.register_lowering(ll.tridiagonal_p, tridiagonal_rule,
+                               platform="metal")
         mlir.register_lowering(ll.eigh_p, eigh_rule, platform="metal")
         mlir.register_lowering(ll.svd_p, svd_rule, platform="metal")
         mlir.register_lowering(ll.eig_p, eig_rule, platform="metal")
