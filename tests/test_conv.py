@@ -52,3 +52,18 @@ def test_conv_grads():
 
     check(jax.grad(loss_k), K, rtol=1e-4, atol=1e-4)
     check(jax.grad(loss_x), X, rtol=1e-4, atol=1e-4)
+
+
+def test_conv_int_complex():
+    rng2 = np.random.default_rng(7)
+    xi = rng2.integers(-50, 50, (2, 3, 8, 8)).astype(np.int32)
+    ki = rng2.integers(-5, 5, (4, 3, 3, 3)).astype(np.int32)
+    check(lambda x, k: jax.lax.conv(x, k, (1, 1), "SAME"), xi, ki)
+    check(lambda a, b: jnp.convolve(a, b),
+          rng2.integers(-9, 9, 20).astype(np.int32),
+          rng2.integers(-9, 9, 5).astype(np.int32))
+    z = (rng2.standard_normal(12)
+         + 1j * rng2.standard_normal(12)).astype(np.complex64)
+    zk = (rng2.standard_normal(4)
+          + 1j * rng2.standard_normal(4)).astype(np.complex64)
+    check(lambda a, b: jnp.convolve(a, b), z, zk, rtol=1e-4, atol=1e-5)

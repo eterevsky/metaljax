@@ -62,6 +62,62 @@ def _opt_list(op, name, default):
     return list(default)
 
 
+def _int_conv(x, w, strides, ldil, rdil, pad, flip, out_dtype):
+    """Exact integer convolution: im2col patches + int64 multiply-sum
+    (mx.conv_general is float-only; f32 emulation would round)."""
+    rank = len(x.shape) - 2
+    if any(b != 1 for b in ldil):
+        # input dilation: insert zero holes
+        for ax, b in enumerate(ldil):
+            if b == 1:
+                continue
+            shape = list(x.shape)
+            shape[ax + 1] = shape[ax + 1] * b
+            holes = mx.zeros(tuple(shape), dtype=x.dtype)
+            sl = [slice(None)] * len(shape)
+            sl[ax + 1] = slice(0, None, b)
+            holes[tuple(sl)] = x
+            sl[ax + 1] = slice(0, shape[ax + 1] - (b - 1))
+            x = holes[tuple(sl)]
+    widths = [(0, 0)] + [(int(l), int(h)) for l, h in pad] + [(0, 0)]
+    if any(v for p_ in widths for v in p_):
+        x = mx.pad(x, widths)
+    x = mx.contiguous(x)
+    wd = list(w.shape[1:-1])
+    C = x.shape[-1]
+    out_sizes = [
+        max(0, (x.shape[i + 1] - ((wd[i] - 1) * int(rdil[i]) + 1))
+            // int(strides[i]) + 1)
+        for i in range(rank)]
+    es = []
+    acc = 1
+    for s in reversed(x.shape):
+        es.append(acc)
+        acc *= s
+    es = es[::-1]
+    view_shape = [x.shape[0]] + out_sizes + wd + [C]
+    view_strides = ([es[0]]
+                    + [es[i + 1] * int(strides[i]) for i in range(rank)]
+                    + [es[i + 1] * int(rdil[i]) for i in range(rank)]
+                    + [es[-1]])
+    patches = mx.as_strided(x, tuple(view_shape), tuple(view_strides), 0)
+    if flip:
+        for ax in range(rank):
+            n = wd[ax]
+            if n > 1:
+                w = mx.take(w, mx.arange(n - 1, -1, -1), axis=ax + 1)
+    K = C
+    for v in wd:
+        K *= v
+    p2 = mx.reshape(patches, tuple([x.shape[0]] + out_sizes + [K]))
+    w2 = mx.reshape(w, (w.shape[0], K))
+    acc_t = mx.bool_ if x.dtype == mx.bool_ else mx.int64
+    prod = p2[..., None, :].astype(acc_t) * w2.astype(acc_t)
+    out = (mx.any(prod, axis=-1) if acc_t == mx.bool_
+           else mx.sum(prod, axis=-1))
+    return out.astype(out_dtype)
+
+
 @register("stablehlo.convolution")
 def _convolution(interp, op, ins, env):
     lhs, rhs = ins
@@ -92,17 +148,10 @@ def _convolution(interp, op, ins, env):
             flip = True
 
     out_dtype = dtypes.mx_result_dtype(op.results[0])
-    if not dtypes.is_float(out_dtype):
-        raise UnsupportedOpError(
-            f"conv: non-float dtype {out_dtype} (MLX conv is float-only)")
 
     # MLX layouts: input (N, *spatial, C_in), weight (C_out, *spatial, C_in).
     x = mx.transpose(lhs, [d["ib"]] + d["is"] + [d["if"]])
     w = mx.transpose(rhs, [d["ko"]] + d["ks"] + [d["ki"]])
-    if x.dtype != out_dtype:
-        x = x.astype(out_dtype)
-    if w.dtype != out_dtype:
-        w = w.astype(out_dtype)
     lo = [int(p) for p in pad[:, 0]]
     hi = [int(p) for p in pad[:, 1]]
 
@@ -113,16 +162,36 @@ def _convolution(interp, op, ins, env):
             input_dilation=[int(v) for v in ldil],
             groups=fgc, flip=flip)
 
-    if bgc > 1:
-        # XLA batch groups: batch and kernel output features split into
-        # bgc groups, group i convolved with kernel group i, outputs
-        # concatenated along the feature axis (used by grad-of-weights).
-        xs = mx.split(x, bgc, axis=0)
-        ws = mx.split(w, bgc, axis=0)
-        out = mx.concatenate([run(xi, wi) for xi, wi in zip(xs, ws)],
-                             axis=-1)
+    def conv_all(xi, wi):
+        if bgc > 1:
+            # XLA batch groups: batch and kernel output features split
+            # into bgc groups, group i convolved with kernel group i,
+            # outputs concatenated along features (grad-of-weights).
+            return mx.concatenate(
+                [run(a, b) for a, b in zip(mx.split(xi, bgc, axis=0),
+                                           mx.split(wi, bgc, axis=0))],
+                axis=-1)
+        return run(xi, wi)
+
+    if out_dtype == mx.complex64:
+        # (ar + i*ai) conv (br + i*bi): four real convolutions.
+        ar, ai = mx.real(x.astype(mx.complex64)), mx.imag(
+            x.astype(mx.complex64))
+        br, bi = mx.real(w.astype(mx.complex64)), mx.imag(
+            w.astype(mx.complex64))
+        re = conv_all(ar, br) - conv_all(ai, bi)
+        im = conv_all(ar, bi) + conv_all(ai, br)
+        out = re.astype(mx.complex64) + im.astype(mx.complex64) * 1j
+    elif not dtypes.is_float(out_dtype):
+        if fgc > 1 or bgc > 1:
+            raise UnsupportedOpError("conv: grouped integer conv")
+        out = _int_conv(x, w, strides, ldil, rdil, pad, flip, out_dtype)
     else:
-        out = run(x, w)
+        if x.dtype != out_dtype:
+            x = x.astype(out_dtype)
+        if w.dtype != out_dtype:
+            w = w.astype(out_dtype)
+        out = conv_all(x, w)
 
     # out is (N, *spatial, C): place dims where the output layout wants.
     axes = [0] * (rank + 2)
