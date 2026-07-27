@@ -120,3 +120,26 @@ dtypes i4/f8 (~67), Schur/Hessenberg/tridiagonal + complex128 (~46),
 misc exotics (>3-D convs, variadic corner cases). Everything above was
 either declared out of scope (platform constraints) or measured as
 poor ROI; nothing known-fixable remains at meaningful count.
+
+## CPU-parity policy (Oleg, 2026-07-28)
+
+Decision framework: JAX-CPU parity is the bar. Every metal-failing test
+was rerun on the CPU backend (scratchpad jaxtests/cpu_parity.json):
+**1,094 of 1,181 pass on CPU (parity targets); 87 fail on CPU too
+(best effort)**. Explicit decisions:
+- bf16: support EVERYTHING (beyond CPU parity — most common format).
+  DONE for linalg: own metal lowerings for eigh/svd/eig emit
+  metaljax_* custom calls accepting all dtypes; host handlers upcast
+  halves to f32. bf16/f16 eigh/svd/qr/cholesky now work where CPU
+  raises NotImplementedError.
+- int4/uint4/float8: emulate (CPU supports create/add/convert; f8 even
+  matmuls; i4 matmul fails on CPU too). Plan: i4/u4 as int8 with mod-16
+  wrap; f8 as byte patterns, 256-entry table for up-conversion, RNE
+  bit-twiddle for down-conversion. CPU fallback acceptable if needed.
+- rng_bit_generator: REQUIRED (CPU implements it; 48+46 rbg tests are
+  parity targets). Implement Philox4x32 matching XLA CPU.
+- Single-device collectives (pmap 53), multi-key lexsort (~225),
+  ApproxTopK (ann_test 32), debug callbacks (29), Schur/Hessenberg,
+  export/shape_poly residue: parity targets, in the 0.5 campaign.
+- The 87 cpu-fail tests (mostly random_lax distribution exactness,
+  api_test internals): best effort / wontfix.
