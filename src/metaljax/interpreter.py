@@ -116,7 +116,9 @@ class Interpreter:
 
     # Ops whose handlers synchronize with the host (.item()) and therefore
     # cannot be traced through mx.compile.
-    _IMPURE_OPS = ("stablehlo.while", "stablehlo.if", "stablehlo.case")
+    _IMPURE_OPS = ("stablehlo.while", "stablehlo.if", "stablehlo.case",
+                   # computed on the host via numpy (see ops.lapack)
+                   "stablehlo.triangular_solve", "stablehlo.cholesky")
 
     # Set by ops.control: hook(interp, while_op) -> bool, True when the loop
     # has a small static trip count and can be unrolled inside a trace.

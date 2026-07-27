@@ -60,21 +60,23 @@ def _batch_apply(fn, args, batch_shape, out_specs):
             for o, spec in zip(flat_outs, out_specs)]
 
 
-@_target("Qr", "lapack_sgeqrf_ffi", "lapack_dgeqrf_ffi")
+@_target("Qr", "lapack_sgeqrf_ffi", "lapack_dgeqrf_ffi", "lapack_cgeqrf_ffi")
 def _qr(op, ins):
     from scipy.linalg import lapack
     (a,) = [_np_in(x) for x in ins]
     specs = _result_specs(op)
     batch = a.shape[:-2]
 
+    geqrf = lapack.cgeqrf if np.iscomplexobj(a) else lapack.sgeqrf
+
     def one(x):
-        qr, tau, _, info = lapack.sgeqrf(x)
+        qr, tau, _, info = geqrf(x)
         return qr, tau
     return _batch_apply(one, [a], batch, specs)
 
 
 @_target("ProductOfElementaryHouseholderReflectors",
-         "lapack_sorgqr_ffi", "lapack_dorgqr_ffi")
+         "lapack_sorgqr_ffi", "lapack_dorgqr_ffi", "lapack_cungqr_ffi")
 def _householder_product(op, ins):
     from scipy.linalg import lapack
     a, taus = (_np_in(x) for x in ins)
@@ -84,8 +86,10 @@ def _householder_product(op, ins):
     k = taus.shape[-1]
     ncols = specs[0][0][-1]
 
+    orgqr = lapack.cungqr if np.iscomplexobj(a) else lapack.sorgqr
+
     def one(x, t):
-        q, _, info = lapack.sorgqr(np.ascontiguousarray(x[:, :max(k, 1)]), t)
+        q, _, info = orgqr(np.ascontiguousarray(x[:, :max(k, 1)]), t)
         if q.shape[1] < ncols:
             q = np.pad(q, [(0, 0), (0, ncols - q.shape[1])])
         return (q[:, :ncols],)
@@ -98,7 +102,8 @@ def _register_ffi(name_map):
             TARGETS[n] = fn
 
 
-@_target("lapack_ssyevd_ffi", "lapack_dsyevd_ffi", "Eigh")
+@_target("lapack_ssyevd_ffi", "lapack_dsyevd_ffi", "lapack_cheevd_ffi",
+         "Eigh")
 def _eigh(op, ins):
     # FFI result convention: (eigenvectors, eigenvalues, info)
     a = _np_in(ins[0])
@@ -110,8 +115,8 @@ def _eigh(op, ins):
     batch = a.shape[:-2]
 
     def one(x):
-        x = np.tril(x) + np.tril(x, -1).T if lower else \
-            np.triu(x) + np.triu(x, 1).T
+        x = (np.tril(x) + np.tril(x, -1).conj().T if lower
+             else np.triu(x) + np.triu(x, 1).conj().T)
         w, v = np.linalg.eigh(x)
         return (v, w) + tuple(
             np.zeros(shape[len(batch):], dtype=dt)
@@ -119,7 +124,8 @@ def _eigh(op, ins):
     return _batch_apply(one, [a], batch, specs)
 
 
-@_target("lapack_sgesdd_ffi", "lapack_dgesdd_ffi", "lapack_sgesvd_ffi")
+@_target("lapack_sgesdd_ffi", "lapack_dgesdd_ffi", "lapack_sgesvd_ffi",
+         "lapack_cgesdd_ffi")
 def _svd(op, ins):
     # FFI result convention: (a_workspace_copy, s, u, vt, info)
     a = _np_in(ins[0])
@@ -136,6 +142,82 @@ def _svd(op, ins):
         return (x, s, u[:, :u_cols], vt[:vt_rows, :]) + tuple(
             np.zeros(shape[nb:], dtype=dt) for shape, dt in specs[4:])
     return _batch_apply(one, [a], batch, specs)
+
+
+@_target("lapack_sgeev_ffi", "lapack_dgeev_ffi", "lapack_cgeev_ffi")
+def _eig(op, ins):
+    # sgeev results: (wr, wi, vl, vr, info); cgeev: (w, vl, vr, info).
+    # jax's jnp.linalg.eig only consumes the right eigenvectors
+    # (compute_left = 'N'), so vl is zero-filled.
+    a = _np_in(ins[0])
+    specs = _result_specs(op)
+    batch = a.shape[:-2]
+    nb = len(batch)
+    split_real = len(specs) == 5
+
+    def one(x):
+        w, vr = np.linalg.eig(x)
+        if split_real:
+            vl = np.zeros(specs[2][0][nb:], dtype=specs[2][1])
+            return (w.real, w.imag, vl, vr,
+                    np.zeros(specs[4][0][nb:], dtype=specs[4][1]))
+        vl = np.zeros(specs[1][0][nb:], dtype=specs[1][1])
+        return (w, vl, vr,
+                np.zeros(specs[3][0][nb:], dtype=specs[3][1]))
+    return _batch_apply(one, [a], batch, specs)
+
+
+from metaljax.interpreter import register  # noqa: E402
+
+
+@register("stablehlo.cholesky")
+def _cholesky(interp, op, ins, env):
+    a = _np_in(ins[0])
+    lower = True
+    if "lower" in op.attributes:
+        lower = "true" in str(op.attributes["lower"])
+    specs = _result_specs(op)
+    batch = a.shape[:-2]
+
+    def one(x):
+        try:
+            c = np.linalg.cholesky(
+                x if lower else x.conj().swapaxes(-1, -2))
+            c = c if lower else c.conj().swapaxes(-1, -2)
+        except np.linalg.LinAlgError:
+            c = np.full_like(x, np.nan)
+        return (c,)
+    return dtypes.to_mx(_batch_apply(one, [a], batch, specs)[0])
+
+
+@register("stablehlo.triangular_solve")
+def _triangular_solve(interp, op, ins, env):
+    from scipy.linalg import solve_triangular
+    a, b = (_np_in(x) for x in ins)
+    attrs = {n: str(op.attributes[n]) for n in op.attributes}
+    left = "true" in attrs.get("left_side", "true")
+    lower = "true" in attrs.get("lower", "false")
+    unit = "true" in attrs.get("unit_diagonal", "false")
+    ta = attrs.get("transpose_a", "NO_TRANSPOSE")
+    specs = _result_specs(op)
+    batch = b.shape[:-2]
+    a = np.broadcast_to(a, batch + a.shape[-2:])
+
+    def one(aa, bb):
+        m, lo = aa, lower
+        if "ADJOINT" in ta:
+            m, lo = m.conj().swapaxes(-1, -2), not lower
+        elif "TRANSPOSE" in ta and "NO_" not in ta:
+            m, lo = m.swapaxes(-1, -2), not lower
+        if left:
+            x = solve_triangular(m, bb, lower=lo, unit_diagonal=unit)
+        else:
+            # X op(A) = B  <=>  op(A)^T X^T = B^T
+            x = solve_triangular(m.swapaxes(-1, -2), bb.swapaxes(-1, -2),
+                                 lower=not lo, unit_diagonal=unit)
+            x = x.swapaxes(-1, -2)
+        return (x,)
+    return dtypes.to_mx(_batch_apply(one, [a, b], batch, specs)[0])
 
 
 def custom_call_host_hook(op):

@@ -192,6 +192,53 @@ def _reduce_window(interp, op, ins, env):
                 if pad[ax, 0] == 0 and pad[ax, 1] == size - 1:
                     return [fn(x, axis=ax, reverse=True)]
 
+    if n == 2:
+        # select_and_gather_add: window-reduce two inputs by picking the
+        # element the first input's compare selects (jax's fused max-pool
+        # gradient pair). Body: one compare on the first pair + selects.
+        from metaljax.ops.elementwise import _comparison_direction
+        first_cmp = next((o for o in body_ops
+                          if o.name == "stablehlo.compare"), None)
+        if first_cmp is None or any(b != 1 for b in bdil + wdil):
+            raise UnsupportedOpError(
+                f"variadic reduce_window body "
+                f"{[o.name for o in body_ops]} not implemented")
+        direction = _comparison_direction(first_cmp)
+        is_max = direction in ("GE", "GT")
+        x0, x1 = inputs
+        init0, init1 = ins[n:]
+        outs01 = []
+        args01 = []
+        for xi, initi in ((x0, init0), (x1, init1)):
+            xi_p = xi
+            if (pad != 0).any():
+                widths = [(int(lo), int(hi)) for lo, hi in pad]
+                xi_p = mx.pad(xi_p, widths,
+                              constant_values=initi.astype(xi.dtype))
+            args01.append(mx.contiguous(xi_p))
+        xp = args01[0]
+        es = []
+        acc = 1
+        for s in reversed(xp.shape):
+            es.append(acc)
+            acc *= s
+        es = es[::-1]
+        out_sizes = [max(0, (xp.shape[i] - int(wd[i])) // int(strides[i]) + 1)
+                     for i in range(rank)]
+        wflat = 1
+        for w_ in wd:
+            wflat *= int(w_)
+        wins = [mx.reshape(
+            mx.as_strided(a, tuple(out_sizes) + tuple(int(w) for w in wd),
+                          tuple(es[i] * int(strides[i]) for i in range(rank))
+                          + tuple(es), 0),
+            tuple(out_sizes) + (wflat,)) for a in args01]
+        arg = (mx.argmax if is_max else mx.argmin)(wins[0], axis=-1)
+        for wv in wins:
+            outs01.append(mx.squeeze(
+                mx.take_along_axis(wv, mx.expand_dims(arg, -1), axis=-1),
+                axis=-1))
+        return outs01
     if n != 1:
         raise UnsupportedOpError(
             f"variadic reduce_window ({n} inputs) not implemented")

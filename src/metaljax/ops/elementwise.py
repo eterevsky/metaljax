@@ -39,7 +39,8 @@ _UNARY = {
     "erf": mx.erf,
     "erf_inv": mx.erfinv,
     "exponential": mx.exp,
-    "exponential_minus_one": mx.expm1,
+    # MLX has no complex expm1 GPU kernel
+    "exponential_minus_one": lambda x: (mx.exp(x) - 1 if x.dtype == mx.complex64 else mx.expm1(x)),
     "floor": mx.floor,
     "is_finite": mx.isfinite,
     "log": mx.log,

@@ -225,6 +225,11 @@ def _scatter_combiner(op):
         }
         if name in table:
             return table[name]
+    # Arbitrary elementwise bodies (jax scatter_apply): evaluate the body
+    # on gathered current values + updates, then scatter-set. Only sound
+    # when indices are unique (scatter_apply guarantees it).
+    if all(o.name.startswith(("stablehlo.", "chlo.")) for o in body):
+        return "apply"
     raise UnsupportedOpError(
         f"scatter body {[o.name for o in body]} not implemented")
 
@@ -240,6 +245,18 @@ def _scatter(interp, op, ins, env):
         return operand
     d = _scatter_dims(op)
     method = _scatter_combiner(op)
+    if operand.dtype == mx.complex64:
+        # MLX GPU scatter has no complex64 kernels; set/add/subtract are
+        # componentwise, so run the scatter on the parts.
+        if method not in ("set", "add", "subtract"):
+            raise UnsupportedOpError(f"complex scatter {method}")
+        re = _scatter(interp, op,
+                      [mx.real(operand), scatter_indices, mx.real(updates)],
+                      env)
+        im = _scatter(interp, op,
+                      [mx.imag(operand), scatter_indices, mx.imag(updates)],
+                      env)
+        return re.astype(mx.complex64) + im.astype(mx.complex64) * 1j
     op_shape = list(operand.shape)
     idx_shape = list(scatter_indices.shape)
     upd_shape = list(updates.shape)
@@ -326,6 +343,20 @@ def _scatter(interp, op, ins, env):
         idx_list.append(base)
     idx_tuple = tuple(idx_list)
     updates_t = updates_t.astype(operand_t.dtype)
+    if method == "apply":
+        unique = ("unique_indices" in op.attributes
+                  and "true" in str(op.attributes["unique_indices"]))
+        if not unique:
+            raise UnsupportedOpError(
+                "scatter with computed body needs unique_indices")
+        from metaljax.ops.reduction import _eval_body
+        block = op.regions[0].blocks[0]
+        bargs = list(block.arguments)
+        old = operand_t[idx_tuple] if idx_tuple else operand_t
+        res = _eval_body(interp, block,
+                         {bargs[0]: old, bargs[1]: updates_t}, env)
+        updates_t = res[0].astype(operand_t.dtype)
+        method = "set"
     if oob is not None:
         oob = mx.reshape(oob, batch_shape + [1] * E)
     # XLA semantics: an update whose index has any out-of-bounds component

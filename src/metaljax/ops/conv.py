@@ -121,8 +121,23 @@ def _int_conv(x, w, strides, ldil, rdil, pad, flip, out_dtype):
 @register("stablehlo.convolution")
 def _convolution(interp, op, ins, env):
     lhs, rhs = ins
+    out_t = ir.RankedTensorType(op.results[0].type)
+    if any(s == 0 for s in out_t.shape):
+        return mx.zeros(list(out_t.shape),
+                        dtype=dtypes.mx_dtype_for(out_t.element_type))
     d = _conv_dims(op)
     rank = len(d["is"])
+    if rank == 0:
+        # No spatial dims: a plain (grouped) matmul over features.
+        x0 = mx.transpose(lhs, [d["ib"], d["if"]])
+        w0 = mx.transpose(rhs, [d["ko"], d["ki"]])
+        out = mx.matmul(x0.astype(mx.float32),
+                        mx.transpose(w0.astype(mx.float32)))
+        out = out.astype(dtypes.mx_dtype_for(out_t.element_type))
+        axes = [0, 0]
+        axes[d["ob"]] = 0
+        axes[d["of"]] = 1
+        return mx.transpose(out, axes)
     strides = _opt_list(op, "window_strides", [1] * rank)
     ldil = _opt_list(op, "lhs_dilation", [1] * rank)
     rdil = _opt_list(op, "rhs_dilation", [1] * rank)

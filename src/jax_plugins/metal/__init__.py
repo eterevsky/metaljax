@@ -57,5 +57,7 @@ def _register_linalg_lowerings():
             mlir.register_lowering(
                 prim, partial(rule, target_name_prefix="cpu"),
                 platform="metal")
+        mlir.register_lowering(ll.eig_p, ll._eig_cpu_lowering,
+                               platform="metal")
     except Exception as e:  # jax internals moved; degrade to unsupported
         logger.warning("metaljax: linalg lowering registration failed: %s", e)
