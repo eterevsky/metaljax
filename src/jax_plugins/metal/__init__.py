@@ -40,3 +40,22 @@ def initialize():
     # via JAX_PLATFORMS=metal / jax.config.update('jax_platforms', 'metal')
     # or jax.devices('metal').
     xb.register_plugin("metal", priority=-1, library_path=str(path))
+    _register_linalg_lowerings()
+
+
+def _register_linalg_lowerings():
+    """eigh/svd have no generic StableHLO lowering — jax only registers
+    per-platform rules. Reuse the CPU rules for platform 'metal': they
+    emit lapack_*_ffi custom_calls, which metaljax's interpreter
+    implements on the host (metaljax.ops.lapack)."""
+    try:
+        from functools import partial
+        from jax._src.interpreters import mlir
+        from jax._src.lax import linalg as ll
+        for prim, rule in ((ll.eigh_p, ll._eigh_cpu_gpu_lowering),
+                           (ll.svd_p, ll._svd_cpu_gpu_lowering)):
+            mlir.register_lowering(
+                prim, partial(rule, target_name_prefix="cpu"),
+                platform="metal")
+    except Exception as e:  # jax internals moved; degrade to unsupported
+        logger.warning("metaljax: linalg lowering registration failed: %s", e)

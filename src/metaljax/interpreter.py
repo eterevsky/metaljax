@@ -121,6 +121,9 @@ class Interpreter:
     # Set by ops.control: hook(interp, while_op) -> bool, True when the loop
     # has a small static trip count and can be unrolled inside a trace.
     while_traceable_hook = None
+    # Set by ops.lapack: hook(op) -> bool, True when a custom_call target
+    # computes on the host (numpy/scipy) and must stay out of traces.
+    custom_call_host_hook = None
 
     def __init__(self, module: bytes | str | ir.Module, context: ir.Context | None = None):
         # Caches keyed by ir.Block (pointer-stable identity across traversals).
@@ -213,6 +216,11 @@ class Interpreter:
                     continue  # statically-counted small loop: unrollable
                 pure = False
                 break
+            if name == "stablehlo.custom_call":
+                hook = type(self).custom_call_host_hook
+                if hook is not None and hook(o):
+                    pure = False
+                    break
             if name in ("func.call", "stablehlo.composite"):
                 attr = "callee" if name == "func.call" else "decomposition"
                 callee = ir.FlatSymbolRefAttr(o.attributes[attr]).value

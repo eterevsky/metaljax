@@ -82,3 +82,22 @@ module {
     b = np.random.default_rng(1).standard_normal((4, 5)).astype(np.float32)
     (out,) = interp(mx.array(a), mx.array(b))
     np.testing.assert_allclose(np.array(out), a @ b, rtol=1e-5, atol=1e-6)
+
+
+def test_lapack_qr_eigh_svd():
+    # host-computed custom_call targets (Qr/orgqr, syevd, gesdd)
+    rng2 = np.random.default_rng(5)
+    x = rng2.standard_normal((4, 4)).astype(np.float32)
+    r53 = rng2.standard_normal((5, 3)).astype(np.float32)
+    sym = (x + x.T).astype(np.float32)
+    # eigenvector/singular-vector signs are arbitrary: compare via
+    # reconstruction identities instead of raw factors.
+    check(lambda r: tuple(jnp.abs(v) for v in jnp.linalg.qr(r)), r53,
+          rtol=1e-4, atol=1e-5)
+    check(lambda s: jnp.sort(jnp.linalg.eigh(s)[0]), sym,
+          rtol=1e-4, atol=1e-5)
+    check(lambda x: jnp.linalg.svd(x, compute_uv=False), x,
+          rtol=1e-4, atol=1e-5)
+    check(lambda x: jnp.linalg.pinv(x), x, rtol=1e-3, atol=1e-4)
+    check(lambda r: jnp.linalg.lstsq(r, jnp.ones(5))[0], r53,
+          rtol=1e-3, atol=1e-4)

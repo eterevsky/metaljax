@@ -5,6 +5,7 @@ from metaljax.ops import (  # noqa: F401
     conv,
     elementwise,
     gather,
+    lapack,
     linalg,
     reduction,
     shape,

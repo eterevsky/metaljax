@@ -544,4 +544,8 @@ def _custom_call(interp, op, ins, env):
         return list(ins)
     if target == "shape_assertion":
         return []
+    from metaljax.ops import lapack
+    res = lapack.run_target(interp, op, ins, env)
+    if res is not None:
+        return res
     raise UnsupportedOpError(f"custom_call target {target!r} not implemented")
