@@ -135,8 +135,13 @@ _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 # ~5k steps of an S32768 run). Clear the cache after roughly this many
 # op-units of loop work have been flushed; the engine-level clears (compile
 # boundaries / 50k executes) are far too coarse for multi-hour single
-# executes.
-_LOOP_CLEAR_COST = int(os.environ.get("METALJAX_LOOP_CLEAR_COST", "100000"))
+# executes. Cadence: the observed worst case accumulated ~0.06 cached
+# buffers per op-unit, so 500k units/window grows ~30k buffers — far under
+# the limit — while clearing rarely enough to cost <2% on big models
+# (100k measured 6-11% slower on emb.1024 configs: every clear forces
+# re-mallocs of the working set). The clear-and-retry at the flush sites
+# remains the hard backstop for pathological workloads.
+_LOOP_CLEAR_COST = int(os.environ.get("METALJAX_LOOP_CLEAR_COST", "500000"))
 _flushed_cost = 0
 
 

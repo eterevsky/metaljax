@@ -331,32 +331,39 @@ def _scatter(interp, op, ins, env):
     # XLA semantics: an update whose index has any out-of-bounds component
     # is DROPPED. Clamping alone clobbers real data at the boundary
     # (jnp.nonzero/where pad with fill_value == size, bincount overflow
-    # slots, sparse fill indices).
-    if oob is not None and method != "set":
-        # Arithmetic combiners: write the combiner's identity instead —
-        # order/duplicate-safe by construction.
+    # slots, sparse fill indices). Two drop strategies:
+    # - dummy slot: append one row along the first indexed axis and
+    #   redirect dropped updates there (touches 2x the operand). Required
+    #   for "set" — neutralizing a set-update would race a genuine
+    #   duplicate write at the clamped slot (fill_value == size clamps
+    #   onto the last real slot, a systematic collision).
+    # - neutral value: rewrite dropped updates to the combiner's identity
+    #   (touches 2x the updates; order/duplicate-safe for arithmetic).
+    # Pick by data touched: embedding-grad scatters (big updates, small
+    # table) measured ~10% slower per texmo step under the neutral path.
+    use_dummy = oob is not None and idx_tuple and (
+        method == "set" or operand_t.size < updates_t.size)
+    if oob is not None and method != "set" and not use_dummy:
         mask = mx.reshape(oob, batch_shape + [1] * (E + len(free_dims)))
         updates_t = mx.where(
             mask, _combiner_neutral(method, operand_t.dtype), updates_t)
-    if method == "set":
-        # mx.array.at has no .set; __setitem__ is MLX's scatter-assign (it
-        # rebinds only this local array object, so no aliasing concerns).
-        if oob is not None and idx_tuple:
-            # Redirect dropped updates to a dummy slot appended along the
-            # first indexed axis. (Writing back the current value at the
-            # clamped position instead would race a genuine duplicate
-            # write there — fill_value == size clamps onto the last real
-            # slot, a systematic collision.)
-            ext = mx.concatenate(
-                [operand_t,
-                 mx.zeros((1,) + operand_t.shape[1:], dtype=operand_t.dtype)],
-                axis=0)
-            idx0 = mx.where(
-                oob, mx.array(operand_t.shape[0], dtype=mx.int32),
-                idx_tuple[0])
+    if use_dummy:
+        ext = mx.concatenate(
+            [operand_t,
+             mx.zeros((1,) + operand_t.shape[1:], dtype=operand_t.dtype)],
+            axis=0)
+        idx0 = mx.where(
+            oob, mx.array(operand_t.shape[0], dtype=mx.int32),
+            idx_tuple[0])
+        if method == "set":
+            # __setitem__ is MLX's scatter-assign (rebinds only this
+            # local array object, so no aliasing concerns).
             ext[(idx0,) + idx_tuple[1:]] = updates_t
-            res_t = ext[: operand_t.shape[0]]
-        elif idx_tuple:
+        else:
+            ext = getattr(ext.at[(idx0,) + idx_tuple[1:]], method)(updates_t)
+        res_t = ext[: operand_t.shape[0]]
+    elif method == "set":
+        if idx_tuple:
             res_t = operand_t
             res_t[idx_tuple] = updates_t
         else:
