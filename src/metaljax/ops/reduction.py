@@ -157,27 +157,44 @@ def _opt_i64_list(op, name, default):
     return default
 
 
-def _extract_windows(x, init, wd, strides, pad, rank):
-    """Pad with init and extract sliding windows: result shape
-    out_sizes + (prod(window),)."""
+def _extract_windows(x, init, wd, strides, pad, rank, bdil=None, wdil=None):
+    """Base-dilate + pad with init, then extract sliding (possibly
+    window-dilated) windows: result shape out_sizes + (prod(window),)."""
+    if bdil is not None and any(int(b) != 1 for b in bdil):
+        for ax, b in enumerate(bdil):
+            b = int(b)
+            if b == 1:
+                continue
+            shape = list(x.shape)
+            shape[ax] = shape[ax] * b
+            holes = mx.contiguous(
+                mx.broadcast_to(init.astype(x.dtype), tuple(shape)))
+            sl = [slice(None)] * rank
+            sl[ax] = slice(0, None, b)
+            holes[tuple(sl)] = x
+            sl[ax] = slice(0, shape[ax] - (b - 1))
+            x = holes[tuple(sl)]
     if (pad != 0).any():
         widths = [(int(lo), int(hi)) for lo, hi in pad]
         x = mx.pad(x, widths, constant_values=init.astype(x.dtype))
     x = mx.contiguous(x)
+    wdil = [1] * rank if wdil is None else [int(v) for v in wdil]
     es = []
     acc = 1
     for s in reversed(x.shape):
         es.append(acc)
         acc *= s
     es = es[::-1]
-    out_sizes = [max(0, (x.shape[i] - int(wd[i])) // int(strides[i]) + 1)
-                 for i in range(rank)]
+    out_sizes = [
+        max(0, (x.shape[i] - ((int(wd[i]) - 1) * wdil[i] + 1))
+            // int(strides[i]) + 1) for i in range(rank)]
     wflat = 1
     for w_ in wd:
         wflat *= int(w_)
     win = mx.as_strided(
         x, tuple(out_sizes) + tuple(int(w) for w in wd),
-        tuple(es[i] * int(strides[i]) for i in range(rank)) + tuple(es), 0)
+        tuple(es[i] * int(strides[i]) for i in range(rank))
+        + tuple(es[i] * wdil[i] for i in range(rank)), 0)
     return mx.reshape(win, tuple(out_sizes) + (wflat,))
 
 
@@ -225,11 +242,9 @@ def _reduce_window(interp, op, ins, env):
                     return [fn(x, axis=ax, reverse=True)]
 
     if n >= 2:
-        if any(b != 1 for b in bdil + wdil):
-            raise UnsupportedOpError(
-                "variadic reduce_window with dilations not implemented")
         inits_v = ins[n:]
-        wins = [_extract_windows(xi, initi, wd, strides, pad, rank)
+        wins = [_extract_windows(xi, initi, wd, strides, pad, rank,
+                                 bdil, wdil)
                 for xi, initi in zip(inputs, inits_v)]
         out_rank = len(wins[0].shape) - 1
         if wins[0].shape[-1] == 0 or any(
@@ -357,6 +372,7 @@ def _select_and_scatter(interp, op, ins, env):
     if (pad != 0).any():
         widths = [(int(lo), int(hi)) for lo, hi in pad]
         x = mx.pad(x, widths, constant_values=mx.array(fill, dtype=x.dtype))
+    x = mx.contiguous(x)  # as_strided requires row-contiguous
     elem_strides = []
     acc = 1
     for s in reversed(x.shape):
