@@ -63,6 +63,10 @@ def _concatenate(interp, op, ins, env):
 
 @register("stablehlo.convert")
 def _convert(interp, op, ins, env):
+    el = str(ir.RankedTensorType(op.results[0].type).element_type)
+    if el in dtypes.EMULATED:
+        # quantize onto the emulated dtype's value grid
+        return dtypes.quantize_emulated(ins[0], el)
     dt = dtypes.mx_result_dtype(op.results[0])
     x = ins[0]
     if x.dtype == mx.complex64 and dt != mx.complex64:

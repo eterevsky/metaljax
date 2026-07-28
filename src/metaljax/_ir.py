@@ -51,6 +51,13 @@ def tensor_type(value: ir.Value) -> ir.RankedTensorType:
 
 _TEXT_NP_DTYPES = {
     "bf16": "bfloat16",  # resolved via ml_dtypes below
+    "i4": "int4", "ui4": "uint4",
+    "f8E4M3FN": "float8_e4m3fn", "f8E5M2": "float8_e5m2",
+    "f8E4M3": "float8_e4m3", "f8E3M4": "float8_e3m4",
+    "f8E8M0FNU": "float8_e8m0fnu",
+    "f8E4M3B11FNUZ": "float8_e4m3b11fnuz",
+    "f8E5M2FNUZ": "float8_e5m2fnuz", "f8E4M3FNUZ": "float8_e4m3fnuz",
+    "f4E2M1FN": "float4_e2m1fn",
     "f16": "float16",
     "f32": "float32",
     "f64": "float64",
@@ -88,7 +95,8 @@ def dense_to_np(attr, ttype: ir.RankedTensorType):
     name = _TEXT_NP_DTYPES.get(el)
     if name is None:
         raise TypeError(f"cannot decode dense constant of element type {el}")
-    np_dtype = np.dtype(ml_dtypes.bfloat16) if name == "bfloat16" else np.dtype(name)
+    np_dtype = (np.dtype(getattr(ml_dtypes, name))
+                if hasattr(ml_dtypes, name) else np.dtype(name))
 
     s = str(attr)
     if not s.startswith("dense<"):

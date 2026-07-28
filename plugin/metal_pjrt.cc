@@ -303,6 +303,18 @@ size_t ItemSize(PJRT_Buffer_Type t) {
     case PJRT_Buffer_Type_S8:
     case PJRT_Buffer_Type_U8:
       return 1;
+    case PJRT_Buffer_Type_F8E5M2:
+    case PJRT_Buffer_Type_F8E4M3FN:
+    case PJRT_Buffer_Type_F8E4M3B11FNUZ:
+    case PJRT_Buffer_Type_F8E5M2FNUZ:
+    case PJRT_Buffer_Type_F8E4M3FNUZ:
+    case PJRT_Buffer_Type_F8E4M3:
+    case PJRT_Buffer_Type_F8E3M4:
+    case PJRT_Buffer_Type_F8E8M0FNU:
+    case PJRT_Buffer_Type_F4E2M1FN:
+    case PJRT_Buffer_Type_S4:
+    case PJRT_Buffer_Type_U4:
+      return 1;
     case PJRT_Buffer_Type_S16:
     case PJRT_Buffer_Type_U16:
     case PJRT_Buffer_Type_F16:

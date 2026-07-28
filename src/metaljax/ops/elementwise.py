@@ -219,9 +219,28 @@ _BINARY = {
     "shift_right_arithmetic": mx.right_shift,
 }
 
+_WRAP4 = {"add", "multiply", "subtract"}
+
+
+def _maybe_wrap4(op, ins, out):
+    # Emulated int4/uint4 live in i8/u8 storage: arithmetic must wrap
+    # to 4 bits like XLA. Only consulted when the storage type matches.
+    if out.dtype == mx.int8:
+        if str(ir.RankedTensorType(op.results[0].type).element_type) == "i4":
+            return (((out.astype(mx.int32) + 8) % 16) - 8).astype(mx.int8)
+    elif out.dtype == mx.uint8:
+        el = str(ir.RankedTensorType(op.results[0].type).element_type)
+        if el == "ui4":
+            return (out.astype(mx.int32) % 16).astype(mx.uint8)
+    return out
+
+
 for _name, _fn in _BINARY.items():
-    def _h(interp, op, ins, env, _fn=_fn):
-        return _fn(ins[0], ins[1])
+    def _h(interp, op, ins, env, _fn=_fn, _w=_name in _WRAP4):
+        out = _fn(ins[0], ins[1])
+        if _w and out.dtype in (mx.int8, mx.uint8):
+            out = _maybe_wrap4(op, ins, out)
+        return out
     register(f"stablehlo.{_name}")(_h)
 
 

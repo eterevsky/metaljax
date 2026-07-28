@@ -50,6 +50,7 @@ _MLIR_TO_MX = {
     "ui64": mx.uint64,
 }
 
+
 # numpy dtypes as JAX should see them (f64 stays f64 in metadata).
 _MLIR_TO_NP = {
     "complex<f32>": np.dtype(np.complex64),
@@ -67,6 +68,30 @@ _MLIR_TO_NP = {
     "ui32": np.dtype(np.uint32),
     "ui64": np.dtype(np.uint64),
 }
+
+
+# Emulated sub-byte / float8 dtypes (no MLX storage): values live EXACTLY
+# in a wider storage dtype (every f8 grid embeds in f16; E8M0's huge
+# exponent range needs f32; i4/u4 fit i8/u8). Host transfer converts
+# via ml_dtypes; stablehlo.convert quantizes onto the target grid.
+import ml_dtypes as _mld
+EMULATED = {
+    "f8E4M3FN":       (mx.float16, np.dtype(_mld.float8_e4m3fn)),
+    "f8E5M2":         (mx.float16, np.dtype(_mld.float8_e5m2)),
+    "f8E4M3":         (mx.float16, np.dtype(_mld.float8_e4m3)),
+    "f8E3M4":         (mx.float16, np.dtype(_mld.float8_e3m4)),
+    "f8E8M0FNU":      (mx.float32, np.dtype(_mld.float8_e8m0fnu)),
+    "f8E4M3B11FNUZ":  (mx.float16, np.dtype(_mld.float8_e4m3b11fnuz)),
+    "f8E5M2FNUZ":     (mx.float16, np.dtype(_mld.float8_e5m2fnuz)),
+    "f8E4M3FNUZ":     (mx.float16, np.dtype(_mld.float8_e4m3fnuz)),
+    "f4E2M1FN":       (mx.float16, np.dtype(_mld.float4_e2m1fn)),
+    "i4":             (mx.int8, np.dtype(_mld.int4)),
+    "ui4":            (mx.uint8, np.dtype(_mld.uint4)),
+}
+for _name, (_mxdt, _npdt) in EMULATED.items():
+    _MLIR_TO_MX[_name] = _mxdt
+    _MLIR_TO_NP[_name] = _npdt
+_EMULATED_BY_NP = {npdt: (name, mxdt) for name, (mxdt, npdt) in EMULATED.items()}
 
 
 def np_dtype_for_mlir(t: ir.Type) -> np.dtype:
@@ -137,6 +162,12 @@ def to_mx(arr: np.ndarray) -> mx.array:
     if not arr.flags.c_contiguous:
         # np.ascontiguousarray promotes 0-d to (1,); restore the shape.
         arr = np.ascontiguousarray(arr).reshape(arr.shape)
+    em = _EMULATED_BY_NP.get(arr.dtype)
+    if em is not None:
+        name, mxdt = em
+        wide = np.int8 if name == "i4" else (
+            np.uint8 if name == "ui4" else np.float32)
+        return mx.array(arr.astype(wide)).astype(mxdt)
     if arr.dtype == ml_dtypes.bfloat16:
         return mx.array(arr.astype(np.float32)).astype(mx.bfloat16)
     if arr.dtype == np.float64:
@@ -198,3 +229,52 @@ _UNSIGNED_OF = {
 
 def unsigned_of(d: mx.Dtype) -> mx.Dtype:
     return _UNSIGNED_OF.get(d, d)
+
+
+def quantize_emulated(x: mx.array, mlir_name: str) -> mx.array:
+    """Round values onto an emulated dtype's grid (storage dtype stays
+    wide). Normal range: RNE mantissa rounding in f32 bits; subnormal
+    range: uniform-grid rounding; overflow saturates (ml_dtypes
+    convention); NaN passes through."""
+    storage, npdt = EMULATED[mlir_name]
+    if mlir_name in ("i4",):
+        v = ((x.astype(mx.int32) + 8) % 16) - 8
+        return v.astype(mx.int8)
+    if mlir_name in ("ui4",):
+        return (x.astype(mx.int32) % 16).astype(mx.uint8)
+    fi = _mld.finfo(npdt)
+    man = fi.nmant
+    if mlir_name == "f8E8M0FNU":
+        # exponent-only log-scale format: nearest power of two
+        f = mx.maximum(x.astype(mx.float32), mx.array(1e-45, mx.float32))
+        e = mx.round(mx.log2(f))
+        e = mx.clip(e, float(fi.minexp), float(fi.maxexp))
+        return mx.power(mx.array(2.0, mx.float32), e)
+    f = x.astype(mx.float32)
+    isnan = mx.isnan(f)
+    # RNE mantissa rounding in f32 bit-space
+    u = mx.view(f, mx.uint32)
+    shift = 23 - man
+    half = mx.array((1 << (shift - 1)) - 1, dtype=mx.uint32)
+    lsb = (u >> shift) & mx.array(1, dtype=mx.uint32)
+    u = (u + half + lsb) & mx.array(~((1 << shift) - 1) & 0xFFFFFFFF,
+                                    dtype=mx.uint32)
+    rounded = mx.view(u, mx.float32)
+    # subnormal range: uniform grid of spacing tiny * 2^-man
+    tiny = float(fi.tiny)
+    step = tiny / (1 << man)
+    sub = mx.round(f / step) * step
+    q = mx.where(mx.abs(f) < tiny, sub, rounded)
+    # overflow: formats with inf produce +-inf, finite-only (FN/FNUZ)
+    # formats produce NaN (XLA convert semantics; ml_dtypes saturates,
+    # but the CPU backend does not)
+    mx_max = float(fi.max)
+    over = mx.abs(q) > mx_max
+    has_inf = mlir_name in ("f8E5M2", "f8E4M3", "f8E3M4")
+    if has_inf:
+        q = mx.where(over, mx.sign(q) * mx.array(float("inf"), mx.float32),
+                     q)
+    else:
+        q = mx.where(over, mx.array(float("nan"), mx.float32), q)
+    q = mx.where(isnan, f, q)
+    return q.astype(storage)

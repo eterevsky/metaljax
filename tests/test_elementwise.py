@@ -124,3 +124,17 @@ module {
     a, b = Interpreter(mod)()
     assert np.all(np.isneginf(np.array(a.astype(mx.float32))))
     assert float(np.array(b.astype(mx.float32))) == 1.0
+
+
+def test_emulated_dtypes_i4_f8():
+    # int4/uint4 in i8/u8 storage with 4-bit wraparound; float8 as exact
+    # values in f16 with grid quantization on convert.
+    check(lambda x: x.astype(jnp.float8_e4m3fn).astype(jnp.float32),
+          np.array([1.7, 300.0, 1e-6, -2.5], np.float32))
+    check(lambda x: x.astype(jnp.float8_e5m2).astype(jnp.float32),
+          np.array([1e6, np.nan, 0.1], np.float32))
+    check(lambda a, b: (a.astype(jnp.int4) + b.astype(jnp.int4))
+          .astype(jnp.int32),
+          np.array([7, -8], np.int32), np.array([1, -1], np.int32))
+    check(lambda x: x.astype(jnp.uint4).astype(jnp.int32),
+          np.array([3, 17], np.int32))
