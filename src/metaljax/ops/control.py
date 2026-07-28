@@ -397,6 +397,15 @@ def _while(interp, op, ins, env):
         if res is not None:
             return res
         if interp._in_trace:
+            if trip > 64:
+                # Reachable only when a loop promised as traceable (an
+                # MSL plan existed at cost time) fell through at run
+                # time: unrolling thousands of iterations into the
+                # enclosing trace exhausts Metal's buffer budget. Abort
+                # the trace; the engine falls back to the eager path.
+                raise RuntimeError(
+                    f"metaljax: refusing to unroll trip={trip} inside a "
+                    "trace (msl plan fell through)")
             # An enclosing mx.compile is tracing us (only possible for
             # unrollable loops): inline the iterations into that graph.
             if _DEBUG:

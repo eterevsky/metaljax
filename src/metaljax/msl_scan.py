@@ -1660,7 +1660,8 @@ class Plan:
                         tuple(sym.shape))
             if isinstance(sym, SymAccDot):
                 return ("dot", resolve(sym.lhs), resolve(sym.rhs), sym.dims,
-                        sym.perm, len(sym.lhs.shape), len(sym.rhs.shape))
+                        sym.perm, tuple(sym.lhs.shape),
+                        tuple(sym.rhs.shape))
             if _contains_accdot(sym):
                 raise _Unsupported(
                     f"acc under elementwise: {_dump(sym)[:200]}")
@@ -2878,9 +2879,16 @@ class Plan:
                     arr = mx.transpose(arr, (0,) + tuple(p + 1 for p in perm))
                 return mx.reshape(arr, (self.trip,) + shape)
             # dot, keeping the time axis: batched matmul with z as batch
-            _, lspec, rspec, dims, perm, lrank, rrank = spec
+            _, lspec, rspec, dims, perm, lshape, rshape = spec
+            lrank, rrank = len(lshape), len(rshape)
             lb, rb, lc, rc = dims
             A, Bv = stacked(lspec), stacked(rspec)
+            # hidden stacks may have been unit-squeezed at plan time;
+            # restore the operand's exact rank (free: all-unit dims)
+            if A.shape[1:] != tuple(lshape):
+                A = mx.reshape(A, (A.shape[0],) + tuple(lshape))
+            if Bv.shape[1:] != tuple(rshape):
+                Bv = mx.reshape(Bv, (Bv.shape[0],) + tuple(rshape))
             zb_l = [0] + [d + 1 for d in lb]
             zb_r = [0] + [d + 1 for d in rb]
             c_l = [d + 1 for d in lc]

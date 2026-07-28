@@ -210,6 +210,11 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
     if _CLEAR_PERIOD and _exec_count % _CLEAR_PERIOD == 0:
         mx.clear_cache()
     args = [b.data for b in buffers]
+    # NB retries happen AFTER the except block: the in-flight exception's
+    # traceback pins every array of the failed attempt (a failed
+    # whole-main trace can hold hundreds of thousands of buffers), so a
+    # retry inside the handler inherits the exhaustion it is retrying.
+    retry = None  # "same" | "eager"
     try:
         outs = list(ex.runner()(*args))
         if outs:
@@ -219,13 +224,15 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
                 mx.async_eval(*outs)
     except (RuntimeError, IndexError, ValueError) as e:
         if isinstance(e, RuntimeError) and "Resource limit" in str(e):
-            # Metal buffer-handle exhaustion, not a graph problem: purge
-            # MLX's cache and retry the same path once (programs are pure,
-            # so re-running from unchanged inputs is safe).
-            mx.clear_cache()
-            outs = list(ex.runner()(*args))
-            if outs:
-                mx.eval(*outs)
+            # Metal buffer-handle exhaustion: if the failure came from a
+            # compile attempt, drop to eager; else retry the same path
+            # once (programs are pure — re-running is safe).
+            if ex._can_compile:
+                ex._can_compile = False
+                ex._compiled = None
+                retry = "eager"
+            else:
+                retry = "same"
         else:
             # MLX's compiler can reject certain traces (fused-kernel
             # argument-buffer exhaustion; unordered_map::at on graphs with
@@ -234,9 +241,13 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
                 raise
             ex._can_compile = False
             ex._compiled = None
-            outs = list(ex.interpreter(*args))
-            if outs:
-                mx.eval(*outs)
+            retry = "eager"
+    if retry is not None:
+        mx.clear_cache()
+        runner = ex.interpreter if retry == "eager" else ex.runner()
+        outs = list(runner(*args))
+        if outs:
+            mx.eval(*outs)
     res = []
     for arr, type_enum, dims in zip(outs, ex.out_types, ex.out_dims):
         res.append(MetalBuffer(arr, type_enum, dims))
