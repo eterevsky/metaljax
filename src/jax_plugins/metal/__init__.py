@@ -100,6 +100,14 @@ def _register_linalg_lowerings():
 
         mlir.register_lowering(ll.triangular_solve_p, tri_solve_rule,
                                platform="metal")
+
+        def tridiag_solve_rule(ctx, dl, d, du, b, *,
+                               perturb_singular=False, **_):
+            return emit(ctx, "metaljax_tridiagonal_solve", [dl, d, du, b],
+                        "p" if perturb_singular else "-")
+
+        mlir.register_lowering(ll.tridiagonal_solve_p, tridiag_solve_rule,
+                               platform="metal")
         mlir.register_lowering(ll.schur_p, schur_rule, platform="metal")
         mlir.register_lowering(ll.hessenberg_p, hessenberg_rule,
                                platform="metal")
@@ -118,6 +126,7 @@ def _register_linalg_lowerings():
             "metaljax_eigh", "metaljax_svd", "metaljax_eig",
             "metaljax_schur", "metaljax_hessenberg",
             "metaljax_tridiagonal", "metaljax_triangular_solve",
+            "metaljax_tridiagonal_solve", "metaljax_callback",
         }
     except Exception as e:  # jax internals moved; degrade to unsupported
         logger.warning("metaljax: linalg lowering registration failed: %s", e)

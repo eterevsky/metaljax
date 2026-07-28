@@ -205,6 +205,11 @@ def _metal_svd(op, ins):
 
     def one(x):
         m, n = x.shape
+        if not np.isfinite(x).all():
+            return tuple(np.full(spec[0][nb:], np.nan, dtype=spec[1])
+                         if np.issubdtype(spec[1], np.inexact)
+                         else np.zeros(spec[0][nb:], dtype=spec[1])
+                         for spec in specs)
         if not compute_uv:
             return (np.linalg.svd(x, compute_uv=False),)
         u_cols = specs[1][0][nb:][1]
@@ -406,3 +411,27 @@ def _metal_tri_solve(op, ins):
         return (x,)
     # custom-call target convention: list of numpy arrays
     return _batch_apply(one, [a, b], batch, specs)
+
+
+@_target("metaljax_tridiagonal_solve")
+def _metal_tridiag_solve(op, ins):
+    dl, d, du, b = (_np_in(x) for x in ins)
+    perturb = "p" in _ir.str_attr(op, "backend_config")
+    specs = _result_specs(op)
+    batch = b.shape[:-2]
+
+    def one(dl_, d_, du_, b_):
+        n = d_.shape[0]
+        m = np.zeros((n, n), dtype=d_.dtype)
+        np.fill_diagonal(m, d_)
+        if n > 1:
+            m[np.arange(1, n), np.arange(n - 1)] = dl_[1:]
+            m[np.arange(n - 1), np.arange(1, n)] = du_[:-1]
+        if perturb:
+            dd = np.diagonal(m).copy()
+            eps = max(np.abs(dd).max(), 1.0) * 1e-30
+            bad = np.abs(dd) < eps
+            if bad.any():
+                np.fill_diagonal(m, np.where(bad, eps, dd))
+        return (np.linalg.solve(m, b_),)
+    return _batch_apply(one, [dl, d, du, b], batch, specs)
