@@ -88,6 +88,18 @@ def _register_linalg_lowerings():
             return emit(ctx, "metaljax_tridiagonal", [operand],
                         "L" if lower else "U")
 
+        def tri_solve_rule(ctx, a, b, *, left_side, lower, transpose_a,
+                           conjugate_a, unit_diagonal,
+                           perturb_singular=False, **_):
+            cfg = (("L" if left_side else "R") + ("l" if lower else "u")
+                   + ("t" if transpose_a else "n")
+                   + ("c" if conjugate_a else "-")
+                   + ("1" if unit_diagonal else "0")
+                   + ("p" if perturb_singular else "-"))
+            return emit(ctx, "metaljax_triangular_solve", [a, b], cfg)
+
+        mlir.register_lowering(ll.triangular_solve_p, tri_solve_rule,
+                               platform="metal")
         mlir.register_lowering(ll.schur_p, schur_rule, platform="metal")
         mlir.register_lowering(ll.hessenberg_p, hessenberg_rule,
                                platform="metal")
@@ -96,5 +108,14 @@ def _register_linalg_lowerings():
         mlir.register_lowering(ll.eigh_p, eigh_rule, platform="metal")
         mlir.register_lowering(ll.svd_p, svd_rule, platform="metal")
         mlir.register_lowering(ll.eig_p, eig_rule, platform="metal")
+        # jax.export refuses to serialize custom calls without a
+        # registered stability guarantee; ours are versioned with the
+        # plugin itself, so they are as stable as the platform.
+        from jax._src.export import _export
+        _export._CUSTOM_CALL_TARGETS_GUARANTEED_STABLE |= {
+            "metaljax_eigh", "metaljax_svd", "metaljax_eig",
+            "metaljax_schur", "metaljax_hessenberg",
+            "metaljax_tridiagonal", "metaljax_triangular_solve",
+        }
     except Exception as e:  # jax internals moved; degrade to unsupported
         logger.warning("metaljax: linalg lowering registration failed: %s", e)

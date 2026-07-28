@@ -115,6 +115,14 @@ def _reduce(interp, op, ins, env):
         if first in ("GT", "GE", "LT", "LE"):
             d = dims[0]
             is_max = first in ("GT", "GE")
+            if any(s == 0 for s in inputs[0].shape):
+                # zero-size batch dims: empty results (jax forbids
+                # argmax over an empty reduced axis, so only batch dims
+                # can be 0 here); MLX reducers crash on empties.
+                out_shape = [s for i, s in enumerate(inputs[0].shape)
+                             if i != d]
+                return [mx.zeros(out_shape, dtype=inputs[0].dtype),
+                        mx.zeros(out_shape, dtype=inputs[1].dtype)]
             val = (mx.max if is_max else mx.min)(inputs[0], axis=d)
             arg = (mx.argmax if is_max else mx.argmin)(inputs[0], axis=d)
             if dtypes.is_float(inputs[0].dtype):
@@ -147,6 +155,30 @@ def _opt_i64_list(op, name, default):
     if name in op.attributes:
         return _ir.i64_list(op, name)
     return default
+
+
+def _extract_windows(x, init, wd, strides, pad, rank):
+    """Pad with init and extract sliding windows: result shape
+    out_sizes + (prod(window),)."""
+    if (pad != 0).any():
+        widths = [(int(lo), int(hi)) for lo, hi in pad]
+        x = mx.pad(x, widths, constant_values=init.astype(x.dtype))
+    x = mx.contiguous(x)
+    es = []
+    acc = 1
+    for s in reversed(x.shape):
+        es.append(acc)
+        acc *= s
+    es = es[::-1]
+    out_sizes = [max(0, (x.shape[i] - int(wd[i])) // int(strides[i]) + 1)
+                 for i in range(rank)]
+    wflat = 1
+    for w_ in wd:
+        wflat *= int(w_)
+    win = mx.as_strided(
+        x, tuple(out_sizes) + tuple(int(w) for w in wd),
+        tuple(es[i] * int(strides[i]) for i in range(rank)) + tuple(es), 0)
+    return mx.reshape(win, tuple(out_sizes) + (wflat,))
 
 
 @register("stablehlo.reduce_window")
@@ -192,56 +224,36 @@ def _reduce_window(interp, op, ins, env):
                 if pad[ax, 0] == 0 and pad[ax, 1] == size - 1:
                     return [fn(x, axis=ax, reverse=True)]
 
-    if n == 2:
-        # select_and_gather_add: window-reduce two inputs by picking the
-        # element the first input's compare selects (jax's fused max-pool
-        # gradient pair). Body: one compare on the first pair + selects.
+    if n >= 2:
+        if any(b != 1 for b in bdil + wdil):
+            raise UnsupportedOpError(
+                "variadic reduce_window with dilations not implemented")
+        inits_v = ins[n:]
+        wins = [_extract_windows(xi, initi, wd, strides, pad, rank)
+                for xi, initi in zip(inputs, inits_v)]
+        out_rank = len(wins[0].shape) - 1
+        if wins[0].shape[-1] == 0 or any(
+                s == 0 for s in wins[0].shape[:-1]):
+            return [mx.broadcast_to(i.astype(x.dtype),
+                                    wins[0].shape[:-1])
+                    for i, x in zip(inits_v, inputs)]
+        # Fast path — select_and_gather_add: one compare on the first
+        # pair + selects picks a single window element for all outputs.
         from metaljax.ops.elementwise import _comparison_direction
         first_cmp = next((o for o in body_ops
                           if o.name == "stablehlo.compare"), None)
-        if first_cmp is None or any(b != 1 for b in bdil + wdil):
-            raise UnsupportedOpError(
-                f"variadic reduce_window body "
-                f"{[o.name for o in body_ops]} not implemented")
-        direction = _comparison_direction(first_cmp)
-        is_max = direction in ("GE", "GT")
-        x0, x1 = inputs
-        init0, init1 = ins[n:]
-        outs01 = []
-        args01 = []
-        for xi, initi in ((x0, init0), (x1, init1)):
-            xi_p = xi
-            if (pad != 0).any():
-                widths = [(int(lo), int(hi)) for lo, hi in pad]
-                xi_p = mx.pad(xi_p, widths,
-                              constant_values=initi.astype(xi.dtype))
-            args01.append(mx.contiguous(xi_p))
-        xp = args01[0]
-        es = []
-        acc = 1
-        for s in reversed(xp.shape):
-            es.append(acc)
-            acc *= s
-        es = es[::-1]
-        out_sizes = [max(0, (xp.shape[i] - int(wd[i])) // int(strides[i]) + 1)
-                     for i in range(rank)]
-        wflat = 1
-        for w_ in wd:
-            wflat *= int(w_)
-        wins = [mx.reshape(
-            mx.as_strided(a, tuple(out_sizes) + tuple(int(w) for w in wd),
-                          tuple(es[i] * int(strides[i]) for i in range(rank))
-                          + tuple(es), 0),
-            tuple(out_sizes) + (wflat,)) for a in args01]
-        arg = (mx.argmax if is_max else mx.argmin)(wins[0], axis=-1)
-        for wv in wins:
-            outs01.append(mx.squeeze(
+        n_selects = sum(o.name == "stablehlo.select" for o in body_ops)
+        n_cmps = sum(o.name == "stablehlo.compare" for o in body_ops)
+        if first_cmp is not None and n_cmps == 1 and n_selects >= n:
+            direction = _comparison_direction(first_cmp)
+            is_max = direction in ("GE", "GT")
+            arg = (mx.argmax if is_max else mx.argmin)(wins[0], axis=-1)
+            return [mx.squeeze(
                 mx.take_along_axis(wv, mx.expand_dims(arg, -1), axis=-1),
-                axis=-1))
-        return outs01
-    if n != 1:
-        raise UnsupportedOpError(
-            f"variadic reduce_window ({n} inputs) not implemented")
+                axis=-1) for wv in wins]
+        # General variadic body: pairwise reduction over the window axis.
+        return _generic_reduce(interp, op, wins, list(inits_v),
+                               [out_rank], env)
     (init,) = ins[n:]
 
     # General path: pad with the init value, extract windows with

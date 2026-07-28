@@ -288,11 +288,13 @@ def _triangular_solve(interp, op, ins, env):
         elif "TRANSPOSE" in ta and "NO_" not in ta:
             m, lo = m.swapaxes(-1, -2), not lower
         if left:
-            x = solve_triangular(m, bb, lower=lo, unit_diagonal=unit)
+            x = solve_triangular(m, bb, lower=lo, unit_diagonal=unit,
+                                 check_finite=False)
         else:
             # X op(A) = B  <=>  op(A)^T X^T = B^T
             x = solve_triangular(m.swapaxes(-1, -2), bb.swapaxes(-1, -2),
-                                 lower=not lo, unit_diagonal=unit)
+                                 lower=not lo, unit_diagonal=unit,
+                                 check_finite=False)
             x = x.swapaxes(-1, -2)
         return (x,)
     return dtypes.to_mx(_batch_apply(one, [a, b], batch, specs)[0])
@@ -326,7 +328,7 @@ def _metal_schur(op, ins):
 
     def one(x):
         kind = "complex" if np.iscomplexobj(x) else "real"
-        t, z = schur(x, output=kind)
+        t, z = schur(x, output=kind, check_finite=False)
         return (t, z)[: len(specs)]
     return _batch_apply(one, [a], batch, specs)
 
@@ -361,3 +363,46 @@ def _metal_tridiagonal(op, ins):
         c, d, e, tau, info = sytrd(x, lower=int(lower))
         return c, d, e, tau
     return _batch_apply(one, [a], batch, specs)
+
+
+@_target("metaljax_triangular_solve")
+def _metal_tri_solve(op, ins):
+    # cfg: side L/R, lower l/u, transpose t/n, conj c/-, unit 1/0,
+    # perturb p/-  (see the plugin's tri_solve_rule)
+    from scipy.linalg import solve_triangular
+    a, b = (_np_in(x) for x in ins)
+    cfg = _ir.str_attr(op, "backend_config")
+    left, lower = cfg[0] == "L", cfg[1] == "l"
+    trans, conj = cfg[2] == "t", cfg[3] == "c"
+    unit, perturb = cfg[4] == "1", cfg[5] == "p"
+    specs = _result_specs(op)
+    batch = b.shape[:-2]
+    a = np.broadcast_to(a, batch + a.shape[-2:])
+
+    def one(aa, bb):
+        m, lo = aa, lower
+        if conj:
+            m = m.conj()
+        if trans:
+            m, lo = m.swapaxes(-1, -2), not lo
+        if perturb and not unit:
+            # XLA's perturb_singular: nudge tiny diagonal entries so the
+            # solve produces finite values instead of inf/nan.
+            d = np.diagonal(m).copy()
+            tiny = np.finfo(np.float64).tiny if m.dtype.kind == "f" else 0
+            eps = max(np.abs(d).max(), 1.0) * 1e-30
+            bad = np.abs(d) < eps
+            if bad.any():
+                m = m.copy()
+                np.fill_diagonal(m, np.where(bad, eps, d))
+        if left:
+            x = solve_triangular(m, bb, lower=lo, unit_diagonal=unit,
+                                 check_finite=False)
+        else:
+            x = solve_triangular(m.swapaxes(-1, -2), bb.swapaxes(-1, -2),
+                                 lower=not lo, unit_diagonal=unit,
+                                 check_finite=False)
+            x = x.swapaxes(-1, -2)
+        return (x,)
+    # custom-call target convention: list of numpy arrays
+    return _batch_apply(one, [a, b], batch, specs)

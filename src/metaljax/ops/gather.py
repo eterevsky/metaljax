@@ -13,6 +13,18 @@ from metaljax import _ir, dtypes
 from metaljax.interpreter import register, UnsupportedOpError
 
 
+def _assign(dst, idx, upd):
+    """Scatter-assign that survives complex64 (MLX has no complex GPU
+    scatter kernels): write the parts, recombine."""
+    if dst.dtype == mx.complex64:
+        re, im = mx.real(dst), mx.imag(dst)
+        re[idx] = mx.real(upd)
+        im[idx] = mx.imag(upd)
+        return re.astype(mx.complex64) + im.astype(mx.complex64) * 1j
+    dst[idx] = upd
+    return dst
+
+
 def _combiner_neutral(method, dtype):
     """Update value that makes the combiner a no-op (for dropped updates)."""
     if method in ("add", "subtract"):
@@ -223,8 +235,17 @@ def _scatter_combiner(op):
             "stablehlo.minimum": "minimum",
             "stablehlo.subtract": "subtract",
         }
-        if name in table:
-            return table[name]
+        args = list(block.arguments)
+        operands = list(body[0].operands)
+        # A genuine combiner takes both block args; f(operand)-style
+        # bodies (scatter_apply) must NOT be treated as combiners.
+        # subtract is order-sensitive; the rest are commutative.
+        if name in table and len(args) == 2:
+            if name == "stablehlo.subtract":
+                if operands == args:
+                    return table[name]
+            elif set(operands) == set(args):
+                return table[name]
     # Arbitrary elementwise bodies (jax scatter_apply): evaluate the body
     # on gathered current values + updates, then scatter-set. Only sound
     # when indices are unique (scatter_apply guarantees it).
@@ -246,17 +267,22 @@ def _scatter(interp, op, ins, env):
     d = _scatter_dims(op)
     method = _scatter_combiner(op)
     if operand.dtype == mx.complex64:
-        # MLX GPU scatter has no complex64 kernels; set/add/subtract are
-        # componentwise, so run the scatter on the parts.
-        if method not in ("set", "add", "subtract"):
+        # MLX GPU scatter has no complex64 kernels. set/add/subtract are
+        # componentwise -> run on the parts; multiply is not, but with
+        # unique indices it is exactly the apply path (gather old,
+        # combine, set), which bottoms out in componentwise sets.
+        if method == "multiply":
+            method = "apply"
+        if method not in ("set", "add", "subtract", "apply"):
             raise UnsupportedOpError(f"complex scatter {method}")
-        re = _scatter(interp, op,
-                      [mx.real(operand), scatter_indices, mx.real(updates)],
-                      env)
-        im = _scatter(interp, op,
-                      [mx.imag(operand), scatter_indices, mx.imag(updates)],
-                      env)
-        return re.astype(mx.complex64) + im.astype(mx.complex64) * 1j
+        if method != "apply":
+            re = _scatter(interp, op,
+                          [mx.real(operand), scatter_indices,
+                           mx.real(updates)], env)
+            im = _scatter(interp, op,
+                          [mx.imag(operand), scatter_indices,
+                           mx.imag(updates)], env)
+            return re.astype(mx.complex64) + im.astype(mx.complex64) * 1j
     op_shape = list(operand.shape)
     idx_shape = list(scatter_indices.shape)
     upd_shape = list(updates.shape)
@@ -348,12 +374,41 @@ def _scatter(interp, op, ins, env):
     if method == "apply":
         unique = ("unique_indices" in op.attributes
                   and "true" in str(op.attributes["unique_indices"]))
-        if not unique:
-            raise UnsupportedOpError(
-                "scatter with computed body needs unique_indices")
         from metaljax.ops.reduction import _eval_body
         block = op.regions[0].blocks[0]
         bargs = list(block.arguments)
+        if not unique:
+            # Order-dependent duplicates: apply updates one at a time
+            # (XLA applies them in some sequential order; combiners are
+            # required to be associative but not idempotent). Bounded —
+            # the general-body-with-duplicates pattern only shows up in
+            # small op-semantics tests.
+            nb_ = 1
+            for s in batch_shape:
+                nb_ *= s
+            if E or nb_ > 1024:
+                raise UnsupportedOpError(
+                    f"scatter computed-body with duplicates: "
+                    f"{nb_} updates, windowed={bool(E)}")
+            flat_idx = [mx.reshape(mapped[dim], (nb_,))
+                        for dim in indexed_dims]
+            upd_f = mx.reshape(
+                updates_t, (nb_,) + tuple(updates_t.shape[len(batch_shape):]))
+            oob_f = (mx.reshape(oob, (nb_,)) if oob is not None else None)
+            res_t = operand_t
+            for i in range(nb_):
+                sel = tuple(f[i] for f in flat_idx)
+                old = res_t[sel]
+                new = _eval_body(interp, block,
+                                 {bargs[0]: old, bargs[1]: upd_f[i]},
+                                 env)[0].astype(res_t.dtype)
+                if oob_f is not None:
+                    new = mx.where(oob_f[i], old, new)
+                res_t = _assign(res_t, sel, new)
+            inv = [0] * len(op_shape)
+            for pos, dim in enumerate(indexed_dims + free_dims):
+                inv[dim] = pos
+            return mx.transpose(res_t, inv)
         old = operand_t[idx_tuple] if idx_tuple else operand_t
         res = _eval_body(interp, block,
                          {bargs[0]: old, bargs[1]: updates_t}, env)
@@ -389,16 +444,15 @@ def _scatter(interp, op, ins, env):
             oob, mx.array(operand_t.shape[0], dtype=mx.int32),
             idx_tuple[0])
         if method == "set":
-            # __setitem__ is MLX's scatter-assign (rebinds only this
-            # local array object, so no aliasing concerns).
-            ext[(idx0,) + idx_tuple[1:]] = updates_t
+            # scatter-assign rebinds only this local array object,
+            # so no aliasing concerns.
+            ext = _assign(ext, (idx0,) + idx_tuple[1:], updates_t)
         else:
             ext = getattr(ext.at[(idx0,) + idx_tuple[1:]], method)(updates_t)
         res_t = ext[: operand_t.shape[0]]
     elif method == "set":
         if idx_tuple:
-            res_t = operand_t
-            res_t[idx_tuple] = updates_t
+            res_t = _assign(operand_t, idx_tuple, updates_t)
         else:
             res_t = updates_t
     else:
