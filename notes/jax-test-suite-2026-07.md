@@ -195,3 +195,11 @@ every failing file, consolidated):
   * singular tri/tridiag solves returning inf/nan instead of raising
     (5), NaN-placement in approx_top_k padding (1), scan-grad
     fixedpoint corner (1), holomorphic-grad tolerance (1).
+
+## 0.5.0 final (2026-07-29)
+
+**27,779 passed / 418 failed / 6,191 skipped -> 98.40%** (0.4.1:
+96.7%; 0.4.0: 95.4%; first run: 79.6%). texmo gate 104/104;
+mid08/big15 perf at baseline. Remaining 418 = ~33 intentional
+(f64/complex128/multi-device/denormals) + ~150 version-skew/harness +
+~235 audited best-effort (dispositions above).

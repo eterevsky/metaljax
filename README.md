@@ -121,10 +121,12 @@ print(g, g.device)"
 ## Coverage and known gaps
 
 Running the entire upstream `jax/tests` suite against metaljax executes
-~28,200 tests with **96.7% passing** (27,304 passed / 898 failed as of
-v0.4.1; the remainder is dominated by `rbg`-PRNG bit-streams,
-int4/float8 dtypes, host callbacks, and version skew against the test
-checkout — see the notes for per-category plans). The gaps fall into three groups:
+~28,200 tests with **98.4% passing** (27,779 passed / 418 failed as of
+v0.5.0). Roughly half the remainder is version skew against the test
+checkout and test infrastructure that doesn't know the platform; the
+rest is audited, documented best-effort residue (complex special
+values at poles, ordered-effect tokens, a few PJRT surface APIs) —
+see the notes for the per-item audit. The gaps fall into three groups:
 
 **Intentional (platform constraints, will not change):**
 
@@ -139,12 +141,11 @@ checkout — see the notes for per-category plans). The gaps fall into three gro
   asserting subnormal outputs (e.g. `jnp.spacing`) differ from CPU.
 
 **Not yet implemented (see `notes/jax-test-suite-2026-07.md` for the
-full taxonomy and per-item plans):**
+audited per-item dispositions):**
 
-- `rng_bit_generator` (the `rbg` PRNG implementation; the default
-  threefry PRNG is fully supported and bit-exact vs CPU)
-- int4 / float8 dtypes (emulation planned; no MLX storage today)
-- `debug_print`/host callbacks, >3-D convolutions
+- ordered-effect token threading; complex64 special values at
+  inf/NaN poles; >3-D convolutions; a few PJRT surface APIs
+  (`unsafe_buffer_pointer`, buffer donation, pinned-host memory)
 
 **Supported** (each verified against the CPU backend): sorting
 (`sort`/`argsort`/`top_k`/`approx_top_k`/`median`/`percentile`/
@@ -162,7 +163,13 @@ Hessenberg — CPU-bound in every backend, free on unified memory) —
 **including bfloat16/float16 inputs, which jax's CPU backend itself
 rejects** (computed in f32, results in the requested dtype);
 single-device `pmap`/`shard_map` with the full collective set;
-`popcnt`/`count_leading_zeros`; sparse (BCOO/BCSR) workloads.
+`rng_bit_generator` (Philox and ThreeFry, **bit-exact vs CPU**, so the
+`rbg`/`unsafe_rbg` PRNG implementations work); int4/uint4 and all
+float8 dtypes (emulated: exact values in wider storage, grid-quantized
+converts, 4-bit wraparound); host callbacks (`jax.debug.print`,
+`pure_callback`, `io_callback`); shape-polymorphic `jax.export` of all
+of the above; `popcnt`/`count_leading_zeros`; sparse (BCOO/BCSR)
+workloads.
 
 **Behavioral differences under investigation** are tracked in the notes
 file above. Unsupported constructs fail loudly at compile time with the
