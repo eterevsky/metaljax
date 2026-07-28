@@ -108,6 +108,8 @@ def _register_linalg_lowerings():
         mlir.register_lowering(ll.eigh_p, eigh_rule, platform="metal")
         mlir.register_lowering(ll.svd_p, svd_rule, platform="metal")
         mlir.register_lowering(ll.eig_p, eig_rule, platform="metal")
+        _register_callback_lowerings(mlir)
+
         # jax.export refuses to serialize custom calls without a
         # registered stability guarantee; ours are versioned with the
         # plugin itself, so they are as stable as the platform.
@@ -119,3 +121,59 @@ def _register_linalg_lowerings():
         }
     except Exception as e:  # jax internals moved; degrade to unsupported
         logger.warning("metaljax: linalg lowering registration failed: %s", e)
+
+
+def _register_callback_lowerings(mlir):
+    """jax.debug.print / debug_callback / pure_callback on metal: stash
+    the Python callable in metaljax's registry and emit a
+    metaljax_callback custom call with its index (we run in-process, so
+    the interpreter can just call it)."""
+    from functools import partial
+    from jax._src import debugging
+
+    def emit_callback(ctx, args, callback, with_results=True):
+        from metaljax.ops import callbacks as cb_mod
+        idx = cb_mod.register_callback(callback)
+        out_types = ([mlir.aval_to_ir_type(ctx.module_context, a)
+                      for a in ctx.avals_out] if with_results else [])
+        op = mlir.custom_call(
+            "metaljax_callback", result_types=out_types,
+            operands=list(args), backend_config=str(idx),
+            has_side_effect=True)
+        try:
+            if ctx.tokens_in:
+                ctx.set_tokens_out(ctx.tokens_in)
+        except Exception:
+            pass
+        return list(op.results)
+
+    def debug_cb_rule(ctx, *args, effect, partitioned, callback, **params):
+        return emit_callback(ctx, args, callback, with_results=False)
+
+    def debug_print_rule(ctx, *dyn_args, fmt, ordered, partitioned,
+                         in_tree, static_args, np_printoptions,
+                         has_placeholders, logging_record):
+        callback = partial(
+            debugging._format_print_callback, fmt, dict(np_printoptions),
+            has_placeholders, logging_record)
+        callback = debugging._make_flat_callback(
+            in_tree, callback, static_args)
+        return emit_callback(ctx, dyn_args, callback, with_results=False)
+
+    mlir.register_lowering(debugging.debug_callback_p, debug_cb_rule,
+                           platform="metal")
+    mlir.register_lowering(debugging.debug_print_p, debug_print_rule,
+                           platform="metal")
+    try:
+        from jax._src import callback as jcb
+
+        def pure_cb_rule(ctx, *args, callback, sharding=None,
+                         vectorized=None, vmap_method=None, **params):
+            return emit_callback(ctx, args, callback)
+
+        mlir.register_lowering(jcb.pure_callback_p, pure_cb_rule,
+                               platform="metal")
+        mlir.register_lowering(jcb.io_callback_p, pure_cb_rule,
+                               platform="metal")
+    except Exception:
+        pass
