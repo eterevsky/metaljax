@@ -189,7 +189,12 @@ def _block_cost(interp, block) -> int:
                 continue
             counted = _analyze_counted(interp, o)
             body = o.regions[1].blocks[0]
-            trip = 1
+            # Unknown trip counts must be PESSIMISTIC: a dynamic-bound
+            # 2048-step loop once cost-counted as one body, so the
+            # enclosing block passed the trace budget and mx.compile
+            # tried to trace the whole thing (buffer exhaustion, and a
+            # worker livelocked retrying it).
+            trip = 1024
             if counted is not None and isinstance(counted[1], int):
                 start = _static_start(o, counted[0])
                 if start is not None:
@@ -440,18 +445,34 @@ def _while(interp, op, ins, env):
         captures = [env[v] for v in free]
         vals = list(ins)
         i = 0
+        limit_retries = 0
         while i < trip:
             try:
                 vals = list(fn(*vals, *captures))
+                limit_retries = 0
             except (RuntimeError, IndexError, ValueError) as e:
                 if isinstance(e, RuntimeError) and "Resource limit" in str(e):
                     # Metal ran out of buffer handles mid-body; `vals` is
                     # only rebound on success, so purge the cache and redo
-                    # the iteration on the same path.
+                    # the iteration. BOUNDED: if the same iteration keeps
+                    # exhausting buffers (e.g. an oversized mx.compile
+                    # trace attempt), retrying the same path livelocks —
+                    # a worker once spun for hours re-tracing. After two
+                    # failures force the uncompiled body; if even that
+                    # can't fit, surface the error.
                     if _DEBUG:
                         print("[metaljax] Metal buffer limit hit in while "
                               "body; clearing cache and retrying", flush=True)
                     mx.clear_cache()
+                    limit_retries += 1
+                    if limit_retries == 2 and compiled:
+                        interp._no_body_compile.add(body_block)
+                        interp._body_cache.pop((body_block, True, 1), None)
+                        fn, free, compiled = _body_fn(
+                            interp, body_block, compile_body=False)
+                        captures = [env[v] for v in free]
+                    elif limit_retries > 3:
+                        raise
                     continue
                 # MLX's compiled path can fail at call time (e.g.
                 # unordered_map::at on graphs with unused inputs). The body
