@@ -275,7 +275,32 @@ executes on the Metal device through plain `jax.numpy`.
    (CPU supports create/add/convert+f8 matmul), Philox
    rng_bit_generator, debug callbacks, eigh_test/lobpcg/scipy_signal
    pockets, lax_test exotics tail.
-17. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+17. ✅ **v0.4.2: gap-closure campaign + final audit → 98.4%** (27,779/
+   418; gate 104/104; perf at baseline). Landed: Philox + ThreeFry
+   rng_bit_generator BIT-EXACT vs CPU (reverse-engineered from xla
+   prng.cc: state=[key,counter]u64, 128-bit counter=(ctr+i, key+carry),
+   round-robin word interleave; ThreeFry splits output shape in halves
+   at first even dim); i4/u4/f8* emulation (exact values in f16/f32
+   storage, grid-quantized converts w/ RNE+subnormals+FN-overflow→NaN,
+   4-bit wrap in binary handlers); host callbacks (in-process registry
+   + metaljax_callback custom call — debug.print/pure/io_callback);
+   shape-poly export (custom calls declare result_shapes via
+   eval_dynamic_shape_as_tensor); XLA shift-overflow semantics;
+   QR/SVD orthonormal completion (zero-tau orgqr padding); Schur/
+   Hessenberg/tridiagonal(+solve, perturb_singular); generic
+   reduce_precision (any e/m); grouped 0-D convs; dilated variadic
+   reduce_window; 0.3.2 LIVELOCK triple-fix: bounded resource-limit
+   retries, pessimistic trip=1024 cost for unknown-trip loops,
+   accdot unit-squeeze bug (67x on composite b1 specs — the old
+   '10 steps/s mystery'), engine retries moved OUT of except blocks
+   (tracebacks pin failed-trace arrays). Remaining 418 dispositioned
+   (notes/jax-test-suite): ~33 intentional, ~150 skew/harness, ~190
+   'under review' itemized in README per Oleg (real cpu-passing gaps:
+   effect tokens ~50, complex pole semantics ~24, PJRT surface ~40,
+   windowed scatter-apply ~13, i4 bitcast 7, dilation corners ~7,
+   singletons). Versioned 0.4.2 per Oleg (no major bump until tests
+   fully closed).
+18. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib

@@ -122,7 +122,7 @@ print(g, g.device)"
 
 Running the entire upstream `jax/tests` suite against metaljax executes
 ~28,200 tests with **98.4% passing** (27,779 passed / 418 failed as of
-v0.5.0). Roughly half the remainder is version skew against the test
+v0.4.2). Roughly half the remainder is version skew against the test
 checkout and test infrastructure that doesn't know the platform; the
 rest is audited, documented best-effort residue (complex special
 values at poles, ordered-effect tokens, a few PJRT surface APIs) —

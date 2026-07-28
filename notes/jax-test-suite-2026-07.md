@@ -154,7 +154,7 @@ Remaining ~898: rng_bit_generator/rbg (~190), i4/f8 dtypes (~100),
 callbacks/tokens (~82), lax_test exotics (~137), eigh/lobpcg/
 scipy_signal pockets (~65), export/version-skew/multi-device tails.
 
-## Final audit + gap-closure campaign (2026-07-28/29, pre-0.5)
+## Final audit + gap-closure campaign (2026-07-28/29, pre-0.4.2)
 
 Projects landed since 0.4.1 (each verified vs CPU, most bit-exact):
 Philox + ThreeFry rng_bit_generator; i4/u4/f8* dtype emulation;
@@ -196,7 +196,7 @@ every failing file, consolidated):
     (5), NaN-placement in approx_top_k padding (1), scan-grad
     fixedpoint corner (1), holomorphic-grad tolerance (1).
 
-## 0.5.0 final (2026-07-29)
+## 0.4.2 final (2026-07-29)
 
 **27,779 passed / 418 failed / 6,191 skipped -> 98.40%** (0.4.1:
 96.7%; 0.4.0: 95.4%; first run: 79.6%). texmo gate 104/104;
