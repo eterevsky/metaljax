@@ -9,6 +9,7 @@ from metaljax.ops import (  # noqa: F401
     lapack,
     linalg,
     reduction,
+    rng,
     shape,
     sort,
 )
