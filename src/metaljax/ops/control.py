@@ -239,11 +239,13 @@ def _msl_plan_for(interp, op):
     plan = interp._msl_cache.get(key, "miss")
     if plan == "miss":
         try:
-            plan = msl_scan.Plan(interp, body, k, trip, start)
+            plan = msl_scan.build_plan(interp, body, k, trip, start)
             if msl_scan._DEBUG:
                 print(f"[metaljax] msl_scan: compiled plan trip={trip} "
-                      f"lanes={plan.N} states={len(plan.states)} "
-                      f"stacked={len(plan.stacked)}", flush=True)
+                      f"mode={plan.mode} lanes={plan.N} "
+                      f"states={len(plan.states)} "
+                      f"stacked={len(plan.stacked)} "
+                      f"packed={len(plan._packed)}", flush=True)
         except Exception as e:
             if msl_scan._DEBUG:
                 print(f"[metaljax] msl_scan: not eligible ({e})", flush=True)

@@ -246,3 +246,125 @@ def test_rectangular_coop_dots():
     check(jax.value_and_grad(lambda a, b, c, d: f(a, b, c, d)[1].sum(),
                              argnums=(0, 1, 2, 3)), Xw, h0w, Wg, Wp,
           rtol=1e-3, atol=1e-4)
+
+
+# ---- coop preference + input packing (0.4.3) ----
+
+F16 = 16
+W16 = (rng.standard_normal((F16, F16)) * 0.25).astype(np.float32)
+X16 = (rng.standard_normal((L, B, F16)) * 0.3).astype(np.float32)
+H16 = rng.standard_normal((B, F16)).astype(np.float32)
+
+
+def _mgru16(xs, h0, w):
+    def cell(h, x):
+        g = jax.nn.sigmoid(x + h @ w)
+        nh = (1 - g) * h + g * jnp.tanh(x)
+        return nh, nh
+    return jax.lax.scan(cell, h0, xs)
+
+
+def _plan_modes(f, *args):
+    """Run through a fresh Interpreter; return the MSL plan modes built."""
+    import mlx.core as mx
+    from helpers import lower_bytes
+    from metaljax import Interpreter
+    from metaljax import dtypes as mdt
+    interp = Interpreter(lower_bytes(f, *args))
+    outs = interp(*[mdt.to_mx(np.asarray(x)) for x in jax.tree.leaves(args)])
+    mx.eval(*outs)
+    return [p.mode for p in interp._msl_cache.values() if p is not None]
+
+
+def test_coop_preferred_for_square_16wide_cell():
+    # F=16 square dots used to pick vector mode (one thread per batch
+    # lane, no latency hiding — 5-8x slower); coop must be preferred and
+    # match CPU.
+    check(_mgru16, X16, H16, W16, rtol=1e-4, atol=1e-5)
+    check(jax.value_and_grad(lambda a, b, c: _mgru16(a, b, c)[1].sum(),
+                             argnums=(0, 1, 2)), X16, H16, W16,
+          rtol=1e-3, atol=1e-4)
+    modes = _plan_modes(_mgru16, X16, H16, W16)
+    assert "coop" in modes, modes
+
+
+def test_coop_pref_off_restores_vector(monkeypatch):
+    from metaljax import msl_scan
+    monkeypatch.setattr(msl_scan, "_COOP_PREF", False)
+    check(_mgru16, X16, H16, W16, rtol=1e-4, atol=1e-5)
+    modes = _plan_modes(_mgru16, X16, H16, W16)
+    assert modes and "coop" not in modes, modes
+
+
+def test_coop_flip_falls_back_to_vector(monkeypatch):
+    # If the preferred coop build dies in emission, build_plan must retry
+    # the old vector pick rather than losing the plan entirely.
+    from metaljax import msl_scan
+
+    def boom(self):
+        raise msl_scan._Unsupported("synthetic coop emitter gap")
+
+    monkeypatch.setattr(msl_scan.Plan, "_emit_coop", boom)
+    check(_mgru16, X16, H16, W16, rtol=1e-4, atol=1e-5)
+    modes = _plan_modes(_mgru16, X16, H16, W16)
+    assert modes and all(m == "vector" for m in modes), modes
+
+
+def test_input_packing_low_trigger(monkeypatch):
+    # Force packing on ordinary plans: results must be unchanged (packing
+    # only relocates buffers; offsets are static per plan).
+    from metaljax import msl_scan
+    monkeypatch.setattr(msl_scan, "_PACK_TRIGGER", 2)
+    check(affine_scan, A, X, H0)
+    check(jax.value_and_grad(
+        lambda a, x, h: affine_scan(a, x, h)[1].sum(),
+        argnums=(0, 1, 2)), A, X, H0)
+    check(_mgru16, X16, H16, W16, rtol=1e-4, atol=1e-5)
+    check(jax.value_and_grad(lambda a, b, c: _mgru16(a, b, c)[1].sum(),
+                             argnums=(0, 1, 2)), X16, H16, W16,
+          rtol=1e-3, atol=1e-4)
+
+
+def test_many_input_cell_packs_over_limit():
+    # A body with enough distinct captured tensors to blow Metal's 31-
+    # binding cap without packing; must still take the MSL path and match.
+    ws = [(rng.standard_normal((H,)) * 0.1
+           + (1.0 if i % 2 else 0.9)).astype(np.float32)
+          for i in range(30)]
+
+    def f(xs, h0, *ws):
+        def cell(h, x):
+            acc = x
+            for i, w in enumerate(ws):
+                acc = acc * w if i % 2 else acc + w * 0.5
+            nh = 0.9 * h + jnp.tanh(acc)
+            return nh, nh
+        return jax.lax.scan(cell, h0, xs)
+
+    check(f, X, H0, *ws, rtol=1e-4, atol=1e-5)
+    modes = _plan_modes(f, X, H0, *ws)
+    assert modes, "expected an MSL plan (packing should rescue the bindings)"
+
+
+def test_packing_with_sliced_weight_window(monkeypatch):
+    # A single sliced gate makes the dot read a non-canonical WINDOW of
+    # the fused weight; weight normalization materializes just the view
+    # (numel 25 of a 50-element buffer here), and run() concatenates
+    # that view into the pool. Pool slots must be sized by the VIEW —
+    # sizing by the source buffer shifts every later member (silent
+    # corruption, found in review).
+    from metaljax import msl_scan
+    monkeypatch.setattr(msl_scan, "_PACK_TRIGGER", 2)
+    Wf = (rng.standard_normal((H, 2 * H)) * 0.3).astype(np.float32)
+
+    def f(xs, h0, w):
+        def cell(h, x):
+            n = jnp.tanh((h @ w)[..., H:] + x)
+            nh = 0.8 * h + 0.2 * n
+            return nh, nh
+        return jax.lax.scan(cell, h0, xs)
+
+    check(f, X, H0, Wf, rtol=1e-4, atol=1e-5)
+    check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
+                             argnums=(0, 1, 2)), X, H0, Wf,
+          rtol=1e-3, atol=1e-4)

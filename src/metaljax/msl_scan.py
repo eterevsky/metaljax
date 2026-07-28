@@ -30,6 +30,24 @@ _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 # unroll the matvec in-lane.
 _REG_LIMIT = int(os.environ.get("METALJAX_MSL_REG", "16"))
 _COOP_WORK_CAP = int(os.environ.get("METALJAX_MSL_COOP_CAP", "2200000"))
+# Prefer coop over vector for square full-width cells at least this wide.
+# Vector mode gives one thread per batch lane and re-reads every weight
+# from device memory each timestep — at typical batches that is a single
+# simdgroup with no latency hiding. Coop runs F threads per lane and
+# stages dot data through threadgroup memory; measured faster at EVERY
+# batch size on square F>=8 cells (rnn.16/mgru.16 b8..b2048: 2.3-8.3x,
+# mullstm.8 likewise, 2026-07). Below F=8 the threadgroups get too
+# narrow to trust without measurement, so vector keeps those.
+_COOP_PREF = os.environ.get("METALJAX_MSL_COOP_PREF", "1") != "0"
+_COOP_PREF_MIN_F = int(os.environ.get("METALJAX_MSL_COOP_MIN_F", "8"))
+# Pool same-dtype kernel inputs into one buffer per dtype (static element
+# offsets baked into the source) once a plan would need more than this
+# many bindings; Metal's hard cap is 31 and MLX needs one slot.
+_PACK_TRIGGER = int(os.environ.get("METALJAX_MSL_PACK_TRIGGER", "30"))
+# Set by Plan.__init__ when the coop preference overrode a vector-eligible
+# pick; build_plan uses it to retry without the flip if the coop build
+# fails deeper in emission (single-threaded engine, module global is safe).
+_last_flipped = False
 # WORKAROUND for a Metal shader-compiler bug: multi-iteration kernel time
 # loops are miscompiled (see notes 2026-07). Only a fully volatile loop
 # counter — a volatile access at EVERY use of t — produces correct code
@@ -1550,7 +1568,10 @@ def _canonicalizer():
 class Plan:
     """A compiled persistent-kernel execution plan for one loop body."""
 
-    def __init__(self, interp, body_block, counter_pos, trip, start):
+    def __init__(self, interp, body_block, counter_pos, trip, start,
+                 no_coop_flip=False):
+        global _last_flipped
+        _last_flipped = False
         self.trip = trip
         args = list(body_block.arguments)
         an = _Analyzer(interp, body_block, counter_pos)
@@ -1698,6 +1719,22 @@ class Plan:
             # dsize (output features of the in-lane matvec) costs registers
             # but no extra serial work per element beyond the unrolled loop
             self.mode = "vector"
+            # ...unless the dots are square multiples of the state width:
+            # then coop is eligible and measured faster at every batch
+            # size (see _COOP_PREF above). Only a cheap structural probe
+            # here — the full coop checks below raise _Unsupported on the
+            # rest, and build_plan retries as vector if that happens.
+            if _COOP_PREF and not no_coop_flip:
+                widths = {sh[-1] for sh in
+                          (self.arg_shapes[p_] for p_, _ in self.states)
+                          if sh}
+                if len(widths) == 1:
+                    F_ = next(iter(widths))
+                    if (F_ >= _COOP_PREF_MIN_F
+                            and all(d.csize % F_ == 0 and d.dsize % F_ == 0
+                                    for d in dots)):
+                        _last_flipped = True
+                        self.mode = "coop"
         elif dots or self.accums:
             self.mode = "coop"
         else:
@@ -1857,6 +1894,51 @@ class Plan:
                 new_widx = tuple(widx0[p] for p in perm)
                 for d in dots:
                     d.widx = new_widx
+        # ---- input packing: Metal caps kernels at 31 buffer bindings.
+        # Deep fused bodies (AD residual chains) can need far more inputs
+        # than that; pool same-dtype inputs into one buffer per dtype with
+        # static element offsets baked into the source (run() concatenates
+        # the flattened buffers in the same order). 0-dim inputs stay
+        # separate — MLX passes those by value, not as buffers.
+        self._packed = {}         # sid -> (pool name, element offset)
+        self._pack_groups = []    # (pool name, dtype key, [sids])
+        raw_bind = (len(self.sources) + 2 * len(self.states)
+                    + (1 if _VOLATILE == "tmap" else 0)
+                    + len(self.stacked) + len(self.hidden))
+        if raw_bind > _PACK_TRIGGER:
+            per_sid = {}
+            for sid, (leaf, _nm) in self._wholes.items():
+                per_sid.setdefault(sid, leaf)
+            for (sid, *_k), (leaf, _nm) in self._reads.items():
+                per_sid.setdefault(sid, leaf)
+            for sid, leaf in self._weights.items():
+                per_sid.setdefault(sid, leaf)
+            by_dtype = {}
+            for sid, leaf in sorted(per_sid.items()):
+                bshape = self._buffer_shape(leaf)
+                if len(bshape) == 0:
+                    continue
+                # Slot size must equal what run() actually concatenates:
+                # weight-normalized sources are replaced by the
+                # materialized window view, whose numel can differ from
+                # the source buffer's (gate-split windows of a fused
+                # weight are strict slices).
+                norm = self._weight_norms.get(sid)
+                n = _numel(norm[0]) if norm is not None else _numel(bshape)
+                by_dtype.setdefault(leaf.dtype, []).append((sid, n))
+            for dt in sorted(by_dtype):
+                members = by_dtype[dt]
+                if len(members) < 2:
+                    continue
+                name = f"pk{len(self._pack_groups)}"
+                off = 0
+                sids = []
+                for sid, n in members:
+                    self._packed[sid] = (name, off)
+                    off += n
+                    sids.append(sid)
+                self._pack_groups.append((name, dt, sids))
+
         if self.mode == "coop":
             src = self._emit_coop()
         elif self.mode == "vector":
@@ -1865,11 +1947,14 @@ class Plan:
             src = self._emit(counter_pos)
         self.source = src
         # Metal caps kernel buffer bindings at 31 (indices 0-30); MLX
-        # assigns them sequentially to inputs then outputs. Deep fused
-        # bodies (e.g. AD residuals of stacked-cell chains) can exceed it
-        # — reject so the loop takes the compiled-graph path instead of
-        # dying at kernel build. One slot of slack for MLX internals.
-        n_bind = (len(self.sources) + 2 * len(self.states)
+        # assigns them sequentially to inputs then outputs. Input packing
+        # above pools most inputs; if a plan still exceeds the cap (e.g.
+        # too many outputs), reject so the loop takes the compiled-graph
+        # path instead of dying at kernel build. One slot for MLX.
+        self._unpacked = [i for i in range(len(self.sources))
+                          if i not in self._packed]
+        n_bind = (len(self._unpacked) + len(self._pack_groups)
+                  + 2 * len(self.states)
                   + (1 if _VOLATILE == "tmap" else 0)
                   + len(self.stacked) + len(self.hidden))
         if n_bind > 30:
@@ -1883,7 +1968,8 @@ class Plan:
         name = f"mj_scan_{_KERNEL_SEQ}"
         self.kernel = mx.fast.metal_kernel(
             name=name,
-            input_names=[f"inp{i}" for i in range(len(self.sources))]
+            input_names=[f"inp{i}" for i in self._unpacked]
+            + [nm for nm, _, _ in self._pack_groups]
             + [f"init{j}" for j in range(len(self.states))]
             + (["tmap"] if _VOLATILE == "tmap" else []),
             output_names=[f"out{q}" for q in range(len(self.stacked))]
@@ -1963,7 +2049,7 @@ class Plan:
                 L.append(f"{mslt(leaf.dtype)} {name} = inp{sid};")
             else:
                 off = _off_strided(leaf.shape, leaf.strides, lane, leaf.offset)
-                L.append(f"{mslt(leaf.dtype)} {name} = inp{sid}[{off}];")
+                L.append(f"{mslt(leaf.dtype)} {name} = {self._src(sid)}[{off}];")
         # state registers
         for j, (pos, expr) in enumerate(self.states):
             if len(self.arg_shapes[pos]) == 0:
@@ -1986,7 +2072,7 @@ class Plan:
             idx = f"((int)t + {self.start}) * {a} + {b}" if a != 1 or b != 0 or self.start \
                 else "(int)t"
             L.append(f"  {mslt(leaf.dtype)} {name} = "
-                     + _vol_load(mslt(leaf.dtype), f"inp{sid}",
+                     + _vol_load(mslt(leaf.dtype), self._src(sid),
                                  f"(uint)({idx}) * {inner}u + ({off})")
                      + ";")
 
@@ -2144,7 +2230,7 @@ class Plan:
             if len(bshape) == 0:
                 out.append(f"{name} = inp{sid};" if R == 1 else "")
             else:
-                out.extend(load(name, leaf.dtype, R, f"inp{sid}",
+                out.extend(load(name, leaf.dtype, R, self._src(sid),
                                 self._vec_off(leaf.shape, leaf.strides,
                                               leaf.offset)))
         # states
@@ -2169,7 +2255,7 @@ class Plan:
                    if a != 1 or b != 0 or self.start else "(int)t")
             off = self._vec_off(leaf.shape, leaf.strides, leaf.offset)
             out.append("  " + declare(name, leaf.dtype, R))
-            out.extend(load(name, leaf.dtype, R, f"inp{sid}",
+            out.extend(load(name, leaf.dtype, R, self._src(sid),
                             f"(uint)({idx}) * {inner}u + ({off})", "  ",
                             vol=True))
 
@@ -2332,7 +2418,7 @@ class Plan:
                 body.append(
                     f"  for (int d = 0; d < {s.dsize}; d++) {{ float _a = 0.0f; "
                     f"for (int cc = 0; cc < {s.csize}; cc++) "
-                    f"_a += {dacc} * inp{wsid}[{woff}]; {name}[d] = _a; }}")
+                    f"_a += {dacc} * {self._src(wsid)}[{woff}]; {name}[d] = _a; }}")
             else:
                 t0 = [t for t in terms if "(uint)d" not in t]
                 woff = " + ".join(t0) if t0 else "0u"
@@ -2340,7 +2426,7 @@ class Plan:
                 body.append(
                     f"  {{ float _a = 0.0f; "
                     f"for (int cc = 0; cc < {s.csize}; cc++) "
-                    f"_a += {dacc} * inp{wsid}[{woff}]; {name} = _a; }}")
+                    f"_a += {dacc} * {self._src(wsid)}[{woff}]; {name} = _a; }}")
             return (name, s.dsize)
 
         def emit_write(val, per_shape, dest_expr):
@@ -2537,7 +2623,7 @@ class Plan:
             if len(bshape) == 0:
                 out.append(f"{name} = inp{sid};")
             else:
-                out.extend(load(name, leaf.dtype, R, f"inp{sid}",
+                out.extend(load(name, leaf.dtype, R, self._src(sid),
                                 self._coop_off(leaf.shape, leaf.strides,
                                                leaf.offset)))
         for j, (pos, expr) in enumerate(self.states):
@@ -2560,7 +2646,7 @@ class Plan:
                    if a != 1 or b != 0 or self.start else "(int)t")
             off = self._coop_off(leaf.shape, leaf.strides, leaf.offset)
             out.append("  " + declare(name, leaf.dtype, R))
-            out.extend(load(name, leaf.dtype, R, f"inp{sid}",
+            out.extend(load(name, leaf.dtype, R, self._src(sid),
                             f"(uint)({idx}) * {inner}u + ({off})", "  ",
                             vol=True))
 
@@ -2664,12 +2750,12 @@ class Plan:
                     body.append(
                         f"  for (int g = 0; g < {k_out}; g++) "
                         f"{{ float _a = 0.0f; for (int cc = 0; cc < {s.csize}; cc++) "
-                        f"_a += {shname}[cc] * inp{wsid}[{woff}]; {name}[g] = _a; }}")
+                        f"_a += {shname}[cc] * {self._src(wsid)}[{woff}]; {name}[g] = _a; }}")
                 else:
                     body.append(f"  float {name};")
                     body.append(
                         f"  {{ float _a = 0.0f; for (int cc = 0; cc < {s.csize}; cc++) "
-                        f"_a += {shname}[cc] * inp{wsid}[{woff}]; {name} = _a; }}")
+                        f"_a += {shname}[cc] * {self._src(wsid)}[{woff}]; {name} = _a; }}")
                 v = (name, k_out)
                 memo[dkey] = v
             elif isinstance(s, SymElem):
@@ -2778,6 +2864,14 @@ class Plan:
             return self.arg_shapes[leaf.source[1]]
         return tuple(_ttype(leaf.source[1]).shape)
 
+    def _src(self, sid):
+        """Source expression for input `sid` in generated MSL: the plain
+        binding name, or a pointer into its dtype pool when packed."""
+        p = self._packed.get(sid)
+        if p is None:
+            return f"inp{sid}"
+        return f"({p[0]} + {p[1]}u)"
+
     # ---- runtime
 
     def run(self, interp, ins, env):
@@ -2817,10 +2911,15 @@ class Plan:
                 buf = mx.as_strided(buf, shape, strides, offset)
                 buf = mx.contiguous(mx.transpose(buf, perm))
             bufs.append(buf)
+        feed = [bufs[i] for i in self._unpacked]
+        for _nm, dt, sids in self._pack_groups:
+            want = _MX_DTYPE[dt]
+            feed.append(mx.concatenate(
+                [mx.reshape(bufs[s], (-1,)).astype(want) for s in sids]))
         for pos, _ in self.states:
-            bufs.append(ins[pos])
+            feed.append(ins[pos])
         if _VOLATILE == "tmap":
-            bufs.append(_tmap(self.trip))
+            feed.append(_tmap(self.trip))
         out_shapes = ([self.arg_shapes[pos] for pos, _, _ in self.stacked]
                       + [(self.trip,) + tuple(h.shape) for h, _ in self.hidden]
                       + [self.arg_shapes[pos] for pos, _ in self.states])
@@ -2830,7 +2929,7 @@ class Plan:
         self._last_bufs = bufs
         tg = (self.F if self.mode == "coop" else min(self.N, 256), 1, 1)
         outs = self.kernel(
-            inputs=bufs,
+            inputs=feed,
             grid=(self.N, 1, 1),
             threadgroup=tg,
             output_shapes=out_shapes,
@@ -3075,6 +3174,13 @@ def try_run(interp, op, ins, env, trip, start, counter_pos):
                         dump = {}
                         for si, bx in enumerate(plan._last_bufs):
                             dump[f"inp{si}"] = _np.array(bx, copy=False)
+                        # packed plans bind pools, not inp{si}: dump those
+                        # too so the source can be replayed from the npz
+                        for nm_, _dt, sids_ in plan._pack_groups:
+                            dump[nm_] = _np.concatenate(
+                                [_np.array(plan._last_bufs[s_],
+                                           copy=False).reshape(-1)
+                                 for s_ in sids_])
                         for sj, (pos_, _e) in enumerate(plan.states):
                             dump[f"init{sj}"] = _np.array(ins[pos_], copy=False)
                         for oi, x5 in enumerate(res):
@@ -3096,3 +3202,20 @@ def try_run(interp, op, ins, env, trip, start, counter_pos):
         body = op.regions[1].blocks[0]
         interp._msl_cache[(body, trip, start)] = None
         return None
+
+
+def build_plan(interp, body_block, counter_pos, trip, start):
+    """Plan() with the coop-over-vector preference applied safely: if the
+    preferred coop build fails deeper in emission (coop's emitter covers
+    fewer leaf kinds than vector's), retry as vector so the preference can
+    never lose a plan that used to build."""
+    global _last_flipped
+    try:
+        return Plan(interp, body_block, counter_pos, trip, start)
+    except Exception:
+        # not just _Unsupported: an emitter crash (KeyError etc.) on the
+        # flipped path must not lose a plan the vector path can build
+        if not _last_flipped:
+            raise
+        return Plan(interp, body_block, counter_pos, trip, start,
+                    no_coop_flip=True)

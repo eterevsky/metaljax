@@ -305,7 +305,29 @@ executes on the Metal device through plain `jax.numpy`.
    windowed scatter-apply ~13, i4 bitcast 7, dilation corners ~7,
    singletons). Versioned 0.4.2 per Oleg (no major bump until tests
    fully closed).
-18. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+18. ✅ **v0.4.3: coop-over-vector mode pick + kernel input packing**
+   (notes/perf-0.4.3-mode-pick-packing.md). From Oleg's search timing
+   data: 0.3.2's catastrophic rows were already fixed by 0.4.x; what
+   remained was (a) F<=16 square cells (rnn.16/mgru.16/mullstm.8/
+   gru.16) picking msl vector mode = batch-only lanes, ONE simdgroup,
+   weights re-read per timestep -> coop measured faster at EVERY batch
+   (b8..b2048, no crossover; threadgroup staging is half the win). Now
+   flipped when dots are square multiples of state width and F>=8
+   (METALJAX_MSL_COOP_MIN_F / _COOP_PREF=0), build_plan retries as
+   vector on ANY flipped-build failure. (b) >31-binding kernels
+   (lmgu-class deep AD bodies): same-dtype inputs pool into per-dtype
+   buffers, static offsets baked into MSL ("(pk0+123u)"), run()
+   concatenates; 0-dim stay by-value. CRITICAL review catch: slot
+   sizes must use the weight-norm WINDOW numel, not source numel
+   (gate-slice windows differ -> silent pool shift; regression test
+   fails on unfixed code). Results: db17 7-12x, db11 5-6x, db14/15
+   ~4-5x, lmgu 11.2->2.1 ms/step, rnn16 7.96->0.95 (beats CPU 2.5),
+   mullstm 5.89->1.09; all other suite rows 1.00x +/- noise; gate
+   104/104 + 3 new-path configs vs CPU. b=1 tiny models deprioritized
+   per Oleg (search optimizes for >=thousands of weights). Leftovers:
+   F<=4 coop pocket unmeasured; output packing; reads&weights sid
+   overlap guard (pre-existing, flagged).
+19. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
