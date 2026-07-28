@@ -31,16 +31,17 @@ def _combiner_neutral(method, dtype):
         return mx.array(0, dtype=dtype)
     if method == "multiply":
         return mx.array(1, dtype=dtype)
+    is_f = dtypes.is_float(dtype)  # NB ml_dtypes bf16 has np kind 'V'
     npdt = dtypes._MX_TO_NP[dtype]
     if method == "maximum":
         if dtype == mx.bool_:
             return mx.array(False)
-        v = -np.inf if npdt.kind == "f" else np.iinfo(npdt).min
+        v = -np.inf if is_f else np.iinfo(npdt).min
         return mx.array(v, dtype=dtype)
     if method == "minimum":
         if dtype == mx.bool_:
             return mx.array(True)
-        v = np.inf if npdt.kind == "f" else np.iinfo(npdt).max
+        v = np.inf if is_f else np.iinfo(npdt).max
         return mx.array(v, dtype=dtype)
     raise UnsupportedOpError(f"no neutral for scatter method {method}")
 

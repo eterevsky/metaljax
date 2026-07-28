@@ -128,11 +128,29 @@ def _convolution(interp, op, ins, env):
     d = _conv_dims(op)
     rank = len(d["is"])
     if rank == 0:
-        # No spatial dims: a plain (grouped) matmul over features.
-        x0 = mx.transpose(lhs, [d["ib"], d["if"]])
-        w0 = mx.transpose(rhs, [d["ko"], d["ki"]])
-        out = mx.matmul(x0.astype(mx.float32),
-                        mx.transpose(w0.astype(mx.float32)))
+        # No spatial dims: a (grouped) matmul over features.
+        fgc0 = (_ir.int_attr(op, "feature_group_count")
+                if "feature_group_count" in op.attributes else 1)
+        bgc0 = (_ir.int_attr(op, "batch_group_count")
+                if "batch_group_count" in op.attributes else 1)
+        x0 = mx.transpose(lhs, [d["ib"], d["if"]]).astype(mx.float32)
+        w0 = mx.transpose(rhs, [d["ko"], d["ki"]]).astype(mx.float32)
+
+        def mm(xg, wg):
+            return mx.matmul(xg, mx.transpose(wg))
+
+        if bgc0 > 1:
+            out = mx.concatenate(
+                [mm(xg, wg) for xg, wg in zip(mx.split(x0, bgc0, axis=0),
+                                              mx.split(w0, bgc0, axis=0))],
+                axis=-1)
+        elif fgc0 > 1:
+            out = mx.concatenate(
+                [mm(xg, wg) for xg, wg in zip(mx.split(x0, fgc0, axis=1),
+                                              mx.split(w0, fgc0, axis=0))],
+                axis=-1)
+        else:
+            out = mm(x0, w0)
         out = out.astype(dtypes.mx_dtype_for(out_t.element_type))
         axes = [0, 0]
         axes[d["ob"]] = 0

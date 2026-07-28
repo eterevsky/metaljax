@@ -192,6 +192,19 @@ def _logical_or_bitwise(logical, bitwise):
     return fn
 
 
+def _shift_guard(a, b, fn, overflow):
+    # XLA: shifting by >= bit width yields 0 (logical/left) or the sign
+    # fill (arithmetic); Metal shifts are mod-width (x86-style).
+    w = a.dtype.size * 8
+    over = b.astype(mx.int32) >= w
+    base = fn(a, b)
+    if overflow == "sign":
+        fill = fn(a, mx.array(w - 1, dtype=b.dtype).astype(b.dtype))
+    else:
+        fill = mx.zeros_like(a)
+    return mx.where(over, fill, base)
+
+
 def _shift_right_logical(a, b):
     if dtypes.is_unsigned(a.dtype) or dtypes.is_bool(a.dtype):
         return mx.right_shift(a, b)
@@ -214,9 +227,11 @@ _BINARY = {
     "xor": _logical_or_bitwise(
         lambda a, b: mx.not_equal(a, b), mx.bitwise_xor
     ),
-    "shift_left": mx.left_shift,
-    "shift_right_logical": _shift_right_logical,
-    "shift_right_arithmetic": mx.right_shift,
+    "shift_left": lambda a, b: _shift_guard(a, b, mx.left_shift, "zero"),
+    "shift_right_logical": lambda a, b: _shift_guard(
+        a, b, _shift_right_logical, "zero"),
+    "shift_right_arithmetic": lambda a, b: _shift_guard(
+        a, b, mx.right_shift, "sign"),
 }
 
 _WRAP4 = {"add", "multiply", "subtract"}
@@ -338,14 +353,33 @@ def _reduce_precision(interp, op, ins, env):
         return x.astype(mx.bfloat16).astype(x.dtype)
     if (exp, man) == (5, 10):
         return x.astype(mx.float16).astype(x.dtype)
-    if exp == 8 and 0 < man < 23 and x.dtype == mx.float32:
-        # Round f32 mantissa to `man` bits (round-to-nearest-even).
+    orig = x.dtype
+    if orig in (mx.float16, mx.bfloat16):
+        x = x.astype(mx.float32)
+    if 0 <= man < 23 and 2 <= exp <= 8 and x.dtype == mx.float32:
+        # Round f32 mantissa to `man` bits (round-to-nearest-even), then
+        # clamp to the e-bit exponent range: overflow -> inf,
+        # underflow -> 0 (XLA reduce_precision has no subnormals).
+        isnan = mx.isnan(x)
         u = mx.view(x, mx.uint32)
-        shift = 23 - man
-        half = mx.array((1 << (shift - 1)) - 1, dtype=mx.uint32)
-        lsb = (u >> shift) & mx.array(1, dtype=mx.uint32)
-        u = (u + half + lsb) & mx.array(~((1 << shift) - 1) & 0xFFFFFFFF,
-                                        dtype=mx.uint32)
-        return mx.view(u, mx.float32)
+        if man < 23:
+            shift = 23 - man
+            half = mx.array((1 << (shift - 1)) - 1, dtype=mx.uint32)
+            lsb = (u >> shift) & mx.array(1, dtype=mx.uint32)
+            u = (u + half + lsb) & mx.array(
+                ~((1 << shift) - 1) & 0xFFFFFFFF, dtype=mx.uint32)
+        r = mx.view(u, mx.float32)
+        if exp < 8:
+            biased = ((u >> 23) & 0xFF).astype(mx.int32)
+            max_e = (1 << (exp - 1)) - 1
+            min_e = 2 - (1 << (exp - 1))
+            sign = mx.where(r < 0, mx.array(-1.0, mx.float32),
+                            mx.array(1.0, mx.float32))
+            over = biased > 127 + max_e
+            under = biased < 127 + min_e
+            r = mx.where(over, sign * mx.array(float("inf"), mx.float32), r)
+            r = mx.where(under, sign * mx.array(0.0, mx.float32), r)
+        r = mx.where(isnan, x, r)
+        return r.astype(orig)
     raise UnsupportedOpError(
-        f"reduce_precision e{exp}m{man} on {x.dtype} not implemented")
+        f"reduce_precision e{exp}m{man} on {orig} not implemented")

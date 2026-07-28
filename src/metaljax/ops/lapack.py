@@ -97,9 +97,16 @@ def _householder_product(op, ins):
     orgqr = lapack.cungqr if np.iscomplexobj(a) else lapack.sorgqr
 
     def one(x, t):
-        q, _, info = orgqr(np.ascontiguousarray(x[:, :max(k, 1)]), t)
-        if q.shape[1] < ncols:
-            q = np.pad(q, [(0, 0), (0, ncols - q.shape[1])])
+        cols = max(k, 1)
+        if ncols > cols:
+            # full_matrices: LAPACK orgqr completes an orthonormal basis
+            # when given room; zero taus are identity reflectors.
+            x = np.pad(np.ascontiguousarray(x[:, :cols]),
+                       [(0, 0), (0, ncols - cols)])
+            t = np.pad(t, (0, ncols - len(t)))
+            q, _, info = orgqr(x, t)
+            return (q,)
+        q, _, info = orgqr(np.ascontiguousarray(x[:, :cols]), t)
         return (q[:, :ncols],)
     return _batch_apply(one, [a, taus], batch, specs)
 
@@ -187,6 +194,9 @@ def _metal_eigh(op, ins):
     batch = a.shape[:-2]
 
     def one(x):
+        if not np.isfinite(x).all():
+            return tuple(np.full(spec[0][len(batch):], np.nan,
+                                 dtype=spec[1]) for spec in specs)
         x = (np.tril(x) + np.tril(x, -1).conj().T if lower
              else np.triu(x) + np.triu(x, 1).conj().T)
         w, v = np.linalg.eigh(x)
@@ -233,6 +243,9 @@ def _metal_eig(op, ins):
     nb = len(batch)
 
     def one(x):
+        if x.shape[0] == 0:
+            return tuple(np.zeros(spec[0][nb:], dtype=spec[1])
+                         for spec in specs)
         w, vr = np.linalg.eig(x)
         res = [w]
         if "L" in cfg:

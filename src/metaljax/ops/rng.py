@@ -47,9 +47,6 @@ def _rng_bit_generator(interp, op, ins, env):
         algo = str(op.attributes["rng_algorithm"])
     except Exception:
         algo = "DEFAULT"
-    if "THREE_FRY" in algo:
-        raise UnsupportedOpError("rng_bit_generator THREE_FRY")
-
     (state,) = ins
     if state.dtype == mx.uint32 and state.shape == (4,):
         state = mx.view(state, mx.uint64)
@@ -60,6 +57,15 @@ def _rng_bit_generator(interp, op, ins, env):
     out_t = ir.RankedTensorType(op.results[1].type)
     out_dtype = dtypes.mx_dtype_for(out_t.element_type)
     out_shape = list(out_t.shape)
+    if "THREE_FRY" in algo:
+        if state.dtype == mx.uint32 and state.shape == (4,):
+            state = mx.view(state, mx.uint64)
+        if out_dtype.size * 8 > 32:
+            raise UnsupportedOpError("rng_bit_generator THREE_FRY 64-bit")
+        new_state, bits = _threefry_bits(state, out_shape, out_dtype)
+        if ins[0].dtype == mx.uint32:
+            new_state = mx.view(new_state, mx.uint32)
+        return [new_state, bits]
     n = 1
     for s in out_shape:
         n *= s
@@ -101,3 +107,72 @@ def _rng_bit_generator(interp, op, ins, env):
     if ins[0].dtype == mx.uint32:
         new_state = mx.view(new_state, mx.uint32)
     return [new_state, mx.reshape(bits, out_shape)]
+
+
+_TF_ROT = (13, 15, 26, 6, 17, 29, 16, 24)
+
+
+def _threefry2x32(x0, x1, k0, k1):
+    """XLA's ThreeFry2x32: 20 rounds, key injection every 4."""
+    parity = mx.array(0x1BD11BDA, dtype=mx.uint32)
+    ks = [k0, k1, parity ^ k0 ^ k1]
+    x0 = x0 + ks[0]
+    x1 = x1 + ks[1]
+    for g in range(5):
+        for r in range(4):
+            rot = _TF_ROT[(g % 2) * 4 + r]
+            x0 = x0 + x1
+            x1 = (x1 << rot) | (x1 >> (32 - rot))
+            x1 = x0 ^ x1
+        j = g + 1
+        x0 = x0 + ks[j % 3]
+        x1 = x1 + ks[(j + 1) % 3] + mx.array(j, dtype=mx.uint32)
+    return x0, x1
+
+
+def _threefry_bits(state, out_shape, out_dtype):
+    """XLA ThreeFryBitGenerator (32-bit-and-narrower path): split the
+    output shape in half, one threefry block per half-element pair."""
+    dims = list(out_shape)
+    if not dims:
+        dims = [1]
+        scalar = True
+    else:
+        scalar = False
+    split_dim = next((i for i, d_ in enumerate(dims) if d_ % 2 == 0), None)
+    if split_dim is None:
+        split_dim = max(range(len(dims)), key=lambda i: dims[i])
+    half = dims.copy()
+    half[split_dim] = -(-dims[split_dim] // 2)
+    n_half = 1
+    for d_ in half:
+        n_half *= d_
+    key = state[0]
+    ctr = state[1]
+    # per-half-element u64 counter = state + row-major linear index
+    lin = mx.arange(n_half, dtype=mx.uint64)
+    u64 = ctr + lin
+    x0 = (u64 & _LO32).astype(mx.uint32)
+    x1 = (u64 >> 32).astype(mx.uint32)
+    k0 = (key & _LO32).astype(mx.uint32)
+    k1 = (key >> 32).astype(mx.uint32)
+    o0, o1 = _threefry2x32(x0, x1, k0, k1)
+    # combine: concat halves on a fresh axis after split_dim, reshape to
+    # the rounded-up shape, slice back down
+    h = tuple(half[:split_dim + 1]) + (1,) + tuple(half[split_dim + 1:])
+    both = mx.concatenate([mx.reshape(o0, h), mx.reshape(o1, h)],
+                          axis=split_dim + 1)
+    rounded = dims.copy()
+    rounded[split_dim] = half[split_dim] * 2
+    both = mx.reshape(both, rounded)
+    if rounded[split_dim] != dims[split_dim]:
+        sl = [slice(None)] * len(dims)
+        sl[split_dim] = slice(0, dims[split_dim])
+        both = both[tuple(sl)]
+    if scalar:
+        both = mx.reshape(both, ())
+    new_state = mx.stack([key, ctr + mx.array(n_half, dtype=mx.uint64)])
+    width = out_dtype.size * 8
+    if width < 32:
+        both = both.astype({8: mx.uint8, 16: mx.uint16}[width])
+    return new_state, both

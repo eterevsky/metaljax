@@ -56,9 +56,18 @@ def _register_linalg_lowerings():
         def emit(ctx, target, operands, config=""):
             out_types = [mlir.aval_to_ir_type(ctx.module_context, a)
                          for a in ctx.avals_out]
+            kwargs = {}
+            if any(not isinstance(d, int)
+                   for a in ctx.avals_out for d in a.shape):
+                # symbolic dims (jax.export shape polymorphism): declare
+                # result shapes so the refine-polymorphic-shapes pass can
+                # staticize our custom calls
+                kwargs["result_shapes"] = [
+                    mlir.eval_dynamic_shape_as_tensor(ctx, a.shape)
+                    for a in ctx.avals_out]
             op = mlir.custom_call(
                 target, result_types=out_types, operands=operands,
-                backend_config=config)
+                backend_config=config, **kwargs)
             return op.results
 
         def eigh_rule(ctx, operand, *, lower, sort_eigenvalues,
