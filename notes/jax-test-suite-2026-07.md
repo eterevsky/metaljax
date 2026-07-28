@@ -153,3 +153,45 @@ ann_test, array_extensibility, lax_scipy; pmap 53->3, setops 38->1.
 Remaining ~898: rng_bit_generator/rbg (~190), i4/f8 dtypes (~100),
 callbacks/tokens (~82), lax_test exotics (~137), eigh/lobpcg/
 scipy_signal pockets (~65), export/version-skew/multi-device tails.
+
+## Final audit + gap-closure campaign (2026-07-28/29, pre-0.5)
+
+Projects landed since 0.4.1 (each verified vs CPU, most bit-exact):
+Philox + ThreeFry rng_bit_generator; i4/u4/f8* dtype emulation;
+host callbacks (debug.print/debug_callback/pure_callback/io_callback);
+single-device collectives (pmap/shard_map); multi-key lexicographic
+sorts; ApproxTopK; Schur/Hessenberg/tridiagonal(+solve incl.
+perturb_singular); bf16/f16 linalg via own custom-call lowerings
+(exceeds CPU); shape-polymorphic export of those custom calls
+(result_shapes); XLA shift-overflow semantics; QR/SVD orthonormal
+completion for full_matrices; generic reduce_precision; grouped 0-D
+convs; dilated variadic reduce_window; and the 0.3.2 livelock triple
+fix (bounded retries, pessimistic cost for unknown trips, accdot
+unit-squeeze bug -> 67x on composite b1 specs).
+
+Explicit dispositions for the remaining tail (16-agent audit over
+every failing file, consolidated):
+- intentional-unsupported (~33): f64/complex128 compute (lobpcg's 27
+  are all f64), multi-device, denormals. CLOSED by policy.
+- version-skew (~77) + harness-mismatch (~76): test checkout newer
+  than jax 0.11 (hijax, gamma(method=), jax._src.hypothesis_test_util)
+  and infrastructure that doesn't know the platform (skip-lists,
+  export platform allowlists, compilation-cache/log internals,
+  x64_context). CLOSED: not ours; shrink when the jax pin advances.
+- best-effort residue (each with documented cause):
+  * complex64 special-value semantics at inf/nan poles (~24): MLX
+    kernel edge semantics; fixing means custom complex kernels.
+  * token plumbing for ordered effects (~24): interpreter treats
+    tokens as sentinels; full ordered-effect token threading through
+    main signatures not implemented.
+  * scatter-apply with duplicates AND windows (~13): needs windowed
+    sequential emulation.
+  * int4/uint4 bitcast_convert (7): sub-byte bitcasts don't map to
+    byte-storage emulation.
+  * window-dilation numeric corners under vmap (~7).
+  * PJRT surface APIs (~40): UnsafePointer (MLX exposes no device
+    pointers), buffer donation, pinned_host memory space,
+    executable-text retrieval, compile-options validation.
+  * singular tri/tridiag solves returning inf/nan instead of raising
+    (5), NaN-placement in approx_top_k padding (1), scan-grad
+    fixedpoint corner (1), holomorphic-grad tolerance (1).
