@@ -140,12 +140,41 @@ see the notes for the per-item audit. The gaps fall into three groups:
 - **Denormals flush to zero** on the GPU (hardware behavior); tests
   asserting subnormal outputs (e.g. `jnp.spacing`) differ from CPU.
 
-**Not yet implemented (see `notes/jax-test-suite-2026-07.md` for the
-audited per-item dispositions):**
+**Under review — real gaps, individually audited, support not yet
+decided** (~190 test failures; these all pass on the CPU backend; see
+`notes/jax-test-suite-2026-07.md` for the full audit):
 
-- ordered-effect token threading; complex64 special values at
-  inf/NaN poles; >3-D convolutions; a few PJRT surface APIs
-  (`unsafe_buffer_pointer`, buffer donation, pinned-host memory)
+- *Ordered-effect token threading* (~50): jax threads
+  `!stablehlo.token` values through function signatures to sequence
+  ordered side effects (`jax.debug.print(..., ordered=True)`,
+  `io_callback(..., ordered=True)`). The interpreter treats tokens as
+  sentinels; full threading through main signatures is unimplemented.
+  Unordered callbacks work. Moderate plumbing.
+- *complex64 special values at inf/NaN poles* (~24): MLX's complex
+  `sin`/`cos`/`tan`/`sqrt`/`log`/... disagree with XLA's
+  C99-conformant kernels at infinities and NaN (finite inputs match to
+  f32 precision). Fixing means reimplementing the special-value
+  branches op by op.
+- *PJRT surface APIs* (~40): `Array.unsafe_buffer_pointer` (blocked —
+  MLX exposes no raw device pointers), buffer donation (implementable;
+  a memory optimization, not a correctness issue), the `pinned_host`
+  memory space, optimized-executable text retrieval, strict
+  compile-options validation.
+- *Scatter with computed update bodies plus duplicate AND windowed
+  indices* (~13): the sequential-application fallback covers duplicate
+  point indices only; the windowed variant needs windowed sequential
+  emulation.
+- *int4/uint4 `bitcast_convert`* (7): sub-byte bitcasts don't map onto
+  the byte-backed int4 emulation.
+- *Window-dilation numeric corners* (~7): specific
+  dilation-plus-padding parameter combinations under `vmap` produce
+  values that differ from XLA's windowing semantics.
+- *>3-D convolutions*: MLX's conv kernels are 1/2/3-D.
+- *Singletons*: singular triangular/tridiagonal solves raise instead
+  of returning inf/NaN (5), `approx_top_k` NaN-padding placement in
+  one exported-vs-native comparison (1), a holomorphic-grad case at
+  1e-6 tolerance where MLX's complex sin is 4e-6 off (1), one
+  scan-gradient fixed-point corner (1).
 
 **Supported** (each verified against the CPU backend): sorting
 (`sort`/`argsort`/`top_k`/`approx_top_k`/`median`/`percentile`/
