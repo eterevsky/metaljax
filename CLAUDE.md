@@ -36,6 +36,11 @@ executes on the Metal device through plain `jax.numpy`.
   JAX clone HEAD ≈ 2026-07-23, matches installed jax 0.11.0.
 - Git: repo remote is git@github.com:eterevsky/metaljax.git. **Commit locally;
   never push** — Oleg pushes himself. No PRs.
+- Releases: build + smoke-test wheels locally, but **never upload to
+  TestPyPI (or anywhere) without Oleg's explicit approval** — he decides
+  version numbers based on what's being published. Plan: iterate on
+  0.4.x; when the gap list is closed to his satisfaction, jump straight
+  to 0.11.0 (tracking the jax pin; 0.5–0.10 intentionally skipped).
 - Python via **uv**: venv at `metaljax/.venv` (CPython 3.13.5), installed:
   `jax 0.11.0`, `jaxlib 0.11.0`, `mlx 0.32.0`, numpy, pytest.
   Run things with `.venv/bin/python`.
