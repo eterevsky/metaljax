@@ -40,6 +40,10 @@ _COOP_WORK_CAP = int(os.environ.get("METALJAX_MSL_COOP_CAP", "2200000"))
 # narrow to trust without measurement, so vector keeps those.
 _COOP_PREF = os.environ.get("METALJAX_MSL_COOP_PREF", "1") != "0"
 _COOP_PREF_MIN_F = int(os.environ.get("METALJAX_MSL_COOP_MIN_F", "8"))
+# In-lane rewrite of small dots between loop-computed values (outer
+# products -> broadcast-multiply, trailing-dim contractions -> register
+# reduce; matlstm-class matrix-state cells). =0 restores plain fission.
+_INLANE_DOTS = os.environ.get("METALJAX_MSL_INLANE", "1") != "0"
 # Pool same-dtype kernel inputs into one buffer per dtype (static element
 # offsets baked into the source) once a plan would need more than this
 # many bindings; Metal's hard cap is 31 and MLX needs one slot.
@@ -48,6 +52,9 @@ _PACK_TRIGGER = int(os.environ.get("METALJAX_MSL_PACK_TRIGGER", "30"))
 # pick; build_plan uses it to retry without the flip if the coop build
 # fails deeper in emission (single-threaded engine, module global is safe).
 _last_flipped = False
+# Same protocol for the in-lane small-dot rewrite (_inlane_dot): retried
+# off if the rewritten build fails, so no pre-existing plan can be lost.
+_last_inlane = False
 # WORKAROUND for a Metal shader-compiler bug: multi-iteration kernel time
 # loops are miscompiled (see notes 2026-07). Only a fully volatile loop
 # counter — a volatile access at EVERY use of t — produces correct code
@@ -290,10 +297,12 @@ _COMPARE = {"EQ": "==", "NE": "!=", "LT": "<", "LE": "<=", "GT": ">", "GE": ">="
 class _Analyzer:
     """Symbolically evaluates a loop body block into Sym expressions."""
 
-    def __init__(self, interp, body_block, counter_pos):
+    def __init__(self, interp, body_block, counter_pos,
+                 no_inlane_dot=False):
         self.interp = interp
         self.body = body_block
         self.counter_pos = counter_pos
+        self.no_inlane_dot = no_inlane_dot
         self.args = list(body_block.arguments)
         self.reads = []          # SymLeaf('read'/'whole') in discovery order
         self.hoist_ok = set()    # ir results representable via hoisting
@@ -917,6 +926,11 @@ class _Analyzer:
         if out is None:
             out = attempt(lhs, rhs, lb, rb, lc, rc, True)
         if out is None:
+            out = self._inlane_dot(lhs, rhs, (lb, rb, lc, rc), shape)
+            if out is not None:
+                global _last_inlane
+                _last_inlane = True
+        if out is None:
             if _DEBUG:
                 print(f"[metaljax] msl_scan: accdot lhs={_dump(lhs)} "
                       f"rhs={_dump(rhs)} dims={(lb, rb, lc, rc)}", flush=True)
@@ -924,6 +938,81 @@ class _Analyzer:
             # representable only as a hoisted post-kernel einsum.
             out = SymAccDot(lhs, rhs, (lb, rb, lc, rc), shape, "f32")
         return out
+
+    def _inlane_dot(self, lhs, rhs, dims4, shape):
+        """Small dots between two LOOP-COMPUTED values (matlstm-class
+        matrix-state cells: outer(v, k), C @ q). Fission can't represent
+        these — the running state feeds each step — but per-lane register
+        forms can: an outer product is a broadcast-multiply, and a
+        last-dim contraction is multiply + register reduce. Gated to the
+        register width so big dW einsums keep the fission path."""
+        lb, rb, lc, rc = dims4
+        if self.no_inlane_dot or not _INLANE_DOTS:
+            return None
+        if getattr(lhs, "dtype", None) != "f32" \
+                or getattr(rhs, "dtype", None) != "f32":
+            return None
+        if max(len(lhs.shape), len(rhs.shape)) < 3 \
+                and len(shape) < 3:
+            # matrix-state signature only: rank-2 cases are fission
+            # territory (measured: db02-class scalar cells regress 1.4x
+            # when their dW dots are pulled in-lane)
+            return None
+        try:
+            nb = len(lb)
+            lfree = [i for i in range(len(lhs.shape))
+                     if i not in lb and i not in lc]
+            rfree = [i for i in range(len(rhs.shape))
+                     if i not in rb and i not in rc]
+            if not lc and not rc:
+                # outer product: result = batch + lfree + rfree
+                if not shape or shape[-1] > _REG_LIMIT:
+                    return None
+                ldims = [0] * len(lhs.shape)
+                rdims = [0] * len(rhs.shape)
+                for k, i in enumerate(lb):
+                    ldims[i] = k
+                for k, i in enumerate(lfree):
+                    ldims[i] = nb + k
+                for k, i in enumerate(rb):
+                    rdims[i] = k
+                for k, i in enumerate(rfree):
+                    rdims[i] = nb + len(lfree) + k
+                a = self._broadcasted(lhs, shape, ldims)
+                b = self._broadcasted(rhs, shape, rdims)
+                return SymElem("stablehlo.multiply", [a, b], "f32",
+                               tuple(shape))
+            if (len(lc) == 1 and len(rc) == 1
+                    and len(lhs.shape) >= 2 and len(rhs.shape) >= 2
+                    and lc[0] == len(lhs.shape) - 1
+                    and rc[0] == len(rhs.shape) - 1
+                    and lhs.shape[lc[0]] <= _REG_LIMIT):
+                # contraction over the trailing dim of both sides:
+                # multiply on (batch + lfree + rfree + c), reduce c in
+                # registers
+                inner = tuple(shape) + (lhs.shape[lc[0]],)
+                last = len(inner) - 1
+                ldims = [0] * len(lhs.shape)
+                rdims = [0] * len(rhs.shape)
+                for k, i in enumerate(lb):
+                    ldims[i] = k
+                for k, i in enumerate(lfree):
+                    ldims[i] = nb + k
+                ldims[lc[0]] = last
+                for k, i in enumerate(rb):
+                    rdims[i] = k
+                for k, i in enumerate(rfree):
+                    rdims[i] = nb + len(lfree) + k
+                rdims[rc[0]] = last
+                a = self._broadcasted(lhs, inner, ldims)
+                b = self._broadcasted(rhs, inner, rdims)
+                mul = SymElem("stablehlo.multiply", [a, b], "f32", inner)
+                return SymRedReg(mul, tuple(shape), "f32")
+        except _Unsupported as e:
+            if _DEBUG:
+                print(f"[metaljax] inlane_dot bail: {e}", flush=True)
+            return None
+        return None
 
     def _counter_arith(self, name, a, b):
         def parts(s):
@@ -1106,6 +1195,20 @@ class _Analyzer:
                     dims)
                 return SymPad(inner, x.lo, x.n, tuple(out_shape))
             raise _Unsupported("broadcast reshaping a pad window")
+        if isinstance(x, (SymAccDot, SymAccRed)):
+            # pure unit-dim insertion commutes with the post-kernel
+            # accumulation: run() reshapes the summed result to the carry
+            # shape, and the dot spec is built from operand shapes only
+            # (matlstm's vmapped dW adds arrive as carry + broadcast(dot))
+            if all(x.shape[i] == out_shape[d] for i, d in enumerate(dims)) \
+                    and all(out_shape[d] == 1
+                            for d in range(len(out_shape))
+                            if d not in set(dims)):
+                return self._reshaped(x, tuple(out_shape))
+            raise _Unsupported(
+                f"size-changing broadcast of accumulator "
+                f"{type(x).__name__} {x.shape}->{tuple(out_shape)} "
+                f"dims={list(dims)}")
         if not isinstance(x, SymLeaf):
             raise _Unsupported(f"broadcast of {type(x).__name__} "
                                f"{x.shape}->{tuple(out_shape)} dims={list(dims)}")
@@ -1404,6 +1507,29 @@ def _collect_dots(roots):
     return out
 
 
+def _needs_registers(roots):
+    """True if the DAG holds register-resident constructs (register
+    reduces, pad windows) that scalar mode cannot emit — such bodies
+    must plan in vector mode even when no SymDot survives (the in-lane
+    dot rewrites replace dots with these forms)."""
+    seen = set()
+    stack = list(roots)
+    while stack:
+        s = stack.pop()
+        if s is None or id(s) in seen:
+            continue
+        seen.add(id(s))
+        if isinstance(s, (SymRedReg, SymPad)):
+            return True
+        if isinstance(s, SymElem):
+            stack.extend(s.args)
+        elif isinstance(s, SymStack):
+            stack.append(s.base)
+            for p_ in getattr(s, "parts", []) or []:
+                stack.append(p_[1] if isinstance(p_, tuple) else p_)
+    return False
+
+
 def _has_dot(roots):
     seen = set()
     stack = list(roots)
@@ -1569,12 +1695,14 @@ class Plan:
     """A compiled persistent-kernel execution plan for one loop body."""
 
     def __init__(self, interp, body_block, counter_pos, trip, start,
-                 no_coop_flip=False):
-        global _last_flipped
+                 no_coop_flip=False, no_inlane_dot=False):
+        global _last_flipped, _last_inlane
         _last_flipped = False
+        _last_inlane = False
         self.trip = trip
         args = list(body_block.arguments)
-        an = _Analyzer(interp, body_block, counter_pos)
+        an = _Analyzer(interp, body_block, counter_pos,
+                       no_inlane_dot=no_inlane_dot)
         rets = an.analyze()
         if rets is None or len(rets) != len(args):
             raise _Unsupported("terminator mismatch")
@@ -1737,6 +1865,8 @@ class Plan:
                         self.mode = "coop"
         elif dots or self.accums:
             self.mode = "coop"
+        elif _needs_registers(exprs0):
+            self.mode = "vector"
         else:
             self.mode = "scalar"
         self.vector = self.mode == "vector"
@@ -3205,17 +3335,22 @@ def try_run(interp, op, ins, env, trip, start, counter_pos):
 
 
 def build_plan(interp, body_block, counter_pos, trip, start):
-    """Plan() with the coop-over-vector preference applied safely: if the
-    preferred coop build fails deeper in emission (coop's emitter covers
-    fewer leaf kinds than vector's), retry as vector so the preference can
-    never lose a plan that used to build."""
-    global _last_flipped
+    """Plan() with the newer heuristics applied safely: if a build using
+    the coop-over-vector preference or the in-lane small-dot rewrite
+    fails deeper in analysis/emission, retry with the heuristics that
+    fired disabled, so neither can lose a plan that used to build. Any
+    exception counts, not just _Unsupported (emitter crashes too)."""
+    global _last_flipped, _last_inlane
     try:
         return Plan(interp, body_block, counter_pos, trip, start)
-    except Exception:
-        # not just _Unsupported: an emitter crash (KeyError etc.) on the
-        # flipped path must not lose a plan the vector path can build
-        if not _last_flipped:
+    except Exception as e:
+        flipped, inlane = _last_flipped, _last_inlane
+        if not (flipped or inlane):
             raise
+        if _DEBUG:
+            print(f"[metaljax] msl_scan: retry without "
+                  f"{'coop-flip ' if flipped else ''}"
+                  f"{'inlane-dot' if inlane else ''} (first build: {e})",
+                  flush=True)
         return Plan(interp, body_block, counter_pos, trip, start,
-                    no_coop_flip=True)
+                    no_coop_flip=flipped, no_inlane_dot=inlane)

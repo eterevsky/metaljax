@@ -368,3 +368,30 @@ def test_packing_with_sliced_weight_window(monkeypatch):
     check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
                              argnums=(0, 1, 2)), X, H0, Wf,
           rtol=1e-3, atol=1e-4)
+
+
+def test_matrix_state_outer_and_matvec():
+    # matlstm-family building blocks: a matrix state updated with an
+    # outer product of loop-computed vectors, and an in-body matvec of
+    # the state (dot_generals with NO invariant operand — the in-lane
+    # rewrite must turn them into broadcast-multiplies / register
+    # reduces rather than illegal fission accumulators).
+    D = 2
+    Q = (rng.standard_normal((L, B, D)) * 0.4).astype(np.float32)
+    K2 = (rng.standard_normal((L, B, D)) * 0.4).astype(np.float32)
+    C0 = (rng.standard_normal((B, D, D)) * 0.3).astype(np.float32)
+
+    def f(qs, ks, c0):
+        def cell(c, qk):
+            q, k = qk
+            nc = 0.9 * c + jnp.einsum('bi,bj->bij', q, k)  # outer accum
+            y = jnp.einsum('bij,bj->bi', nc, q)     # state matvec
+            out = nc * (1.0 + 0.1 * y[:, :, None])
+            return nc, out
+        return jax.lax.scan(cell, c0, (qs, ks))
+    check(f, Q, K2, C0, rtol=1e-4, atol=1e-5)
+    check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
+                             argnums=(0, 1, 2)), Q, K2, C0,
+          rtol=1e-3, atol=1e-4)
+    assert _plan_modes(f, Q, K2, C0), \
+        "matrix-state cell fell off the MSL path"
