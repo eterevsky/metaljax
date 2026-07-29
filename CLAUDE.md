@@ -327,7 +327,26 @@ executes on the Metal device through plain `jax.numpy`.
    per Oleg (search optimizes for >=thousands of weights). Leftovers:
    F<=4 coop pocket unmeasured; output packing; reads&weights sid
    overlap guard (pre-existing, flagged).
-19. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+19. ✅ **v0.4.4: worker buffer GC + matlstm groundwork.** (a) From a
+   live worker crash (Resource limit 499000 surviving clear-and-retry):
+   Python's cycle gc barely triggers under array workloads, dead
+   managers in refcycles pin ~500 buffers/config (measured via new
+   metaljax.diagnostics.live_buffer_floor — allocate 1-elem buffers to
+   the limit and count; MLX has no count API and bytes round to zero
+   at these sizes), and mx.clear_cache() can't free REFERENCED
+   buffers. Fix: gc.collect() before clear_cache in every
+   resource-limit recovery + at compile boundaries + the 50k-execute
+   backstop; plan._last_bufs debug retention gated MJDBG_VERIFY_MSL;
+   METALJAX_MEMDBG telemetry. Release chain itself verified clean
+   (floor returns to baseline after config release). (b) matlstm
+   diagnosis (300x vs CPU: matrix state needs 2-D register blocks —
+   feature DROPPED per Oleg, off Pareto frontier; notes/matlstm-2026-07)
+   yielded three generic recognizer fixes: acc-broadcast unit-dims,
+   in-lane small-dot rewrite (rank>=3 gated, METALJAX_MSL_INLANE=0,
+   db17 24% win kept, db02 regression found+gated), _needs_registers
+   mode probe; build_plan retries with fired heuristics off. Gate
+   104/104, 200 pytest, perf at baseline.
+20. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
