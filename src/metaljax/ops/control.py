@@ -112,6 +112,7 @@ def _analyze_counted(interp, op):
     return result
 
 
+import gc
 import os
 
 # Max ops a single mx.compile trace may contain (counted loops unrolled).
@@ -142,6 +143,7 @@ _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 # re-mallocs of the working set). The clear-and-retry at the flush sites
 # remains the hard backstop for pathological workloads.
 _LOOP_CLEAR_COST = int(os.environ.get("METALJAX_LOOP_CLEAR_COST", "500000"))
+_MEMDBG = os.environ.get("METALJAX_MEMDBG", "") == "1"
 _flushed_cost = 0
 
 
@@ -157,12 +159,17 @@ def _loop_flush(arrays, cost_units):
         if _DEBUG:
             print("[metaljax] Metal buffer limit hit at loop flush; "
                   "clearing cache and retrying", flush=True)
+        gc.collect()  # dead refcycles pin buffers clear_cache can't free
         mx.clear_cache()
         mx.eval(*arrays)
     _flushed_cost += cost_units
     if _flushed_cost >= _LOOP_CLEAR_COST:
         _flushed_cost = 0
         mx.clear_cache()
+        if _MEMDBG:
+            print(f"[metaljax-mem] loop clear: "
+                  f"active={mx.get_active_memory()}B "
+                  f"cache={mx.get_cache_memory()}B", flush=True)
 
 
 def _static_start(op, k):
@@ -474,6 +481,7 @@ def _while(interp, op, ins, env):
                     if _DEBUG:
                         print("[metaljax] Metal buffer limit hit in while "
                               "body; clearing cache and retrying", flush=True)
+                    gc.collect()
                     mx.clear_cache()
                     limit_retries += 1
                     if limit_retries == 2 and compiled:

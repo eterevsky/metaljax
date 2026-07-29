@@ -7,6 +7,7 @@ since these run while jax may still be mid-initialization.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
 
@@ -160,7 +161,12 @@ def compile_program(code: bytes, fmt: str) -> MetalExecutable:
     if fmt not in ("mlir",):
         raise ValueError(f"unsupported program format {fmt!r}")
     # New program = config boundary: cached buffers from prior shapes are
-    # dead weight against the Metal buffer-count limit.
+    # dead weight against the Metal buffer-count limit. gc.collect() first:
+    # dead managers/executables often sit in reference cycles (Python's gc
+    # triggers on allocation counts, which array workloads barely tick),
+    # and each pins its mx.compile traces and plan arrays — clear_cache
+    # cannot free buffers that are still referenced.
+    gc.collect()
     mx.clear_cache()
     from jaxlib.mlir.dialects import stablehlo
 
@@ -208,6 +214,7 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
     global _exec_count
     _exec_count += 1
     if _CLEAR_PERIOD and _exec_count % _CLEAR_PERIOD == 0:
+        gc.collect()  # array workloads rarely trip Python's own gc
         mx.clear_cache()
     args = [b.data for b in buffers]
     # NB retries happen AFTER the except block: the in-flight exception's
@@ -243,11 +250,16 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
             ex._compiled = None
             retry = "eager"
     if retry is not None:
+        gc.collect()  # dead refcycles pin executables clear_cache can't free
         mx.clear_cache()
         runner = ex.interpreter if retry == "eager" else ex.runner()
         outs = list(runner(*args))
         if outs:
             mx.eval(*outs)
+    if os.environ.get("METALJAX_MEMDBG", "") == "1":
+        print(f"[metaljax-mem] execute done: "
+              f"active={mx.get_active_memory()}B "
+              f"cache={mx.get_cache_memory()}B", flush=True)
     res = []
     for arr, type_enum, dims in zip(outs, ex.out_types, ex.out_dims):
         res.append(MetalBuffer(arr, type_enum, dims))

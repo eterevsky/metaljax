@@ -3056,7 +3056,10 @@ class Plan:
         out_dtypes = ([_MX_DTYPE[self.arg_dtypes[pos]] for pos, _, _ in self.stacked]
                       + [mx.float32 for _ in self.hidden]
                       + [_MX_DTYPE[self.arg_dtypes[pos]] for pos, _ in self.states])
-        self._last_bufs = bufs
+        if os.environ.get("MJDBG_VERIFY_MSL"):
+            # debug-only: retaining last-call buffers pins real device
+            # memory per plan for the executable's lifetime
+            self._last_bufs = bufs
         tg = (self.F if self.mode == "coop" else min(self.N, 256), 1, 1)
         outs = self.kernel(
             inputs=feed,
