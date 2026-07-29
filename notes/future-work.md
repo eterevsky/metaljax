@@ -88,3 +88,8 @@ Collected during the lrnn/mullstm passes; each is concrete and scoped.
   `np.array(mx.matmul(mx.zeros((0,4)), mx.ones((4,2))))` segfaults on a
   null data pointer after successful eval (MLX 0.32; M=0 or N=0 outputs;
   zero-K is fine). Report upstream; found by jax/tests lax_numpy suite.
+
+- 2-D register blocks in msl_scan vector mode (matrix-state cells:
+  matlstm/mLSTM family) — full sketch + diagnosis in
+  notes/matlstm-2026-07.md. Dropped 2026-07-29 (matlstm off the search
+  Pareto frontier); revisit if the family becomes competitive.

@@ -54,6 +54,15 @@ over chosen block dims, broadcast strides per block dim, stacked
 writes. Est. 1-2 days + full validation. Covers matlstm.2/.4 fwd+bwd;
 matlstm.8+ (64+ regs/lane) would need a coop-style threadgroup variant.
 
+## Decision (Oleg, 2026-07-29)
+
+matlstm is not on the search's Pareto frontier — register blocks are
+DROPPED for now. The three recognizer fixes stay (committed 9d73eda,
+generally useful). If matlstm ever matters, the feature sketch above
+is the starting point; until then metal runs it ~300x slower than CPU
+(replay path), which the search tolerates since the family is
+off-frontier.
+
 ## Meanwhile
 
 The three recognizer fixes stand on their own (validated: 200 pytest
