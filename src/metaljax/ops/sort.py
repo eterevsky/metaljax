@@ -211,6 +211,16 @@ def approx_top_k(op, ins):
     comp = str(op.attributes["called_computations"])
     is_max = "_gt_" in comp or "_ge_" in comp
     vals, idxs = ins[0], ins[1]
+    try:
+        out_n = int(ir.RankedTensorType(op.results[0].type).shape[dim])
+    except Exception:
+        out_n = -1
+    if out_n > 0:
+        # aggregate_to_topk=False: the result is wider than backend_config's
+        # top_k (XLA returns an unsorted approximate set of that width).
+        # Slicing to top_k under-fills the result buffer, leaving the tail
+        # as uninitialised device memory.
+        k = max(k, min(out_n, vals.shape[dim]))
     key = _sort_key(vals)
     if is_max:
         key = ~key

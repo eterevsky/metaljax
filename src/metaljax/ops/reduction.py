@@ -191,11 +191,24 @@ def _extract_windows(x, init, wd, strides, pad, rank, bdil=None, wdil=None):
     wflat = 1
     for w_ in wd:
         wflat *= int(w_)
+    est = wflat
+    for o_ in out_sizes:
+        est *= o_
+    if est > 200_000_000:
+        raise UnsupportedOpError(
+            f"reduce_window materialization too large ({est} elements)")
     win = mx.as_strided(
         x, tuple(out_sizes) + tuple(int(w) for w in wd),
         tuple(es[i] * int(strides[i]) for i in range(rank))
         + tuple(es[i] * wdil[i] for i in range(rank)), 0)
-    return mx.reshape(win, tuple(out_sizes) + (wflat,))
+    win = mx.reshape(win, tuple(out_sizes) + (wflat,))
+    # MLX 0.32: reductions over a strided as_strided view read the WRONG
+    # elements once the reshape folds the window block into a non-unit
+    # stride axis (window_dilation != 1, or a window on a non-innermost
+    # axis) — the tail of the result is stale device memory. Materialize
+    # before reducing. Free when the reshape already had to copy, which
+    # is every multi-axis window (ordinary 2-D/3-D pooling).
+    return mx.contiguous(win)
 
 
 @register("stablehlo.reduce_window")
@@ -321,6 +334,13 @@ def _reduce_window(interp, op, ins, env):
     win = mx.reshape(win, tuple(out_sizes) + (wflat,))
     if any(o == 0 for o in out_sizes) or wflat == 0:
         return [mx.broadcast_to(init.astype(x.dtype), tuple(out_sizes))]
+    # MLX 0.32: reductions over a strided as_strided view read the WRONG
+    # elements once the reshape folds the window block into a non-unit
+    # stride axis (window_dilation != 1, or a window on a non-innermost
+    # axis) — the tail of the result is stale device memory. Materialize
+    # before reducing. Free when the reshape already had to copy, which
+    # is every multi-axis window (ordinary 2-D/3-D pooling).
+    win = mx.contiguous(win)
 
     if len(body_ops) == 2:
         table = _BOOL_REDUCERS if dtypes.is_bool(win.dtype) else _REDUCERS
@@ -388,7 +408,7 @@ def _select_and_scatter(interp, op, ins, env):
     wflat = 1
     for w in wd:
         wflat *= int(w)
-    win = mx.reshape(win, tuple(out_sizes) + (wflat,))
+    win = mx.contiguous(mx.reshape(win, tuple(out_sizes) + (wflat,)))
     arg = (mx.argmax if is_max else mx.argmin)(win, axis=-1)  # first hit,
     # matching XLA's in-order GE/LE select
 

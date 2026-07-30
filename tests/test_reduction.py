@@ -119,3 +119,24 @@ def test_reduce_window_general():
     # select_and_scatter (pool backward), overlapping windows included
     check(jax.grad(lambda x: lax.reduce_window(
         x, -jnp.inf, lax.max, (1, 1, 3, 3), (1, 1, 1, 1), "SAME").sum()), x)
+
+
+def test_reduce_window_dilated():
+    # window_dilation makes the strided window view fold into a
+    # non-unit-stride axis; MLX's reductions read the wrong elements
+    # there (stale device memory in the tail) unless it is materialized.
+    from jax import lax
+    x2 = rng.standard_normal((4, 6)).astype(np.float32)
+    x4 = rng.standard_normal((3, 2, 4, 6)).astype(np.float32)
+    for op, iv in ((lax.max, -np.inf), (lax.min, np.inf), (lax.add, 0.0)):
+        check(lambda v, op=op, iv=iv: lax.reduce_window(
+            v, jnp.float32(iv), op, (1, 2), (1, 1), 'SAME', (1, 1), (1, 2)),
+            x2)
+        check(lambda v, op=op, iv=iv: lax.reduce_window(
+            v, jnp.float32(iv), op, (1, 1, 2, 1), (1, 1, 1, 1),
+            ((0, 1), (1, 0), (2, 3), (0, 2)), (2, 1, 3, 2), (1, 2, 2, 1)),
+            x4)
+    # non-monoid body: goes through the generic pairwise reduce
+    check(lambda v: lax.reduce_window(
+        v, jnp.float32(-np.inf), jnp.logaddexp, (1, 2), (1, 1), 'SAME',
+        (1, 1), (1, 2)), x2, rtol=1e-5, atol=1e-6)

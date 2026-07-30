@@ -52,3 +52,12 @@ def test_searchsorted_nan_total_order():
 def test_sort_complex_lexicographic():
     z = np.array([3 + 1j, 1 + 5j, 1 + 2j, 3 - 1j], np.complex64)
     check(lambda z: jnp.sort(z), z)
+
+
+def test_approx_top_k_no_aggregate():
+    # aggregate_to_topk=False asks for a wider (unsorted, approximate)
+    # result than backend_config's top_k; filling only top_k left the
+    # rest of the output buffer uninitialised.
+    x = rng.standard_normal((3, 8, 32)).astype(np.float32)
+    check(lambda a: jax.lax.approx_max_k(a, k=4, reduction_dimension=1,
+                                         aggregate_to_topk=False), x)
