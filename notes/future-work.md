@@ -72,8 +72,10 @@ Collected during the lrnn/mullstm passes; each is concrete and scoped.
 ## Bigger arcs
 
 - Stage 2: native engine (C++/Obj-C++, StableHLO parsed natively).
-- sort, general reduce_window, partial-window scatter coverage.
 - bf16 msl kernels (currently f32/f16/int only in generated kernels).
+- (sort, general reduce_window and windowed scatter landed in 0.4.0;
+  the remaining op-coverage backlog is the "under review" list in
+  README / notes/jax-test-suite-2026-07.md.)
 
 ## Robustness
 

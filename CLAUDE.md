@@ -84,7 +84,7 @@ executes on the Metal device through plain `jax.numpy`.
    emulation (needed only under jax_enable_x64, e.g. optax AdamW's
    beta**step; NB texmo.py sets x64 FALSE — scripts/texmo_train.py must
    match it, an earlier x64=True copy skewed repro perf/dtype profiles).
-   Driver: scratchpad texmo_metal_train.py (imports ManagerJax directly,
+   Driver: scripts/texmo_train.py (imports ManagerJax directly,
    avoids texmo.py's hardcoded platforms; torch installed just for imports).
    `bench_jax.py --platform metal` works (flag committed to texmo repo).
    Verified: `bits.1+bp|rnn.1.tanh` and `bits.1+bp|mgru.4-dense.4.gelu` train

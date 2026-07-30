@@ -58,8 +58,6 @@ def _rng_bit_generator(interp, op, ins, env):
     out_dtype = dtypes.mx_dtype_for(out_t.element_type)
     out_shape = list(out_t.shape)
     if "THREE_FRY" in algo:
-        if state.dtype == mx.uint32 and state.shape == (4,):
-            state = mx.view(state, mx.uint64)
         if out_dtype.size * 8 > 32:
             raise UnsupportedOpError("rng_bit_generator THREE_FRY 64-bit")
         new_state, bits = _threefry_bits(state, out_shape, out_dtype)

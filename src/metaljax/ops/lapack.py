@@ -111,12 +111,6 @@ def _householder_product(op, ins):
     return _batch_apply(one, [a, taus], batch, specs)
 
 
-def _register_ffi(name_map):
-    for names, fn in name_map:
-        for n in names:
-            TARGETS[n] = fn
-
-
 @_target("lapack_ssyevd_ffi", "lapack_dsyevd_ffi", "lapack_cheevd_ffi",
          "Eigh")
 def _eigh(op, ins):

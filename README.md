@@ -332,15 +332,24 @@ CPU (≤4.2%), so that's cross-backend bf16 numerics, not a backend bug.
 
 ## Known limitations
 
-- Scan bodies that don't fit the kernel-codegen patterns (in-cell
-  reductions, gather/scatter in the loop, non-affine indexing) fall back
-  to per-timestep compiled-graph replay, which pays per-step dispatch.
-- float64 is emulated in f32 (see `METALJAX_F64`); complex dtypes are
-  unsupported.
-- Not yet implemented (fail with a clear `UnsupportedOpError`):
-  `sort`, general `reduce_window` (only cumsum/cumprod/cummax/cummin
-  patterns), partial-window scatter, send/recv, multi-device anything.
-- Buffer donation is ignored (correct, but no memory savings).
+Three platform constraints are permanent (detailed under *Coverage and
+known gaps* above): no float64 or complex128 **compute** (pass-through
+is fine; `METALJAX_F64=downcast` emulates in f32), one physical device
+(single-device `pmap`/`shard_map`/collectives work; real multi-device
+sharding has no hardware), and denormals flushing to zero on the GPU.
+Everything else still open is itemized in the "Under review" list
+above.
+
+Performance, not correctness:
+
+- Scan bodies that don't fit the kernel-codegen patterns (gather/scatter
+  in the loop, non-affine indexing, bodies exceeding the trace or binding
+  budgets) fall back to per-timestep compiled-graph replay, which pays
+  per-step dispatch.
+- Buffer donation is honoured (`donate_argnums` invalidates the donated
+  inputs, matching other backends), but MLX cannot write outputs into
+  the donated memory in place — the win is prompt buffer release rather
+  than CUDA-style aliasing.
 
 ## License / provenance
 
