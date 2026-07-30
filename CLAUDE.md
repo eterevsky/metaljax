@@ -53,6 +53,10 @@ executes on the Metal device through plain `jax.numpy`.
   costs — and let Oleg decide whether the compatibility is worth the
   slowdown. Don't just implement it.
 - `~/texmo` is the acceptance workload (read-only; don't modify it either).
+- Delegation (per Oleg): well-defined "investigate and fix" tasks go to
+  Opus subagents (worktree-isolated, GPU-light validation only while
+  other GPU work runs) to preserve main-context tokens. The main agent
+  reviews every diff before it is committed — subagents never commit.
 
 ## Layout (planned)
 - `CLAUDE.md` — this file.
