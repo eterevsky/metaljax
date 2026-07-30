@@ -166,7 +166,15 @@ def _register_callback_lowerings(mlir):
         return list(op.results)
 
     def debug_cb_rule(ctx, *args, effect, partitioned, callback, **params):
-        return emit_callback(ctx, args, callback, with_results=False)
+        # Route through the primitive's impl like jax's own lowering does:
+        # it device_puts the operands onto CPU, so the user callback sees
+        # jax Arrays (not raw numpy) exactly as on other backends.
+        def run(*flat_args):
+            debugging.debug_callback_p.impl(
+                *flat_args, effect=effect, partitioned=partitioned,
+                callback=callback, **params)
+            return ()
+        return emit_callback(ctx, args, run, with_results=False)
 
     def debug_print_rule(ctx, *dyn_args, fmt, ordered, partitioned,
                          in_tree, static_args, np_printoptions,
@@ -176,7 +184,13 @@ def _register_callback_lowerings(mlir):
             has_placeholders, logging_record)
         callback = debugging._make_flat_callback(
             in_tree, callback, static_args)
-        return emit_callback(ctx, dyn_args, callback, with_results=False)
+
+        def run(*flat_args):
+            debugging.debug_callback_p.impl(
+                *flat_args, effect=debugging.debug_effect,
+                partitioned=partitioned, callback=callback)
+            return ()
+        return emit_callback(ctx, dyn_args, run, with_results=False)
 
     mlir.register_lowering(debugging.debug_callback_p, debug_cb_rule,
                            platform="metal")

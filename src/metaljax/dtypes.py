@@ -94,6 +94,18 @@ for _name, (_mxdt, _npdt) in EMULATED.items():
 _EMULATED_BY_NP = {npdt: (name, mxdt) for name, (mxdt, npdt) in EMULATED.items()}
 
 
+# jax carries ordered-effect tokens as bool[0] buffers at the runtime
+# boundary (core.get_token_aval() is ShapedArray((0,), bool); dispatch
+# seeds them with np.zeros(0, bool)), so that is what the interpreter
+# reports for !stablehlo.token avals and hands back as a token value.
+TOKEN_SHAPE = (0,)
+TOKEN_NP_DTYPE = np.dtype(np.bool_)
+
+
+def token_value() -> "mx.array":
+    return mx.zeros(TOKEN_SHAPE, mx.bool_)
+
+
 def np_dtype_for_mlir(t: ir.Type) -> np.dtype:
     """The numpy dtype JAX expects for this element type (f64 reported as-is)."""
     s = str(t)

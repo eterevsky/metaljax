@@ -41,6 +41,30 @@ def _splat_int(op) -> int | None:
         return None
 
 
+def _cond_has_effects(interp, block) -> bool:
+    """True if a while-cond region performs host-visible side effects
+    (callbacks / debug prints), directly or through a callee."""
+    for op in block.operations:
+        o = op.operation
+        if o.name == "stablehlo.custom_call":
+            try:
+                if ir.BoolAttr(o.attributes["has_side_effect"]).value:
+                    return True
+            except (KeyError, ValueError):
+                pass
+        if o.name in ("func.call", "stablehlo.composite"):
+            attr = "callee" if o.name == "func.call" else "decomposition"
+            fn = interp.funcs.get(_callee_name(o, attr))
+            if fn is not None and _cond_has_effects(
+                    interp, fn.regions[0].blocks[0]):
+                return True
+        for region in o.regions:
+            for b in region.blocks:
+                if _cond_has_effects(interp, b):
+                    return True
+    return False
+
+
 def _analyze_counted(interp, op):
     """Detect the canonical counted loop JAX emits for scan/fori_loop.
 
@@ -56,6 +80,12 @@ def _analyze_counted(interp, op):
     cached = interp._counted_cache.get(cond_block, "miss")
     if cached != "miss":
         return cached
+    if _cond_has_effects(interp, cond_block):
+        # The counted fast path never executes the cond region, so a cond
+        # with host-visible effects must take the dynamic path (which runs
+        # the cond trip+1 times, matching XLA).
+        interp._counted_cache[cond_block] = None
+        return None
 
     result = None
     try:
@@ -243,6 +273,11 @@ def _msl_plan_for(interp, op):
         return None
     body = op.regions[1].blocks[0]
     key = (body, trip, start)
+    if any(_ir.is_token(a.type) for a in body.arguments):
+        # ordered-effect carries: not kernel-representable, and the
+        # analyzer would raise deep inside on the non-tensor type
+        interp._msl_cache[key] = None
+        return None
     plan = interp._msl_cache.get(key, "miss")
     if plan == "miss":
         try:

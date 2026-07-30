@@ -179,22 +179,32 @@ class Interpreter:
     def _main_block(self) -> ir.Block:
         return self.main.regions[0].blocks[0]
 
+    @staticmethod
+    def _aval_for(t: ir.Type) -> tuple[tuple[int, ...], np.dtype]:
+        """Shape/dtype JAX expects for an MLIR type. Ordered-effect tokens
+        are not tensors — they cross the PJRT boundary as bool[0]."""
+        if _ir.is_token(t):
+            return (dtypes.TOKEN_SHAPE, dtypes.TOKEN_NP_DTYPE)
+        rt = ir.RankedTensorType(t)
+        return (tuple(rt.shape), dtypes.np_dtype_for_mlir(rt.element_type))
+
     @property
     def in_avals(self) -> list[tuple[tuple[int, ...], np.dtype]]:
-        out = []
-        for a in self._main_block().arguments:
-            t = ir.RankedTensorType(a.type)
-            out.append((tuple(t.shape), dtypes.np_dtype_for_mlir(t.element_type)))
-        return out
+        return [self._aval_for(a.type) for a in self._main_block().arguments]
 
     @property
     def out_avals(self) -> list[tuple[tuple[int, ...], np.dtype]]:
         ftype = ir.FunctionType(ir.TypeAttr(self.main.attributes["function_type"]).value)
-        out = []
-        for t in ftype.results:
-            rt = ir.RankedTensorType(t)
-            out.append((tuple(rt.shape), dtypes.np_dtype_for_mlir(rt.element_type)))
-        return out
+        return [self._aval_for(t) for t in ftype.results]
+
+    @property
+    def in_tokens(self) -> list[bool]:
+        return [_ir.is_token(a.type) for a in self._main_block().arguments]
+
+    @property
+    def out_tokens(self) -> list[bool]:
+        ftype = ir.FunctionType(ir.TypeAttr(self.main.attributes["function_type"]).value)
+        return [_ir.is_token(t) for t in ftype.results]
 
     # --- purity / capture analysis (used for mx.compile) ---
 
@@ -203,11 +213,21 @@ class Interpreter:
         cached = self._pure_cache.get(block)
         if cached is not None:
             return cached
+        # Token-carrying code sequences host-visible effects: keep it off
+        # every tracing path (whole-main compile, counted-loop replay,
+        # compiled while bodies). Such programs sync with the host anyway,
+        # so nothing is lost.
+        if any(_ir.is_token(a.type) for a in block.arguments):
+            self._pure_cache[block] = False
+            return False
         self._pure_cache[block] = True  # optimistic; no recursion in jax IR
         pure = True
         for op in block.operations:
             o = op.operation
             name = o.name
+            if any(_ir.is_token(r.type) for r in o.results):
+                pure = False
+                break
             if name in self._IMPURE_OPS:
                 hook = type(self).while_traceable_hook
                 if (

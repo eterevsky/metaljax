@@ -43,6 +43,7 @@ TARGETS["metaljax_callback"] = _run_callback
 
 @register("stablehlo.create_token", "stablehlo.after_all")
 def _token(interp, op, ins, env):
-    # Tokens only sequence effects; a zero-size sentinel suffices.
-    import mlx.core as mx
-    return mx.zeros((0,))
+    # Tokens only sequence effects; the value carries nothing. Use the
+    # bool[0] representation jax expects at the runtime boundary so a
+    # token returned from main matches its declared aval.
+    return dtypes.token_value()

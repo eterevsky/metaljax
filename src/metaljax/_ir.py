@@ -49,6 +49,17 @@ def tensor_type(value: ir.Value) -> ir.RankedTensorType:
     return ir.RankedTensorType(value.type)
 
 
+def is_token(t: ir.Type) -> bool:
+    """True for !stablehlo.token — the value jax threads through function
+    signatures to sequence ordered effects (jax.debug.print(ordered=True),
+    io_callback(ordered=True)). Not a tensor type: everything that assumes
+    RankedTensorType must check this first."""
+    try:
+        return stablehlo.TokenType.isinstance(t)
+    except Exception:
+        return str(t) == "!stablehlo.token"
+
+
 _TEXT_NP_DTYPES = {
     "bf16": "bfloat16",  # resolved via ml_dtypes below
     "i4": "int4", "ui4": "uint4",
