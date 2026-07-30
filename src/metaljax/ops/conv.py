@@ -214,7 +214,7 @@ def _convolution(interp, op, ins, env):
             w.astype(mx.complex64))
         re = conv_all(ar, br) - conv_all(ai, bi)
         im = conv_all(ar, bi) + conv_all(ai, br)
-        out = re.astype(mx.complex64) + im.astype(mx.complex64) * 1j
+        out = dtypes.make_complex(re, im)
     elif not dtypes.is_float(out_dtype):
         if fgc > 1 or bgc > 1:
             raise UnsupportedOpError("conv: grouped integer conv")

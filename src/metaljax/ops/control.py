@@ -210,6 +210,32 @@ def _static_start(op, k):
     return None
 
 
+def _scatter_cost(interp, op) -> int:
+    """Cost of a scatter's update-computation region. A computed body with
+    possibly-duplicate indices is replayed once per update (the sequential
+    apply path in ops/gather.py), so charge the whole expansion instead of
+    a single body. Must never raise — fall back to one body."""
+    body = 0
+    for region in op.regions:
+        for b in region.blocks:
+            body += _block_cost(interp, b)
+    try:
+        from metaljax.ops.gather import _scatter_combiner, _scatter_dims
+        if ("unique_indices" in op.attributes
+                and "true" in str(op.attributes["unique_indices"])):
+            return body
+        if _scatter_combiner(op) != "apply":
+            return body
+        ivd = _scatter_dims(op)["index_vector_dim"]
+        n = 1
+        for i, s in enumerate(_ir.tensor_type(op.operands[1]).shape):
+            if i != ivd:
+                n *= s
+        return max(n, 1) * body
+    except Exception:
+        return body
+
+
 def _block_cost(interp, block) -> int:
     """Approximate op count when this block is traced (loops unrolled)."""
     cached = interp._cost_cache.get(block)
@@ -237,6 +263,8 @@ def _block_cost(interp, block) -> int:
                 if start is not None:
                     trip = max(counted[1] - start, 1)
             cost += trip * _block_cost(interp, body)
+        elif o.name == "stablehlo.scatter":
+            cost += _scatter_cost(interp, o)
         elif o.name in ("func.call", "stablehlo.composite"):
             attr = "callee" if o.name == "func.call" else "decomposition"
             fn = interp.funcs.get(_callee_name(o, attr))

@@ -20,7 +20,7 @@ def _assign(dst, idx, upd):
         re, im = mx.real(dst), mx.imag(dst)
         re[idx] = mx.real(upd)
         im[idx] = mx.imag(upd)
-        return re.astype(mx.complex64) + im.astype(mx.complex64) * 1j
+        return dtypes.make_complex(re, im)
     dst[idx] = upd
     return dst
 
@@ -283,7 +283,7 @@ def _scatter(interp, op, ins, env):
             im = _scatter(interp, op,
                           [mx.imag(operand), scatter_indices,
                            mx.imag(updates)], env)
-            return re.astype(mx.complex64) + im.astype(mx.complex64) * 1j
+            return dtypes.make_complex(re, im)
     op_shape = list(operand.shape)
     idx_shape = list(scatter_indices.shape)
     upd_shape = list(updates.shape)
@@ -379,20 +379,34 @@ def _scatter(interp, op, ins, env):
         block = op.regions[0].blocks[0]
         bargs = list(block.arguments)
         if not unique:
-            # Order-dependent duplicates: apply updates one at a time
-            # (XLA applies them in some sequential order; combiners are
-            # required to be associative but not idempotent). Bounded —
-            # the general-body-with-duplicates pattern only shows up in
-            # small op-semantics tests.
+            # Order-dependent duplicates: apply the updates one at a time,
+            # in row-major update order (XLA applies them sequentially;
+            # combiners are required to be associative but not idempotent,
+            # and a computed body need be neither). Only the BATCH axis has
+            # to be sequential — within a single update the window elements
+            # land on distinct operand slots, so the window axes stay
+            # vectorized and each iteration is a constant number of MLX
+            # ops. Bounded by the update count: the general-body-with-
+            # duplicates pattern only shows up in small op-semantics tests.
             nb_ = 1
             for s in batch_shape:
                 nb_ *= s
-            if E or nb_ > 1024:
+            if nb_ > 1024:
                 raise UnsupportedOpError(
                     f"scatter computed-body with duplicates: "
-                    f"{nb_} updates, windowed={bool(E)}")
-            flat_idx = [mx.reshape(mapped[dim], (nb_,))
-                        for dim in indexed_dims]
+                    f"{nb_} updates")
+            # Same construction as idx_list below, with the batch dims
+            # flattened into one leading axis (identical when E == 0).
+            flat_idx = []
+            for dim in indexed_dims:
+                base = mx.reshape(mapped[dim], (nb_,) + (1,) * E)
+                if dim in expand:
+                    k = expand.index(dim)
+                    view = [1] * (1 + E)
+                    view[1 + k] = wsize[dim]
+                    base = base + mx.reshape(
+                        mx.arange(wsize[dim], dtype=mx.int32), view)
+                flat_idx.append(base)
             upd_f = mx.reshape(
                 updates_t, (nb_,) + tuple(updates_t.shape[len(batch_shape):]))
             oob_f = (mx.reshape(oob, (nb_,)) if oob is not None else None)

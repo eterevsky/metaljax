@@ -244,6 +244,8 @@ def make_complex(re: mx.array, im: mx.array) -> mx.array:
     """
     re = re.astype(mx.float32)
     im = im.astype(mx.float32)
+    if re.shape != im.shape:
+        re, im = mx.broadcast_arrays(re, im)
     pair = mx.stack([re, im], axis=-1)
     return mx.reshape(mx.view(pair, mx.complex64), re.shape)
 

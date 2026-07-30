@@ -1,10 +1,12 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 
-from helpers import check
+from helpers import check, run_metal
 
 rng = np.random.default_rng(3)
 
@@ -129,3 +131,80 @@ def test_scatter_windowed_indexed():
           np.array([1.0, 2.0, 3.0], np.float32))
     check(lambda x: jnp.pad(x, 1, mode="linear_ramp"),
           np.array([1.0, 2.0], np.float32))
+
+
+def test_scatter_apply_windowed_duplicates():
+    # scatter_apply: computed body, unique_indices=false, and a window that
+    # lands on an indexed dim. Duplicate starts apply the body repeatedly,
+    # in update order; XLA CPU (via check) is the reference for that order.
+    dn = jax.lax.ScatterDimensionNumbers(
+        update_window_dims=(1,), inserted_window_dims=(),
+        scatter_dims_to_operand_dims=(0,))
+    check(partial(jax.lax.scatter_apply, func=jnp.sin, update_shape=(3, 2),
+                  dimension_numbers=dn),
+          np.arange(10, dtype=np.float32), np.array([[0], [0], [4]], np.int32))
+    # Overlapping (not identical) windows: slot 1 gets the body twice.
+    check(partial(jax.lax.scatter_apply, func=jnp.sin, update_shape=(3, 2),
+                  dimension_numbers=dn),
+          np.arange(10, dtype=np.float32), np.array([[0], [1], [7]], np.int32))
+    # Out-of-bounds start (limit = 10 - 2): the WHOLE window is dropped.
+    check(partial(jax.lax.scatter_apply, func=jnp.sin, update_shape=(3, 2),
+                  dimension_numbers=dn),
+          np.arange(10, dtype=np.float32), np.array([[9], [0], [0]], np.int32))
+
+    # Partial window on a free dim + an inserted (size-1 window) index dim.
+    dn2 = jax.lax.ScatterDimensionNumbers(
+        update_window_dims=(1,), inserted_window_dims=(0,),
+        scatter_dims_to_operand_dims=(0,))
+    check(partial(jax.lax.scatter_apply, func=jnp.sin, update_shape=(3, 3),
+                  dimension_numbers=dn2),
+          rng.standard_normal((10, 5)).astype(np.float32),
+          np.array([[2], [2], [7]], np.int32))
+
+    # E > 0 together with a non-empty free dim (full window on dim 0,
+    # 2-wide indexed window on dim 1) -- the vmapped-scatter shape.
+    dn3 = jax.lax.ScatterDimensionNumbers(
+        update_window_dims=(1, 2), inserted_window_dims=(),
+        scatter_dims_to_operand_dims=(1,))
+    check(partial(jax.lax.scatter_apply, func=jnp.cos, update_shape=(3, 5, 2),
+                  dimension_numbers=dn3),
+          rng.standard_normal((5, 10)).astype(np.float32),
+          np.array([[0], [0], [8]], np.int32))
+
+    # operand/indices batching dims + window, with a dropped OOB start.
+    dn4 = jax.lax.ScatterDimensionNumbers(
+        update_window_dims=(2,), inserted_window_dims=(),
+        scatter_dims_to_operand_dims=(2,), operand_batching_dims=(0, 1),
+        scatter_indices_batching_dims=(1, 0))
+    check(partial(jax.lax.scatter_apply, func=jnp.sin, update_shape=(3, 2, 3),
+                  dimension_numbers=dn4),
+          rng.standard_normal((2, 3, 10)).astype(np.float32),
+          np.array([[[0], [1]], [[2], [3]], [[8], [9]]], np.int32))
+
+
+def test_scatter_complex_preserves_specials():
+    # A complex scatter is run on the real/imag parts and recombined. The
+    # recombination must be a bit layout, not arithmetic: re + im * 1j
+    # turns a finite/inf pair into nan (inf * 1j == nan + infj) and loses
+    # the sign of -0 -- corrupting elements the scatter never touched.
+    x = np.array([complex(np.inf, 1.0),    # inf in the real part
+                  complex(-0.0, -0.0),     # -0 in both parts
+                  complex(1.0, np.inf),    # inf in the imag part
+                  complex(np.nan, -0.0),
+                  complex(3.0, 4.0)], np.complex64)
+    i = np.array([4], np.int32)
+    v = np.array([7.0 - 8.0j], np.complex64)
+
+    def f(x, i, v):
+        return x.at[i].set(v)
+
+    got = run_metal(f, x, i, v)[0]
+    want = np.asarray(jax.jit(f)(x, i, v))
+    assert got.dtype == want.dtype
+    for name, g, w in (("real", got.real, want.real),
+                       ("imag", got.imag, want.imag)):
+        np.testing.assert_array_equal(np.isnan(g), np.isnan(w), err_msg=name)
+        m = ~np.isnan(w)
+        np.testing.assert_array_equal(g[m], w[m], err_msg=name)
+        np.testing.assert_array_equal(np.signbit(g), np.signbit(w),
+                                      err_msg=name)

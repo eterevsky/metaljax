@@ -160,10 +160,6 @@ decided** (~190 test failures; these all pass on the CPU backend; see
   a memory optimization, not a correctness issue), the `pinned_host`
   memory space, optimized-executable text retrieval, strict
   compile-options validation.
-- *Scatter with computed update bodies plus duplicate AND windowed
-  indices* (~13): the sequential-application fallback covers duplicate
-  point indices only; the windowed variant needs windowed sequential
-  emulation.
 - *int4/uint4 `bitcast_convert`* (7): sub-byte bitcasts don't map onto
   the byte-backed int4 emulation.
 - *Window-dilation numeric corners* (~7): specific

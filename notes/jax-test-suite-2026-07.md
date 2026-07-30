@@ -184,8 +184,18 @@ every failing file, consolidated):
   * token plumbing for ordered effects (~24): interpreter treats
     tokens as sentinels; full ordered-effect token threading through
     main signatures not implemented.
-  * scatter-apply with duplicates AND windows (~13): needs windowed
-    sequential emulation.
+  * scatter-apply with duplicates AND windows (~13): CLOSED post-0.4.4.
+    Only the update-batch axis has to be applied sequentially — within
+    one update the window elements land on distinct operand slots, so
+    the window axes stay vectorized (ops/gather.py builds the same
+    start+arange index arrays the vectorized path uses, with the batch
+    dims flattened to one leading axis). ops/control._scatter_cost now
+    charges the nb_-fold expansion so the trace budget stays honest.
+    Fixes lax_vmap_test testScatterApply 0/2/3/4/5/6/9 and lax_test
+    testScatterApply 0/1/6/7/8/9. NB lax_test testScatter1 is flaky
+    on metal at ~30% independent of this change (scatter-SET with
+    duplicate overlapping windows is order-nondeterministic on GPU,
+    same class as scatter-add).
   * int4/uint4 bitcast_convert (7): sub-byte bitcasts don't map to
     byte-storage emulation.
   * window-dilation numeric corners under vmap (~7).
