@@ -105,6 +105,30 @@ TOKEN_NP_DTYPE = np.dtype(np.bool_)
 def token_value() -> "mx.array":
     return mx.zeros(TOKEN_SHAPE, mx.bool_)
 
+# LOGICAL bit width of an MLIR element type -- what XLA's memory layout uses,
+# which for the emulated types above is NOT the storage width (an i4 lives in
+# a whole int8, an f8 in a float16). Only bit-level ops (bitcast_convert)
+# care; everything else works on values. i1 is deliberately absent: XLA's
+# PRED occupies a full byte, like mx.bool_.
+_LOGICAL_BITS = {
+    "i4": 4, "ui4": 4, "f4E2M1FN": 4,
+    "f8E4M3FN": 8, "f8E5M2": 8, "f8E4M3": 8, "f8E3M4": 8, "f8E8M0FNU": 8,
+    "f8E4M3B11FNUZ": 8, "f8E5M2FNUZ": 8, "f8E4M3FNUZ": 8,
+    "f64": 64,
+}
+
+
+def bit_width(t: ir.Type) -> int:
+    """Bits one value of this element type occupies in XLA's memory layout."""
+    b = _LOGICAL_BITS.get(str(t))
+    return b if b is not None else mx_dtype_for(t).size * 8
+
+
+def storage_is_bit_exact(t: ir.Type) -> bool:
+    """True if our MLX storage has the same bit width as the logical type,
+    i.e. the raw bytes of the storage ARE the type's bit pattern."""
+    return bit_width(t) == mx_dtype_for(t).size * 8
+
 
 def np_dtype_for_mlir(t: ir.Type) -> np.dtype:
     """The numpy dtype JAX expects for this element type (f64 reported as-is)."""

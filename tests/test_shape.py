@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
 
@@ -98,6 +99,56 @@ def test_bitcast_convert_size_changing():
           np.arange(8, dtype=np.uint8).reshape(2, 4))
     check(lambda x: x.byteswap(), np.array([1, 256], np.int32))
     check(lambda x: x.byteswap(), np.int32(7))
+
+
+I4 = np.arange(-8, 8, dtype=np.int8).astype(ml_dtypes.int4)
+U4 = np.arange(16, dtype=np.uint8).astype(ml_dtypes.uint4)
+
+
+def test_bitcast_convert_from_int4():
+    # 4-bit values are STORED one per byte here but XLA lays them out
+    # PACKED, two per byte, low nibble first: widening bitcasts must pack.
+    for dst in (jnp.int8, jnp.uint8):
+        check(lambda x: jax.lax.bitcast_convert_type(x, dst), I4.reshape(8, 2))
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.int16),
+          I4.reshape(2, 2, 4))
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.int32), I4.reshape(2, 8))
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.float16),
+          I4.reshape(4, 4))
+    # unsigned nibbles (no sign extension) + odd leading dims
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.uint8), U4.reshape(8, 2))
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.int32), U4.reshape(2, 8))
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.int8),
+          I4[:6].reshape(3, 2))
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.int16),
+          U4[:12].reshape(3, 4))
+    # rank-0 result
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.int8), I4[:2])
+
+
+def test_bitcast_convert_to_int4():
+    # Narrowing adds a trailing dim of 2 nibbles per byte, low nibble first;
+    # metaljax stores i4 sign-extended, so 0xF must come back as -1.
+    # (i4/u4 results are cast to i32: the harness compares dtypes and our
+    #  host transfer reports int8/uint8 storage, not ml_dtypes.int4.)
+    i4 = lambda x: jax.lax.bitcast_convert_type(x, jnp.int4).astype(jnp.int32)
+    u4 = lambda x: jax.lax.bitcast_convert_type(x, jnp.uint4).astype(jnp.int32)
+    check(i4, np.array([-1, -128, 0, 127, 18], np.int8))
+    check(u4, np.array([-1, -128, 0, 127, 18], np.int8))
+    check(i4, np.array([0x1234, -2], np.int16))
+    check(u4, np.arange(6, dtype=np.uint8))
+    check(u4, np.array([1.0, -2.5], np.float32))
+    check(i4, np.float32(-0.5))  # rank-0 operand -> (8,) nibbles
+    check(lambda x: jnp.asarray(x).view(jnp.uint4).astype(jnp.int32),
+          np.arange(8, dtype=np.uint8))
+
+
+def test_bitcast_convert_int4_same_width():
+    # i4 <-> ui4 keeps the shape and reinterprets the nibble.
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.uint4).astype(jnp.int32),
+          I4.reshape(4, 4))
+    check(lambda x: jax.lax.bitcast_convert_type(x, jnp.int4).astype(jnp.int32),
+          U4.reshape(4, 4))
 
 
 def test_reverse_degenerate_dims():

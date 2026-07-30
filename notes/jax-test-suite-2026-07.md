@@ -196,8 +196,13 @@ every failing file, consolidated):
     on metal at ~30% independent of this change (scatter-SET with
     duplicate overlapping windows is order-nondeterministic on GPU,
     same class as scatter-add).
-  * int4/uint4 bitcast_convert (7): sub-byte bitcasts don't map to
-    byte-storage emulation.
+  * int4/uint4 bitcast_convert (7): FIXED after 0.4.4 — the handler now
+    packs/unpacks nibbles (2 per byte, low nibble first) around the
+    byte-storage emulation, so i4/ui4 bitcasts to and from any
+    byte-multiple type match XLA. Also cleared lax_numpy testView
+    1/5/6/8. Bitcasts of f8*/f4/f64 now raise UnsupportedOpError
+    (storage width != logical width) instead of silently producing
+    wrong bits.
   * window-dilation numeric corners under vmap (~7).
   * PJRT surface APIs (~40): UnsafePointer (MLX exposes no device
     pointers), buffer donation, pinned_host memory space,

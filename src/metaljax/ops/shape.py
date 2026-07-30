@@ -5,7 +5,7 @@ import mlx.core as mx
 from jaxlib.mlir import ir
 
 from metaljax import _ir, dtypes
-from metaljax.interpreter import register
+from metaljax.interpreter import UnsupportedOpError, register
 
 
 def _result_shape(op, i=0):
@@ -74,20 +74,76 @@ def _convert(interp, op, ins, env):
     return x.astype(dt)
 
 
+def _to_bytes(x):
+    """Flat little-endian byte buffer of an array's storage (rank-0 ok)."""
+    return mx.reshape(mx.view(mx.reshape(x, (-1, 1)), mx.uint8), (-1,))
+
+
+def _nibbles(x):
+    """i4/ui4 storage (one value per byte, i4 sign-extended) -> flat uint8
+    nibbles in [0, 15]."""
+    return mx.bitwise_and(mx.reshape(x, (-1,)).astype(mx.uint8),
+                          mx.array(0x0F, mx.uint8))
+
+
+def _from_nibbles(n, name):
+    """Flat nibbles -> the emulated dtype's storage values. quantize_emulated
+    maps i4 -> ((n+8)%16)-8 (sign extension) and ui4 -> n%16 (identity)."""
+    return dtypes.quantize_emulated(n, name)
+
+
 @register("stablehlo.bitcast_convert")
 def _bitcast_convert(interp, op, ins, env):
     t = ir.RankedTensorType(op.results[0].type)
-    dt = dtypes.mx_dtype_for(t.element_type)
+    in_el = _ir.tensor_type(op.operands[0]).element_type
+    out_el = t.element_type
+    dt = dtypes.mx_dtype_for(out_el)
+    out_shape = list(t.shape)
     x = ins[0]
-    if dt.size == x.dtype.size:
-        return mx.view(x, dt)
-    if dt.size < x.dtype.size:
-        # Narrowing: the result gains a trailing dim of ratio; mx.view
-        # rescales the LAST axis, so give it a fresh unit axis to split
-        # (also makes rank-0 inputs legal).
-        return mx.view(mx.expand_dims(x, -1), dt)
-    # Widening: the input's trailing ratio-sized dim collapses to 1.
-    return mx.squeeze(mx.view(x, dt), axis=-1)
+
+    # bitcast reads BITS, so the storage must be the logical bit pattern.
+    # i4/ui4 are the one exception we can reconstruct (whole nibbles);
+    # f8/f4 hold VALUES in a wider float and f64 is truncated to f32, so
+    # their bit patterns simply do not exist on this device.
+    for el in (in_el, out_el):
+        if not dtypes.storage_is_bit_exact(el) and str(el) not in ("i4", "ui4"):
+            raise UnsupportedOpError(
+                f"bitcast_convert on {el}: metaljax stores it in a wider "
+                f"dtype, so its bit pattern is unavailable"
+            )
+
+    ib, ob = dtypes.bit_width(in_el), dtypes.bit_width(out_el)
+    if ib != 4 and ob != 4:
+        # Byte-multiple types: MLX storage is already the XLA layout.
+        if dt.size == x.dtype.size:
+            return mx.view(x, dt)
+        if dt.size < x.dtype.size:
+            # Narrowing: the result gains a trailing dim of ratio; mx.view
+            # rescales the LAST axis, so give it a fresh unit axis to split
+            # (also makes rank-0 inputs legal).
+            return mx.view(mx.expand_dims(x, -1), dt)
+        # Widening: the input's trailing ratio-sized dim collapses to 1.
+        return mx.squeeze(mx.view(x, dt), axis=-1)
+
+    # 4-bit end: XLA packs two values per byte along the minor-most
+    # dimension, low nibble first, and a width-changing bitcast adds (or
+    # removes) exactly that trailing ratio dim -- so a row-major flatten
+    # makes the packed byte stream contiguous and the whole thing is one
+    # linear reinterpretation.
+    if x.size == 0:
+        return mx.zeros(out_shape, dtype=dt)
+    if ib == 4 and ob == 4:  # i4 <-> ui4: reinterpret the nibble in place
+        return mx.reshape(_from_nibbles(_nibbles(x), str(out_el)), out_shape)
+    if ib == 4:  # pack pairs into bytes, low nibble first
+        n = _nibbles(x)
+        b = n[0::2] | (n[1::2] << 4)
+    else:
+        b = _to_bytes(x)
+    if ob == 4:  # unpack each byte into (low, high)
+        lo = mx.bitwise_and(b, mx.array(0x0F, mx.uint8))
+        n = mx.reshape(mx.stack([lo, b >> 4], axis=-1), (-1,))
+        return mx.reshape(_from_nibbles(n, str(out_el)), out_shape)
+    return mx.reshape(mx.view(b, dt), out_shape)
 
 
 @register("stablehlo.pad")

@@ -29,7 +29,12 @@ def run_metal(f, *args):
 
 def check(f, *args, rtol=1e-5, atol=1e-6):
     got = run_metal(f, *args)
-    want = [np.asarray(x) for x in jax.tree.leaves(jax.jit(f)(*args))]
+    # Pin the reference to the CPU backend: under JAX_PLATFORMS=metal,cpu
+    # the default backend is metal, and an unpinned reference would compare
+    # this backend against itself — masking wrong values (found by the int4
+    # subagent: its regression test passed against broken code that way).
+    with jax.default_device(jax.devices("cpu")[0]):
+        want = [np.asarray(x) for x in jax.tree.leaves(jax.jit(f)(*args))]
     assert len(got) == len(want), f"{len(got)} outputs vs {len(want)} expected"
     for i, (g, w) in enumerate(zip(got, want)):
         assert g.shape == w.shape, f"out[{i}]: shape {g.shape} != {w.shape}"
