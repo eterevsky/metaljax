@@ -127,6 +127,14 @@ def _register_linalg_lowerings():
         mlir.register_lowering(ll.eig_p, eig_rule, platform="metal")
         _register_callback_lowerings(mlir)
 
+        # Buffer donation: jax only sets up input-output aliasing for
+        # platforms in this list. With metal added, donate_argnums marks
+        # arguments in the lowered module (tf.aliasing_output /
+        # jax.buffer_donor) and the plugin invalidates those buffers
+        # after execute — the standard XLA contract. Reusing a donated
+        # array afterwards raises, exactly as on cpu/cuda/tpu.
+        mlir._platforms_with_donation.append("metal")
+
         # jax.export refuses to serialize custom calls without a
         # registered stability guarantee; ours are versioned with the
         # plugin itself, so they are as stable as the platform.

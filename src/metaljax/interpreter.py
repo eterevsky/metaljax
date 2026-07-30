@@ -198,6 +198,22 @@ class Interpreter:
         return [self._aval_for(t) for t in ftype.results]
 
     @property
+    def donated_args(self) -> list[int]:
+        """Main-function argument indices the caller donated: jax marks
+        them with tf.aliasing_output (aliased to an output) or
+        jax.buffer_donor (donated without a specific alias)."""
+        out = []
+        try:
+            arg_attrs = self.main.attributes["arg_attrs"]
+        except KeyError:
+            return out
+        for i, a in enumerate(ir.ArrayAttr(arg_attrs)):
+            d = ir.DictAttr(a)
+            if "tf.aliasing_output" in d or "jax.buffer_donor" in d:
+                out.append(i)
+        return out
+
+    @property
     def in_tokens(self) -> list[bool]:
         return [_ir.is_token(a.type) for a in self._main_block().arguments]
 

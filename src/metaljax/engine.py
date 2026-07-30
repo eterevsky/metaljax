@@ -115,6 +115,8 @@ class MetalExecutable:
         self.num_outputs = len(outs)
         self.out_types = [_NP_TO_ENUM[np.dtype(dt)] for _, dt in outs]
         self.out_dims = [list(shape) for shape, _ in outs]
+        with interp.context:
+            self.donated_params = interp.donated_args
         self._compiled = None
         self._can_compile = None  # resolved lazily on first execute
 

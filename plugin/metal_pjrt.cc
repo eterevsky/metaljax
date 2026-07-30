@@ -102,6 +102,7 @@ struct PJRT_Executable {
   std::vector<size_t> memory_kind_sizes;
   std::vector<const char*> param_memory_kinds;
   std::vector<size_t> param_memory_kind_sizes;
+  std::vector<int64_t> donated_params;  // arg indices donated by the caller
 };
 
 struct PJRT_LoadedExecutable {
@@ -541,6 +542,10 @@ static PJRT_Error* ClientCompile(PJRT_Client_Compile_Args* args) {
             GetAttrSizeT(py_exec, "num_outputs", &ex->num_outputs) &&
             GetAttrSizeT(py_exec, "num_params", &ex->num_params) &&
             GetAttrInt64List(py_exec, "out_types", &out_types);
+  if (ok && !GetAttrInt64List(py_exec, "donated_params", &ex->donated_params)) {
+    PyErr_Clear();  // older engines: no donation metadata
+    ex->donated_params.clear();
+  }
   PyObject* dims_list = ok ? PyObject_GetAttrString(py_exec, "out_dims") : nullptr;
   if (ok && dims_list != nullptr && PyList_Check(dims_list)) {
     for (Py_ssize_t i = 0; i < PyList_Size(dims_list); ++i) {
@@ -986,6 +991,33 @@ static PJRT_Error* LoadedExecutableExecute(
     args->output_lists[0][j] = buf;
   }
   Py_DECREF(outs);
+  // Donation: the caller promised not to reuse these inputs, and jax's
+  // dispatch relies on them reading as deleted afterwards. The lazy MLX
+  // graph holds its own references to the underlying arrays, so dropping
+  // the wrapper here is safe even though evaluation may still be pending.
+  if (!args->executable->exec->donated_params.empty()) {
+    const int64_t* skip = nullptr;
+    size_t nskip = 0;
+    if (args->options != nullptr) {
+      skip = args->options->non_donatable_input_indices;
+      nskip = args->options->num_non_donatable_input_indices;
+    }
+    for (int64_t idx : args->executable->exec->donated_params) {
+      bool excluded = false;
+      for (size_t k = 0; k < nskip; ++k) {
+        if (skip[k] == idx) { excluded = true; break; }
+      }
+      if (excluded || idx < 0 ||
+          static_cast<size_t>(idx) >= args->num_args) {
+        continue;
+      }
+      PJRT_Buffer* b = args->argument_lists[0][idx];
+      if (!b->deleted) {
+        Py_CLEAR(b->py_buf);
+        b->deleted = true;
+      }
+    }
+  }
   if (args->device_complete_events != nullptr) {
     args->device_complete_events[0] = ReadyEvent();
   }
