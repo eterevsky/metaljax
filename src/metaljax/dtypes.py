@@ -234,6 +234,20 @@ def is_unsigned(d: mx.Dtype) -> bool:
     return d in (mx.uint8, mx.uint16, mx.uint32, mx.uint64)
 
 
+def make_complex(re: mx.array, im: mx.array) -> mx.array:
+    """complex64 from its parts by bit interleave.
+
+    Building the value arithmetically (re + im*1j) runs a complex multiply
+    that destroys exactly the values XLA/C99 specify: (1, inf) becomes
+    (nan, inf) because inf*0 is nan, and -0 + 0 collapses to +0. Writing
+    the halves into place keeps every bit.
+    """
+    re = re.astype(mx.float32)
+    im = im.astype(mx.float32)
+    pair = mx.stack([re, im], axis=-1)
+    return mx.reshape(mx.view(pair, mx.complex64), re.shape)
+
+
 _UNSIGNED_OF = {
     mx.int8: mx.uint8, mx.int16: mx.uint16, mx.int32: mx.uint32, mx.int64: mx.uint64,
 }

@@ -31,16 +31,103 @@ def _cbrt(x):
     return mx.sign(x) * mx.power(mx.abs(x), 1.0 / 3.0)
 
 
+# --- complex special values (C99 Annex G / XLA semantics) ---
+#
+# MLX's complex kernels compute the naive formulas, which overflow or
+# produce NaN where XLA is exact. Each helper below dispatches on dtype in
+# PYTHON, so real-dtype programs emit exactly the same ops as before —
+# the extra work exists only on complex values.
+
+_INF = float("inf")
+
+
+def _cabs(z):
+    """|z| via scaled hypot: naive sqrt(re^2+im^2) overflows for large
+    parts and underflows for tiny ones."""
+    a, b = mx.abs(mx.real(z)), mx.abs(mx.imag(z))
+    big, small = mx.maximum(a, b), mx.minimum(a, b)
+    safe = mx.where(big == 0, mx.ones_like(big), big)
+    r = mx.where(big == 0, mx.zeros_like(big), small / safe)
+    out = big * mx.sqrt(1 + r * r)
+    return mx.where(mx.isinf(a) | mx.isinf(b),
+                    mx.full(a.shape, _INF, mx.float32), out)
+
+
+def _abs(x):
+    return _cabs(x) if x.dtype == mx.complex64 else mx.abs(x)
+
+
+def _sign(x):
+    if x.dtype == mx.complex64:
+        re, im = mx.real(x), mx.imag(x)
+        m = _cabs(x)
+        return mx.where((re == 0) & (im == 0), x,
+                        dtypes.make_complex(re / m, im / m))
+    if x.dtype in (mx.float32, mx.float16, mx.bfloat16):
+        # mx.sign returns 0 for NaN; stablehlo.sign must propagate it
+        return mx.where(mx.isnan(x), x, mx.sign(x))
+    return mx.sign(x)
+
+
+def _expm1_acc(x):
+    """expm1 accurate enough for the complex reconstruction below; mx.expm1
+    carries ~500 ULP of f32 error, which shows up directly in complex
+    cos/sin/cosh/sinh (jax lowers those through real expm1)."""
+    u = mx.exp(x)
+    d = u - 1.0
+    out = d * (x / mx.log(u))
+    out = mx.where(u == 1.0, x, out)
+    out = mx.where(d == -1.0, d, out)
+    # at overflow log(u) is inf too, so the correction is inf*0 = nan
+    return mx.where(mx.isinf(u), u, out)
+
+
+def _exp(x):
+    if x.dtype == mx.complex64:
+        a, b = mx.real(x), mx.imag(x)
+        e = mx.exp(a)
+        return dtypes.make_complex(
+            e * mx.cos(b),
+            mx.where(b == 0, b, e * mx.sin(b)),  # else inf*0 = nan
+        )
+    return mx.exp(x)
+
+
+def _expm1(x):
+    if x.dtype == mx.complex64:
+        # exp(z)-1 cancels catastrophically; use the C99 reconstruction
+        a, b = mx.real(x), mx.imag(x)
+        hs = mx.sin(b / 2)
+        return dtypes.make_complex(
+            _expm1_acc(a) * mx.cos(b) - 2 * hs * hs,
+            mx.where(b == 0, b, mx.exp(a) * mx.sin(b)),
+        )
+    return mx.expm1(x)
+
+
+def _tan(x):
+    if x.dtype == mx.complex64:
+        # C99: tan(x +- i*inf) = +-i, whatever the real part
+        im = mx.imag(x)
+        pole = mx.isinf(im)
+        safe = mx.where(pole, dtypes.make_complex(mx.zeros_like(im), im), x)
+        out = mx.tan(safe)
+        return mx.where(
+            pole,
+            dtypes.make_complex(mx.zeros_like(im), mx.sign(im)),
+            out)
+    return mx.tan(x)
+
+
 _UNARY = {
-    "abs": mx.abs,
+    "abs": _abs,
     "cbrt": _cbrt,
     "ceil": mx.ceil,
     "cosine": mx.cos,
     "erf": mx.erf,
     "erf_inv": mx.erfinv,
-    "exponential": mx.exp,
-    # MLX has no complex expm1 GPU kernel
-    "exponential_minus_one": lambda x: (mx.exp(x) - 1 if x.dtype == mx.complex64 else mx.expm1(x)),
+    "exponential": _exp,
+    "exponential_minus_one": _expm1,
     "floor": mx.floor,
     "is_finite": mx.isfinite,
     "log": mx.log,
@@ -50,13 +137,10 @@ _UNARY = {
     "round_nearest_afz": _round_afz,
     "round_nearest_even": _round_even,
     "rsqrt": mx.rsqrt,
-    # mx.sign returns 0 for NaN; stablehlo.sign must propagate it
-    "sign": lambda x: (mx.where(mx.isnan(x), x, mx.sign(x))
-                       if x.dtype in (mx.float32, mx.float16, mx.bfloat16)
-                       else mx.sign(x)),
+    "sign": _sign,
     "sine": mx.sin,
     "sqrt": mx.sqrt,
-    "tan": mx.tan,
+    "tan": _tan,
     "tanh": mx.tanh,
 }
 
@@ -133,8 +217,7 @@ def _imag(interp, op, ins, env):
 
 @register("stablehlo.complex")
 def _complex(interp, op, ins, env):
-    re, im = ins
-    return re.astype(mx.complex64) + im.astype(mx.complex64) * mx.array(1j)
+    return dtypes.make_complex(ins[0], ins[1])
 
 
 @register("stablehlo.fft")
