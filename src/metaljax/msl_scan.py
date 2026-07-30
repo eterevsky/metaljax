@@ -1953,6 +1953,36 @@ class Plan:
         self.N = _numel(lane)
         if self.N == 0:
             raise _Unsupported("empty lane space")
+        if self.vector and len(lane) == 1 and lane[-1] > 1:
+            # A per-step value shaped exactly like the lane space is ONE
+            # SCALAR PER LANE (e.g. a per-example loss stacked out of a
+            # vmapped scan). The emitter reads a value's trailing dim as
+            # its register width, so such a value looks like `lane[-1]`
+            # registers and every lane broadcast-writes all lanes' output
+            # slots — silently wrong results (v0.2.0..v0.4.4). Reading the
+            # width from the lane shape instead is not safe either: when
+            # the batch happens to equal the feature width, genuine
+            # register vectors get demoted (measured 4.6x slowdown on the
+            # lrnn family at b4). Until the emitter tracks lane vs
+            # register dims properly, refuse the plan so the loop takes
+            # the compiled-graph path, which is correct.
+            #
+            # Restricted to a 1-D lane space: with 2+ lane dims the
+            # trailing lane dim doubles as the register axis and the
+            # existing offset math places each thread's writes correctly
+            # (lrnn's (4,4) lane space relies on this, and rejecting it
+            # cost 4.6x standalone).
+            # The DESTINATION layout disambiguates: a stacked buffer whose
+            # per-step shape is exactly the lane shape has no feature dim,
+            # so its value must be one scalar per lane. (The value's own
+            # shape cannot tell us — a register vector whose width equals
+            # the batch size looks identical.)
+            for _pos, _idx, _val in self.stacked:
+                if tuple(self.arg_shapes[_pos][1:]) == tuple(lane) \
+                        and self._R(_val) > 1:
+                    raise _Unsupported(
+                        "stacked output is one scalar per lane "
+                        f"(per-step shape {tuple(lane)})")
 
         # Device inputs: unique sources for reads/wholes + state inits
         self.sources = []          # list of ('carry', i) | ('free', ir.Value)

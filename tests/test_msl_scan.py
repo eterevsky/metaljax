@@ -395,3 +395,27 @@ def test_matrix_state_outer_and_matvec():
           rtol=1e-3, atol=1e-4)
     assert _plan_modes(f, Q, K2, C0), \
         "matrix-state cell fell off the MSL path"
+
+
+def test_vmapped_scan_scalar_stacked_output():
+    # A per-step output that is ONE SCALAR PER LANE has a shape equal to
+    # the lane shape; the emitter used to read that trailing dim as a
+    # register width, so every lane broadcast its own value across all
+    # lanes' output slots (wrong since v0.2.0, silently).
+    d = rng.standard_normal(2).astype(np.float32)
+    c0 = rng.standard_normal(4).astype(np.float32)
+
+    def cell(c, a):
+        b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(d))
+        return jnp.sin(c * b), b
+
+    for bdim in (0, 1, 2):
+        shape = [5, 3]
+        shape.insert(bdim, 7)
+        xs = rng.standard_normal(shape).astype(np.float32)
+        f = jax.vmap(lambda a: jax.lax.scan(cell, jnp.asarray(c0), a),
+                     in_axes=bdim)
+        check(f, xs)
+        check(jax.value_and_grad(lambda a: jax.vmap(
+            lambda v: jax.lax.scan(cell, jnp.asarray(c0), v)[1].sum(),
+            in_axes=bdim)(a).sum()), xs, rtol=1e-4, atol=1e-5)
