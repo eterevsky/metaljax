@@ -48,6 +48,10 @@ _INLANE_DOTS = os.environ.get("METALJAX_MSL_INLANE", "1") != "0"
 # offsets baked into the source) once a plan would need more than this
 # many bindings; Metal's hard cap is 31 and MLX needs one slot.
 _PACK_TRIGGER = int(os.environ.get("METALJAX_MSL_PACK_TRIGGER", "30"))
+# Materialize dot weights with the output-feature dim at unit stride so
+# threadgroup reads coalesce (see Plan._weight_norms). =0 keeps the
+# source layout.
+_WNORM = os.environ.get("METALJAX_MSL_WNORM", "1") != "0"
 # Set by Plan.__init__ when the coop preference overrode a vector-eligible
 # pick; build_plan uses it to retry without the flip if the coop build
 # fails deeper in emission (single-threaded engine, module global is safe).
@@ -1542,8 +1546,11 @@ def _needs_registers(roots):
             stack.extend(s.args)
         elif isinstance(s, SymStack):
             stack.append(s.base)
-            for p_ in getattr(s, "parts", []) or []:
-                stack.append(p_[1] if isinstance(p_, tuple) else p_)
+            # parts is {index: Sym}; iterating the dict yields int KEYS,
+            # which the original code pushed — so stack parts were never
+            # scanned and bodies whose only register constructs live
+            # there misclassified as scalar mode (losing the MSL plan).
+            stack.extend(s.parts.values())
     return False
 
 
@@ -2035,7 +2042,7 @@ class Plan:
         # stride-F apart across adjacent threads — ~100x slower in coop mode).
         # Non-canonical weights are materialized contiguous once per call.
         self._weight_norms = {}
-        if os.environ.get("METALJAX_MSL_WNORM", "1") != "0":
+        if _WNORM:
             for sid, wleaf in list(self._weights.items()):
                 dots = self._weight_dots.get(sid, [])
                 if not dots:
@@ -2205,15 +2212,7 @@ class Plan:
         lane = self.lane_shape
         L.append("uint lane = thread_position_in_grid.x;")
         L.append(f"if (lane >= {self.N}u) return;")
-        # lane coords
-        rem = "lane"
-        tail = _numel(lane)
-        for i, d in enumerate(lane):
-            tail //= d
-            L.append(f"uint c{i} = ({rem}) / {tail}u;")
-            rem = f"lane % {tail}u" if False else f"(lane % {tail}u)"
-        # (recompute coords properly: c_i = (lane / prod(after)) % d_i)
-        L = L[:2]
+        # lane coords: c_i = (lane / prod(dims after i)) % d_i
         tail = _numel(lane)
         for i, d in enumerate(lane):
             tail //= d
