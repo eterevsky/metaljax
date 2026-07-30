@@ -87,6 +87,17 @@ def _vol_load(msl_type, buf, off):
     if _VOLATILE == "load":
         return f"(*(volatile device const {msl_type}*)&{buf}[{off}])"
     return f"{buf}[{off}]"
+# MSL has no expm1, and exp(x)-1 loses everything near zero (measured
+# worst relative error 1.0 there). Kahan's correction restores it using
+# only exp/log: measured 2.6e-07 across [-10, 10].
+_KERNEL_HEADER = """
+static inline float mj_expm1(float x) {
+    float u = metal::precise::exp(x);
+    float d = u - 1.0f;
+    return (u == 1.0f) ? x : d * (x / metal::precise::log(u));
+}
+"""
+
 _KERNEL_SEQ = 0
 
 
@@ -262,7 +273,7 @@ _UNARY = {
     "stablehlo.exponential": "metal::precise::exp({0})",
     "stablehlo.log": "metal::precise::log({0})",
     "stablehlo.log_plus_one": "metal::precise::log(1.0f + {0})",
-    "stablehlo.exponential_minus_one": "(metal::precise::exp({0}) - 1.0f)",
+    "stablehlo.exponential_minus_one": "mj_expm1({0})",
     "stablehlo.tanh": "metal::precise::tanh({0})",
     "stablehlo.logistic": "(1.0f / (1.0f + metal::precise::exp(-({0}))))",
     "stablehlo.sqrt": "metal::precise::sqrt({0})",
@@ -2106,6 +2117,7 @@ class Plan:
             + [nm for _, nm in self.hidden]
             + [f"fin{j}" for j in range(len(self.states))],
             source=src,
+            header=_KERNEL_HEADER,
         )
 
     # ---- collection

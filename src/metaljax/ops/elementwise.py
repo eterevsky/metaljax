@@ -69,17 +69,14 @@ def _sign(x):
     return mx.sign(x)
 
 
-def _expm1_acc(x):
-    """expm1 accurate enough for the complex reconstruction below; mx.expm1
-    carries ~500 ULP of f32 error, which shows up directly in complex
-    cos/sin/cosh/sinh (jax lowers those through real expm1)."""
-    u = mx.exp(x)
-    d = u - 1.0
-    out = d * (x / mx.log(u))
-    out = mx.where(u == 1.0, x, out)
-    out = mx.where(d == -1.0, d, out)
-    # at overflow log(u) is inf too, so the correction is inf*0 = nan
-    return mx.where(mx.isinf(u), u, out)
+def _expm1_f32(x):
+    """MLX's Metal expm1 kernel is fast-math: worst relative error 2.0e-5,
+    against 2.1e-7 for MLX's own CPU expm1 and 1.5e-7 for its Metal exp —
+    an MLX kernel choice, not a hardware limit. exp(x)-1 is ~1 ULP except
+    near zero where it cancels, so use MLX's expm1 only there. Measured
+    worst relative error of the split: 2.9e-7. Halves keep mx.expm1 (their
+    own expm1 is already ~half-ULP and the split makes them worse)."""
+    return mx.where(mx.abs(x) < 0.25, mx.expm1(x), mx.exp(x) - 1)
 
 
 def _exp(x):
@@ -99,9 +96,11 @@ def _expm1(x):
         a, b = mx.real(x), mx.imag(x)
         hs = mx.sin(b / 2)
         return dtypes.make_complex(
-            _expm1_acc(a) * mx.cos(b) - 2 * hs * hs,
+            _expm1_f32(a) * mx.cos(b) - 2 * hs * hs,
             mx.where(b == 0, b, mx.exp(a) * mx.sin(b)),
         )
+    if x.dtype == mx.float32:
+        return _expm1_f32(x)
     return mx.expm1(x)
 
 

@@ -43,7 +43,12 @@ def run_file(path: Path, outdir: Path, timeout: int):
         out = proc.stdout + proc.stderr
         rc = proc.returncode
     except subprocess.TimeoutExpired as e:
-        out = (e.stdout or "") + (e.stderr or "") + f"\n\nTIMEOUT {timeout}s\n"
+        # TimeoutExpired carries bytes even under text=True
+        def _txt(v):
+            if v is None:
+                return ""
+            return v.decode(errors="replace") if isinstance(v, bytes) else v
+        out = _txt(e.stdout) + _txt(e.stderr) + f"\n\nTIMEOUT {timeout}s\n"
         rc = -9
     dt = time.perf_counter() - t0
     (outdir / (path.stem + ".log")).write_text(out)

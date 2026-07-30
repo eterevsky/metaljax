@@ -138,3 +138,12 @@ def test_emulated_dtypes_i4_f8():
           np.array([7, -8], np.int32), np.array([1, -1], np.int32))
     check(lambda x: x.astype(jnp.uint4).astype(jnp.int32),
           np.array([3, 17], np.int32))
+
+
+def test_expm1_accuracy():
+    # MLX's Metal expm1 kernel is fast-math (worst rel 2e-5); the generic
+    # comparison grid is too coarse to catch it.
+    x = np.concatenate([np.linspace(-10, 10, 501),
+                        np.logspace(-8, 1, 300),
+                        -np.logspace(-8, 1, 300)]).astype(np.float32)
+    check(lambda v: jnp.expm1(v), x, rtol=5e-7, atol=1e-8)
