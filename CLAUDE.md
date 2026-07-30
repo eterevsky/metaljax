@@ -46,6 +46,12 @@ executes on the Metal device through plain `jax.numpy`.
   Run things with `.venv/bin/python`.
 - Correctness bar: every implemented op/feature gets a pytest comparing Metal
   results against the CPU backend (tolerances appropriate for f32).
+- **Perf-costing correctness fixes need Oleg's sign-off first.** Where
+  matching XLA/C99 semantics would mean adding per-element branches to a
+  hot path (complex special values at inf/NaN poles are the motivating
+  case), report the finding — which ops, how many tests, what the branch
+  costs — and let Oleg decide whether the compatibility is worth the
+  slowdown. Don't just implement it.
 - `~/texmo` is the acceptance workload (read-only; don't modify it either).
 
 ## Layout (planned)
