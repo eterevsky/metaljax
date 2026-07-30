@@ -154,6 +154,14 @@ def _canon_float(x):
     return mx.where(mx.isnan(x), mx.array(float("nan"), dtype=x.dtype), x)
 
 
+def _argsort(key, axis):
+    """mx.argsort/mx.sort read the WRONG elements from a non-contiguous
+    input (MLX 0.32): jax lowers a non-last-axis sort/top_k as
+    transpose -> sort -> transpose, so the operand is routinely a strided
+    view. Materialize first; a no-op when the input is already dense."""
+    return mx.argsort(mx.contiguous(key), axis=axis)
+
+
 def _lex_sorted(ins, num_keys, dim):
     """Stable lexicographic sort by operands[0..num_keys-1], ascending:
     successive stable argsorts from the last key to the first."""
@@ -162,7 +170,7 @@ def _lex_sorted(ins, num_keys, dim):
         key = _sort_key(ins[j])
         if perm is not None:
             key = mx.take_along_axis(key, perm, axis=dim)
-        idx = mx.argsort(key, axis=dim)
+        idx = _argsort(key, axis=dim)
         perm = idx if perm is None else mx.take_along_axis(perm, idx,
                                                            axis=dim)
     outs = [mx.take_along_axis(x, perm, axis=dim) for x in ins]
@@ -183,7 +191,7 @@ def _gather_sorted(ins, key, descending, dim):
         key = key.astype(mx.uint8)
     if descending:
         key = ~key  # bitwise NOT reverses order for signed and unsigned
-    idx = mx.argsort(key, axis=dim)
+    idx = _argsort(key, axis=dim)
     outs = [mx.take_along_axis(x, idx, axis=dim) for x in ins]
     return outs if len(outs) > 1 else outs[0]
 
@@ -195,7 +203,7 @@ def _top_k(interp, op, ins, env):
     key = dtypes.total_order_key(x) if dtypes.is_float(x.dtype) else x
     if dtypes.is_bool(key.dtype):
         key = key.astype(mx.uint8)
-    idx = mx.argsort(~key, axis=-1)[..., :k]  # stable descending
+    idx = _argsort(~key, axis=-1)[..., :k]  # stable descending
     return [mx.take_along_axis(x, idx, axis=-1), idx.astype(mx.int32)]
 
 
@@ -224,7 +232,7 @@ def approx_top_k(op, ins):
     key = _sort_key(vals)
     if is_max:
         key = ~key
-    order = mx.argsort(key, axis=dim)
+    order = _argsort(key, axis=dim)
     sl = [slice(None)] * len(vals.shape)
     sl[dim] = slice(0, k)
     top = order[tuple(sl)]

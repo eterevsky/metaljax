@@ -439,7 +439,10 @@ def _reduce_precision(interp, op, ins, env):
     orig = x.dtype
     if orig in (mx.float16, mx.bfloat16):
         x = x.astype(mx.float32)
-    if 0 <= man < 23 and 2 <= exp <= 8 and x.dtype == mx.float32:
+    # exp == 1 is degenerate but well-defined: bias 0 makes every finite
+    # value either overflow (|x| >= 2) or underflow (|x| < 2), which the
+    # general clamp below already produces.
+    if 0 <= man < 23 and 1 <= exp <= 8 and x.dtype == mx.float32:
         # Round f32 mantissa to `man` bits (round-to-nearest-even), then
         # clamp to the e-bit exponent range: overflow -> inf,
         # underflow -> 0 (XLA reduce_precision has no subnormals).

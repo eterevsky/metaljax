@@ -61,3 +61,15 @@ def test_approx_top_k_no_aggregate():
     x = rng.standard_normal((3, 8, 32)).astype(np.float32)
     check(lambda a: jax.lax.approx_max_k(a, k=4, reduction_dimension=1,
                                          aggregate_to_topk=False), x)
+
+
+def test_top_k_non_last_axis():
+    # jax lowers top_k(axis=non-last) as transpose -> chlo.top_k ->
+    # transpose, so the operand is a strided view; MLX's argsort reads
+    # the wrong elements from one unless it is materialized.
+    xf = rng.standard_normal((3, 5, 3)).astype(np.float32)
+    xi = rng.integers(0, 45, size=(3, 5, 3)).astype(np.int32)
+    for v in (xf, xi):
+        for axis in (0, 1, -1):
+            check(lambda a, axis=axis: jax.lax.top_k(a, k=2, axis=axis)[0], v)
+            check(lambda a, axis=axis: jax.lax.top_k(a, k=2, axis=axis)[1], v)
