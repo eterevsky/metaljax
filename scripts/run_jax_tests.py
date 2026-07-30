@@ -22,6 +22,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# Default: the reference clone (~HEAD of 2026-07-23, slightly ahead of the
+# jax 0.11.0 release we pin — expect version-skew failures). Point --tests
+# at jax-v0.11.0/tests for the exact-release suite.
 TESTS = ROOT / "jax" / "tests"
 PY = ROOT / ".venv" / "bin" / "python"
 
@@ -83,11 +86,14 @@ def main():
     ap.add_argument("--filter", default=None,
                     help="only files whose name contains this")
     ap.add_argument("--timeout", type=int, default=3600)
+    ap.add_argument("--tests", default=None,
+                    help="alternate tests directory (e.g. jax-v0.11.0/tests)")
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    files = sorted(p for p in TESTS.glob("*_test.py"))
+    tests_dir = Path(args.tests) if args.tests else TESTS
+    files = sorted(p for p in tests_dir.glob("*_test.py"))
     if args.filter:
         files = [p for p in files if args.filter in p.name]
     print(f"{len(files)} test files, {args.jobs} jobs -> {outdir}", flush=True)
