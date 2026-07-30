@@ -563,8 +563,14 @@ class _Analyzer:
             acc = None
             off = 0
             for x in ins:
-                part = SymPad(x, off, total, out_shape)
-                off += x.shape[-1]
+                # span is the PART's own width, not the concat total: the
+                # emitter fills [lo, lo+n) from this part, so passing the
+                # total made the first part claim every slot (a scalar
+                # part then landed in all of them and the sum
+                # double-counted it — partially unrolled scans).
+                w = x.shape[-1] if x.shape else 1
+                part = SymPad(x, off, w, out_shape)
+                off += w
                 acc = part if acc is None else SymElem(
                     "stablehlo.add", [acc, part], x.dtype, out_shape)
             return [acc]

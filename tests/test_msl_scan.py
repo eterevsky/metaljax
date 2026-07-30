@@ -419,3 +419,22 @@ def test_vmapped_scan_scalar_stacked_output():
         check(jax.value_and_grad(lambda a: jax.vmap(
             lambda v: jax.lax.scan(cell, jnp.asarray(c0), v)[1].sum(),
             in_axes=bdim)(a).sum()), xs, rtol=1e-4, atol=1e-5)
+
+
+def test_partially_unrolled_scan():
+    # unroll=k makes one loop body do k steps and concatenate their
+    # per-step outputs. Each concat part was padded with the concat TOTAL
+    # width instead of its own, so the first part claimed every slot: a
+    # scalar part landed in all of them and the sum double-counted it.
+    c0 = rng.standard_normal(3).astype(np.float32)
+    xs = rng.standard_normal((8, 3)).astype(np.float32)
+
+    def cell(c, x):
+        nc = jnp.tanh(c * 0.5 + x)
+        return nc, jnp.sum(nc)
+
+    for u in (1, 2, 3, 4, 8):
+        check(lambda a, b, u=u: jax.lax.scan(cell, a, b, unroll=u), c0, xs)
+        check(jax.value_and_grad(
+            lambda a, b, u=u: jax.lax.scan(cell, a, b, unroll=u)[1].sum(),
+            argnums=(0, 1)), c0, xs, rtol=1e-4, atol=1e-5)
