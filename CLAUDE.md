@@ -399,7 +399,33 @@ executes on the Metal device through plain `jax.numpy`.
    before most of the campaign landed). Export-harness sweep
    (scripts/run_export_harnesses.py): 5,460/5,587 with every non-pass
    attributed (CPU's own f16/bf16 linalg gaps block joint artifacts).
-21. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+21. ✅ **v0.11.0 released** (version jumps 0.4.x→0.11.0 per plan, tracks
+   the jax pin; gap list reviewed + approved by Oleg item by item, see
+   notes/jax-test-suite-2026-07.md release-review section; complex pole
+   semantics reclassified intentional/MLX-level). Real-LLM validation:
+   gemma-4-31B-it + 12B-it end-to-end via DeepMind's gemma library
+   (HF safetensors → lib tree converter in session scratch; 31B bf16
+   374 ms/tok warm, 12B bf16 189 / f32 254, CPU-f32 12B 938; README
+   table). Found+fixed: bf16 host transfers staged through f32
+   (2x transfer, 2x transient device mem — 31B cold run 502s→90.6s,
+   THE "7-min warmup" was paging; MLX f32→bf16 astype kills NaN
+   payload+sign) → bitcast both directions, tests/test_dtypes.py.
+   31B f32 (123 GB) does NOT fit 128 GB: metaljax thrashes, CPU
+   attempt kernel-panicked the machine (LLM decode = zero-locality
+   sweep, swap can't help; add memory watchdogs to big runs).
+   Measured: decode is ~120 ms/tok Python-dispatch-bound (dtype-
+   independent; f32/bf16 only 1.34x apart) → Stage 2 phase 1 =
+   native replay engine for the execute hot loop (C++, MLX C++ API +
+   nanobind ext; keep Python compile path), phase 2 = full native
+   (StableHLO/MLIR C++); also noted: running XLA's HLO pass pipeline
+   as a library pre-step would clean input graphs + enable
+   OptimizedProgram. Pinned suite on release tree: 27,649/130
+   (99.53%), zero regressions; itemized list in
+   notes/data/pinned-0.11.0-failures.txt. TestPyPI 0.11.0 uploaded by
+   Oleg, install verified fresh-3.13 (+3.12 wheel pre-upload); real
+   PyPI + git push = Oleg.
+22. ⬜ Stage 2: migrate engine to native code (llvm-project clone
+   available). Phase 1 = C++ replay engine (see item 21 measurements).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
