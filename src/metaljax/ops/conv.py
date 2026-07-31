@@ -122,7 +122,13 @@ def _int_conv(x, w, strides, ldil, rdil, pad, flip, out_dtype):
 def _convolution(interp, op, ins, env):
     lhs, rhs = ins
     out_t = ir.RankedTensorType(op.results[0].type)
-    if any(s == 0 for s in out_t.shape):
+    if any(s == 0 for s in out_t.shape) or lhs.size == 0 or rhs.size == 0:
+        # An empty operand means every output element sums an empty set of
+        # products, so the result is all zeros at the XLA-declared shape.
+        # (Never hand this to MLX: for a zero-size *spatial* input dim it
+        # computes the dilated extent as (0-1)*d+1 instead of XLA's 0, so
+        # mx.conv_general returns a narrower array and the engine then reads
+        # uninitialized memory past its end.)
         return mx.zeros(list(out_t.shape),
                         dtype=dtypes.mx_dtype_for(out_t.element_type))
     d = _conv_dims(op)
@@ -185,15 +191,68 @@ def _convolution(interp, op, ins, env):
     # MLX layouts: input (N, *spatial, C_in), weight (C_out, *spatial, C_in).
     x = mx.transpose(lhs, [d["ib"]] + d["is"] + [d["if"]])
     w = mx.transpose(rhs, [d["ko"]] + d["ks"] + [d["ki"]])
+
+    if (pad < 0).any():
+        # XLA pads *after* lhs dilation, so negative padding crops the
+        # dilated array. MLX crops the undilated operand instead (its output
+        # is a whole dilation step short per cropped element), and mx.pad on
+        # the integer path rejects negative widths. Rewrite each crop of k
+        # elements as dropping q = ceil(k / dilation) operand elements plus a
+        # non-negative pad of q*dilation - k: dropping q operand elements
+        # removes q*dilation entries from the dilated array, and the excess
+        # is exactly that many interior holes, i.e. zeros, on that side.
+        pad = pad.copy()
+        sl = [slice(None)] * (rank + 2)
+        for a in range(rank):
+            dl = int(ldil[a])
+            k0 = max(0, int(-pad[a, 0]))
+            k1 = max(0, int(-pad[a, 1]))
+            if not k0 and not k1:
+                continue
+            q0, q1 = -(-k0 // dl), -(-k1 // dl)
+            n = x.shape[a + 1]
+            start, stop = min(q0, n), max(n - q1, 0)
+            sl[a + 1] = slice(start, max(stop, start))
+            if k0:
+                pad[a, 0] = q0 * dl - k0
+            if k1:
+                pad[a, 1] = q1 * dl - k1
+        x = mx.contiguous(x[tuple(sl)])
+        if x.size == 0:
+            return mx.zeros(list(out_t.shape),
+                            dtype=dtypes.mx_dtype_for(out_t.element_type))
+
     lo = [int(p) for p in pad[:, 0]]
     hi = [int(p) for p in pad[:, 1]]
 
-    def run(xi, wi):
+    # Integers go through the exact im2col path (mx.conv_general is
+    # float-only and f32 emulation would round); complex is four real
+    # convolutions, so it uses mx.conv_general too.
+    mx_conv = dtypes.is_float(out_dtype) or out_dtype == mx.complex64
+    # ...and mx.conv_general implements feature groups only for 1-D and 2-D.
+    native_groups = mx_conv and rank <= 2
+
+    def run(xi, wi, groups=1):
+        if not mx_conv:
+            return _int_conv(xi, wi, strides, ldil, rdil, pad, flip, out_dtype)
         return mx.conv_general(
             xi, wi, stride=[int(s) for s in strides], padding=(lo, hi),
             kernel_dilation=[int(v) for v in rdil],
             input_dilation=[int(v) for v in ldil],
-            groups=fgc, flip=flip)
+            groups=groups, flip=flip)
+
+    def feature_groups(xi, wi):
+        if fgc == 1:
+            return run(xi, wi)
+        if native_groups:
+            return run(xi, wi, fgc)
+        # XLA feature groups: input features split into fgc groups, output
+        # feature block g computed from input group g. Expanded into one
+        # ungrouped convolution per group for the cases MLX won't take.
+        return mx.concatenate(
+            [run(a, b) for a, b in zip(mx.split(xi, fgc, axis=-1),
+                                       mx.split(wi, fgc, axis=0))],
+            axis=-1)
 
     def conv_all(xi, wi):
         if bgc > 1:
@@ -201,10 +260,11 @@ def _convolution(interp, op, ins, env):
             # into bgc groups, group i convolved with kernel group i,
             # outputs concatenated along features (grad-of-weights).
             return mx.concatenate(
-                [run(a, b) for a, b in zip(mx.split(xi, bgc, axis=0),
-                                           mx.split(wi, bgc, axis=0))],
+                [feature_groups(a, b)
+                 for a, b in zip(mx.split(xi, bgc, axis=0),
+                                 mx.split(wi, bgc, axis=0))],
                 axis=-1)
-        return run(xi, wi)
+        return feature_groups(xi, wi)
 
     if out_dtype == mx.complex64:
         # (ar + i*ai) conv (br + i*bi): four real convolutions.
@@ -215,10 +275,8 @@ def _convolution(interp, op, ins, env):
         re = conv_all(ar, br) - conv_all(ai, bi)
         im = conv_all(ar, bi) + conv_all(ai, br)
         out = dtypes.make_complex(re, im)
-    elif not dtypes.is_float(out_dtype):
-        if fgc > 1 or bgc > 1:
-            raise UnsupportedOpError("conv: grouped integer conv")
-        out = _int_conv(x, w, strides, ldil, rdil, pad, flip, out_dtype)
+    elif not mx_conv:
+        out = conv_all(x, w)
     else:
         if x.dtype != out_dtype:
             x = x.astype(out_dtype)
@@ -232,4 +290,13 @@ def _convolution(interp, op, ins, env):
     axes[d["of"]] = rank + 1
     for k, s in enumerate(d["os"]):
         axes[s] = 1 + k
+    # Guard against MLX sizing a window differently from XLA: silently
+    # returning a wrong-shaped buffer makes the caller read past its end.
+    want = ([out_t.shape[d["ob"]]] + [out_t.shape[s] for s in d["os"]]
+            + [out_t.shape[d["of"]]])
+    if list(out.shape) != want:
+        raise UnsupportedOpError(
+            f"conv: produced {list(out.shape)}, XLA declares {want} "
+            f"(strides={list(strides)} pad={pad.tolist()} "
+            f"lhs_dilation={list(ldil)} rhs_dilation={list(rdil)})")
     return mx.transpose(out, axes)
