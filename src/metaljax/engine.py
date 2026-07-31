@@ -54,6 +54,8 @@ _ENUM_TO_NP = {
     _ENUM["F8E3M4"]: np.dtype(ml_dtypes.float8_e3m4),
     _ENUM["F8E8M0FNU"]: np.dtype(ml_dtypes.float8_e8m0fnu),
     _ENUM["F4E2M1FN"]: np.dtype(ml_dtypes.float4_e2m1fn),
+    _ENUM["F6E2M3FN"]: np.dtype(ml_dtypes.float6_e2m3fn),
+    _ENUM["F6E3M2FN"]: np.dtype(ml_dtypes.float6_e3m2fn),
     _ENUM["S4"]: np.dtype(ml_dtypes.int4),
     _ENUM["U4"]: np.dtype(ml_dtypes.uint4),
 }

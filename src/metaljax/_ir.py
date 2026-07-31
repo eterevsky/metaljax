@@ -69,6 +69,7 @@ _TEXT_NP_DTYPES = {
     "f8E4M3B11FNUZ": "float8_e4m3b11fnuz",
     "f8E5M2FNUZ": "float8_e5m2fnuz", "f8E4M3FNUZ": "float8_e4m3fnuz",
     "f4E2M1FN": "float4_e2m1fn",
+    "f6E2M3FN": "float6_e2m3fn", "f6E3M2FN": "float6_e3m2fn",
     "f16": "float16",
     "f32": "float32",
     "f64": "float64",

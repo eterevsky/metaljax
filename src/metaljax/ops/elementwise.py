@@ -143,9 +143,28 @@ _UNARY = {
     "tanh": mx.tanh,
 }
 
+
+def _regrid(op, out):
+    """Round an arithmetic result back onto an OCP FP4/FP6 value grid.
+
+    Those grids are coarse enough (16 or 64 points) that keeping full f16
+    precision between ops diverges from XLA after a single operation --
+    on f4E2M1FN, 4 + 4 is 6, not 8. The float8 family deliberately stays
+    unrounded here, as it has since the emulation landed.
+
+    Callers check `out.dtype == mx.float16` first (the storage these
+    formats use) so no other program pays for the element-type lookup.
+    """
+    el = str(ir.RankedTensorType(op.results[0].type).element_type)
+    if el in dtypes.NO_NAN_EMULATED:
+        return dtypes.quantize_emulated(out, el)
+    return out
+
+
 for _name, _fn in _UNARY.items():
     def _h(interp, op, ins, env, _fn=_fn):
-        return _fn(ins[0])
+        out = _fn(ins[0])
+        return _regrid(op, out) if out.dtype == mx.float16 else out
     register(f"stablehlo.{_name}")(_h)
 # chlo variants that sometimes survive lowering
 register("chlo.erf")(lambda i, o, ins, e: mx.erf(ins[0]))
@@ -344,7 +363,7 @@ for _name, _fn in _BINARY.items():
         out = _fn(ins[0], ins[1])
         if _w and out.dtype in (mx.int8, mx.uint8):
             out = _maybe_wrap4(op, ins, out)
-        return out
+        return _regrid(op, out) if out.dtype == mx.float16 else out
     register(f"stablehlo.{_name}")(_h)
 
 

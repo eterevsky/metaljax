@@ -84,6 +84,8 @@ EMULATED = {
     "f8E4M3B11FNUZ":  (mx.float16, np.dtype(_mld.float8_e4m3b11fnuz)),
     "f8E5M2FNUZ":     (mx.float16, np.dtype(_mld.float8_e5m2fnuz)),
     "f8E4M3FNUZ":     (mx.float16, np.dtype(_mld.float8_e4m3fnuz)),
+    "f6E2M3FN":       (mx.float16, np.dtype(_mld.float6_e2m3fn)),
+    "f6E3M2FN":       (mx.float16, np.dtype(_mld.float6_e3m2fn)),
     "f4E2M1FN":       (mx.float16, np.dtype(_mld.float4_e2m1fn)),
     "i4":             (mx.int8, np.dtype(_mld.int4)),
     "ui4":            (mx.uint8, np.dtype(_mld.uint4)),
@@ -112,6 +114,7 @@ def token_value() -> "mx.array":
 # PRED occupies a full byte, like mx.bool_.
 _LOGICAL_BITS = {
     "i4": 4, "ui4": 4, "f4E2M1FN": 4,
+    "f6E2M3FN": 6, "f6E3M2FN": 6,
     "f8E4M3FN": 8, "f8E5M2": 8, "f8E4M3": 8, "f8E3M4": 8, "f8E8M0FNU": 8,
     "f8E4M3B11FNUZ": 8, "f8E5M2FNUZ": 8, "f8E4M3FNUZ": 8,
     "f64": 64,
@@ -283,11 +286,20 @@ def unsigned_of(d: mx.Dtype) -> mx.Dtype:
     return _UNSIGNED_OF.get(d, d)
 
 
+# Formats with neither inf nor NaN encodings: every one of their 2^n bit
+# patterns is a finite value (the OCP microscaling FP4/FP6 types). XLA's
+# convert therefore saturates on overflow and maps NaN to -0 rather than
+# producing a NaN the format cannot hold.
+NO_NAN_EMULATED = ("f4E2M1FN", "f6E2M3FN", "f6E3M2FN")
+# Formats that do have infinities: overflow becomes +-inf.
+_HAS_INF = ("f8E5M2", "f8E4M3", "f8E3M4")
+
+
 def quantize_emulated(x: mx.array, mlir_name: str) -> mx.array:
     """Round values onto an emulated dtype's grid (storage dtype stays
     wide). Normal range: RNE mantissa rounding in f32 bits; subnormal
-    range: uniform-grid rounding; overflow saturates (ml_dtypes
-    convention); NaN passes through."""
+    range: RNE onto the uniform subnormal grid; overflow gives +-inf,
+    NaN or +-max depending on what the format can encode."""
     storage, npdt = EMULATED[mlir_name]
     if mlir_name in ("i4",):
         v = ((x.astype(mx.int32) + 8) % 16) - 8
@@ -312,21 +324,37 @@ def quantize_emulated(x: mx.array, mlir_name: str) -> mx.array:
     u = (u + half + lsb) & mx.array(~((1 << shift) - 1) & 0xFFFFFFFF,
                                     dtype=mx.uint32)
     rounded = mx.view(u, mx.float32)
-    # subnormal range: uniform grid of spacing tiny * 2^-man
+    # Subnormal range: uniform grid of spacing tiny * 2^-man. Round to
+    # nearest-EVEN on that grid by borrowing f32's own rounding: adding
+    # 1.5 * 2^23 * step puts the value where f32's ulp *is* step, so the
+    # addition rounds it onto the grid; subtracting is exact. Done on the
+    # magnitude so that -0 (and anything rounding to zero from below)
+    # keeps its sign, which f32's own arithmetic would drop.
     tiny = float(fi.tiny)
     step = tiny / (1 << man)
-    sub = mx.round(f / step) * step
+    shifter = mx.array(step * float(1 << 23) * 1.5, mx.float32)
+    neg = (mx.view(f, mx.uint32) >> 31) != 0
+    sub_mag = (mx.abs(f) + shifter) - shifter
+    sub = mx.where(neg, -sub_mag, sub_mag)
     q = mx.where(mx.abs(f) < tiny, sub, rounded)
-    # overflow: formats with inf produce +-inf, finite-only (FN/FNUZ)
-    # formats produce NaN (XLA convert semantics; ml_dtypes saturates,
-    # but the CPU backend does not)
+    # Overflow: formats with inf produce +-inf; FN/FNUZ float8s (which
+    # keep a NaN encoding) produce NaN, matching XLA's convert (ml_dtypes
+    # saturates, the CPU backend does not); the OCP FP4/FP6 formats have
+    # no NaN at all, so XLA saturates them to +-max.
     mx_max = float(fi.max)
     over = mx.abs(q) > mx_max
-    has_inf = mlir_name in ("f8E5M2", "f8E4M3", "f8E3M4")
-    if has_inf:
-        q = mx.where(over, mx.sign(q) * mx.array(float("inf"), mx.float32),
-                     q)
+    if mlir_name in _HAS_INF:
+        big = mx.array(float("inf"), mx.float32)
+    elif mlir_name in NO_NAN_EMULATED:
+        big = mx.array(mx_max, mx.float32)
     else:
-        q = mx.where(over, mx.array(float("nan"), mx.float32), q)
+        big = mx.array(float("nan"), mx.float32)
+    q = mx.where(over, mx.where(neg, -big, big), q)
+    # NaN passes through the storage dtype. For the NO_NAN_EMULATED
+    # formats that is still what XLA produces once the value reaches the
+    # host: their cast maps NaN to a zero, which is what ml_dtypes does
+    # in to_host. (Do NOT substitute a literal -0 here: MLX bakes scalar
+    # constants into its fused kernels and the sign of zero does not
+    # survive that.)
     q = mx.where(isnan, f, q)
     return q.astype(storage)
