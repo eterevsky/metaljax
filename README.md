@@ -317,6 +317,38 @@ the gemma3 family diverges ≤3.6% in bf16 KV-cache tensors (a few bf16
 ULPs across 26+ layers) — the 4090 shows the same divergence class vs
 CPU (≤4.2%), so that's cross-backend bf16 numerics, not a backend bug.
 
+### Gemma 4 end-to-end inference
+
+Real LLM inference through unmodified JAX code: `google/gemma-4-12B-it`
+and `google/gemma-4-31B-it` (HF safetensors mapped into DeepMind's
+[gemma](https://github.com/google-deepmind/gemma) library, greedy
+`ChatSampler`, batch 1, ~40-token prompt, 218–275 generated tokens).
+*decode* is the steady-state warm rate; *warmup* is the one-time
+first-generation overhead (jax tracing + metaljax compile + Metal
+kernel builds), measured as cold minus warm generation time. Memory is
+device-active for metaljax, weight footprint for CPU.
+
+| model | dtype / backend | decode ms/tok | tok/s | warmup | memory |
+|---|---|---:|---:|---:|---:|
+| gemma-4-31B-it | bf16 **metaljax** | **374** | 2.68 | 9 s | 65 GB |
+| gemma-4-31B-it | f32 metaljax | —¹ | | | 123 GB |
+| gemma-4-31B-it | f32 jax CPU | —¹ | | | 123 GB |
+| gemma-4-12B-it | bf16 **metaljax** | **189** | 5.28 | 6 s | 25 GB |
+| gemma-4-12B-it | f32 **metaljax** | **254** | 3.93 | 6 s | 50 GB |
+| gemma-4-12B-it | f32 jax CPU | 938 | 1.07 | 11 s | 48 GB |
+
+¹ f32 weights alone are 122.8 GB: metaljax loads them but decode —
+which streams every weight byte per token — pages a 128 GB machine into
+the ground (the CPU attempt took the whole OS with it). bf16 is the
+only way to run the 31B locally; bf16 on the CPU backend is omitted
+because XLA:CPU upcasts bf16 matmuls to f32 internally.
+
+Single-token decode is the worst case for a Python interpreter: ~120
+ms/token of the metal rows is dtype-independent host-side dispatch
+(measured via process-CPU vs wall time), which is why f32 costs only
+1.34× bf16 rather than the 2× that pure bandwidth would predict. That
+overhead is the target of the planned native replay engine.
+
 ## Known limitations
 
 Three platform constraints are permanent (detailed under *Coverage and
