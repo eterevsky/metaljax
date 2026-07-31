@@ -126,3 +126,79 @@ def test_linalg_half_precision():
             s32 = jnp.linalg.svd(x, compute_uv=False)
             np.testing.assert_allclose(np.asarray(s16, np.float32),
                                        np.asarray(s32), rtol=2e-2, atol=2e-2)
+
+
+def _metal_device():
+    try:
+        return jax.devices("metal")[0]
+    except RuntimeError:
+        pytest.skip("metal plugin not available")
+
+
+def test_singular_triangular_solve_is_nonfinite():
+    # XLA never fails on a singular triangular solve: the zero pivot
+    # divides through to +-inf/nan.  scipy raises LinAlgError, which used
+    # to surface as a backend crash.  Only "does not raise" and "not all
+    # finite" are checked -- the inf/nan placement is implementation
+    # defined, so no value comparison against CPU.
+    metal = _metal_device()
+    a = np.array([[1.0, 1.0], [0.0, 0.0]], np.float32)
+    b = np.array([[1.0], [1.0]], np.float32)
+    with jax.default_device(metal):
+        out = np.asarray(jax.jit(
+            lambda x, y: jax.lax.linalg.triangular_solve(
+                x, y, left_side=True))(jnp.asarray(a), jnp.asarray(b)))
+        assert not np.all(np.isfinite(out)), out
+        # batched (the vmapped/batched lowering takes the same host path)
+        outb = np.asarray(jax.jit(
+            lambda x, y: jax.lax.linalg.triangular_solve(
+                x, y, left_side=True))(jnp.asarray(a)[None],
+                                       jnp.asarray(b)[None]))
+        assert not np.all(np.isfinite(outb)), outb
+
+
+def test_singular_det_grad_is_finite_after_filtering():
+    # jnp.linalg.det's JVP does the singular triangular solve
+    # unconditionally and filters the non-finite results with a where;
+    # it only works if the solve returns instead of raising.
+    metal = _metal_device()
+    with jax.default_device(metal):
+        for shape in ((3, 3), (5, 7, 7)):
+            z = jnp.zeros(shape, jnp.float32)
+            g = np.asarray(jax.jit(jax.grad(
+                lambda a: jnp.linalg.det(a).sum()))(z))
+            assert g.shape == shape
+            assert np.all(np.isfinite(g)), g
+
+
+@pytest.mark.parametrize("dl,d,du,b", [
+    ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [[1.0], [1.0], [1.0]]),
+    ([0.0, 1.0], [1.0, 3.0], [3.0, 0.0], [[1.0], [4.0]]),
+])
+def test_singular_tridiagonal_solve_is_nonfinite(dl, d, du, b):
+    # Same contract for the tridiagonal solve: np.linalg.solve raises on
+    # a singular matrix, XLA's sweep divides through the zero pivot.
+    metal = _metal_device()
+    args = [np.array(v, np.float32) for v in (dl, d, du, b)]
+    with jax.default_device(metal):
+        x = np.asarray(jax.jit(jax.lax.linalg.tridiagonal_solve)(
+            *[jnp.asarray(v) for v in args]))
+    assert x.shape == args[3].shape
+    assert np.any(np.isnan(x)) or np.any(np.isinf(x)), x
+
+
+def test_nonsingular_tridiagonal_solve_matches_cpu():
+    # The singular fallback must not disturb the normal path.
+    metal = _metal_device()
+    cpu = jax.devices("cpu")[0]
+    r = np.random.default_rng(11)
+    dl = np.concatenate([[0.0], r.standard_normal(4)]).astype(np.float32)
+    d = (r.standard_normal(5) + 4.0).astype(np.float32)
+    du = np.concatenate([r.standard_normal(4), [0.0]]).astype(np.float32)
+    b = r.standard_normal((5, 2)).astype(np.float32)
+    outs = []
+    for dev in (metal, cpu):
+        with jax.default_device(dev):
+            outs.append(np.asarray(jax.jit(jax.lax.linalg.tridiagonal_solve)(
+                *[jnp.asarray(v) for v in (dl, d, du, b)])))
+    np.testing.assert_allclose(outs[0], outs[1], rtol=1e-5, atol=1e-6)

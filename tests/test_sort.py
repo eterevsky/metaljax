@@ -73,3 +73,32 @@ def test_top_k_non_last_axis():
         for axis in (0, 1, -1):
             check(lambda a, axis=axis: jax.lax.top_k(a, k=2, axis=axis)[0], v)
             check(lambda a, axis=axis: jax.lax.top_k(a, k=2, axis=axis)[1], v)
+
+
+def test_complex_sort_signed_zero_ties():
+    # The complex comparator is recognized structurally (not evaluated),
+    # so the -0/+0 and NaN canonicalization jax bakes into the real-key
+    # comparator has to be applied to the packed complex key by hand.
+    # Without it -0 sorts strictly before +0 and splits groups whose
+    # order is then decided by the imaginary part.
+    z = np.array([complex(-0.0, 1.0), complex(0.0, -1.0),
+                  complex(-0.0, -1.0), complex(0.0, 1.0),
+                  complex(np.nan, 2.0), complex(1.0, np.nan)],
+                 np.complex64)
+    check(lambda z: jnp.sort(z), z)
+
+
+def test_unique_complex_nans():
+    # jnp.unique lexsorts, then marks group boundaries by comparing
+    # neighbours: a mis-ordered tie shows up as extra "unique" values.
+    # Not jittable (data-dependent shape), so pin the device instead of
+    # going through check().
+    try:
+        metal = jax.devices("metal")[0]
+    except RuntimeError:
+        pytest.skip("metal plugin not available")
+    x = [-0.0, 0.0, 1.0, 1.0, np.nan, -np.nan]
+    z = np.array([complex(i, j) for i in x for j in x], np.complex64)
+    with jax.default_device(metal):
+        u = np.asarray(jnp.unique(jnp.asarray(z)))
+    assert u.shape == (5,), u

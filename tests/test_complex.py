@@ -41,3 +41,15 @@ def test_fft():
     check(lambda z: jnp.fft.irfft(z, n=8), np.fft.rfft(
         rng.standard_normal(8)).astype(np.complex64), rtol=1e-5, atol=1e-5)
     check(lambda z: jnp.fft.fft2(z.reshape(2, 4)), Z, rtol=1e-5, atol=1e-5)
+
+
+def test_fft_zero_size():
+    # MLX rejects size-0 transforms; XLA returns the empty result.
+    check(lambda z: jnp.fft.fft(z), np.zeros((0,), np.complex64))
+    check(lambda z: jnp.fft.ifft(z), np.zeros((0,), np.complex64))
+    check(lambda z: jnp.fft.fft2(z), np.zeros((0, 0), np.complex64))
+    check(lambda z: jnp.fft.fftn(z), np.zeros((2, 0), np.complex64))
+    check(lambda z: jnp.fft.irfft(z), np.zeros((0,), np.complex64))
+    # zero-size batch dim with a non-empty transform axis
+    check(lambda z: jnp.fft.fft(z), np.zeros((0, 4), np.complex64))
+    check(lambda x: jnp.fft.rfft(x), np.zeros((0, 4), np.float32))

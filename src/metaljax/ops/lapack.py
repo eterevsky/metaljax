@@ -42,6 +42,61 @@ def _np_in(x):
     return a
 
 
+def _tri_substitute(m, b, lower, unit):
+    """Forward/back substitution for a SINGULAR triangular system.
+
+    XLA's triangular solve never fails: a zero pivot simply divides
+    through to +-inf/nan.  jnp.linalg.det's JVP depends on that (it
+    computes the solve unconditionally and filters the non-finite
+    results with a `where`), so raising is not an option.  scipy's
+    solve_triangular raises LinAlgError instead, so this runs as its
+    fallback; the placement of inf vs nan is implementation-defined.
+    """
+    n = m.shape[0]
+    x = np.array(b, dtype=np.result_type(m.dtype, b.dtype), copy=True)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        for i in (range(n) if lower else range(n - 1, -1, -1)):
+            if lower and i:
+                x[i] -= m[i, :i] @ x[:i]
+            elif not lower and i + 1 < n:
+                x[i] -= m[i, i + 1:] @ x[i + 1:]
+            if not unit:
+                x[i] = x[i] / m[i, i]
+    return x
+
+
+def _tri_solve_host(m, b, lower, unit):
+    """scipy's triangular solve, falling back to substitution when the
+    matrix is singular (see _tri_substitute)."""
+    from scipy.linalg import solve_triangular
+    try:
+        return solve_triangular(m, b, lower=lower, unit_diagonal=unit,
+                                check_finite=False)
+    except np.linalg.LinAlgError:
+        return _tri_substitute(m, b, lower, unit)
+
+
+def _thomas(dl, d, du, b):
+    """Thomas sweep for a SINGULAR tridiagonal system: like the
+    triangular case, XLA divides through zero pivots to +-inf/nan
+    instead of failing.  Runs only when np.linalg.solve raises."""
+    n = d.shape[0]
+    dt = np.result_type(d.dtype, b.dtype)
+    x = np.array(b, dtype=dt, copy=True)
+    cp = np.zeros(n, dtype=dt)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        piv = d[0]
+        cp[0] = du[0] / piv
+        x[0] = x[0] / piv
+        for i in range(1, n):
+            piv = d[i] - dl[i] * cp[i - 1]
+            cp[i] = du[i] / piv
+            x[i] = (x[i] - dl[i] * x[i - 1]) / piv
+        for i in range(n - 2, -1, -1):
+            x[i] = x[i] - cp[i] * x[i + 1]
+    return x
+
+
 def _result_specs(op):
     out = []
     for r in op.results:
@@ -282,7 +337,6 @@ def _cholesky(interp, op, ins, env):
 
 @register("stablehlo.triangular_solve")
 def _triangular_solve(interp, op, ins, env):
-    from scipy.linalg import solve_triangular
     a, b = (_np_in(x) for x in ins)
     attrs = {n: str(op.attributes[n]) for n in op.attributes}
     left = "true" in attrs.get("left_side", "true")
@@ -300,13 +354,11 @@ def _triangular_solve(interp, op, ins, env):
         elif "TRANSPOSE" in ta and "NO_" not in ta:
             m, lo = m.swapaxes(-1, -2), not lower
         if left:
-            x = solve_triangular(m, bb, lower=lo, unit_diagonal=unit,
-                                 check_finite=False)
+            x = _tri_solve_host(m, bb, lo, unit)
         else:
             # X op(A) = B  <=>  op(A)^T X^T = B^T
-            x = solve_triangular(m.swapaxes(-1, -2), bb.swapaxes(-1, -2),
-                                 lower=not lo, unit_diagonal=unit,
-                                 check_finite=False)
+            x = _tri_solve_host(m.swapaxes(-1, -2), bb.swapaxes(-1, -2),
+                                not lo, unit)
             x = x.swapaxes(-1, -2)
         return (x,)
     return dtypes.to_mx(_batch_apply(one, [a, b], batch, specs)[0])
@@ -381,7 +433,6 @@ def _metal_tridiagonal(op, ins):
 def _metal_tri_solve(op, ins):
     # cfg: side L/R, lower l/u, transpose t/n, conj c/-, unit 1/0,
     # perturb p/-  (see the plugin's tri_solve_rule)
-    from scipy.linalg import solve_triangular
     a, b = (_np_in(x) for x in ins)
     cfg = _ir.str_attr(op, "backend_config")
     left, lower = cfg[0] == "L", cfg[1] == "l"
@@ -408,12 +459,10 @@ def _metal_tri_solve(op, ins):
                 m = m.copy()
                 np.fill_diagonal(m, np.where(bad, eps, d))
         if left:
-            x = solve_triangular(m, bb, lower=lo, unit_diagonal=unit,
-                                 check_finite=False)
+            x = _tri_solve_host(m, bb, lo, unit)
         else:
-            x = solve_triangular(m.swapaxes(-1, -2), bb.swapaxes(-1, -2),
-                                 lower=not lo, unit_diagonal=unit,
-                                 check_finite=False)
+            x = _tri_solve_host(m.swapaxes(-1, -2), bb.swapaxes(-1, -2),
+                                not lo, unit)
             x = x.swapaxes(-1, -2)
         return (x,)
     # custom-call target convention: list of numpy arrays
@@ -429,16 +478,20 @@ def _metal_tridiag_solve(op, ins):
 
     def one(dl_, d_, du_, b_):
         n = d_.shape[0]
+        if perturb and n:
+            eps = max(np.abs(d_).max(), 1.0) * 1e-30
+            bad = np.abs(d_) < eps
+            if bad.any():
+                d_ = np.where(bad, eps, d_).astype(d_.dtype)
         m = np.zeros((n, n), dtype=d_.dtype)
         np.fill_diagonal(m, d_)
         if n > 1:
             m[np.arange(1, n), np.arange(n - 1)] = dl_[1:]
             m[np.arange(n - 1), np.arange(1, n)] = du_[:-1]
-        if perturb:
-            dd = np.diagonal(m).copy()
-            eps = max(np.abs(dd).max(), 1.0) * 1e-30
-            bad = np.abs(dd) < eps
-            if bad.any():
-                np.fill_diagonal(m, np.where(bad, eps, dd))
-        return (np.linalg.solve(m, b_),)
+        try:
+            x = np.linalg.solve(m, b_)
+        except np.linalg.LinAlgError:
+            # singular: XLA's sweep divides through the zero pivot
+            x = _thomas(dl_, d_, du_, b_)
+        return (x,)
     return _batch_apply(one, [dl, d, du, b], batch, specs)

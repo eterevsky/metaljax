@@ -49,3 +49,29 @@ def test_rng_bit_generator_bit_exact():
     with jax.default_device(cpu):
         uc = np.asarray(jax.random.uniform(k, (16,)))
     np.testing.assert_array_equal(um, uc)
+
+
+def test_rng_bit_generator_empty_output():
+    # XLA consumes zero philox blocks for an empty output, so the
+    # returned state is the input state unchanged (rounding the block
+    # count up to one advanced the counter by one).
+    try:
+        metal = jax.devices("metal")[0]
+        cpu = jax.devices("cpu")[0]
+    except RuntimeError:
+        pytest.skip("metal plugin not available")
+    key = jnp.array([3, 1, 4, 2], dtype=jnp.uint32)
+    for shape in ((0,), (0, 5)):
+        for dt in (jnp.uint8, jnp.uint16, jnp.uint32):
+            for alg in (jax.lax.RandomAlgorithm.RNG_DEFAULT,
+                        jax.lax.RandomAlgorithm.RNG_THREE_FRY,
+                        jax.lax.RandomAlgorithm.RNG_PHILOX):
+                def f(k, shape=shape, dt=dt, alg=alg):
+                    return jax.lax.rng_bit_generator(
+                        k, shape, dtype=dt, algorithm=alg)
+                with jax.default_device(metal):
+                    sm, bm = jax.jit(f)(key)
+                with jax.default_device(cpu):
+                    sc, bc = jax.jit(f)(key)
+                np.testing.assert_array_equal(np.asarray(sm), np.asarray(sc))
+                assert np.asarray(bm).shape == shape

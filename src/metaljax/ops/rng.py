@@ -71,7 +71,16 @@ def _rng_bit_generator(interp, op, ins, env):
 
     # number of u32 words to generate (narrow types truncate one u32 each)
     num_u32 = n * 2 if width == 64 else n
-    nv4 = max(1, -(-num_u32 // 4))
+    nv4 = -(-num_u32 // 4)  # philox blocks consumed, 4 u32 words each
+    if nv4 == 0:
+        # Empty output: XLA consumes no blocks, so the returned state is
+        # the input state unchanged (rounding the block count up to 1
+        # here advanced the counter by one -- lax_test's
+        # testRngBitGeneratorReturnedKey asks for shape (0,)).
+        new_state = state
+        if ins[0].dtype == mx.uint32:
+            new_state = mx.view(new_state, mx.uint32)
+        return [new_state, mx.zeros(tuple(out_shape), dtype=out_dtype)]
 
     key = state[0]
     ctr = state[1]

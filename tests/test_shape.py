@@ -165,3 +165,20 @@ def test_empty_gather_result():
     check(lambda x, i: jax.lax.gather(x, i, dn, slice_sizes=(1, 2)),
           np.arange(8, dtype=np.float32).reshape(4, 2),
           np.zeros((0, 1), np.int32))
+
+
+def test_rank0_dynamic_slice():
+    # A rank-0 operand carries no start-index operands at all; the
+    # clamping helper used to mx.stack an empty list and die (jax
+    # batching_test's testIssue3883 builds exactly these two programs).
+    check(lambda x: jax.lax.dynamic_slice(x, (), ()),
+          np.float32(3.5))
+    check(lambda x, u: jax.lax.dynamic_update_slice(x, u, ()),
+          np.float32(3.5), np.float32(-1.25))
+    # the vmapped forms (which jax rewrites to rank-1 slices) must keep
+    # working too
+    check(lambda x: jax.vmap(lambda a: jax.lax.dynamic_slice(a, (), ()))(x),
+          np.arange(4, dtype=np.float32))
+    check(lambda x, u: jax.vmap(
+        lambda a, b: jax.lax.dynamic_update_slice(a, b, ()))(x, u),
+        np.arange(4, dtype=np.float32), np.ones(4, np.float32))

@@ -226,6 +226,13 @@ def _fft(interp, op, ins, env):
     length = _ir.i64_list(op, "fft_length")
     axes = list(range(len(x.shape) - len(length), len(x.shape)))
     s = [int(v) for v in length]
+    # MLX rejects zero-size transforms outright; XLA returns the
+    # (correctly typed) empty result, and a transform of an empty input
+    # is a sum over nothing == 0.
+    if x.size == 0 or any(d == 0 for d in s):
+        out_t = ir.RankedTensorType(op.results[0].type)
+        return mx.zeros(tuple(out_t.shape),
+                        dtype=dtypes.mx_dtype_for(out_t.element_type))
     if "IRFFT" in kind:
         return mx.fft.irfftn(x, s=s, axes=axes)
     if "RFFT" in kind:

@@ -180,11 +180,18 @@ def _lex_sorted(ins, num_keys, dim):
 def _gather_sorted(ins, key, descending, dim):
 
     if key.dtype == mx.complex64:
-        # numpy/XLA order complex lexicographically by (real, imag):
-        # pack both 32-bit total-order keys into one u64.
-        re_k = dtypes.total_order_key(mx.real(key)).astype(mx.uint64)
-        im_k = dtypes.total_order_key(mx.imag(key)).astype(mx.uint64)
-        key = (re_k << 32) | im_k
+        # numpy/XLA order complex lexicographically by (real, imag), on
+        # CANONICALIZED components: -0 ties with +0 and every NaN with
+        # every other NaN.  The tie matters here (unlike a real sort,
+        # where nothing can be ordered between -0 and +0): a -0 real
+        # part must not split a group whose imaginary parts then decide
+        # the order.  jax emits the canonicalization inside the
+        # comparator for real keys, but for complex keys it emits a
+        # select tree we recognize structurally instead of evaluating,
+        # so we must apply it here.  (jnp.unique lexsorts complex rows
+        # and then compares neighbours -- unsorted ties => extra
+        # "uniques".)
+        key = _sort_key(key)
     elif dtypes.is_float(key.dtype):
         key = dtypes.total_order_key(key)
     elif dtypes.is_bool(key.dtype):

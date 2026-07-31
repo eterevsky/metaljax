@@ -189,6 +189,8 @@ def _clamped_starts(start_arrs, x_shape, sizes):
 def _dynamic_slice(interp, op, ins, env):
     x, *start_arrs = ins
     sizes = _ir.i64_list(op, "slice_sizes")
+    if not start_arrs:
+        return x  # rank-0 operand: no index operands, the slice is all of x
     starts = _clamped_starts(start_arrs, x.shape, sizes)
     return mx.slice(x, starts, tuple(range(len(sizes))), sizes)
 
@@ -197,5 +199,7 @@ def _dynamic_slice(interp, op, ins, env):
 def _dynamic_update_slice(interp, op, ins, env):
     x, update, *start_arrs = ins
     sizes = update.shape
+    if not start_arrs:
+        return update  # rank-0 operand: the update replaces all of x
     starts = _clamped_starts(start_arrs, x.shape, sizes)
     return mx.slice_update(x, update, starts, tuple(range(len(x.shape))))
