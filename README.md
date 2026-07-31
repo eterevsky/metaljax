@@ -155,11 +155,10 @@ decided** (~190 test failures; these all pass on the CPU backend; see
   C99-conformant kernels at infinities and NaN (finite inputs match to
   f32 precision). Fixing means reimplementing the special-value
   branches op by op.
-- *PJRT surface APIs* (~40): `Array.unsafe_buffer_pointer` (blocked —
-  MLX exposes no raw device pointers), buffer donation (implementable;
-  a memory optimization, not a correctness issue), the `pinned_host`
-  memory space, optimized-executable text retrieval, strict
-  compile-options validation.
+- *PJRT surface APIs*: the `pinned_host` memory space and
+  optimized-executable text retrieval are unimplemented.
+  `Array.unsafe_buffer_pointer`, buffer donation and compile-option
+  validation are supported.
 - *Window-dilation numeric corners* (~7): specific
   dilation-plus-padding parameter combinations under `vmap` produce
   values that differ from XLA's windowing semantics.
@@ -230,6 +229,7 @@ needs the Xcode command-line tools.
 | `JAX_PLATFORMS` | *(unset)* | Set to `metal` (or `metal,cpu`) to select the backend; unset keeps CPU default. |
 | `METALJAX_MATMUL_PRECISION` | `highest` | On M5-class GPUs MLX routes f32 GEMM through the neural accelerators at ~bf16 input precision (~4e-3 error). `highest` pins MLX kernels to the previous GPU generation for exact f32; set `default` to allow the fast path. |
 | `METALJAX_F64` | `error` | Metal has no float64. Default (`error`): f64 values may pass **through** the device (x64 mode wraps Python scalars as f64 buffers that programs immediately convert to f32 — stored as f32, which rounds exactly once and stays bit-identical to CPU), but any op that **computes** in f64 fails at compile time, naming the op. `downcast`: emulate all f64 in f32 (one warning). Example: under `jax_enable_x64`, optax AdamW's `beta**step` bias correction is real f64 arithmetic — strict mode rejects it, and `downcast` is the opt-in for such workloads. |
+| `METALJAX_COMPILE_OPTIONS` | *(unset)* | `jit(..., compiler_options={...})` entries are validated like XLA validates them (unknown name → `No such compile option`, wrong type → `is not a valid <type> value`) and then ignored, since metaljax has no XLA flag surface. Set `ignore` to skip the check and accept anything. |
 | `METALJAX_PLUGIN_PATH` | *(auto)* | Override the path to `libmetal_pjrt.dylib`. |
 
 ## Repository layout

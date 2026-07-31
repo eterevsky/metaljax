@@ -7,6 +7,7 @@ since these run while jax may still be mid-initialization.
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import hashlib
 import os
@@ -45,6 +46,7 @@ _ENUM_TO_NP = {
     _ENUM["F64"]: np.dtype(np.float64),  # stored as f32 on device (downcast)
     _ENUM["BF16"]: np.dtype(ml_dtypes.bfloat16),
     _ENUM["C64"]: np.dtype(np.complex64),
+    _ENUM["C128"]: np.dtype(np.complex128),  # stored as c64 on device
     _ENUM["F8E5M2"]: np.dtype(ml_dtypes.float8_e5m2),
     _ENUM["F8E4M3FN"]: np.dtype(ml_dtypes.float8_e4m3fn),
     _ENUM["F8E4M3B11FNUZ"]: np.dtype(ml_dtypes.float8_e4m3b11fnuz),
@@ -179,9 +181,16 @@ class MetalExecutable:
         return self._compiled
 
 
-def compile_program(code: bytes, fmt: str) -> MetalExecutable:
+def compile_program(code: bytes, fmt: str,
+                    options: bytes | None = None) -> MetalExecutable:
     if fmt not in ("mlir",):
         raise ValueError(f"unsupported program format {fmt!r}")
+    # `options` is the serialized CompileOptionsProto. metaljax applies none
+    # of it, but an option XLA would refuse has to be refused here too --
+    # accepting a misspelled flag silently is how a caller ends up believing
+    # a dump/debug switch took effect. See metaljax.compile_options.
+    from metaljax import compile_options as _copts
+    _copts.validate(options)
     # New program = config boundary: cached buffers from prior shapes are
     # dead weight against the Metal buffer-count limit. gc.collect() first:
     # dead managers/executables often sit in reference cycles (Python's gc
@@ -314,6 +323,45 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
     return res
 
 
+class _PyBuffer(ctypes.Structure):
+    """CPython's Py_buffer (documented, stable-ABI layout)."""
+
+    _fields_ = [
+        ("buf", ctypes.c_void_p),
+        ("obj", ctypes.c_void_p),  # borrowed here: ctypes must not refcount
+        ("len", ctypes.c_ssize_t),
+        ("itemsize", ctypes.c_ssize_t),
+        ("readonly", ctypes.c_int),
+        ("ndim", ctypes.c_int),
+        ("format", ctypes.c_char_p),
+        ("shape", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("strides", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("suboffsets", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("internal", ctypes.c_void_p),
+    ]
+
+
+_PyObject_GetBuffer = ctypes.pythonapi.PyObject_GetBuffer
+_PyObject_GetBuffer.argtypes = [ctypes.py_object, ctypes.POINTER(_PyBuffer),
+                                ctypes.c_int]
+_PyObject_GetBuffer.restype = ctypes.c_int
+_PyBuffer_Release = ctypes.pythonapi.PyBuffer_Release
+_PyBuffer_Release.argtypes = [ctypes.POINTER(_PyBuffer)]
+_PyBuffer_Release.restype = None
+_PyBUF_STRIDES = 0x0018  # PyBUF_ND | PyBUF_STRIDES
+
+
+def _strided_base_address(obj) -> int:
+    """Py_buffer.buf of a strided export: the address of element [0, ...]."""
+    view = _PyBuffer()
+    if _PyObject_GetBuffer(obj, ctypes.byref(view), _PyBUF_STRIDES) != 0:
+        raise BufferError("object does not export a strided buffer")
+    try:
+        return int(view.buf or 0)
+    finally:
+        _PyBuffer_Release(ctypes.byref(view))
+
+
 def buffer_pointer(buf: MetalBuffer) -> int:
     """Unified-memory address of the buffer's data (PJRT UnsafePointer).
 
@@ -325,12 +373,26 @@ def buffer_pointer(buf: MetalBuffer) -> int:
     addresses that made distinct buffers compare equal and equal buffers
     compare distinct. "Unsafe" per the PJRT contract: aliasing checks,
     not access.
+
+    An mx.array need not be contiguous: broadcasts export stride 0 (every
+    `jnp.ones` lands here), slices export a step. What we report for those
+    is the address their leading element [0, 0, ...] occupies — the base
+    of the buffer as this handle sees it, the same thing a contiguous array
+    reports, and the only answer that keeps aliasing checks meaningful (two
+    handles on one buffer must compare equal, distinct buffers must not).
+    Neither numpy route reaches it: np.frombuffer refuses a non-C-contiguous
+    memoryview outright, and np.asarray(mv) chokes on bfloat16 (MLX exports
+    it as PEP-3118 'B' with itemsize 2, which numpy calls a mismatch); nor
+    does memoryview indexing, which cannot take a sub-view of a >1-D buffer
+    at all. Read Py_buffer.buf, which is that address by definition.
     """
     mx.eval(buf.data)
     mv = memoryview(buf.data)
     if mv.nbytes == 0:
         return 0
-    return np.frombuffer(mv, dtype=np.uint8).__array_interface__["data"][0]
+    if mv.c_contiguous:
+        return np.frombuffer(mv, dtype=np.uint8).__array_interface__["data"][0]
+    return _strided_base_address(buf.data)
 
 
 def device_kind() -> str:

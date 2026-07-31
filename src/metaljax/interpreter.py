@@ -68,10 +68,15 @@ _F64_DATA_MOVEMENT = {
 }
 
 
+# The double-width element types: neither exists on Metal, and both follow
+# the same policy (pass-through stored narrowed, compute rejected).
+_F64_ELEMENT_TYPES = ("f64", "complex<f64>")
+
+
 def _has_f64(types) -> bool:
     for t in types:
         try:
-            if str(ir.RankedTensorType(t).element_type) == "f64":
+            if str(ir.RankedTensorType(t).element_type) in _F64_ELEMENT_TYPES:
                 return True
         except Exception:
             pass
@@ -79,7 +84,7 @@ def _has_f64(types) -> bool:
 
 
 def _check_no_f64_compute(module_op: ir.Operation):
-    """Raise if any non-data-movement op touches an f64 tensor."""
+    """Raise if any non-data-movement op touches an f64/complex128 tensor."""
 
     def visit(op: ir.Operation):
         name = op.name
@@ -88,8 +93,9 @@ def _check_no_f64_compute(module_op: ir.Operation):
                 o.type for o in op.operands
             ):
                 raise dtypes.UnsupportedDtypeError(
-                    f"program computes in float64, unsupported on Metal "
-                    f"(set METALJAX_F64=downcast to compute in float32):\n"
+                    f"program computes in float64/complex128, unsupported on "
+                    f"Metal (set METALJAX_F64=downcast to compute in "
+                    f"float32/complex64):\n"
                     f"  {str(op).splitlines()[0]}"
                 )
         for region in op.regions:

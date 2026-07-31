@@ -14,11 +14,12 @@ class UnsupportedDtypeError(TypeError):
     pass
 
 
-# Metal has no float64. Default policy (strict): f64 values may pass
-# *through* the device (jax_enable_x64 wraps python scalars as f64 buffers
-# that programs immediately convert to f32 — storing them as f32 rounds
-# exactly once, bit-identical to CPU), but any op that *computes* in f64
-# fails at compile time. METALJAX_F64=downcast opts into full f32 emulation.
+# Metal has no float64 (and hence no complex128). Default policy (strict):
+# f64/c128 values may pass *through* the device (jax_enable_x64 wraps python
+# scalars as f64 buffers that programs immediately convert to f32 — storing
+# them as f32 rounds exactly once, bit-identical to CPU), but any op that
+# *computes* in f64/c128 fails at compile time. METALJAX_F64=downcast opts
+# into full f32/c64 emulation.
 F64_DOWNCAST = os.environ.get("METALJAX_F64", "error") == "downcast"
 _warned_f64 = False
 
@@ -28,7 +29,8 @@ def _warn_f64():
     if not _warned_f64:
         _warned_f64 = True
         warnings.warn(
-            "metaljax: float64 is not supported on Metal; computing in float32 "
+            "metaljax: float64/complex128 are not supported on Metal; "
+            "computing in float32/complex64 "
             "(set METALJAX_F64=error to fail instead)",
             stacklevel=3,
         )
@@ -51,9 +53,10 @@ _MLIR_TO_MX = {
 }
 
 
-# numpy dtypes as JAX should see them (f64 stays f64 in metadata).
+# numpy dtypes as JAX should see them (f64/c128 stay f64/c128 in metadata).
 _MLIR_TO_NP = {
     "complex<f32>": np.dtype(np.complex64),
+    "complex<f64>": np.dtype(np.complex128),
     "f16": np.dtype(np.float16),
     "f32": np.dtype(np.float32),
     "f64": np.dtype(np.float64),
@@ -117,7 +120,7 @@ _LOGICAL_BITS = {
     "f6E2M3FN": 6, "f6E3M2FN": 6,
     "f8E4M3FN": 8, "f8E5M2": 8, "f8E4M3": 8, "f8E3M4": 8, "f8E8M0FNU": 8,
     "f8E4M3B11FNUZ": 8, "f8E5M2FNUZ": 8, "f8E4M3FNUZ": 8,
-    "f64": 64,
+    "f64": 64, "complex<f64>": 128,
 }
 
 
@@ -165,12 +168,12 @@ _NP_TO_MX = {v: k for k, v in _MX_TO_NP.items()}
 def mx_dtype_for(t: ir.Type) -> mx.Dtype:
     """MLX dtype for an MLIR tensor *element* type."""
     s = str(t)
-    if s == "f64":
+    if s in ("f64", "complex<f64>"):
         # Storage dtype. In strict mode the interpreter's compile-time check
-        # already rejected any op that would *compute* in f64.
+        # already rejected any op that would *compute* in f64/complex128.
         if F64_DOWNCAST:
             _warn_f64()
-        return mx.float32
+        return mx.float32 if s == "f64" else mx.complex64
     try:
         return _MLIR_TO_MX[s]
     except KeyError:
@@ -213,6 +216,10 @@ def to_mx(arr: np.ndarray) -> mx.array:
         if F64_DOWNCAST:
             _warn_f64()
         return mx.array(arr.astype(np.float32))
+    if arr.dtype == np.complex128:
+        if F64_DOWNCAST:
+            _warn_f64()
+        return mx.array(arr.astype(np.complex64))
     return mx.array(arr)
 
 

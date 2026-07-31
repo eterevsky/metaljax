@@ -332,6 +332,10 @@ size_t ItemSize(PJRT_Buffer_Type t) {
     case PJRT_Buffer_Type_F64:
     case PJRT_Buffer_Type_C64:
       return 8;
+    // Like F64, complex128 is a pass-through type: values cross the
+    // boundary at their host width and are STORED as complex64.
+    case PJRT_Buffer_Type_C128:
+      return 16;
     default:
       return 0;
   }
@@ -527,13 +531,25 @@ static PJRT_Error* ClientCompile(PJRT_Client_Compile_Args* args) {
   PyObject* fmt_obj = PyUnicode_FromStringAndSize(
       args->program->format,
       static_cast<Py_ssize_t>(args->program->format_size));
+  // Serialized CompileOptionsProto: the engine reads the caller's
+  // env_option_overrides out of it and rejects options XLA would reject.
+  PyObject* opts_obj = nullptr;
+  if (args->compile_options != nullptr && args->compile_options_size > 0) {
+    opts_obj = PyBytes_FromStringAndSize(
+        args->compile_options,
+        static_cast<Py_ssize_t>(args->compile_options_size));
+  } else {
+    opts_obj = Py_None;
+    Py_INCREF(Py_None);
+  }
   PyObject* py_exec = nullptr;
-  if (code_obj != nullptr && fmt_obj != nullptr) {
-    py_exec = PyObject_CallMethod(engine, "compile_program", "OO",
-                                  code_obj, fmt_obj);
+  if (code_obj != nullptr && fmt_obj != nullptr && opts_obj != nullptr) {
+    py_exec = PyObject_CallMethod(engine, "compile_program", "OOO",
+                                  code_obj, fmt_obj, opts_obj);
   }
   Py_XDECREF(code_obj);
   Py_XDECREF(fmt_obj);
+  Py_XDECREF(opts_obj);
   if (py_exec == nullptr) return PyErrToErr("compile");
 
   auto* ex = new PJRT_Executable();

@@ -101,7 +101,9 @@ def dense_to_np(attr, ttype: ir.RankedTensorType):
             pass
 
     if el.startswith("complex"):
-        return complex_dense_from_text(str(attr), shape)
+        return complex_dense_from_text(
+            str(attr), shape,
+            np.complex128 if el == "complex<f64>" else np.complex64)
 
     import ml_dtypes
     name = _TEXT_NP_DTYPES.get(el)
@@ -146,32 +148,39 @@ def dense_to_np(attr, ttype: ir.RankedTensorType):
     return np.array(vals, dtype=np_dtype).reshape(shape)
 
 
-def complex_dense_from_text(text: str, shape: tuple) -> "np.ndarray":
+def complex_dense_from_text(text: str, shape: tuple,
+                            np_dtype=None) -> "np.ndarray":
     """Decode a complex dense constant from MLIR text: dense<(re,im)>,
     dense<[(re,im), ...]>, or the hex-blob form. Needed because the
     python bindings cannot even *cast* complex dense attributes
-    (op.attributes["value"] raises)."""
+    (op.attributes["value"] raises). np_dtype selects the component
+    width (complex<f64> constants are pass-through data, decoded at
+    their declared width and narrowed by dtypes.to_mx)."""
     import re
 
     import numpy as np
 
+    if np_dtype is None:
+        np_dtype = np.complex64
+    np_dtype = np.dtype(np_dtype)
+    part = np.dtype(f"f{np_dtype.itemsize // 2}")
     m = re.search(r"dense<(.*)> : ", text, re.S)
     if not m:
         raise TypeError(f"no dense constant in: {text[:80]}")
     body = m.group(1)
     if body.startswith('"0x'):
         return np.frombuffer(
-            bytes.fromhex(body[3:-1]), np.complex64).reshape(shape)
+            bytes.fromhex(body[3:-1]), np_dtype).reshape(shape)
 
     def num(tok):
         tok = tok.strip()
         if tok.startswith("0x"):
-            import struct
-            return struct.unpack("<f", int(tok, 16).to_bytes(4, "little"))[0]
+            bits = int(tok, 16).to_bytes(part.itemsize, "little")
+            return np.frombuffer(bits, part)[0]
         return float(tok)
 
     pairs = re.findall(r"\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)", body)
-    arr = np.array([complex(num(a), num(b)) for a, b in pairs], np.complex64)
+    arr = np.array([complex(num(a), num(b)) for a, b in pairs], np_dtype)
     if arr.size == 1 and shape != (1,) * len(shape or (1,)):
         return np.broadcast_to(arr.reshape(()), shape).copy()
     return arr.reshape(shape)

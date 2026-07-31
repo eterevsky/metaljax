@@ -97,6 +97,31 @@ def _register_linalg_lowerings():
             return emit(ctx, "metaljax_tridiagonal", [operand],
                         "L" if lower else "U")
 
+        # LU: jax's generic (non-cpu/gpu/tpu) lowering is a *python* blocked
+        # factorization — `for k in range(0, min(m, n), 128)` — so a symbolic
+        # *matrix* dimension cannot enter it ('_DimExpr' object cannot be
+        # interpreted as an integer, and min() on two unrelated symbols is
+        # inconclusive). Only those shapes go to a host getrf, whose result
+        # shapes travel with the call. Symbolic BATCH dimensions are fine
+        # (they are vmap axes, not loop bounds) and keep the on-device
+        # factorization, as do fully static shapes: the two algorithms round
+        # differently, and at bfloat16 that difference is visible, so the
+        # host path must not take work the device path can do.
+        try:
+            generic_lu = mlir.lower_fun(ll._lu_python, multiple_results=True)
+
+            def lu_rule(ctx, operand, **_):
+                m_n = ctx.avals_in[0].shape[-2:]
+                if all(isinstance(d, int) for d in m_n):
+                    return generic_lu(ctx, operand)
+                return emit(ctx, "metaljax_lu", [operand])
+
+            mlir.register_lowering(ll.lu_p, lu_rule, platform="metal")
+        except AttributeError:
+            # jax renamed its private generic LU; leaving lu_p unregistered
+            # keeps static-shape LU working (jax's own default rule).
+            logger.warning("metaljax: shape-polymorphic LU unavailable")
+
         def tri_solve_rule(ctx, a, b, *, left_side, lower, transpose_a,
                            conjugate_a, unit_diagonal,
                            perturb_singular=False, **_):
@@ -141,7 +166,7 @@ def _register_linalg_lowerings():
         from jax._src.export import _export
         _export._CUSTOM_CALL_TARGETS_GUARANTEED_STABLE |= {
             "metaljax_eigh", "metaljax_svd", "metaljax_eig",
-            "metaljax_schur", "metaljax_hessenberg",
+            "metaljax_lu", "metaljax_schur", "metaljax_hessenberg",
             "metaljax_tridiagonal", "metaljax_triangular_solve",
             "metaljax_tridiagonal_solve", "metaljax_callback",
         }

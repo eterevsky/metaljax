@@ -202,3 +202,65 @@ def test_nonsingular_tridiagonal_solve_matches_cpu():
             outs.append(np.asarray(jax.jit(jax.lax.linalg.tridiagonal_solve)(
                 *[jnp.asarray(v) for v in (dl, d, du, b)])))
     np.testing.assert_allclose(outs[0], outs[1], rtol=1e-5, atol=1e-6)
+
+
+def _export_both(f, poly, dtype, x):
+    """Export f for metal and for cpu under the same symbolic shape and
+    run both on x."""
+    from jax import export
+    _metal_device()
+    outs = []
+    for name in ("metal", "cpu"):
+        with jax.default_device(jax.devices(name)[0]):
+            e = export.export(jax.jit(f), platforms=[name])(
+                jax.ShapeDtypeStruct(export.symbolic_shape(poly), dtype))
+            outs.append(jax.tree.map(np.asarray, e.call(x)))
+    return outs
+
+
+@pytest.mark.parametrize("poly,shape,dtype", [
+    ("b, 4", (5, 4), np.float32),
+    ("m, n", (5, 4), np.float32),
+    ("b1, b2, m, n", (2, 3, 4, 5), np.float32),
+    ("b1, b2, m, n", (2, 3, 8, 4), np.complex64),
+    ("b, m, 0", (2, 4, 0), np.float32),
+    ("b, 0, n", (2, 0, 4), np.float32),
+    # symbolic BATCH only: must stay on jax's generic device algorithm,
+    # whose rounding the host getrf does not reproduce at low precision
+    ("b1, b2, 4, 5", (2, 3, 4, 5), np.float32),
+])
+def test_shape_polymorphic_lu_matches_cpu(poly, shape, dtype):
+    # jax's generic LU lowering is a python loop over min(m, n), which a
+    # symbolic dimension cannot drive; metal routes those to a host getrf.
+    r = np.random.default_rng(3)
+    x = r.standard_normal(shape).astype(dtype)
+    if np.issubdtype(dtype, np.complexfloating):
+        x = x + 1j * r.standard_normal(shape).astype(np.float32)
+    got, want = _export_both(jax.lax.linalg.lu, poly, dtype, x)
+    for g, w in zip(got, want):
+        assert g.shape == w.shape and g.dtype == w.dtype
+        if np.issubdtype(g.dtype, np.inexact):
+            np.testing.assert_allclose(g, w, rtol=1e-5, atol=1e-6)
+        else:
+            np.testing.assert_array_equal(g, w)
+
+
+def test_shape_polymorphic_inv_matches_cpu():
+    r = np.random.default_rng(4)
+    x = (r.standard_normal((5, 5)) + 5 * np.eye(5)).astype(np.float32)
+    got, want = _export_both(jnp.linalg.inv, "b, b", np.float32, x)
+    np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-5)
+
+
+def test_static_shape_lu_still_matches_cpu():
+    # The host path must not disturb the on-device factorization.
+    metal = _metal_device()
+    x = np.random.default_rng(5).standard_normal((6, 4)).astype(np.float32)
+    outs = []
+    for dev in (metal, jax.devices("cpu")[0]):
+        with jax.default_device(dev):
+            outs.append([np.asarray(t)
+                         for t in jax.jit(jax.lax.linalg.lu)(jnp.asarray(x))])
+    np.testing.assert_allclose(outs[0][0], outs[1][0], rtol=1e-5, atol=1e-6)
+    np.testing.assert_array_equal(outs[0][1], outs[1][1])
+    np.testing.assert_array_equal(outs[0][2], outs[1][2])

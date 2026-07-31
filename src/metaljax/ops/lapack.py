@@ -397,6 +397,41 @@ def _metal_schur(op, ins):
     return _batch_apply(one, [a], batch, specs)
 
 
+@_target("metaljax_lu")
+def _metal_lu(op, ins):
+    """getrf, plus the permutation jax derives from its pivots.
+
+    Only reached when the matrix dimensions themselves are symbolic: jax's
+    generic lowering builds a blocked factorization out of a python loop
+    over min(m, n), which no symbolic dimension can drive (see the metal
+    lu lowering)."""
+    from scipy.linalg import lapack
+    a = _np_in(ins[0])
+    specs = _result_specs(op)
+    batch = a.shape[:-2]
+    m, n = a.shape[-2], a.shape[-1]
+    k = min(m, n)
+    getrf = lapack.cgetrf if np.iscomplexobj(a) else lapack.sgetrf
+
+    def one(x):
+        if k == 0:
+            lu, piv = x, np.zeros((0,), np.int32)
+        else:
+            # scipy's wrapper already returns 0-based pivots. info > 0 is a
+            # singular factor, which is still a valid factorization (XLA
+            # returns it too); only info < 0 -- an illegal argument -- makes
+            # jax poison the result.
+            lu, piv, info = getrf(x)
+            if info < 0:
+                lu = np.full_like(x, np.nan)
+        perm = np.arange(m, dtype=np.int32)
+        for i in range(k):
+            j = int(piv[i])
+            perm[i], perm[j] = perm[j], perm[i]
+        return lu, np.asarray(piv, np.int32), perm
+    return _batch_apply(one, [a], batch, specs)
+
+
 @_target("metaljax_hessenberg")
 def _metal_hessenberg(op, ins):
     from scipy.linalg import lapack
