@@ -1097,6 +1097,22 @@ static PJRT_Error* BufferDelete(PJRT_Buffer_Delete_Args* args) {
   return nullptr;
 }
 
+static PJRT_Error* BufferUnsafePointer(PJRT_Buffer_UnsafePointer_Args* args) {
+  if (args->buffer->deleted || args->buffer->py_buf == nullptr) {
+    return Err(PJRT_Error_Code_FAILED_PRECONDITION, "buffer was deleted");
+  }
+  Gil gil;
+  PyObject* engine = EnsureEngine();
+  if (engine == nullptr) return PyErrToErr("import metaljax.engine");
+  PyObject* r = PyObject_CallMethod(engine, "buffer_pointer", "O",
+                                    args->buffer->py_buf);
+  if (r == nullptr) return PyErrToErr("buffer_pointer");
+  args->buffer_pointer = static_cast<uintptr_t>(PyLong_AsUnsignedLongLong(r));
+  Py_DECREF(r);
+  if (PyErr_Occurred()) return PyErrToErr("buffer_pointer result");
+  return nullptr;
+}
+
 static PJRT_Error* BufferIsDeleted(PJRT_Buffer_IsDeleted_Args* args) {
   args->is_deleted = args->buffer->deleted;
   return nullptr;
@@ -1173,7 +1189,7 @@ METALJAX_UNIMPL(PJRT_Executable_Serialize)
 METALJAX_UNIMPL(PJRT_Executable_DeserializeAndLoad)
 METALJAX_UNIMPL(PJRT_Executable_GetCompiledMemoryStats)
 METALJAX_UNIMPL(PJRT_Executable_GetCompileOptions)
-METALJAX_UNIMPL(PJRT_Buffer_UnsafePointer)
+
 METALJAX_UNIMPL(PJRT_Buffer_IncreaseExternalReferenceCount)
 METALJAX_UNIMPL(PJRT_Buffer_DecreaseExternalReferenceCount)
 METALJAX_UNIMPL(PJRT_Buffer_OpaqueDeviceMemoryDataPointer)
@@ -1368,13 +1384,13 @@ extern "C" __attribute__((visibility("default"))) const PJRT_Api* GetPjrtApi() {
   api.PJRT_Buffer_Device = BufferDevice;
   api.PJRT_Buffer_Memory = BufferMemory;
   api.PJRT_Buffer_Delete = BufferDelete;
+  api.PJRT_Buffer_UnsafePointer = BufferUnsafePointer;
   api.PJRT_Buffer_IsDeleted = BufferIsDeleted;
   api.PJRT_Buffer_CopyToDevice = BufferCopyToDevice;
   api.PJRT_Buffer_CopyToMemory = BufferCopyToMemory;
   api.PJRT_Buffer_ToHostBuffer = BufferToHostBuffer;
   api.PJRT_Buffer_IsOnCpu = BufferIsOnCpu;
   api.PJRT_Buffer_ReadyEvent = BufferReadyEvent;
-  api.PJRT_Buffer_UnsafePointer = PJRT_Buffer_UnsafePointer_Unimpl;
   api.PJRT_Buffer_IncreaseExternalReferenceCount =
       PJRT_Buffer_IncreaseExternalReferenceCount_Unimpl;
   api.PJRT_Buffer_DecreaseExternalReferenceCount =

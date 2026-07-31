@@ -198,6 +198,22 @@ class Interpreter:
         return [self._aval_for(t) for t in ftype.results]
 
     @property
+    def forwarded_outputs(self) -> list[tuple[int, int]]:
+        """(output_index, argument_index) pairs where main returns one of
+        its arguments directly. XLA's no-alias contract requires such
+        outputs to be COPIES unless the argument was donated; the engine
+        inserts the copy. (Buffer sharing through views of arguments is
+        not detected — nothing asserts on it today.)"""
+        blk = self._main_block()
+        args = list(blk.arguments)
+        ret = list(blk.operations)[-1].operation
+        out = []
+        for j, v in enumerate(ret.operands):
+            if isinstance(v, ir.BlockArgument) and v in args:
+                out.append((j, args.index(v)))
+        return out
+
+    @property
     def donated_args(self) -> list[int]:
         """Main-function argument indices the caller donated: jax marks
         them with tf.aliasing_output (aliased to an output) or

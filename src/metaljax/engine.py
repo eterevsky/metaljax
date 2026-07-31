@@ -117,6 +117,7 @@ class MetalExecutable:
         self.out_dims = [list(shape) for shape, _ in outs]
         with interp.context:
             self.donated_params = interp.donated_args
+            self.forwarded_outputs = interp.forwarded_outputs
         self._compiled = None
         self._can_compile = None  # resolved lazily on first execute
 
@@ -262,10 +263,53 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
         print(f"[metaljax-mem] execute done: "
               f"active={mx.get_active_memory()}B "
               f"cache={mx.get_cache_memory()}B", flush=True)
+    # XLA's no-alias contract: outputs may not share a buffer with a
+    # non-donated input or with another output (jit identity must return
+    # a FRESH buffer; jax asserts this via unsafe_buffer_pointer). The
+    # interpreter naturally forwards pass-through values, so copy any
+    # output that IS an input array — unless that input was donated, in
+    # which case aliasing is exactly what donation licenses.
+    donated = set(getattr(ex, "donated_params", ()) or ())
+    # Statically-known forwards (main returns an argument): these alias
+    # even through mx.compile, whose outputs are fresh objects sharing
+    # the input's buffer — object identity cannot see that.
+    for j, i in getattr(ex, "forwarded_outputs", ()) or ():
+        if i not in donated and j < len(outs):
+            outs[j] = mx.array(outs[j])
+    # Dynamic pass: eager paths can also forward objects (and duplicate
+    # an output); catch those by identity.
+    in_ids = {id(a) for i, a in enumerate(args) if i not in donated}
+    seen_out: set = set()
+    fixed = []
+    for arr in outs:
+        if id(arr) in in_ids or id(arr) in seen_out:
+            arr = mx.array(arr)
+        seen_out.add(id(arr))
+        fixed.append(arr)
+    outs = fixed
     res = []
     for arr, type_enum, dims in zip(outs, ex.out_types, ex.out_dims):
         res.append(MetalBuffer(arr, type_enum, dims))
     return res
+
+
+def buffer_pointer(buf: MetalBuffer) -> int:
+    """Unified-memory address of the buffer's data (PJRT UnsafePointer).
+
+    Apple silicon MTLBuffers in shared mode are CPU-addressable, and MLX
+    exports them zero-copy through the buffer protocol (all dtypes,
+    including bf16 — raw bytes). The buffer protocol CANNOT copy, unlike
+    np.array(copy=False) (silently converts non-native dtypes) and
+    __dlpack__ (stages a GPU-side copy), both of which returned transient
+    addresses that made distinct buffers compare equal and equal buffers
+    compare distinct. "Unsafe" per the PJRT contract: aliasing checks,
+    not access.
+    """
+    mx.eval(buf.data)
+    mv = memoryview(buf.data)
+    if mv.nbytes == 0:
+        return 0
+    return np.frombuffer(mv, dtype=np.uint8).__array_interface__["data"][0]
 
 
 def device_kind() -> str:
