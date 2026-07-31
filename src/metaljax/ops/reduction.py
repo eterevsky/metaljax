@@ -375,16 +375,21 @@ def _select_and_scatter(interp, op, ins, env):
 
     sel_ops = [o.operation for o in op.regions[0].blocks[0].operations]
     sct_ops = [o.operation for o in op.regions[1].blocks[0].operations]
+    comb = sct_ops[0].name if len(sct_ops) == 2 else None
+    # bool operands scatter with or/and (jax emits `or` for PRED pooling
+    # gradients); or == elementwise maximum, and == minimum
     if not (len(sel_ops) == 2 and sel_ops[0].name == "stablehlo.compare"
-            and len(sct_ops) == 2 and sct_ops[0].name == "stablehlo.add"):
+            and comb in ("stablehlo.add", "stablehlo.or", "stablehlo.and")):
         raise UnsupportedOpError(
             f"select_and_scatter bodies "
             f"{[o.name for o in sel_ops]} / {[o.name for o in sct_ops]}")
     direction = _comparison_direction(sel_ops[0])
     if direction in ("GE", "GT"):
-        is_max, fill = True, float("-inf")
+        is_max = True
+        fill = False if dtypes.is_bool(operand.dtype) else float("-inf")
     elif direction in ("LE", "LT"):
-        is_max, fill = False, float("inf")
+        is_max = False
+        fill = True if dtypes.is_bool(operand.dtype) else float("inf")
     else:
         raise UnsupportedOpError(f"select_and_scatter compare {direction}")
 
@@ -426,12 +431,27 @@ def _select_and_scatter(interp, op, ins, env):
     total = 1
     for s in x.shape:
         total *= s
-    base = mx.zeros((total,), dtype=operand.dtype)
-    base = base.at[mx.reshape(flat, (-1,))].add(
-        mx.reshape(source.astype(operand.dtype), (-1,)))
+    src_flat = mx.reshape(source.astype(operand.dtype), (-1,))
+    idx = mx.reshape(flat, (-1,))
+    if comb == "stablehlo.and":
+        base = mx.ones((total,), dtype=operand.dtype)  # identity of AND
+        base = base.at[idx].minimum(src_flat)
+    elif comb == "stablehlo.or":
+        base = mx.zeros((total,), dtype=operand.dtype)
+        base = base.at[idx].maximum(src_flat)
+    else:
+        base = mx.zeros((total,), dtype=operand.dtype)
+        base = base.at[idx].add(src_flat)
     base = mx.reshape(base, x.shape)
     if (pad != 0).any():
         sl = tuple(slice(int(pad[i, 0]), int(pad[i, 0]) + operand.shape[i])
                    for i in range(rank))
         base = base[sl]
-    return base + init.astype(operand.dtype)
+    init_c = init.astype(operand.dtype)
+    if comb == "stablehlo.and":
+        return mx.logical_and(base, init_c) if dtypes.is_bool(base.dtype) \
+            else mx.minimum(base, init_c)
+    if comb == "stablehlo.or":
+        return mx.logical_or(base, init_c) if dtypes.is_bool(base.dtype) \
+            else mx.maximum(base, init_c)
+    return base + init_c

@@ -140,3 +140,16 @@ def test_reduce_window_dilated():
     check(lambda v: lax.reduce_window(
         v, jnp.float32(-np.inf), jnp.logaddexp, (1, 2), (1, 1), 'SAME',
         (1, 1), (1, 2)), x2, rtol=1e-5, atol=1e-6)
+
+
+def test_select_and_scatter_bool():
+    # PRED pooling gradients: jax emits an `or` scatter body for bool
+    # (or == maximum); the handler previously accepted only `add`.
+    import numpy as np
+    from jax._src.internal_test_util import test_harnesses
+    hs = [h for h in test_harnesses.all_harnesses
+          if h.fullname.startswith("select_and_scatter_add_dtypes_shape_bool")]
+    assert hs, "harness renamed upstream"
+    hrng = np.random.RandomState(42)
+    for h in hs:
+        check(h.dyn_fun, *h.dyn_args_maker(hrng))

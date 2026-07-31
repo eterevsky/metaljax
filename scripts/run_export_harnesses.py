@@ -84,11 +84,15 @@ def main():
                 if g.dtype != w.dtype:
                     status, detail = f"{tag}-mismatch", f"dtype {g.dtype} vs {w.dtype}"
                     break
-                if np.issubdtype(g.dtype, np.inexact):
-                    if not np.allclose(g, w, rtol=1e-4, atol=1e-4,
+                inexact = (np.issubdtype(g.dtype, np.inexact)
+                           or g.dtype.kind == "V")  # ml_dtypes (bf16 etc.)
+                if inexact:
+                    gg = g.astype(np.float64) if g.dtype.kind == "V" else g
+                    ww = w.astype(np.float64) if w.dtype.kind == "V" else w
+                    if not np.allclose(gg, ww, rtol=1e-4, atol=1e-4,
                                        equal_nan=True):
-                        finite = np.isfinite(w) & np.isfinite(g)
-                        md = (np.abs(g[finite] - w[finite]).max()
+                        finite = np.isfinite(ww) & np.isfinite(gg)
+                        md = (np.abs(gg[finite] - ww[finite]).max()
                               if finite.any() else float("inf"))
                         status, detail = f"{tag}-mismatch", f"maxdiff {md:.3e}"
                         break
