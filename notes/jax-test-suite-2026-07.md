@@ -261,10 +261,45 @@ real axis. Plus: -0.0 literals lose their sign under mx.compile, and
 f32->f16 astype canonicalizes NaN signs (both documented, worked
 around where they mattered).
 
-Remaining 130 + 35 collection errors, all classified: ~44 intentional
+Remaining 130 + collection errors, all classified: ~44 intentional
 (f64/c128 compute, multi-device, denormals), ~44 export-harness
-platform allowlist, ~35 collection (cache internals, import skew),
+platform allowlist, collection errors (see correction below),
 ~4 better-than-CPU shape-poly cases, ~3 jax-side callback platform
 allowlists, and singletons documented individually (sinc-at-inf CPU-
 also-fails, FD-reference sign flip with the full number table,
 OptimizedProgram debugging surface).
+
+## Release review + corrections (2026-07-31, 0.11.0 sign-off)
+
+Oleg reviewed the list above item by item. Rulings:
+
+- Complex inf/NaN pole semantics -> reclassified INTENTIONAL (category
+  A). It is MLX-kernel behavior, not Metal hardware; C99 poles would
+  need per-element branches (standing perf policy). README updated.
+- Better-than-CPU shape-poly cases: approved as-is.
+- OptimizedProgram: wontfix (no optimized HLO exists in our
+  architecture; jax hands plugins unoptimized StableHLO). Noted for
+  Stage 2: running XLA's HLO pass pipeline as a library inside our
+  compile would both improve input graphs and make this implementable.
+- CPU-also-fails: allowed by default. FD-reference scanGrad singleton
+  accepted (number table above).
+- CORRECTION to the collection-error line: a fresh sequential
+  --collect-only of the pinned suite counts 22 errors, not ~35, and
+  the count is IDENTICAL with metal enabled and on CPU-only. All are
+  environment imports: Pallas/Mosaic GPU+TPU modules needing
+  CUDA/libtpu, plus two files needing the optional `hypothesis`
+  package. No jaxlib-cache internals (that phrasing leaked from the
+  retired HEAD-suite triage). Ruled out of scope.
+- Export-harness/callback allowlists: verified `cpu_pass` in
+  cpu_parity.json — they pass on CPU because cpu is inside the
+  hard-coded (cpu, cuda, tpu) platform lists (multi-platform export
+  lowers for absent hardware, executes on cpu). Functionality covered
+  for metal by scripts/run_export_harnesses.py: 5,460/5,587.
+
+Also landed pre-release: bf16 host-transfer bitcast fix (dtypes.to_mx/
+to_np staged through f32: 2x transfer, 2x transient device memory —
+gemma-4-31B load held 122.8 GB and its cold run took 502s from paging;
+90.6s after the fix — and MLX's f32->bf16 astype canonicalizes NaN
+payload AND sign; tests/test_dtypes.py pins bits + memory).
+Version 0.11.0 per Oleg (gap list closed to his satisfaction; jumps
+0.5-0.10 as planned, tracking the jax 0.11 pin).

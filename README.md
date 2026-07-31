@@ -137,20 +137,23 @@ fall into three groups:
   sharding has no hardware to run on.
 - **Denormals flush to zero** on the GPU (hardware behavior); tests
   asserting subnormal outputs (e.g. `jnp.spacing`) differ from CPU.
+- **Complex special values at inf/NaN poles** for a handful of
+  transcendentals (log/trig/hyperbolic family) follow MLX's kernel
+  semantics rather than C99. Finite inputs match CPU; full C99 pole
+  behavior would need per-element branches in hot paths (policy: not
+  worth the slowdown). `sqrt`/`rsqrt`/`exp`/`expm1`/`tan`/`abs`/`sign`
+  are rebuilt and exact.
 
-**Under review — remaining audited gaps** (every one re-examined
-during the 0.4.5 parity campaign; each carries evidence in
+**Remaining audited gaps** (every one re-examined during the 0.11.0
+parity campaign and approved as-is; each carries evidence in
 `notes/jax-test-suite-2026-07.md`):
 
 - *Ordered-effect residue* (~3): `buffer_callback` and
   `emit_python_callback` are rejected by jax-side platform allowlists
   (`callback.py`, `buffer_callback.py` hard-code cpu/cuda/rocm/tpu) —
-  not reachable from a plugin. Ordered `debug.print`/`io_callback`
+  not reachable from a plugin; verified passing on CPU because cpu is
+  inside those hard-coded lists. Ordered `debug.print`/`io_callback`
   work.
-- *Complex special values at inf/NaN poles*: MLX's complex kernels
-  differ from C99 at infinities for a handful of transcendentals we
-  have not rebuilt (finite inputs match; sqrt/rsqrt/exp/expm1/tan/abs/
-  sign are rebuilt and exact).
 - *`testSincInfinities`, FD-reference gradient corners*: fail on the
   CPU backend too, or the test's finite-difference reference is
   numerically meaningless in f32 (documented with numbers).
