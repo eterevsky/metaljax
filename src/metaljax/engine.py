@@ -122,6 +122,23 @@ class MetalExecutable:
             self.forwarded_outputs = interp.forwarded_outputs
         self._compiled = None
         self._can_compile = None  # resolved lazily on first execute
+        self._sync_inputs = None  # ditto (a whole-module walk)
+
+    @property
+    def sync_inputs(self) -> bool:
+        """Whether execute must settle this program's inputs first.
+
+        MLX's FFT kernels can run ahead of a pending async evaluation of
+        their input (jax.numpy.fft crops/pads to `s` in a separate
+        executable, and every execute ends in async_eval, so the transform
+        read the padded buffer mid-copy). Programs that transform need
+        their inputs materialized; ops.elementwise._fft repeats the barrier
+        for values produced inside an eagerly interpreted program.
+        """
+        if self._sync_inputs is None:
+            with self.interpreter.context:
+                self._sync_inputs = self.interpreter.main_has_fft
+        return self._sync_inputs
 
     def runner(self):
         """The callable executing this program, mx.compile'd when possible."""
@@ -222,6 +239,8 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
         gc.collect()  # array workloads rarely trip Python's own gc
         mx.clear_cache()
     args = [b.data for b in buffers]
+    if args and ex.sync_inputs:
+        mx.eval(*args)
     # NB retries happen AFTER the except block: the in-flight exception's
     # traceback pins every array of the failed attempt (a failed
     # whole-main trace can hold hundreds of thousands of buffers), so a

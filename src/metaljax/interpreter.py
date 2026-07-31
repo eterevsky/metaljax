@@ -137,6 +137,7 @@ class Interpreter:
         self._no_chunk: set = set()    # body blocks where chunking failed
         self._no_body_compile: set = set()  # bodies whose compiled fn failed
         self._msl_cache: dict = {}     # (body block, trip, start) -> Plan | None
+        self._fft_cache: dict = {}     # block -> contains a stablehlo.fft?
         self._in_trace = False  # True while mx.compile is tracing our code
         if isinstance(module, ir.Module):
             if context is None:
@@ -302,6 +303,44 @@ class Interpreter:
     def main_pure(self) -> bool:
         with self.context:
             return self.block_is_pure(self._main_block())
+
+    def block_has_fft(self, block: ir.Block) -> bool:
+        """True if the block, or anything it calls, holds a stablehlo.fft.
+
+        MLX's FFT kernels can start before a pending async evaluation of
+        their input has landed, so such programs need their inputs
+        materialized first — see engine.execute and ops.elementwise._fft.
+        """
+        cached = self._fft_cache.get(block)
+        if cached is not None:
+            return cached
+        self._fft_cache[block] = False  # break cycles defensively
+        found = False
+        for op in block.operations:
+            o = op.operation
+            if o.name == "stablehlo.fft":
+                found = True
+                break
+            if o.name in ("func.call", "stablehlo.composite"):
+                attr = "callee" if o.name == "func.call" else "decomposition"
+                callee = ir.FlatSymbolRefAttr(o.attributes[attr]).value
+                fn = self.funcs.get(callee)
+                if fn is not None and self.block_has_fft(
+                    fn.regions[0].blocks[0]
+                ):
+                    found = True
+                    break
+            if any(self.block_has_fft(b)
+                   for region in o.regions for b in region.blocks):
+                found = True
+                break
+        self._fft_cache[block] = found
+        return found
+
+    @property
+    def main_has_fft(self) -> bool:
+        with self.context:
+            return self.block_has_fft(self._main_block())
 
     # --- execution ---
 

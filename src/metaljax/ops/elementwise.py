@@ -252,6 +252,29 @@ def _fft(interp, op, ins, env):
         out_t = ir.RankedTensorType(op.results[0].type)
         return mx.zeros(tuple(out_t.shape),
                         dtype=dtypes.mx_dtype_for(out_t.element_type))
+    # MLX bug: its FFT kernels can read an input buffer whose producing
+    # copy is still in flight. jax.numpy.fft crops/pads to `s` in its own
+    # executable, and the eager path ends every execute with async_eval,
+    # so a pad feeding a transform reads pre-pad garbage — nondeterminis-
+    # tically, and only across execute boundaries (jnp.fft.ifftn over >3
+    # axes lowers to several stablehlo.fft ops and was 100% wrong). Inside
+    # an mx.compile trace the program is one graph that MLX orders
+    # correctly, so only the eager path needs the barrier.
+    if not interp._in_trace:
+        mx.eval(x)
+    # MLX bug: rfftn/irfftn with a unit last transform length silently
+    # skip the transforms over the remaining axes (and, when the array has
+    # batch dims, the batching too). A length-1 real transform is the
+    # identity on the single DC bin, so spell it out: the real axis just
+    # drops (irfft) or gains (rfft) its imaginary part, and the leading
+    # axes take an ordinary complex transform. Complex FFT/IFFT are fine.
+    if s[-1] == 1 and ("RFFT" in kind or "IRFFT" in kind):
+        lead_s, lead_axes = s[:-1], axes[:-1]
+        if "IRFFT" in kind:
+            y = mx.fft.ifftn(x, s=lead_s, axes=lead_axes) if lead_axes else x
+            return mx.real(y)
+        y = x.astype(mx.complex64)
+        return mx.fft.fftn(y, s=lead_s, axes=lead_axes) if lead_axes else y
     if "IRFFT" in kind:
         return mx.fft.irfftn(x, s=s, axes=axes)
     if "RFFT" in kind:
