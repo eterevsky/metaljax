@@ -211,7 +211,11 @@ def to_mx(arr: np.ndarray) -> mx.array:
             np.uint8 if name == "ui4" else np.float32)
         return mx.array(arr.astype(wide)).astype(mxdt)
     if arr.dtype == ml_dtypes.bfloat16:
-        return mx.array(arr.astype(np.float32)).astype(mx.bfloat16)
+        # Bitcast, never widen: the old astype(f32) detour uploaded 2x the
+        # bytes, pinned a 2x-size f32 device buffer until the first eval
+        # (loading a 62 GB model transiently held 123 GB), and MLX's
+        # f32->bf16 astype canonicalizes NaNs (payload AND sign lost).
+        return mx.view(mx.array(arr.view(np.uint16)), mx.bfloat16)
     if arr.dtype == np.float64:
         if F64_DOWNCAST:
             _warn_f64()
@@ -230,7 +234,10 @@ def to_np(arr: mx.array) -> np.ndarray:
         # conversion segfaults on a null data pointer.
         return np.empty(arr.shape, dtype=_MX_TO_NP[arr.dtype])
     if arr.dtype == mx.bfloat16:
-        return np.array(arr.astype(mx.float32)).astype(ml_dtypes.bfloat16)
+        # Bitcast for the same reasons as to_mx (NaN bits survive, no f32
+        # staging copy). view() needs a contiguous input.
+        u16 = np.array(mx.view(mx.contiguous(arr), mx.uint16))
+        return u16.view(ml_dtypes.bfloat16)
     return np.array(arr)
 
 
