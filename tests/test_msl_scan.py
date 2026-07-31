@@ -438,3 +438,51 @@ def test_partially_unrolled_scan():
         check(jax.value_and_grad(
             lambda a, b, u=u: jax.lax.scan(cell, a, b, unroll=u)[1].sum(),
             argnums=(0, 1)), c0, xs, rtol=1e-4, atol=1e-5)
+
+
+def test_carry_permutation_is_a_parallel_assignment():
+    # Per-iteration state updates are emitted as `st0 = new0; st1 = new1;
+    # ...`. A computed update lands in its own temporary first, but an
+    # update that IS verbatim another state register (a carry rotation
+    # like `[c[-1], *c[:-1]]`) used to read the already-overwritten slot,
+    # so every carry collapsed onto one element -- silently, since the
+    # AD-transposed loop is a different program and stayed correct
+    # (jax api_test's dce_jaxpr_scan_nontrivial_fixedpoint_extensive_output
+    # caught it as a *gradient* mismatch). All three emission modes.
+
+    # scalar mode: 4 rotating scalar carries
+    def rot_scalars(a, b, c, d):
+        def body(cr, _):
+            return [cr[-1], *cr[:-1]], cr[-1]
+        return jax.lax.scan(body, [a, b, c, d], None, length=4)[1]
+
+    s = [np.float32(v) for v in (1.0, 2.0, 3.0, 4.0)]
+    check(rot_scalars, *s)
+    assert _plan_modes(rot_scalars, *s) == ["scalar"]
+
+    # scalar mode: two array carries, one a bare move of the other
+    def swap_arrays(xs, h0, h1):
+        def cell(c, x):
+            p, q = c
+            return (q, jnp.tanh(p + x)), p
+        return jax.lax.scan(cell, (h0, h1), xs)
+
+    H1 = rng.standard_normal((B, H)).astype(np.float32)
+    check(swap_arrays, X, H0, H1)
+    assert _plan_modes(swap_arrays, X, H0, H1) == ["scalar"]
+
+    # vector / coop modes: same move alongside a matvec cell
+    def swap_matvec(xs, h0, h1, w):
+        def cell(c, x):
+            p, q = c
+            nh = jnp.tanh(x + p @ w)
+            return (q, nh), nh
+        return jax.lax.scan(cell, (h0, h1), xs)
+
+    for width, mode in ((4, "vector"), (F16, "coop")):
+        w = (rng.standard_normal((width, width)) * 0.25).astype(np.float32)
+        xs = (rng.standard_normal((L, B, width)) * 0.3).astype(np.float32)
+        a0 = rng.standard_normal((B, width)).astype(np.float32)
+        b0 = rng.standard_normal((B, width)).astype(np.float32)
+        check(swap_matvec, xs, a0, b0, w, rtol=1e-4, atol=1e-5)
+        assert _plan_modes(swap_matvec, xs, a0, b0, w) == [mode]

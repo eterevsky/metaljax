@@ -112,3 +112,49 @@ def test_fft_zero_size():
     # zero-size batch dim with a non-empty transform axis
     check(lambda z: jnp.fft.fft(z), np.zeros((0, 4), np.complex64))
     check(lambda x: jnp.fft.rfft(x), np.zeros((0, 4), np.float32))
+
+
+def test_complex_sqrt_near_negative_real_axis():
+    # MLX evaluates the textbook `sqrt((|z|+x)/2)` for the real part of a
+    # complex sqrt. Just below the negative real axis f32 rounds |z| to
+    # exactly |x|, that term underflows to 0, and both sqrt and rsqrt come
+    # back with a spurious zero real part (jax lax_test's complex rsqrt
+    # cases OpAgainstNumpy197/200). Reference is float64, not the CPU
+    # backend: XLA's own complex rsqrt only gets ~1e-4 here.
+    from helpers import run_metal
+
+    r = np.random.default_rng(4)
+    x = -np.abs(r.standard_normal(512)).astype(np.float32)
+    y = (r.standard_normal(512)
+         * 10.0 ** r.uniform(-7.0, -2.0, 512)).astype(np.float32)
+    z = (x + 1j * y).astype(np.complex64)
+    got_s, got_r = run_metal(
+        lambda v: (jax.lax.sqrt(v), jax.lax.rsqrt(v)), z)
+
+    zz = z.astype(np.complex128)
+    for got, want, name in ((got_s, np.sqrt(zz), "sqrt"),
+                            (got_r, 1.0 / np.sqrt(zz), "rsqrt")):
+        g = np.asarray(got, np.complex128)
+        assert np.all(g.real != 0), f"{name}: spurious zero real part"
+        rel = np.abs(g - want) / np.abs(want)
+        assert rel.max() < 1e-6, f"{name}: max rel {rel.max():.3e}"
+        rel_re = np.abs(g.real - want.real) / np.abs(want.real)
+        assert rel_re.max() < 1e-5, f"{name}: real part rel {rel_re.max():.3e}"
+
+
+def test_complex_sqrt_large_magnitude():
+    # 2*(|z|+|x|) leaves the f32 range for |z| > ~1.7e38, which used to
+    # return inf+infj (sqrt) / nan+nanj (rsqrt); jax-CPU is finite there.
+    from helpers import run_metal
+
+    z = np.array([1e38 + 1e38j, 3.4e38 + 0j, 0 + 3.4e38j, -3.4e38 + 1e30j],
+                 np.complex64)
+    got_s, got_r = run_metal(
+        lambda v: (jax.lax.sqrt(v), jax.lax.rsqrt(v)), z)
+    zz = z.astype(np.complex128)
+    for got, want, name in ((got_s, np.sqrt(zz), "sqrt"),
+                            (got_r, 1.0 / np.sqrt(zz), "rsqrt")):
+        g = np.asarray(got, np.complex128)
+        assert np.all(np.isfinite(g)), f"{name}: {g}"
+        rel = np.abs(g - want) / np.abs(want)
+        assert rel.max() < 1e-6, f"{name}: max rel {rel.max():.3e}"

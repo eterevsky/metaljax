@@ -1599,6 +1599,23 @@ def _bshape(a, b):
 
 # ------------------------------------------------------------ planning
 
+def _aliased_state_moves(srcs):
+    """State slots that must be snapshotted before the per-iteration
+    parallel assignment `st0 = new0; st1 = new1; ...`.
+
+    Every *computed* update already lives in its own `v{n}` temporary, so
+    the sequential assignments are safe for those.  An update that IS
+    verbatim another state register (an identity move -- e.g. a scan whose
+    carry is a rotating list, `[c[-1], *c[:-1]]`) instead reads a slot an
+    earlier assignment has already overwritten, silently turning the
+    permutation into a broadcast of one element.  Return the source slots
+    needing an old-value copy; `srcs` is the emitted source name per slot.
+    """
+    live = {f"st{k}": k for k in range(len(srcs))}
+    return sorted({live[v] for j, v in enumerate(srcs)
+                   if v in live and live[v] != j})
+
+
 def _numel(shape):
     n = 1
     for d in shape:
@@ -2320,8 +2337,13 @@ class Plan:
             news.append((j, v))
         L.extend(body)
         L.extend(writes)
+        moved = _aliased_state_moves([v for _, v in news])
+        for k in moved:
+            L.append(f"  {mslt(self.arg_dtypes[self.states[k][0]])} "
+                     f"sv{k} = st{k};")
+        ren = {f"st{k}": f"sv{k}" for k in moved}
         for j, v in news:
-            L.append(f"  st{j} = {v};")
+            L.append(f"  st{j} = {ren.get(v, v)};")
         L.append("}")
         for j, (pos, expr) in enumerate(self.states):
             off = _lane_offset(self.arg_shapes[pos], lane)
@@ -2686,7 +2708,20 @@ class Plan:
             news.append((j, nm, R, sR))
         out.extend(body)
         out.extend(writes)
+        moved = _aliased_state_moves([nm for _, nm, _, _ in news])
+        for k in moved:
+            kpos = self.states[k][0]
+            kshape = self.arg_shapes[kpos]
+            kR = kshape[-1] if kshape else 1
+            out.append("  " + declare(f"sv{k}", self.arg_dtypes[kpos], kR))
+            if kR > 1:
+                out.append(f"  for (int r = 0; r < {kR}; r++) "
+                           f"sv{k}[r] = st{k}[r];")
+            else:
+                out.append(f"  sv{k} = st{k};")
+        ren = {f"st{k}": f"sv{k}" for k in moved}
         for j, nm, R, sR in news:
+            nm = ren.get(nm, nm)
             src = f"{nm}[r]" if R > 1 else nm
             if sR > 1:
                 out.append(f"  for (int r = 0; r < {sR}; r++) st{j}[r] = {src};")
@@ -3003,7 +3038,19 @@ class Plan:
             news.append((j, nm, R, sR))
         out.extend(body)
         out.extend(writes)
+        moved = _aliased_state_moves([nm for _, nm, _, _ in news])
+        for k in moved:
+            kpos = self.states[k][0]
+            kR = self._coop_R_shape(self.arg_shapes[kpos])
+            out.append("  " + declare(f"sv{k}", self.arg_dtypes[kpos], kR))
+            if kR > 1:
+                out.append(f"  for (int r = 0; r < {kR}; r++) "
+                           f"sv{k}[r] = st{k}[r];")
+            else:
+                out.append(f"  sv{k} = st{k};")
+        ren = {f"st{k}": f"sv{k}" for k in moved}
         for j, nm, R, sR in news:
+            nm = ren.get(nm, nm)
             src = f"{nm}[r]" if R > 1 else nm
             if sR > 1:
                 out.append(f"  for (int r = 0; r < {sR}; r++) st{j}[r] = {src};")

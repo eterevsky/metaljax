@@ -104,6 +104,58 @@ def _expm1(x):
     return mx.expm1(x)
 
 
+def _csqrt(z):
+    """Complex square root, Kahan's rearrangement of the C99 formula.
+
+    MLX evaluates the textbook `sqrt((|z|+x)/2) + i*y/(2*that)`. Near the
+    negative real axis f32 rounds |z| to exactly |x|, so the real part
+    underflows to a spurious 0 -- measured worst relative error 1.9e-4
+    over random complex64 (190x lax_test's 1e-6 tolerance; the real
+    component alone is off by 100%). The same expression overflows to
+    inf+infj once 2|z| leaves the f32 range. Kahan's form takes the small
+    component from `y` directly so neither branch cancels: measured worst
+    relative error 1.3e-7, against 1.2e-7 for numpy's own f32 csqrt and
+    matching jax-CPU on every finite case probed. Non-finite inputs keep
+    MLX's answers -- complex inf/NaN semantics are a separate documented
+    gap, deliberately untouched here.
+    """
+    x, y = mx.real(z), mx.imag(z)
+    # scale huge inputs by 2^-60 (a power of four: exact, and sqrt halves
+    # the exponent to 2^-30) so 2*(|z|+|x|) stays finite
+    huge = mx.maximum(mx.abs(x), mx.abs(y)) > 1e18
+    scale = mx.where(huge, 2.0 ** -60, 1.0)
+    xs, ys = x * scale, y * scale
+    t = mx.sqrt(2.0 * (_cabs(dtypes.make_complex(xs, ys)) + mx.abs(xs)))
+    tsafe = mx.where(t == 0, mx.ones_like(t), t)
+    half = t / 2
+    # copysign(half, ys): MLX has no signbit, so read the bit (-0.0 counts)
+    neg = mx.view(ys, mx.int32) < 0
+    pos_re = xs >= 0
+    re = mx.where(pos_re, half, mx.abs(ys) / tsafe)
+    im = mx.where(pos_re, ys / tsafe, mx.where(neg, -half, half))
+    unscale = mx.where(huge, 2.0 ** 30, 1.0)
+    out = dtypes.make_complex(re * unscale, im * unscale)
+    return mx.where(mx.isfinite(x) & mx.isfinite(y), out, mx.sqrt(z))
+
+
+def _sqrt(x):
+    return _csqrt(x) if x.dtype == mx.complex64 else mx.sqrt(x)
+
+
+def _rsqrt(x):
+    """1/sqrt(z) = conj(sqrt(z))/|z| -- both factors cancellation-free
+    (see _csqrt). MLX's own complex rsqrt inherits the sqrt defect."""
+    if x.dtype != mx.complex64:
+        return mx.rsqrt(x)
+    s = _csqrt(x)
+    m = _cabs(x)
+    msafe = mx.where(m == 0, mx.ones_like(m), m)
+    out = dtypes.make_complex(mx.real(s) / msafe, -mx.imag(s) / msafe)
+    re, im = mx.real(x), mx.imag(x)
+    ok = mx.isfinite(re) & mx.isfinite(im) & (m != 0)
+    return mx.where(ok, out, mx.rsqrt(x))
+
+
 def _tan(x):
     if x.dtype == mx.complex64:
         # C99: tan(x +- i*inf) = +-i, whatever the real part
@@ -135,10 +187,10 @@ _UNARY = {
     "negate": mx.negative,
     "round_nearest_afz": _round_afz,
     "round_nearest_even": _round_even,
-    "rsqrt": mx.rsqrt,
+    "rsqrt": _rsqrt,
     "sign": _sign,
     "sine": mx.sin,
-    "sqrt": mx.sqrt,
+    "sqrt": _sqrt,
     "tan": _tan,
     "tanh": mx.tanh,
 }
@@ -438,6 +490,23 @@ def _clamp(interp, op, ins, env):
     return mx.minimum(mx.maximum(x, lo), hi)
 
 
+def _roundtrips_as_literal(v: float) -> bool:
+    """True if MLX can bake `v` into generated Metal source without loss.
+
+    mx.compile inlines RANK-0 constants as decimal literals printed with 7
+    significant digits, one short of float32's round-trip requirement of 9:
+    measured over 4000 random f32 constants, 2675 came back from a compiled
+    kernel 1 ULP away from the correctly-rounded product, and `float32(
+    "%.7g" % c)` predicted the compiled result in 4000/4000 cases. One ULP
+    is normally invisible, but an ill-conditioned consumer magnifies it --
+    `tan(pi/2 - pi*q)` (scipy.stats.cauchy.isf) reaches 4.7e-3 relative
+    error near the pole against 2.3e-7 for the same graph run eagerly.
+    Constants that survive %.7g stay literals; the rest are materialized
+    through a 1-element buffer, which MLX reads exactly (see _constant).
+    """
+    return float("%.7g" % v) == v
+
+
 @register("stablehlo.constant")
 def _constant(interp, op, ins, env):
     from metaljax import _ir
@@ -449,7 +518,13 @@ def _constant(interp, op, ins, env):
         arr = _ir.complex_dense_from_text(str(op), tuple(t.shape))
         return dtypes.to_mx(arr)
     arr = _ir.dense_to_np(op.attributes["value"], t)
-    out = dtypes.to_mx(arr)
+    if (arr.ndim == 0 and arr.dtype.kind == "f"
+            and not _roundtrips_as_literal(float(arr))):
+        # Buffer-backed: MLX only inlines rank-0 constants (shaped ones
+        # already ride in memory), and only literals lose the last ULP.
+        out = mx.reshape(dtypes.to_mx(arr.reshape(1)), ())
+    else:
+        out = dtypes.to_mx(arr)
     want = dtypes.mx_dtype_for(t.element_type)
     if out.dtype != want:
         out = out.astype(want)

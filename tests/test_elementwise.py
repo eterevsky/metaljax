@@ -147,3 +147,52 @@ def test_expm1_accuracy():
                         np.logspace(-8, 1, 300),
                         -np.logspace(-8, 1, 300)]).astype(np.float32)
     check(lambda v: jnp.expm1(v), x, rtol=5e-7, atol=1e-8)
+
+
+def _jit_on(platform, f, *args):
+    """Run f through the REAL backend on `platform` (the bare Interpreter
+    used by `check` never calls mx.compile, where this bug lives)."""
+    with jax.default_device(jax.devices(platform)[0]):
+        return np.asarray(jax.jit(f)(*[jnp.asarray(a) for a in args]))
+
+
+def test_rank0_constant_is_not_a_lossy_literal():
+    # mx.compile inlines RANK-0 constants into generated Metal source as
+    # %.7g decimal literals -- one digit short of float32's 9-digit round
+    # trip, so 2/3 of constants come back 1 ULP off. A single f32 multiply
+    # is exactly rounded on any IEEE backend, so metal must match CPU bit
+    # for bit here.
+    consts = np.array([np.pi, np.pi / 2, 1 / 3, 12345.6789, 0.7, 8.5e-9,
+                       1e-7, 2.0, 0.1, 0.5], np.float32)
+    # rank-0 operands in a CHAIN: a constant that first feeds
+    # broadcast_in_dim rides in memory anyway, and a lone binary op uses
+    # MLX's prebuilt kernel (scalar as a kernel argument) -- only a fused
+    # multi-op kernel bakes the literal.
+    xs = np.array([0.995, -3.25, 7.125, 1.0000001], np.float32)
+
+    def f(v):
+        return jnp.stack([jnp.float32(c) * v * v for c in consts])
+
+    for x in xs:
+        got, want = _jit_on("metal", f, x), _jit_on("cpu", f, x)
+        bad = np.argwhere(got != want).ravel()
+        assert not len(bad), (
+            f"x={x}: {len(bad)}/{got.size} products differ: "
+            f"{[(float(consts[i]), float(got[i]), float(want[i])) for i in bad[:4]]}")
+
+
+def test_ill_conditioned_constant_expression_matches_cpu():
+    # One ULP on a constant is invisible until something ill-conditioned
+    # amplifies it: jax's scipy.stats.cauchy.isf is tan(pi/2 - pi*q), whose
+    # condition number is ~64 at the ends of the test's clipped q range
+    # (scipy_stats_test's testCauchyIsf, which compares the jitted result
+    # against the op-by-op one, saw 3.8e-5 there against a 3e-4 tolerance,
+    # and up to 4.7e-3 closer to the pole).
+    def f(v):
+        return jnp.tan(jnp.float32(np.pi / 2) - jnp.float32(np.pi) * v)
+
+    for q in (0.995, 0.005, 0.99, 0.01, 0.75):
+        got = _jit_on("metal", f, np.float32(q))
+        want = _jit_on("cpu", f, np.float32(q))
+        rel = abs(float(got) - float(want)) / abs(float(want))
+        assert rel < 1e-6, f"q={q}: {got} vs {want} (rel {rel:.3e})"
