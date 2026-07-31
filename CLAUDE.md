@@ -356,7 +356,50 @@ executes on the Metal device through plain `jax.numpy`.
    db17 24% win kept, db02 regression found+gated), _needs_registers
    mode probe; build_plan retries with fired heuristics off. Gate
    104/104, 200 pytest, perf at baseline.
-20. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
+20. ✅ **jax-tests parity campaign (post-0.4.4, per Oleg: examine every
+   failure, fix or establish benign; delegate investigate-and-fix to
+   Opus subagents, review all diffs before commit).** Pinned-release
+   suite (new jax-v0.11.0/ checkout + scripts/run_jax_tests.py --tests)
+   is the honest headline; HEAD-clone suite kept as early warning.
+   Landed (each gated 104/104): ordered-effect tokens (bool[0] avals;
+   ordering free — in-process sync callbacks); complex make_complex
+   bit-interleave + C99 special values (abs/sign/exp/expm1/tan) + Kahan
+   csqrt/rsqrt (beats CPU); accurate f32 expm1 (~500 ULP -> 2.9e-7,
+   MSL header helper); reduce_window/sort/conv contiguity + shape
+   workarounds; donation end-to-end + XLA no-alias contract (static
+   forwarded-output copies); UnsafePointer via buffer protocol +
+   Py_buffer.buf (np copy=False and dlpack both return TRANSIENT
+   addresses — never use); windowed scatter-apply; i4 bitcast nibble
+   packing; f6/f4 OCP emulation (saturating overflow; XLA:CPU's fp6 is
+   itself broken — ml_dtypes is the reference); grouped int + negative-
+   pad + zero-size convs; singular solves -> inf/nan; c128 pass-through
+   (f64 checker didn't match c128 — compute silently ran in c64);
+   compile-options validation; shape-poly LU (symbolic MATRIX dims only
+   — host getrf rounds differently, bf16-visible); fft unit-length
+   rewrite + input barrier.
+   SILENT-WRONGNESS bugs fixed in OUR code (7): msl lane-scalar
+   broadcast (0.2.0+), msl concat pad-total width (partial unrolls),
+   msl SEQUENTIAL carry assignment (rotating carries collapsed,
+   [4,4,4,4] for [4,3,2,1], all 3 emitters), top_k non-last axis,
+   dilated reduce_window stale memory, complex sort -0/+0 ties, conv
+   short-buffer overread (uninit memory, flaky).
+   MLX BUG TALLY (7): strided-view reductions, strided argsort, conv
+   zero-dim short buffer, rfftn unit-last-length dropping transforms,
+   FFT-vs-async_eval RACE (eager-after-jit stale reads; fixed with
+   fft-scoped input barrier), %.7g rank-0 constant baking (1 ULP on
+   67% of constants in EVERY fused kernel), complex sqrt cancellation.
+   Harness lessons: 4-job suite runs UNDER-report failures; worktree
+   agents branch from origin/main AND their diffs omit untracked files
+   (check git status before harvesting); helpers.check now pins its
+   reference to CPU (was self-comparing under JAX_PLATFORMS=metal,cpu).
+   Wontfixes documented with numbers (FD-reference sign flip, CPU-also-
+   fails, better-than-CPU shape-poly cases). Pinned suite: 213 -> 130
+   failed (99.53%, 27,649 passed), zero files regressed; HEAD-clone
+   suite retired per Oleg (moving target; last measured 489 -> 328
+   before most of the campaign landed). Export-harness sweep
+   (scripts/run_export_harnesses.py): 5,460/5,587 with every non-pass
+   attributed (CPU's own f16/bf16 linalg gaps block joint artifacts).
+21. ⬜ Stage 2: migrate engine to native code (llvm-project clone available).
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib

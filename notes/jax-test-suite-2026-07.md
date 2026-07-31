@@ -218,3 +218,53 @@ every failing file, consolidated):
 mid08/big15 perf at baseline. Remaining 418 = ~33 intentional
 (f64/complex128/multi-device/denormals) + ~150 version-skew/harness +
 ~235 audited best-effort (dispositions above).
+
+## Parity campaign final (2026-07-31, post-0.4.4 -> pre-next-release)
+
+Pinned jax-v0.11.0 suite (the honest headline; scripts/run_jax_tests.py
+--tests jax-v0.11.0/tests): **27,649 passed / 130 failed = 99.53%**,
+zero files regressed across the campaign (213 -> 130 on this suite; the
+retired HEAD-clone suite went 489 -> 328 before most fixes landed).
+Export-harness sweep: 5,460/5,587 pass; every non-pass attributed
+(107 = XLA:CPU's own f16/bf16 linalg lowering gaps blocking the joint
+(cpu,metal) artifact, 2 harness-invalid, 1 real gap -> fixed).
+
+Fix chronology (each commit gated 104/104): ordered-effect tokens (25);
+complex constructor + C99 special values (15); reduce_window strided
+views (2, silent); top_k non-last axis (7, silent); msl lane-scalar
+guard (66, silent since 0.2.0); msl concat pad width (12, silent);
+expm1 accuracy (8); donation (15+, 21 jax tests unskipped);
+UnsafePointer + no-alias contract (15); windowed scatter-apply (13);
+i4 bitcast (11); f6/f4 emulation (13); conv grouped-int/neg-pad/
+zero-size (13, incl. an uninit-memory overread); small fixes (13:
+rank-0 slice, empty fft, complex sort ties, rng state, singular
+solves); fft unit-length + async barrier (4); numerics (4: carry
+aliasing PRIMAL bug, Kahan csqrt, %.7g constants, + 1 wontfix with
+numbers); mechanical tail (21: c128, pointers, options, LU).
+
+Silent-wrongness bugs fixed in metaljax (7): msl lane-scalar broadcast;
+msl concat pad-total; msl sequential carry assignment (rotating carries
+collapsed, all 3 emitters, since ever); top_k non-last axis (all
+dtypes); dilated reduce_window reading stale device memory; complex
+sort -0/+0 tie splitting; conv short-buffer overread (uninitialized
+memory, nondeterministic).
+
+MLX 0.32 bugs found and worked around (7): reductions over strided
+as_strided views read wrong elements; argsort/sort on non-contiguous
+inputs; conv zero-size spatial dim returns a NARROWER buffer than
+declared; rfftn/irfftn with unit last length silently drop leading-axis
+transforms; FFT kernels race a pending async_eval of their input
+(eager-after-jit stale reads; pure-MLX repro); mx.compile bakes rank-0
+constants as %.7g literals (1 ULP on 67% of constants in every fused
+kernel); complex sqrt textbook-formula cancellation at the negative
+real axis. Plus: -0.0 literals lose their sign under mx.compile, and
+f32->f16 astype canonicalizes NaN signs (both documented, worked
+around where they mattered).
+
+Remaining 130 + 35 collection errors, all classified: ~44 intentional
+(f64/c128 compute, multi-device, denormals), ~44 export-harness
+platform allowlist, ~35 collection (cache internals, import skew),
+~4 better-than-CPU shape-poly cases, ~3 jax-side callback platform
+allowlists, and singletons documented individually (sinc-at-inf CPU-
+also-fails, FD-reference sign flip with the full number table,
+OptimizedProgram debugging surface).

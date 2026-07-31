@@ -120,13 +120,11 @@ print(g, g.device)"
 
 ## Coverage and known gaps
 
-Running the entire upstream `jax/tests` suite against metaljax executes
-~28,200 tests with **98.4% passing** (27,779 passed / 418 failed as of
-v0.4.2). Roughly half the remainder is version skew against the test
-checkout and test infrastructure that doesn't know the platform; the
-rest is audited, documented best-effort residue (complex special
-values at poles, ordered-effect tokens, a few PJRT surface APIs) —
-see the notes for the per-item audit. The gaps fall into three groups:
+Running the test suite of the exact jax release we pin (v0.11.0)
+executes ~27,800 tests with **99.53% passing** (27,649 passed / 130
+failed). Every remaining failure has been individually examined and
+classified with evidence (`notes/jax-test-suite-2026-07.md`); they
+fall into three groups:
 
 **Intentional (platform constraints, will not change):**
 
@@ -140,34 +138,29 @@ see the notes for the per-item audit. The gaps fall into three groups:
 - **Denormals flush to zero** on the GPU (hardware behavior); tests
   asserting subnormal outputs (e.g. `jnp.spacing`) differ from CPU.
 
-**Under review — real gaps, individually audited, support not yet
-decided** (~190 test failures; these all pass on the CPU backend; see
-`notes/jax-test-suite-2026-07.md` for the full audit):
+**Under review — remaining audited gaps** (every one re-examined
+during the 0.4.5 parity campaign; each carries evidence in
+`notes/jax-test-suite-2026-07.md`):
 
-- *Ordered-effect token threading* (~50): jax threads
-  `!stablehlo.token` values through function signatures to sequence
-  ordered side effects (`jax.debug.print(..., ordered=True)`,
-  `io_callback(..., ordered=True)`). The interpreter treats tokens as
-  sentinels; full threading through main signatures is unimplemented.
-  Unordered callbacks work. Moderate plumbing.
-- *complex64 special values at inf/NaN poles* (~24): MLX's complex
-  `sin`/`cos`/`tan`/`sqrt`/`log`/... disagree with XLA's
-  C99-conformant kernels at infinities and NaN (finite inputs match to
-  f32 precision). Fixing means reimplementing the special-value
-  branches op by op.
-- *PJRT surface APIs*: the `pinned_host` memory space and
-  optimized-executable text retrieval are unimplemented.
-  `Array.unsafe_buffer_pointer`, buffer donation and compile-option
-  validation are supported.
-- *Window-dilation numeric corners* (~7): specific
-  dilation-plus-padding parameter combinations under `vmap` produce
-  values that differ from XLA's windowing semantics.
-- *>3-D convolutions*: MLX's conv kernels are 1/2/3-D.
-- *Singletons*: singular triangular/tridiagonal solves raise instead
-  of returning inf/NaN (5), `approx_top_k` NaN-padding placement in
-  one exported-vs-native comparison (1), a holomorphic-grad case at
-  1e-6 tolerance where MLX's complex sin is 4e-6 off (1), one
-  scan-gradient fixed-point corner (1).
+- *Ordered-effect residue* (~3): `buffer_callback` and
+  `emit_python_callback` are rejected by jax-side platform allowlists
+  (`callback.py`, `buffer_callback.py` hard-code cpu/cuda/rocm/tpu) —
+  not reachable from a plugin. Ordered `debug.print`/`io_callback`
+  work.
+- *Complex special values at inf/NaN poles*: MLX's complex kernels
+  differ from C99 at infinities for a handful of transcendentals we
+  have not rebuilt (finite inputs match; sqrt/rsqrt/exp/expm1/tan/abs/
+  sign are rebuilt and exact).
+- *`testSincInfinities`, FD-reference gradient corners*: fail on the
+  CPU backend too, or the test's finite-difference reference is
+  numerically meaningless in f32 (documented with numbers).
+- *Better-than-reference cases* (4): shape-polymorphic `jnp.insert` /
+  `jnp.nonzero` — the harness asserts `NotImplementedError` because
+  jax's CPU path cannot lower them; ours can, and values match CPU on
+  concrete shapes. We fail these tests by succeeding.
+- *`test_dce_sink_prevents_xla_dce`*: needs optimized-HLO text
+  retrieval (`PJRT_Executable_OptimizedProgram`), a debugging surface
+  we have not implemented.
 
 **Supported** (each verified against the CPU backend): sorting
 (`sort`/`argsort`/`top_k`/`approx_top_k`/`median`/`percentile`/
