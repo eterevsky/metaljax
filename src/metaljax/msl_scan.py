@@ -79,6 +79,13 @@ _T_DECL = {"t": "  volatile uint t = t_;",
 _TMAPS = {}
 
 
+def _force_build_fail():
+    """Test hook: emit deliberately invalid MSL so every generated kernel
+    fails to build, exercising the execute path's recovery. Read per plan
+    (not at import) so a test can flip it on a live process."""
+    return os.environ.get("METALJAX_MSL_FORCE_BUILD_FAIL", "") == "1"
+
+
 def _tmap(trip):
     m = _TMAPS.get(trip)
     if m is None:
@@ -1616,6 +1623,22 @@ def _aliased_state_moves(srcs):
                    if v in live and live[v] != j})
 
 
+def _reg_src(name, R, tgt_R, what):
+    """Read expression for a value held in `R` registers when the write
+    loop runs over a target of `tgt_R` registers.
+
+    The register loop variable `r` exists only when tgt_R > 1, so an R>1
+    value written into a narrower target would emit `name[r]` with no `r`
+    in scope ("use of undeclared identifier 'r'" at kernel build), and an
+    R != tgt_R > 1 value would index past the register array. Only a
+    width-1 value may broadcast into a wider target."""
+    if R > 1 and R != tgt_R:
+        raise _Unsupported(
+            f"{what}: value holds {R} registers, target holds {tgt_R} "
+            "(register axis mapped onto a lane dim)")
+    return f"{name}[r]" if R > 1 else name
+
+
 def _numel(shape):
     n = 1
     for d in shape:
@@ -2146,6 +2169,9 @@ class Plan:
             src = self._emit_vector()
         else:
             src = self._emit(counter_pos)
+        if _force_build_fail():
+            # test hook: exercise the engine's Metal-build-failure recovery
+            src += "\n_metaljax_forced_build_failure;\n"
         self.source = src
         # Metal caps kernel buffer bindings at 31 (indices 0-30); MLX
         # assigns them sequentially to inputs then outputs. Input packing
@@ -2395,6 +2421,55 @@ class Plan:
             return f"{expr} + r * {reg_stride}u"
         return expr
 
+    def _check_state_view(self, s, pos, coop=False):
+        """Reject a use of a state carry whose view is not the layout the
+        carry was LOADED with.
+
+        A carry lives in registers (`st{j}`), loaded once from the natural
+        layout of its carry shape, and every use is emitted as that bare
+        register name — correct only when the use addresses exactly the
+        same element per (lane, register). Bodies that mix carry ranks
+        (matlstm's (B,) stabilizer inside (B,F)/(B,F,F) expressions) view
+        the carry with its trailing REGISTER axis moved onto a lane
+        coordinate: `st{j}` holds all B values in every lane, while the
+        use wants the one selected by a lane coordinate. Registers cannot
+        be indexed by a lane coordinate, so reject the plan and let the
+        loop take the compiled-graph path.
+
+        Compared as address expressions — the emitters' own model of
+        "which element does this lane hold" — plus the register width,
+        which the offset alone does not carry."""
+        shape = tuple(self.arg_shapes[pos])
+        off = self._coop_off if coop else self._vec_off
+        # interior unit dims address nothing (broadcast lowerings leave
+        # them behind); the trailing axis IS the register axis and is
+        # compared as-is
+        vshape, vstrides = [], []
+        for i, (d, st) in enumerate(zip(s.shape, s.strides)):
+            if d == 1 and i < len(s.shape) - 1:
+                continue
+            vshape.append(d)
+            vstrides.append(st)
+        reg_use, reg_st = 1, 1
+        try:
+            want = off(shape)
+            got = off(tuple(vshape), tuple(vstrides), s.offset)
+            if coop:
+                reg_st = self._coop_R_shape(shape)
+                reg_use = self._coop_R_shape(tuple(vshape))
+            else:
+                reg_st = shape[-1] if shape else 1
+                reg_use = vshape[-1] if vshape else 1
+            if vstrides and vstrides[-1] == 0:
+                reg_use = 1  # broadcast along the trailing axis
+        except _Unsupported:
+            got, want = None, "unmappable"
+        if got != want or reg_use != reg_st:
+            raise _Unsupported(
+                f"state carry {pos} {shape} used as {tuple(s.shape)} "
+                f"strides {tuple(s.strides)} offset {s.offset}: register "
+                f"axis mapped onto a lane coordinate")
+
     def _emit_vector(self):
         lane = self.lane_shape
         out = []
@@ -2484,6 +2559,7 @@ class Plan:
                     pos = s.source[1]
                     if pos in self._state_args:
                         shape = self.arg_shapes[pos]
+                        self._check_state_view(s, pos)
                         v = (f"st{self._state_args[pos]}",
                              shape[-1] if shape else 1)
                     else:
@@ -2683,7 +2759,7 @@ class Plan:
                 off2 = self._vec_off(tuple(val.shape)
                                      if val.shape else per_shape)
                 tgt_R2 = val.shape[-1] if val.shape else 1
-            src2 = f"{nm2}[r]" if R2 > 1 else nm2
+            src2 = _reg_src(nm2, R2, tgt_R2, "stacked write")
             if tgt_R2 > 1:
                 writes.append(f"  for (int r = 0; r < {tgt_R2}; r++) "
                               f"{dest_expr}({off2})] = {src2};")
@@ -2722,7 +2798,7 @@ class Plan:
         ren = {f"st{k}": f"sv{k}" for k in moved}
         for j, nm, R, sR in news:
             nm = ren.get(nm, nm)
-            src = f"{nm}[r]" if R > 1 else nm
+            src = _reg_src(nm, R, sR, f"state {self.states[j][0]} update")
             if sR > 1:
                 out.append(f"  for (int r = 0; r < {sR}; r++) st{j}[r] = {src};")
             else:
@@ -2886,6 +2962,7 @@ class Plan:
                 elif s.kind == "arg":
                     pos = s.source[1]
                     if pos in self._state_args:
+                        self._check_state_view(s, pos, coop=True)
                         v = (f"st{self._state_args[pos]}",
                              self._coop_R_shape(self.arg_shapes[pos]))
                     else:
@@ -3011,7 +3088,7 @@ class Plan:
             off = self._coop_off(tuple(self.arg_shapes[pos][1:]))
             ii = f"((int)t + {self.start}) * {idx.a} + {idx.b}"
             tgt_R = self._coop_R_shape(tuple(self.arg_shapes[pos][1:]))
-            src = f"{nm}[r]" if R > 1 else nm
+            src = _reg_src(nm, R, tgt_R, f"stacked write {pos}")
             if tgt_R > 1:
                 writes.append(f"  for (int r = 0; r < {tgt_R}; r++) "
                               f"out{q}[(uint)({ii}) * {inner}u + ({off})] = {src};")
@@ -3025,7 +3102,7 @@ class Plan:
             numel = _numel(sym.shape)
             off = self._coop_off(sym.shape)
             tgt_R = self._coop_R_shape(tuple(sym.shape))
-            src = f"{nm}[r]" if R > 1 else nm
+            src = _reg_src(nm, R, tgt_R, f"hidden stack {hname}")
             if tgt_R > 1:
                 writes.append(f"  for (int r = 0; r < {tgt_R}; r++) "
                               f"{hname}[t * {numel}u + ({off})] = {src};")
@@ -3051,7 +3128,7 @@ class Plan:
         ren = {f"st{k}": f"sv{k}" for k in moved}
         for j, nm, R, sR in news:
             nm = ren.get(nm, nm)
-            src = f"{nm}[r]" if R > 1 else nm
+            src = _reg_src(nm, R, sR, f"state {self.states[j][0]} update")
             if sR > 1:
                 out.append(f"  for (int r = 0; r < {sR}; r++) st{j}[r] = {src};")
             else:
@@ -3162,13 +3239,22 @@ class Plan:
             output_shapes=out_shapes,
             output_dtypes=out_dtypes,
         )
-        if not getattr(self, "_validated", False) and not interp._in_trace:
-            # Force the first evaluation here: a Metal build error surfacing
-            # later inside an async eval worker would abort the process.
-            # (Inside an mx.compile trace evaluation is impossible; the
-            # engine's compile-failure fallback covers that path.)
-            mx.eval(*outs)
-            self._validated = True
+        if not getattr(self, "_validated", False):
+            if not interp._in_trace:
+                # Force the first evaluation here: a Metal build error
+                # surfacing later inside an async eval worker would abort
+                # the process. try_run turns the exception into a fallback.
+                mx.eval(*outs)
+                self._validated = True
+            else:
+                # Traced into an enclosing mx.compile graph: evaluation is
+                # impossible here, so flag the plan as unproven — the
+                # engine settles this execute's outputs SYNCHRONOUSLY (so
+                # a build failure raises instead of aborting an async
+                # worker) and then recovers by disabling msl_scan for the
+                # program.
+                if all(p is not self for p in interp._msl_pending):
+                    interp._msl_pending.append(self)
         ns, nh = len(self.stacked), len(self.hidden)
         vals = [None] * len(ins)
         for i in self.passthrough:

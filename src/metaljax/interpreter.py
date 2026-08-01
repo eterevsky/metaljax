@@ -143,6 +143,14 @@ class Interpreter:
         self._no_chunk: set = set()    # body blocks where chunking failed
         self._no_body_compile: set = set()  # bodies whose compiled fn failed
         self._msl_cache: dict = {}     # (body block, trip, start) -> Plan | None
+        # Set by engine.execute after a generated kernel failed to build:
+        # this program then plans no more msl_scan kernels (loops take the
+        # compiled-graph path, which is correct).
+        self._no_msl = False
+        # msl_scan plans traced into an mx.compile graph and never yet
+        # evaluated; engine.execute settles those executes synchronously so
+        # a Metal build error raises here instead of in an async worker.
+        self._msl_pending: list = []
         self._fft_cache: dict = {}     # block -> contains a stablehlo.fft?
         self._in_trace = False  # True while mx.compile is tracing our code
         if isinstance(module, ir.Module):

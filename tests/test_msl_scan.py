@@ -486,3 +486,89 @@ def test_carry_permutation_is_a_parallel_assignment():
         b0 = rng.standard_normal((B, width)).astype(np.float32)
         check(swap_matvec, xs, a0, b0, w, rtol=1e-4, atol=1e-5)
         assert _plan_modes(swap_matvec, xs, a0, b0, w) == [mode]
+
+
+def test_mixed_rank_carry_stabilizer_cell():
+    # matlstm/mLSTM shape: a matrix carry (B,D,D), a vector carry (B,D)
+    # and a per-batch SCALAR carry (B,) (the exponential stabilizer). In
+    # vector mode the (B,) carry is register-resident (all B values in
+    # every lane), yet the body views it as (B,1)/(B,D)/(B,D,D) — its
+    # register axis mapped onto a LANE coordinate. The emitter used to
+    # take those uses at face value and write `v{n}[r]` with no `r` in
+    # scope: "use of undeclared identifier 'r'" at Metal build time,
+    # killing the process mid-training. Such carries must be rejected so
+    # the loop falls back to the compiled-graph path.
+    D, Bm, Lm = 2, 2, 6
+    Q = (rng.standard_normal((Lm, Bm, D)) * 0.4).astype(np.float32)
+    K2 = (rng.standard_normal((Lm, Bm, D)) * 0.4).astype(np.float32)
+    V = (rng.standard_normal((Lm, Bm, D)) * 0.4).astype(np.float32)
+    IG = (rng.standard_normal((Lm, Bm)) * 0.5).astype(np.float32)
+    FG = (rng.standard_normal((Lm, Bm)) * 0.5).astype(np.float32)
+    C0 = (rng.standard_normal((Bm, D, D)) * 0.3).astype(np.float32)
+    N0 = (rng.standard_normal((Bm, D)) * 0.3).astype(np.float32)
+    M0 = np.zeros(Bm, np.float32)
+
+    def f(qs, ks, vs, igs, fgs, c0, n0, m0):
+        def cell(carry, step):
+            c, n, m = carry
+            q, k, v, ig, fg = step
+            nm = jnp.maximum(fg + m, ig)             # (B,)
+            i_ = jnp.exp(ig - nm)
+            f_ = jnp.exp(fg + m - nm)
+            # in-cell contractions as broadcast-multiply + reduce (how
+            # texmo's matlstm lowers): those stay inside the kernel's
+            # register lanes, so the plan reaches the emitter
+            o = v[:, :, None] * k[:, None, :]
+            nc = f_[:, None, None] * c + i_[:, None, None] * o
+            nn = f_[:, None] * n + i_[:, None] * k
+            num = jnp.sum(nc * q[:, None, :], axis=-1)
+            den = jnp.maximum(jnp.abs(jnp.sum(nn * q, axis=-1)), 1.0)
+            return (nc, nn, nm), num / den[:, None]
+        return jax.lax.scan(cell, (c0, n0, m0), (qs, ks, vs, igs, fgs))
+
+    args = (Q, K2, V, IG, FG, C0, N0, M0)
+    check(f, *args, rtol=1e-4, atol=1e-5)
+    check(jax.value_and_grad(lambda *a: f(*a)[1].sum(),
+                             argnums=tuple(range(len(args)))), *args,
+          rtol=1e-3, atol=1e-4)
+
+
+def test_metal_build_failure_falls_back(monkeypatch):
+    # Any generated kernel Metal's compiler rejects must degrade to the
+    # compiled-graph path instead of killing the program: engine.execute
+    # disables msl_scan for that executable and re-runs it (the program is
+    # pure). Runs through the real backend — the recovery lives there.
+    monkeypatch.setenv("METALJAX_MSL_FORCE_BUILD_FAIL", "1")
+
+    def f(a, x, h0):
+        return affine_scan(a, x, h0)
+
+    metal = jax.devices("metal")[0]
+    jf = jax.jit(f)
+    with jax.default_device(metal):
+        got = jax.tree.leaves(jf(A, X, H0))
+        # ...and again on the same executable: the blacklisted plan must
+        # stay blacklisted instead of being rebuilt (and re-failing).
+        again = jax.tree.leaves(jf(A, X, H0))
+    with jax.default_device(jax.devices("cpu")[0]):
+        want = jax.tree.leaves(jax.jit(f)(A, X, H0))
+    for g, g2, w in zip(got, again, want):
+        np.testing.assert_allclose(np.asarray(g), np.asarray(w),
+                                   rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(g2), np.asarray(w),
+                                   rtol=1e-5, atol=1e-6)
+
+
+def test_register_write_width_guard():
+    # Unit-level cover for the invalid-MSL form of the same bug: the
+    # register loop variable `r` exists only when the TARGET is wider
+    # than one register, so an R>1 value may only be written into an
+    # R-wide target ("use of undeclared identifier 'r'" otherwise).
+    from metaljax.msl_scan import _Unsupported, _reg_src
+
+    assert _reg_src("v0", 2, 2, "w") == "v0[r]"
+    assert _reg_src("v0", 1, 4, "w") == "v0"    # scalar broadcast is fine
+    assert _reg_src("v0", 1, 1, "w") == "v0"
+    for R, tgt in ((2, 1), (2, 4), (4, 2)):
+        with pytest.raises(_Unsupported):
+            _reg_src("v0", R, tgt, "w")

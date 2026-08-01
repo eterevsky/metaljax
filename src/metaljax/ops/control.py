@@ -297,7 +297,7 @@ def _msl_plan_for(interp, op):
     if trip <= 0:
         return None
     from metaljax import msl_scan
-    if not msl_scan.ENABLED:
+    if not msl_scan.ENABLED or interp._no_msl:
         return None
     body = op.regions[1].blocks[0]
     key = (body, trip, start)

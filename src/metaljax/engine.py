@@ -125,6 +125,36 @@ class MetalExecutable:
         self._compiled = None
         self._can_compile = None  # resolved lazily on first execute
         self._sync_inputs = None  # ditto (a whole-module walk)
+        self._msl_build_failed = False  # a generated kernel didn't compile
+
+    def disable_msl(self, plans=()):
+        """Drop msl_scan persistent kernels after Metal's shader compiler
+        rejected one ("Unable to build metal library").
+
+        `plans` are the loops whose kernels were still unproven when the
+        failure surfaced — the only ones that can be at fault, since a
+        kernel that has evaluated once is built. Blacklisting just those
+        keeps the rest of the program on the fast path; with no candidates
+        (or on a repeat failure) the whole program stops planning kernels.
+        Either way every cache that could hand out — or re-trace — the
+        offending kernel is dropped. Per executable, not per process: a
+        worker sweeping configurations keeps the fast path for the
+        programs whose kernels do build."""
+        interp = self.interpreter
+        bad = [k for k, p in interp._msl_cache.items()
+               if any(p is q for q in plans)]
+        if bad:
+            for k in bad:
+                interp._msl_cache[k] = None   # cached "not eligible"
+        else:
+            interp._no_msl = True
+            interp._msl_cache.clear()
+        interp._msl_pending.clear()
+        interp._body_cache.clear()      # compiled bodies embed the kernel
+        interp._traceable_cache.clear()  # an msl plan made a loop traceable
+        interp._cost_cache.clear()      # ...and cost it as one kernel (8)
+        self._compiled = None
+        self._can_compile = None        # re-decide with the new costs
 
     @property
     def sync_inputs(self) -> bool:
@@ -254,16 +284,36 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
     # traceback pins every array of the failed attempt (a failed
     # whole-main trace can hold hundreds of thousands of buffers), so a
     # retry inside the handler inherits the exhaustion it is retrying.
-    retry = None  # "same" | "eager"
+    retry = None  # "same" | "eager" | "no_msl"
+    pending = ex.interpreter._msl_pending
+    pending.clear()
     try:
         outs = list(ex.runner()(*args))
         if outs:
-            if _SYNC:
+            # An msl_scan kernel that was traced into a compiled graph has
+            # never been built: settle synchronously so a Metal build error
+            # raises here (in an async worker it would abort the process).
+            if _SYNC or pending:
                 mx.eval(*outs)
             else:
                 mx.async_eval(*outs)
+        for plan in pending:
+            plan._validated = True
+        pending.clear()
     except (RuntimeError, IndexError, ValueError) as e:
-        if isinstance(e, RuntimeError) and "Resource limit" in str(e):
+        if isinstance(e, RuntimeError) and "Unable to build metal library" in str(e):
+            # A generated msl_scan kernel did not compile. The program is
+            # pure, so re-run it without the kernels that could be at
+            # fault. BOUNDED: the second failure disables the whole
+            # persistent-kernel path for this program, after which the
+            # error can no longer come from a generated kernel.
+            if ex.interpreter._no_msl:
+                raise
+            # note the suspects here, act on them after the handler
+            suspect = list(pending) if not ex._msl_build_failed else []
+            ex._msl_build_failed = True
+            retry = "no_msl"
+        elif isinstance(e, RuntimeError) and "Resource limit" in str(e):
             # Metal buffer-handle exhaustion: if the failure came from a
             # compile attempt, drop to eager; else retry the same path
             # once (programs are pure — re-running is safe).
@@ -283,6 +333,17 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
             ex._compiled = None
             retry = "eager"
     if retry is not None:
+        if retry == "no_msl":
+            # NB outside the handler: the in-flight traceback pins the
+            # failed attempt's arrays, and disable_msl drops the caches
+            # holding them.
+            from metaljax.ops import control
+            if control._DEBUG:
+                print(f"[metaljax] msl_scan kernel failed to build; "
+                      f"dropping {len(suspect) or 'all'} generated "
+                      f"kernel(s) for this program and retrying", flush=True)
+            ex.disable_msl(suspect)
+            retry = "same"
         gc.collect()  # dead refcycles pin executables clear_cache can't free
         mx.clear_cache()
         runner = ex.interpreter if retry == "eager" else ex.runner()
