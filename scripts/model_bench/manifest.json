@@ -178,10 +178,11 @@
       "model": "Qwen/Qwen3-8B",
       "size_gb": 8.7,
       "backends": [
+        "cpu",
         "metaljax"
       ],
-      "status": "blocked-metaljax",
-      "note": "TRACKED: int8 at real-model scale becomes the headline quant story once dequant+matmul maps onto mx.quantized_matmul; today the int64 cliff makes it 16x slower and storage saves nothing"
+      "status": "cpu-runnable",
+      "note": "CPU: real memory win (int8 packed, ~9 GB vs 16.4 bf16) at ~1.7x decode cost. metal: blocked as a HEADLINE row until quantized-matmul mapping (would run, but 3.2x slower AND no memory saving today). Needs one-time qwix quantization pass of the 8B checkpoint."
     },
     {
       "id": "siglip2-so400m",

@@ -22,7 +22,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 12 | Mixtral 8×7B bf16 | ✗ | TODO (93 GB, hosting ok) | TODO | — | TODO |
 | 13 | gemma4-E2B keras-int4 (packed) | TODO | TODO | TODO | — | TODO |
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
-| 14b | *qwix-int8 Qwen3-8B* | — | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
+| 14b | *qwix-int8 Qwen3-8B* | queued (~9 GB packed, ~1.7× decode) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 15 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
 | 16 | SD 3.5 Large (ms/diff-step) | ✗ f16 dots | ⚠ 8577, BLACK IMAGE ⁹ | TODO (mflux) | TODO | — |
 | 17 | LoRA E2B train (ms/step) | 3287 | **417** (7.9×, losses agree) | — | TODO ¹⁰ | — |
