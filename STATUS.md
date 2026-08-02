@@ -21,14 +21,14 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | TODO |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ¹⁷ | **13.7** | — | TODO |
 | 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ¹⁷ | 131.8 | — | TODO |
-| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | TODO ⁶ | — | — | — |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | — | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.5 | **15.8** ⁷ | — | — | — |
-| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ (93 GB — not attempted, foregone) | TODO | — | TODO |
+| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **52.8** (93.4 GB) | — | TODO |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.5** ¹⁸ | 339.5 @ 2.7 GB ¹⁸ | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 146 | **48.3** ᵛ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ needs quantized-matmul path ⁸ | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 965 (b32: 23324) | **248** (b32: 5287) | — | 29.8 (b32: 591) | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | 654 @512², 2998 @1024² ¹⁹ | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
 | 18 | LoRA E2B train (ms/step) | 2141 | **417** ᵗ | — | 135.6 ¹⁰ | — |
 | 19 | maxtext train 0.6B (ms/step) | TODO ¹¹ | TODO ¹¹ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **28.0** (102.9 GB, load 12 s) | — | — |
@@ -141,6 +141,9 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
 19. torch SD3.5 via the ungated diffusers mirror
     adamo1139/stable-diffusion-3.5-large-ungated @5d868ff (official
     repo is gated); coherent images verified at both resolutions.
+    MLX cell: mflux is Flux-only; DiffusionKit supports the SD3 family
+    but 3.5-Large weights are gated in its formats — no ungated MLX
+    path exists, cell closed as not-runnable.
 13. CPU cells run what XLA:CPU supports: weights load bf16, matmuls
     upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
 14. 26B-A4B CPU attempt per Oleg, behind the memory guard: killed at
