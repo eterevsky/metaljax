@@ -26,7 +26,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
 | 14b | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 15 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
-| 16 | SD 3.5 Large (ms/diff-step) | ✗ keras requests F16_F16_F32 dot algorithm, unsupported on CPU (strip-workaround planned) | ⚠ ~8577, image now CORRECT ⁹ | TODO (mflux) | TODO | — |
+| 16 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ⚠ ~8577 ⁹ | TODO (mflux) | TODO | — |
 | 17 | LoRA E2B train (ms/step) | 3287 | **417** (7.9×, losses agree) | — | TODO ¹⁰ | — |
 | 18 | maxtext train 0.6B (loss) | 228.42 | ⚠ mismatch ¹¹ | — | — | — |
 | 19 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | TODO (103 GB, fits) | — | — |
@@ -105,7 +105,12 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
 10. torch MPS SDPA has no backward kernel (falls back to math attention) —
     any torch training comparison must disclose this.
 11. First-step loss: CPU 228.4169, metal-compiled 228.3945,
-    metal-uncompiled 191.2499 — inconsistent; triage queued behind bug ⁷.
+    metal-uncompiled 191.2499 — the EAGER path diverges (compiled and
+    CPU agree). In scope for 0.11.2; under investigation.
+12. keras's mixed-precision layers request the F16_F16_F32 dot
+    algorithm, which XLA:CPU rejects (plain f16 dots work; the
+    algorithm spec is an accelerator contract). A strip-workaround
+    would enable a CPU reference; planned.
 
 ## Bug ledger (found by this suite)
 
