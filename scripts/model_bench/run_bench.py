@@ -76,6 +76,12 @@ def run_gemma_lib(bench, backend, prompt, n_decode):
 def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
     import keras
     keras.config.set_dtype_policy("bfloat16")
+    # `import tensorflow` (pulled in by keras-hub tokenizer metadata paths)
+    # poisons pip sentencepiece: SentencePieceProcessor.Init SIGABRTs
+    # ("mutex lock failed") — that killed the gemma4-e2b rows. The shim
+    # routes the native call through the tf-text tokenizer instead.
+    from adapter_keras_extra import patch_sentencepiece_native
+    patch_sentencepiece_native()
     import keras_hub
 
     cls = getattr(keras_hub.models, bench["arch"])
