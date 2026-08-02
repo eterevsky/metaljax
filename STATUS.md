@@ -25,9 +25,9 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 13 | gemma4-E2B keras-int4 (packed) | **67.5** (beats its bf16!) | ⚠ 339.5 @ **2.7 GB** ¹⁸ | (4-bit: see row 4 stacks) | — | — |
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
-| 16 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
+| 16 | SigLIP 2 (fwd b1 ms) | 965 | **248** (3.9×; b32 4.4×) | — | TODO | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | TODO | — |
-| 18 | LoRA E2B train (ms/step) | 3287 | **417** (7.9×, losses agree) | — | TODO ¹⁰ | — |
+| 18 | LoRA E2B train (ms/step) | 2141 | **417** ᵗ (losses agree) | — | TODO ¹⁰ | — |
 | 19 | maxtext train 0.6B (loss) | 228.42 | ⚠ mismatch ¹¹ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | TODO (103 GB, fits) | — | — |
 
@@ -115,6 +115,10 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
 11. First-step loss: CPU 228.4169, metal-compiled 228.3945,
     metal-uncompiled 191.2499 — the EAGER path diverges (compiled and
     CPU agree). In scope for 0.11.2; under investigation.
+ᵗ tentative (pre-splat-fix agent run): official metal re-run
+    guard-killed at 122 GB during the keras load transient (the
+    documented initializer waste, footnote 17 ledger) — number stands
+    until the keras streaming load lands.
 12. keras's mixed-precision layers request the F16_F16_F32 dot
     algorithm, which XLA:CPU rejects (plain f16 dots work; the
     algorithm spec is an accelerator contract). A strip-workaround
