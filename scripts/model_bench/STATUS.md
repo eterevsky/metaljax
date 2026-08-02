@@ -18,13 +18,13 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ʰ | **13.7** | — | TODO |
 | 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ʰ | 131.8 | — | TODO |
 | 10 | DeepSeek-V2-Lite (maxtext) | ⚠ 50–105 GB ⁶ | TODO ⁶ | — | — | — |
-| 11 | Qwen3-0.6B (maxtext decode) | 87 | **BROKEN ⁷** (82 w/o compile) | — | — | — |
+| 11 | Qwen3-0.6B (maxtext decode) | 87 | **15.9** (fixed by 28ad2eb) ⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ʰ (93 GB — not attempted, foregone) | TODO | — | TODO |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.5** (beats its bf16!) | ⚠ 339.5 @ **2.7 GB** ⁱ | (4-bit: see row 4 stacks) | — | — |
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
 | 14b | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 15 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
-| 16 | SD 3.5 Large (ms/diff-step) | ✗ keras requests F16_F16_F32 dot algorithm, unsupported on CPU (strip-workaround planned) | ⚠ 8577, BLACK IMAGE ⁹ | TODO (mflux) | TODO | — |
+| 16 | SD 3.5 Large (ms/diff-step) | ✗ keras requests F16_F16_F32 dot algorithm, unsupported on CPU (strip-workaround planned) | ⚠ ~8577, image now CORRECT ⁹ | TODO (mflux) | TODO | — |
 | 17 | LoRA E2B train (ms/step) | 3287 | **417** (7.9×, losses agree) | — | TODO ¹⁰ | — |
 | 18 | maxtext train 0.6B (loss) | 228.42 | ⚠ mismatch ¹¹ | — | — | — |
 | 19 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | TODO (103 GB, fits) | — | — |
@@ -87,18 +87,19 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
 6. maxtext memory model: sparse path still wants 50–83 GB for a 16B MoE
    prefill. Rescope decision pending (candidate for drop; Qwen3.6-35B
    covers the MoE class).
-7. OPEN BUG: bf16 + `mx.compile` → nondeterministic garbage tokens
-   (different every run); `METALJAX_COMPILE=0` is token-identical to
-   CPU; f32 unaffected; MSL not involved. Under exclusive-machine
-   investigation.
+7. FIXED (28ad2eb): was MLX 0.32 corrupting compiled graphs split
+   across Metal command buffers at the 40 MB byte default; byte cap
+   raised. 3/3 runs byte-identical to CPU at 15.9 ms/tok.
 8. int8 is functionally exact on both backends (tokens verified) but a
    pessimization everywhere today: jax-CPU 1.7× slower than its bf16,
    metal 3.2× at decode and ~16× at prefill (the int64 outer-product
    materialization scales with batch×seq). Nobody has a fast int path on
    this hardware — the case for mapping onto `mx.quantized_matmul`.
-9. Timings real, output all-zeros at every resolution. Stage-by-stage NaN
-   diagnostic ready. No CPU reference possible (XLA:CPU rejects the
-   preset's f16 dots).
+9. RESOLVED by 28ad2eb (same MLX command-buffer corruption — an MMDiT
+   step is an LLM-sized compiled graph): post-fix diagnostic shows all
+   stages finite and a full-range image (mean 111). Official timing
+   cell pending re-run; the 8577 ms/step figure is from the corrupted
+   era (timing-plausible but unverified).
 10. torch MPS SDPA has no backward kernel (falls back to math attention) —
     any torch training comparison must disclose this.
 11. First-step loss: CPU 228.4169, metal-compiled 228.3945,
@@ -113,8 +114,8 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
 - **Dynamic-while bodies never compiled** (FIXED, d9d774e, gated): LLM
   decode loops interpreted op-by-op → Python-dispatch-bound (the reason
   8B decode lost to CPU pre-fix).
-- **bf16 mx.compile garbage** (open): footnote 7.
-- **SD3.5 black image** (open): footnote 9.
+- **bf16 mx.compile garbage** (FIXED, 28ad2eb — MLX command-buffer split): footnote 7.
+- **SD3.5 black image** (RESOLVED by 28ad2eb, same MLX bug): footnote 9.
 - **sentencepiece SIGABRT** (worked around): footnote 1.
 - **int8 dot_general int64 cliff** (known, measured): footnote 8.
 - **MoE dense-expert lowering** (open, measured 27.8×): footnote ᵍ.
