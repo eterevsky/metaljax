@@ -45,6 +45,10 @@ def mem_gb(backend):
 def run_gemma_lib(bench, backend, prompt, n_decode):
     """DeepMind gemma library + our HF-safetensors converter."""
     sys.path.insert(0, str(HERE))
+    # gemma -> kauldron -> tensorflow, and importing TF poisons pip
+    # sentencepiece (SIGABRT at tokenizer init) — same shim as keras path.
+    from adapter_keras_extra import patch_sentencepiece_native
+    patch_sentencepiece_native()
     from gemma_loader import load_gemma4  # shared with the 0.11.0 work
     import jax
 
