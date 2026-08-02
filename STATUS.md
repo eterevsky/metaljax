@@ -29,7 +29,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 16 | SigLIP 2 (fwd b1 ms) | 965 | **248** (3.9×; b32 4.4×) | — | TODO | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | TODO | — |
 | 18 | LoRA E2B train (ms/step) | 2141 | **417** ᵗ (losses agree) | — | TODO ¹⁰ | — |
-| 19 | maxtext train 0.6B (loss) | 247.81 | **247.78** (eager ≡ compiled) ¹¹ | — | — | — |
+| 19 | maxtext train 0.6B (first-step loss; ms/step in final run) | loss 247.8117 | loss **247.7775** (eager ≡ compiled bitwise; 1.4e-4 vs CPU) ¹¹ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **28.0** (102.9 GB, load 12 s) | — | — |
 
 **Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
