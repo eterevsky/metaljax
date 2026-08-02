@@ -61,7 +61,9 @@ train_set = DataSet(path=str(TEXMO / "data" / "pride.txt"))
 CHECK_STEPS = 2
 CHECK_MAX_LEN = 128
 BENCH_TARGET_S = 3.0    # steady-state measurement budget per config/platform
-BENCH_MAX_CHUNK = 8     # training steps per jitted chunk
+BENCH_CHUNK = 256       # production texmo chunking: one jitted scan of
+                        # 256 training steps — per-step numbers must
+                        # amortize dispatch over the SAME trip count
 
 
 def build(row, nsteps, length):
@@ -182,9 +184,7 @@ def bench_platform(row, run_chunk, args, nsteps):
 
 
 def bench_config(row):
-    # honest chunk size: long-sequence configs get small chunks so a
-    # single measurement stays inside the budget
-    nsteps = BENCH_MAX_CHUNK if row["length"] <= 4096 else 2
+    nsteps = BENCH_CHUNK
     manager, args = build(row, nsteps, row["length"])
     text = manager._train_chunk.lower(*args).as_text()
     flat_in = [np.asarray(x) for x in jax.tree_util.tree_leaves(args)]
