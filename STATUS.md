@@ -5,7 +5,8 @@
 *Last updated: 2026-08-03 (block 4: big models, MoE, packed int4). Headline metric per cell: LLM rows =
 warm decode ms/token; vision = forward ms; diffusion = ms per step;
 training = ms per step. ⚠ = measured but contaminated by a since-diagnosed
-bug; ✗ = established impossible; TODO = not yet measured. All values
+bug; ✗ = established impossible; TODO = not yet measured (llama.cpp
+column is informational and unscheduled). All values
 tentative until the final sequential re-run with finished instrumentation.*
 
 | # | benchmark | jax CPU | metaljax | mlx-lm | torch-MPS | llama.cpp |
@@ -29,7 +30,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | TODO | — |
 | 18 | LoRA E2B train (ms/step) | 2141 | **417** ᵗ (losses agree) | — | TODO ¹⁰ | — |
 | 19 | maxtext train 0.6B (loss) | 228.42 | ⚠ mismatch ¹¹ | — | — | — |
-| 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | TODO (103 GB, fits) | — | — |
+| 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **28.0** (102.9 GB, load 12 s) | — | — |
 
 **Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
 (143.6→16.4 GB); Llama-8B 228→58.6 (127→16.1 GB); gpt-oss 2090→220.4
