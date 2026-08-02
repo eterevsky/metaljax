@@ -192,8 +192,7 @@
       "backends": [
         "metaljax",
         "cpu"
-      ],
-      "status": "needs-adapter"
+      ]
     },
     {
       "id": "sd35-large",
@@ -202,8 +201,7 @@
       "size_gb": 18.0,
       "backends": [
         "metaljax"
-      ],
-      "status": "needs-adapter"
+      ]
     },
     {
       "id": "lora-gemma4-e2b",
@@ -214,8 +212,7 @@
         "metaljax",
         "cpu"
       ],
-      "arch": "Gemma4CausalLM",
-      "status": "needs-adapter"
+      "arch": "Gemma4CausalLM"
     },
     {
       "id": "maxtext-train-06b",

@@ -174,11 +174,22 @@ def run_mlx(bench, backend, prompt, n_decode):
                 mem_gb_mlx=mx.get_active_memory() / 1e9)
 
 
+def _extra(name):
+    def call(b, bk, p, n):
+        sys.path.insert(0, str(HERE))
+        import adapter_keras_extra as x
+        return getattr(x, name)(b, bk, p, n)
+    return call
+
+
 ADAPTERS = {
     "gemma_lib": run_gemma_lib,
     "keras_lm": run_keras_lm,
     "keras_lm_quant": lambda b, bk, p, n: run_keras_lm(b, bk, p, n,
                                                        quant=b["quant"]),
+    "keras_vision": _extra("run_keras_vision"),
+    "keras_diffusion": _extra("run_keras_diffusion"),
+    "keras_lora_train": _extra("run_keras_lora_train"),
     "mlx_only": run_mlx,
 }
 
