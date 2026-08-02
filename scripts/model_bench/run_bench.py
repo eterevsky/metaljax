@@ -110,7 +110,14 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
         backbone = cls.backbone_cls.from_preset(bench["model"])
         lm = cls(backbone=backbone, preprocessor=pre_cls(tokenizer=tok))
     if quant:
-        lm.quantize(quant)
+        try:
+            lm.quantize(quant)
+        except ValueError as e:
+            if "isn't yet built" not in str(e):
+                raise
+            # Multimodal wrappers carry never-built vision layers in
+            # text-only use; the language backbone is the decode path.
+            lm.backbone.quantize(quant)
     load_s = time.monotonic() - t0
 
     # token count of the prompt, for prefill bookkeeping
