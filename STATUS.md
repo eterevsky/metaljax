@@ -24,7 +24,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 11 | Qwen3-0.6B (maxtext decode) | 89.5 | **15.8** (5.7×) ⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ (93 GB — not attempted, foregone) | TODO | — | TODO |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.5** (beats its bf16!) | ⚠ 339.5 @ **2.7 GB** ¹⁸ | (4-bit: see row 4 stacks) | — | — |
-| 14 | maxtext qwix-int8 0.6B | 146 | ⚠ 48.3 ᵛ | — | — | — |
+| 14 | maxtext qwix-int8 0.6B | 146 | **48.3** ᵛ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 965 | **248** (3.9×; b32 4.4×) | — | TODO | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | TODO | — |
@@ -126,12 +126,14 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
     algorithm, which XLA:CPU rejects (plain f16 dots work; the
     algorithm spec is an accelerator contract). A strip-workaround
     would enable a CPU reference; planned.
-ᵛ int8-metal timing valid (3.1× vs its bf16 — the int64 cliff) but
-    greedy tokens DIVERGE from int8-CPU after a shared 10-token prefix,
-    deterministically and identically in eager and compiled modes (so
-    NOT the command-buffer bug). Signature of quantization-amplified
-    rounding flipping one greedy tie; benign-vs-bug certification
-    needs a logit-level comparison — open, tracked.
+ᵛ CERTIFIED BENIGN (notes/int8-divergence-verdict.md): the token
+    divergence vs int8-CPU is an exact logit tie on metal (14.5 vs
+    14.5) at a step whose CPU margin is 7 bf16 ULPs = 1.3σ of the
+    quantization noise; the s8 dot+dequant is bit-identical on real
+    data; even CPU-int8 vs CPU-bf16 flips the same token. Timing valid
+    (3.1× vs bf16 — the int64 cliff). NB token-stream equality is not
+    a usable correctness criterion for quantized decode; use the
+    logit-delta ladder.
 13. CPU cells run what XLA:CPU supports: weights load bf16, matmuls
     upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
 14. 26B-A4B CPU attempt per Oleg, behind the memory guard: killed at
