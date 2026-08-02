@@ -21,7 +21,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 11 | Qwen3-0.6B (maxtext decode) | 87 | **BROKEN ⁷** (82 w/o compile) | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | TODO (93 GB, hosting ok) | TODO | — | TODO |
 | 13 | gemma4-E2B keras-int4 (packed) | TODO | TODO | TODO | — | TODO |
-| 14 | maxtext qwix-int8 0.6B | ~ | ⚠ 308 vs 96 bf16 (16×) ⁸ | — | — | — |
+| 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
 | 14b | *qwix-int8 Qwen3-8B* | — | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 15 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
 | 16 | SD 3.5 Large (ms/diff-step) | ✗ f16 dots | ⚠ 8577, BLACK IMAGE ⁹ | TODO (mflux) | TODO | — |
@@ -61,9 +61,11 @@ upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
    (different every run); `METALJAX_COMPILE=0` is token-identical to
    CPU; f32 unaffected; MSL not involved. Under exclusive-machine
    investigation.
-8. The int64-materialization cliff, measured: int8 decode functionally
-   exact but 16× slower than bf16 — the case for mapping dequant+matmul
-   onto `mx.quantized_matmul` in the C++-era work.
+8. int8 is functionally exact on both backends (tokens verified) but a
+   pessimization everywhere today: jax-CPU 1.7× slower than its bf16,
+   metal 3.2× at decode and ~16× at prefill (the int64 outer-product
+   materialization scales with batch×seq). Nobody has a fast int path on
+   this hardware — the case for mapping onto `mx.quantized_matmul`.
 9. Timings real, output all-zeros at every resolution. Stage-by-stage NaN
    diagnostic ready. No CPU reference possible (XLA:CPU rejects the
    preset's f16 dots).
