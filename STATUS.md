@@ -20,10 +20,10 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ¹⁷ | **13.7** | — | TODO |
 | 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ¹⁷ | 131.8 | — | TODO |
 | 10 | DeepSeek-V2-Lite (maxtext) | ⚠ 50–105 GB ⁶ | TODO ⁶ | — | — | — |
-| 11 | Qwen3-0.6B (maxtext decode) | 87 | **15.9** (fixed by 28ad2eb) ⁷ | — | — | — |
+| 11 | Qwen3-0.6B (maxtext decode) | 89.5 | **15.8** (5.7×) ⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ (93 GB — not attempted, foregone) | TODO | — | TODO |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.5** (beats its bf16!) | ⚠ 339.5 @ **2.7 GB** ¹⁸ | (4-bit: see row 4 stacks) | — | — |
-| 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
+| 14 | maxtext qwix-int8 0.6B | 146 | ⚠ 48.3 ᵛ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 965 | **248** (3.9×; b32 4.4×) | — | TODO | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | TODO | — |
@@ -123,6 +123,12 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
     algorithm, which XLA:CPU rejects (plain f16 dots work; the
     algorithm spec is an accelerator contract). A strip-workaround
     would enable a CPU reference; planned.
+ᵛ int8-metal timing valid (3.1× vs its bf16 — the int64 cliff) but
+    greedy tokens DIVERGE from int8-CPU after a shared 10-token prefix,
+    deterministically and identically in eager and compiled modes (so
+    NOT the command-buffer bug). Signature of quantization-amplified
+    rounding flipping one greedy tie; benign-vs-bug certification
+    needs a logit-level comparison — open, tracked.
 13. CPU cells run what XLA:CPU supports: weights load bf16, matmuls
     upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
 14. 26B-A4B CPU attempt per Oleg, behind the memory guard: killed at
