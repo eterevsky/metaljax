@@ -1,6 +1,6 @@
 # Model benchmark suite — status
 
-*Last updated: 2026-08-02 (night — post splat-fix re-measurements). Headline metric per cell: LLM rows =
+*Last updated: 2026-08-03 (block 3: uniform-harness gemma rows + mlx-lm comparisons). Headline metric per cell: LLM rows =
 warm decode ms/token; vision = forward ms; diffusion = ms per step;
 training = ms per step. ⚠ = measured but contaminated by a since-diagnosed
 bug; ✗ = established impossible; TODO = not yet measured. All values
@@ -8,13 +8,13 @@ tentative until the final sequential re-run with finished instrumentation.*
 
 | # | benchmark | jax CPU | metaljax | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|
-| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **374** | TODO | TODO | TODO |
-| 2 | gemma4-12B bf16 | 938 (f32) | **189** (bf16) / 254 (f32) | TODO | TODO | TODO |
+| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **363** | 137 | TODO | TODO |
+| 2 | gemma4-12B bf16 | 346 (f32) | **101** | needs git-main ᶠ | TODO | TODO |
 | 3 | gemma4-26B-A4B (MoE) | queued (try)ᵉ | TODO | TODO | — | TODO |
-| 4 | gemma4-E2B bf16 | 79.2 (bf16→f32)ᵈ | **28.9** | TODO | — | — |
-| 5 | Qwen3-8B bf16 | 219 (bf16→f32)ᵈ | **60.3** | TODO (4-bit cached) | smoke-verified ³ | TODO |
-| 6 | Llama-3.1-8B bf16 | 206 (bf16→f32)ᵈ | **58.6** | TODO (4-bit cached) | TODO | TODO |
-| 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB) | TODO | — | TODO |
+| 4 | gemma4-E2B bf16 | 79.2 (bf16→f32)ᵈ | **28.9** | needs git-main ᶠ | — | — |
+| 5 | Qwen3-8B bf16 | 219 (bf16→f32)ᵈ | **60.3** | 30.4 | smoke-verified ³ | TODO |
+| 6 | Llama-3.1-8B bf16 | 206 (bf16→f32)ᵈ | **58.6** | 29.4 | TODO | TODO |
+| 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | TODO |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | TODO | TODO | — | TODO |
 | 9 | R1-Distill-32B | ✗ 131 GB | TODO ⁵ | TODO | — | TODO |
 | 10 | DeepSeek-V2-Lite (maxtext) | ⚠ 50–105 GB ⁶ | TODO ⁶ | — | — | — |
@@ -24,7 +24,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
 | 14b | *qwix-int8 Qwen3-8B* | queued (~9 GB packed, ~1.7× decode) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 15 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
-| 16 | SD 3.5 Large (ms/diff-step) | ✗ f16 dots | ⚠ 8577, BLACK IMAGE ⁹ | TODO (mflux) | TODO | — |
+| 16 | SD 3.5 Large (ms/diff-step) | ✗ XLA:CPU can't run f16 dots | ⚠ 8577, BLACK IMAGE ⁹ | TODO (mflux) | TODO | — |
 | 17 | LoRA E2B train (ms/step) | 3287 | **417** (7.9×, losses agree) | — | TODO ¹⁰ | — |
 | 18 | maxtext train 0.6B (loss) | 228.42 | ⚠ mismatch ¹¹ | — | — | — |
 | 19 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | TODO (103 GB, fits) | — | — |
@@ -37,6 +37,20 @@ tentative until the final sequential re-run with finished instrumentation.*
 upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
 ᵉ Per Oleg: attempt behind the memory guard; observed keras-CPU RSS is
 ~2.9× checkpoint → ~150 GB projected, expect a guard kill but measure.
+
+**mlx-lm gap band (same Metal library underneath — the C++-rewrite
+target):** bf16 dense decode 2.0–2.6× (Qwen3-8B 60.3 vs 30.4; Llama
+58.6 vs 29.4; 12B 101 vs git-main-pending; 31B 363 vs 137); gpt-oss
+25× (native-MXFP4 quantized_matmul + our dispatch, the two roadmap
+items compounded). metaljax prefill trails ~6×; load ~20–30×
+(mlx-lm mmaps quantized/bf16 weights directly).
+
+ᶠ Released mlx-lm 0.31.3 cannot run gemma4_unified (12B) or the
+E-series KV-sharing layout (E2B) at all; cells pending a pinned
+git-main mlx-lm venv. The 12B/31B gemma-lib decode improvements vs
+earlier entries (189→101, 374→363) come from the dynamic-while
+body-compile fix landing in the sampler's decode loop; old CPU 938
+superseded by the uniform harness (cache length now matched).
 
 ## Footnotes
 
