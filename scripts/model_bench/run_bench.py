@@ -45,10 +45,14 @@ def mem_gb(backend):
 def run_gemma_lib(bench, backend, prompt, n_decode):
     """DeepMind gemma library + our HF-safetensors converter."""
     sys.path.insert(0, str(HERE))
-    # gemma -> kauldron -> tensorflow, and importing TF poisons pip
-    # sentencepiece (SIGABRT at tokenizer init) — same shim as keras path.
-    from adapter_keras_extra import patch_sentencepiece_native
-    patch_sentencepiece_native()
+    # MUST run in a TF-free venv (the scratchpad gemma-venv): importing
+    # tensorflow poisons pip sentencepiece, and gemma's tokenizer enters
+    # through LoadFromSerializedProto, which the keras-path shim does not
+    # cover. bench-venv's kauldron also imports TF unconditionally, so
+    # there is no in-process fix — the venv split is the fix.
+    if "tensorflow" in sys.modules:
+        raise RuntimeError("run_gemma_lib requires a tensorflow-free venv "
+                           "(use the gemma-venv; see comment)")
     from gemma_loader import load_gemma4  # shared with the 0.11.0 work
     import jax
 
