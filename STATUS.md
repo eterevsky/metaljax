@@ -24,12 +24,12 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ʰ (93 GB — not attempted, foregone) | TODO | — | TODO |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.5** (beats its bf16!) | ⚠ 339.5 @ **2.7 GB** ⁱ | (4-bit: see row 4 stacks) | — | — |
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
-| 14b | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
-| 15 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
-| 16 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ⚠ ~8577 ⁹ | TODO (mflux) | TODO | — |
-| 17 | LoRA E2B train (ms/step) | 3287 | **417** (7.9×, losses agree) | — | TODO ¹⁰ | — |
-| 18 | maxtext train 0.6B (loss) | 228.42 | ⚠ mismatch ¹¹ | — | — | — |
-| 19 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | TODO (103 GB, fits) | — | — |
+| 15 | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
+| 16 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ⚠ ~8577 ⁹ | TODO (mflux) | TODO | — |
+| 18 | LoRA E2B train (ms/step) | 3287 | **417** (7.9×, losses agree) | — | TODO ¹⁰ | — |
+| 19 | maxtext train 0.6B (loss) | 228.42 | ⚠ mismatch ¹¹ | — | — | — |
+| 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | TODO (103 GB, fits) | — | — |
 
 **Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
 (143.6→16.4 GB); Llama-8B 228→58.6 (127→16.1 GB); gpt-oss 2090→220.4
