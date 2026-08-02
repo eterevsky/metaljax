@@ -27,9 +27,9 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 13 | gemma4-E2B keras-int4 (packed) | **67.5** ¹⁸ | 339.5 @ 2.7 GB ¹⁸ | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 146 | **48.3** ᵛ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ needs quantized-matmul path ⁸ | — | — | — |
-| 16 | SigLIP 2 (fwd b1 ms) | 965 (b32: 23324) | **248** (b32: 5287) | — | TODO | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | TODO | — |
-| 18 | LoRA E2B train (ms/step) | 2141 | **417** ᵗ | — | TODO ¹⁰ | — |
+| 16 | SigLIP 2 (fwd b1 ms) | 965 (b32: 23324) | **248** (b32: 5287) | — | 29.8 (b32: 591) | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | 654 @512², 2998 @1024² ¹⁹ | — |
+| 18 | LoRA E2B train (ms/step) | 2141 | **417** ᵗ | — | 135.6 ¹⁰ | — |
 | 19 | maxtext train 0.6B (ms/step) | TODO ¹¹ | TODO ¹¹ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **28.0** (102.9 GB, load 12 s) | — | — |
 
@@ -112,8 +112,10 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
    shape until MLX fixes the corruption. Evidence: 512²/2-step
    diagnostic at 16 GB cap = correct full-range image; every larger
    configuration black or guard-killed.
-10. torch MPS SDPA has no backward kernel (falls back to math attention) —
-    any torch training comparison must disclose this.
+10. torch MPS SDPA has no backward kernel — substantiated by autograd
+    node inspection (math fallback), disclosed in the record. Loss
+    series not comparable across stacks (different preprocessing);
+    step cost is the comparison.
 11. Correctness FIXED (52b90a2): the eager loss divergence was the
     command-buffer bug's THIRD face — ops=400 landed a buffer boundary
     that corrupted one RNG key in the init scan; ops now 800 (+2–3%).
@@ -136,6 +138,9 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
     (3.1× vs bf16 — the int64 cliff). NB token-stream equality is not
     a usable correctness criterion for quantized decode; use the
     logit-delta ladder.
+19. torch SD3.5 via the ungated diffusers mirror
+    adamo1139/stable-diffusion-3.5-large-ungated @5d868ff (official
+    repo is gated); coherent images verified at both resolutions.
 13. CPU cells run what XLA:CPU supports: weights load bf16, matmuls
     upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
 14. 26B-A4B CPU attempt per Oleg, behind the memory guard: killed at
