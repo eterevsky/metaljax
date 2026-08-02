@@ -29,7 +29,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 16 | SigLIP 2 (fwd b1 ms) | 965 | **248** (3.9×; b32 4.4×) | — | TODO | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | TODO | — |
 | 18 | LoRA E2B train (ms/step) | 2141 | **417** ᵗ (losses agree) | — | TODO ¹⁰ | — |
-| 19 | maxtext train 0.6B (loss) | 228.42 | ⚠ mismatch ¹¹ | — | — | — |
+| 19 | maxtext train 0.6B (loss) | 247.81 | **247.78** (eager ≡ compiled) ¹¹ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **28.0** (102.9 GB, load 12 s) | — | — |
 
 **Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
@@ -113,9 +113,11 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
    configuration black or guard-killed.
 10. torch MPS SDPA has no backward kernel (falls back to math attention) —
     any torch training comparison must disclose this.
-11. First-step loss: CPU 228.4169, metal-compiled 228.3945,
-    metal-uncompiled 191.2499 — the EAGER path diverges (compiled and
-    CPU agree). In scope for 0.11.2; under investigation.
+11. FIXED (52b90a2): the eager divergence was the command-buffer bug's
+    THIRD face — ops=400 landed a buffer boundary that corrupted one
+    RNG key in the init scan. ops now 800 (+2–3%); eager bit-identical
+    to compiled, 1.4e-4 vs CPU. All three of the week's correctness
+    mysteries were one MLX 0.32 bug via different budget alignments.
 ᵗ tentative (pre-splat-fix agent run): official metal re-run
     guard-killed at 122 GB during the keras load transient (the
     documented initializer waste, footnote 17 ledger) — number stands
@@ -168,7 +170,11 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
 - **Dynamic-while bodies never compiled** (FIXED, d9d774e, gated): LLM
   decode loops interpreted op-by-op → Python-dispatch-bound (the reason
   8B decode lost to CPU pre-fix).
-- **bf16 mx.compile garbage** (FIXED, 28ad2eb — MLX command-buffer split): footnote 7.
+- **MLX command-buffer corruption, three faces** (all worked around:
+  28ad2eb bytes-floor, 0da62c0 bytes-ceiling, 52b90a2 ops alignment;
+  upstream report pending): footnotes 7, 9, 11. Every finite budget is
+  a lottery draw until MLX fixes it; the command-buffer tests pin the
+  shipped values.
 - **SD3.5 black image** (RESOLVED by 28ad2eb, same MLX bug): footnote 9.
 - **sentencepiece SIGABRT** (worked around): footnote 1.
 - **int8 dot_general int64 cliff** (known, measured): footnote 8.
