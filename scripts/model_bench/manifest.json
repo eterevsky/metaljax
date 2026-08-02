@@ -1,0 +1,231 @@
+{
+  "prompt": "The unified memory architecture of Apple silicon changed what is possible for local inference of large language models. In a few sentences, explain why memory bandwidth, rather than raw compute, dominates the decode phase of transformer inference, and what that implies for model quantization.",
+  "decode_tokens": 128,
+  "benchmarks": [
+    {
+      "id": "gemma4-31b-bf16",
+      "path": "gemma_lib",
+      "model": "google/gemma-4-31B-it",
+      "size_gb": 62.6,
+      "backends": [
+        "metaljax",
+        "mlx"
+      ],
+      "cpu": false,
+      "note": "CPU f32 would be 123 GB (exceeds RAM)"
+    },
+    {
+      "id": "gemma4-12b-bf16",
+      "path": "gemma_lib",
+      "model": "google/gemma-4-12B-it",
+      "size_gb": 23.9,
+      "backends": [
+        "metaljax",
+        "cpu",
+        "mlx"
+      ]
+    },
+    {
+      "id": "gemma4-26b-a4b",
+      "path": "keras_lm",
+      "model": "hf://google/gemma-4-26B-A4B-it",
+      "size_gb": 51.6,
+      "backends": [
+        "metaljax",
+        "mlx"
+      ],
+      "cpu": false,
+      "note": "MoE; CPU f32 103 GB marginal",
+      "arch": "Gemma4CausalLM"
+    },
+    {
+      "id": "gemma4-e2b-bf16",
+      "path": "keras_lm",
+      "model": "hf://google/gemma-4-E2B-it",
+      "size_gb": 10.3,
+      "backends": [
+        "metaljax",
+        "cpu",
+        "mlx"
+      ],
+      "arch": "Gemma4CausalLM"
+    },
+    {
+      "id": "qwen3-8b-bf16",
+      "path": "keras_lm",
+      "model": "hf://Qwen/Qwen3-8B",
+      "size_gb": 16.4,
+      "backends": [
+        "metaljax",
+        "cpu",
+        "mlx"
+      ],
+      "arch": "Qwen3CausalLM"
+    },
+    {
+      "id": "llama31-8b-bf16",
+      "path": "keras_lm",
+      "model": "hf://unsloth/Meta-Llama-3.1-8B-Instruct",
+      "size_gb": 16.1,
+      "backends": [
+        "metaljax",
+        "cpu",
+        "mlx"
+      ],
+      "arch": "Llama3CausalLM"
+    },
+    {
+      "id": "gpt-oss-20b",
+      "path": "keras_lm",
+      "model": "hf://openai/gpt-oss-20b",
+      "size_gb": 13.8,
+      "backends": [
+        "metaljax",
+        "cpu",
+        "mlx"
+      ],
+      "arch": "GptOssCausalLM",
+      "note": "MXFP4-native repo; keras dequantizes"
+    },
+    {
+      "id": "qwen36-35b-a3b",
+      "path": "keras_lm",
+      "model": "hf://Qwen/Qwen3.6-35B-A3B",
+      "size_gb": 71.9,
+      "backends": [
+        "metaljax",
+        "mlx"
+      ],
+      "cpu": false,
+      "note": "MoE flagship; CPU f32 144 GB exceeds RAM",
+      "arch": "Qwen35MoeCausalLM"
+    },
+    {
+      "id": "r1-distill-32b",
+      "path": "keras_lm",
+      "model": "hf://deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+      "size_gb": 65.5,
+      "backends": [
+        "metaljax",
+        "mlx"
+      ],
+      "cpu": false,
+      "arch": "QwenCausalLM",
+      "note": "converter path unverified"
+    },
+    {
+      "id": "deepseek-v2-lite",
+      "path": "maxtext",
+      "model": "deepseek-ai/DeepSeek-V2-Lite-Chat",
+      "size_gb": 31.4,
+      "backends": [
+        "metaljax",
+        "cpu"
+      ],
+      "status": "needs-adapter"
+    },
+    {
+      "id": "qwen3-06b-maxtext",
+      "path": "maxtext",
+      "model": "Qwen/Qwen3-0.6B",
+      "size_gb": 1.5,
+      "backends": [
+        "metaljax",
+        "cpu"
+      ],
+      "status": "needs-adapter"
+    },
+    {
+      "id": "mixtral-8x7b",
+      "path": "keras_lm",
+      "model": "mixtral_8_instruct_7b_en",
+      "size_gb": 93.4,
+      "backends": [
+        "metaljax"
+      ],
+      "cpu": false,
+      "note": "over-range showcase; keras preset hosting",
+      "arch": "MixtralCausalLM"
+    },
+    {
+      "id": "gemma4-e2b-int4",
+      "path": "keras_lm_quant",
+      "model": "hf://google/gemma-4-E2B-it",
+      "size_gb": 3.0,
+      "backends": [
+        "metaljax",
+        "cpu"
+      ],
+      "arch": "Gemma4CausalLM",
+      "quant": "int4",
+      "note": "packed two-per-byte; the only real sub-byte JAX path"
+    },
+    {
+      "id": "maxtext-qwix-int8",
+      "path": "maxtext",
+      "model": "Qwen/Qwen3-0.6B",
+      "size_gb": 1.5,
+      "backends": [
+        "metaljax",
+        "cpu"
+      ],
+      "status": "needs-adapter",
+      "note": "s8xs8->s32 dot_general; measures the int64 cliff"
+    },
+    {
+      "id": "siglip2-so400m",
+      "path": "keras_vision",
+      "model": "siglip2_so400m_patch14_384",
+      "size_gb": 2.3,
+      "backends": [
+        "metaljax",
+        "cpu"
+      ],
+      "status": "needs-adapter"
+    },
+    {
+      "id": "sd35-large",
+      "path": "keras_diffusion",
+      "model": "stable_diffusion_3.5_large",
+      "size_gb": 18.0,
+      "backends": [
+        "metaljax"
+      ],
+      "status": "needs-adapter"
+    },
+    {
+      "id": "lora-gemma4-e2b",
+      "path": "keras_lora_train",
+      "model": "hf://google/gemma-4-E2B-it",
+      "size_gb": 10.3,
+      "backends": [
+        "metaljax",
+        "cpu"
+      ],
+      "arch": "Gemma4CausalLM",
+      "status": "needs-adapter"
+    },
+    {
+      "id": "maxtext-train-06b",
+      "path": "maxtext_train",
+      "model": "Qwen/Qwen3-0.6B",
+      "size_gb": 1.5,
+      "backends": [
+        "metaljax",
+        "cpu"
+      ],
+      "status": "needs-adapter"
+    },
+    {
+      "id": "aspirational-235b-3bit",
+      "path": "mlx_only",
+      "model": "mlx-community/Qwen3-235B-A22B-Instruct-2507-3bit",
+      "size_gb": 102.9,
+      "backends": [
+        "mlx"
+      ],
+      "status": "blocked-metaljax",
+      "note": "TRACKED: fits mlx-lm (103 GB, verified); 4-bit is 132 GB and does NOT fit; metaljax needs packed quantized storage"
+    }
+  ]
+}

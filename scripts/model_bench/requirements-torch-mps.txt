@@ -1,0 +1,20 @@
+# torch-MPS comparison leg — install into its OWN venv (never alongside
+# jax/mlx; torch and Metal-backed JAX must not share a process).
+#
+#   uv venv torch-venv --python 3.13
+#   uv pip install --python torch-venv/bin/python \
+#       -r scripts/model_bench/requirements-torch-mps.txt
+#
+# Plain PyPI `torch` on macOS/arm64 already carries the MPS backend — there
+# is no separate index or extra to select (the +cpu / +cuXXX wheel indexes
+# are Linux-only). Verify with:
+#   torch-venv/bin/python -c "import torch; print(torch.backends.mps.is_available())"
+#
+# Versions below are what was resolved and validated on 2026-08-02; see
+# versions.lock.md for the full frozen set.
+
+torch==2.13.0
+transformers==5.14.1
+accelerate==1.14.0
+safetensors==0.8.0
+huggingface-hub==1.26.0
