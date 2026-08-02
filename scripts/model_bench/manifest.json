@@ -98,7 +98,7 @@
       ],
       "cpu": false,
       "note": "MoE flagship; CPU f32 144 GB exceeds RAM",
-      "arch": "Qwen35MoeCausalLM"
+      "arch": "Qwen3MoeCausalLM"
     },
     {
       "id": "r1-distill-32b",
@@ -111,7 +111,7 @@
       ],
       "cpu": false,
       "arch": "QwenCausalLM",
-      "note": "converter path unverified"
+      "note": "metal: jetsam-killed at keras load peak (~94 GB random-init before checkpoint overwrite) \u2014 blocked on keras load-path fix; mlx cell valid"
     },
     {
       "id": "deepseek-v2-lite",
