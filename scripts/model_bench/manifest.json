@@ -32,10 +32,10 @@
       "size_gb": 51.6,
       "backends": [
         "metaljax",
+        "cpu",
         "mlx"
       ],
-      "cpu": false,
-      "note": "MoE; CPU f32 103 GB marginal",
+      "note": "MoE; CPU try per Oleg \u2014 projected ~150 GB RSS at the observed 2.9x keras-CPU ratio, guard armed",
       "arch": "Gemma4CausalLM"
     },
     {
@@ -171,6 +171,17 @@
       ],
       "status": "needs-adapter",
       "note": "s8xs8->s32 dot_general; measures the int64 cliff"
+    },
+    {
+      "id": "qwix-int8-qwen3-8b",
+      "path": "maxtext",
+      "model": "Qwen/Qwen3-8B",
+      "size_gb": 8.7,
+      "backends": [
+        "metaljax"
+      ],
+      "status": "blocked-metaljax",
+      "note": "TRACKED: int8 at real-model scale becomes the headline quant story once dequant+matmul maps onto mx.quantized_matmul; today the int64 cliff makes it 16x slower and storage saves nothing"
     },
     {
       "id": "siglip2-so400m",
