@@ -26,7 +26,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ⚠ ~8577 ⁹ | TODO (mflux) | TODO | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | TODO | — |
 | 18 | LoRA E2B train (ms/step) | 3287 | **417** (7.9×, losses agree) | — | TODO ¹⁰ | — |
 | 19 | maxtext train 0.6B (loss) | 228.42 | ⚠ mismatch ¹¹ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | TODO (103 GB, fits) | — | — |
@@ -97,11 +97,19 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
    metal 3.2× at decode and ~16× at prefill (the int64 outer-product
    materialization scales with batch×seq). Nobody has a fast int path on
    this hardware — the case for mapping onto `mx.quantized_matmul`.
-9. RESOLVED by 28ad2eb (same MLX command-buffer corruption — an MMDiT
-   step is an LLM-sized compiled graph): post-fix diagnostic shows all
-   stages finite and a full-range image (mean 111). Official timing
-   cell pending re-run; the 8577 ms/step figure is from the corrupted
-   era (timing-plausible but unverified).
+9. Blocked on two independent walls, both fully diagnosed. (a) MEMORY:
+   we lower attention unfused (matmul-softmax-matmul), so SD3.5's
+   attention logits are ~12 GB/block at 1024² — peak live set ~90 GB in
+   ANY execution mode (guard-killed compiled, eager, and at 20 steps
+   even 512²: intermediates pin across steps under large command-buffer
+   caps). Fix: map onto mx.fast.scaled_dot_product_attention (C++-era).
+   (b) CORRECTNESS: with small command buffers MLX 0.32 corrupts
+   compiled graphs (the footnote-7 bug), and diffusion's GB-sized
+   kernels force small-kernel-count buffers at any byte cap that is
+   memory-safe — the two constraints are unsatisfiable for this graph
+   shape until MLX fixes the corruption. Evidence: 512²/2-step
+   diagnostic at 16 GB cap = correct full-range image; every larger
+   configuration black or guard-killed.
 10. torch MPS SDPA has no backward kernel (falls back to math attention) —
     any torch training comparison must disclose this.
 11. First-step loss: CPU 228.4169, metal-compiled 228.3945,
