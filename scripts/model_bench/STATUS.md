@@ -9,9 +9,9 @@ tentative until the final sequential re-run with finished instrumentation.*
 | # | benchmark | jax CPU | metaljax | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|
 | 1 | gemma4-31B bf16 | ✗ f32=123 GB | **363** | 137 | TODO | TODO |
-| 2 | gemma4-12B bf16 | 346 (f32) | **101** | needs git-main ᶠ | TODO | TODO |
+| 2 | gemma4-12B bf16 | 346 (f32) | **101** | 58.3 ᶠ | TODO | TODO |
 | 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ᵉ | ⚠ 473 ᵍ | **17.0** | — | TODO |
-| 4 | gemma4-E2B bf16 | 79.2 (bf16→f32)ᵈ | **28.9** | needs git-main ᶠ | — | — |
+| 4 | gemma4-E2B bf16 | 79.2 (bf16→f32)ᵈ | **28.9** | 10.5 ᶠ | — | — |
 | 5 | Qwen3-8B bf16 | 219 (bf16→f32)ᵈ | **60.3** | 30.4 | smoke-verified ³ | TODO |
 | 6 | Llama-3.1-8B bf16 | 206 (bf16→f32)ᵈ | **58.6** | 29.4 | TODO | TODO |
 | 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | TODO |
@@ -46,8 +46,8 @@ items compounded). metaljax prefill trails ~6×; load ~20–30×
 (mlx-lm mmaps quantized/bf16 weights directly).
 
 ᶠ Released mlx-lm 0.31.3 cannot run gemma4_unified (12B) or the
-E-series KV-sharing layout (E2B) at all; cells pending a pinned
-git-main mlx-lm venv. The 12B/31B gemma-lib decode improvements vs
+E-series KV-sharing layout (E2B) at all; these two cells measured on
+mlx-lm git main (2026-08-03 install). The 12B/31B gemma-lib decode improvements vs
 earlier entries (189→101, 374→363) come from the dynamic-while
 body-compile fix landing in the sampler's decode loop; old CPU 938
 superseded by the uniform harness (cache length now matched).
