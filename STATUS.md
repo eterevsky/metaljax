@@ -11,18 +11,18 @@ tentative until the final sequential re-run with finished instrumentation.*
 | # | benchmark | jax CPU | metaljax | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|
 | 1 | gemma4-31B bf16 | ✗ f32=123 GB | **363** | 137 | TODO | TODO |
-| 2 | gemma4-12B bf16 | 346 (f32) | **101** | 58.3 ᶠ | TODO | TODO |
-| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ᵉ | ⚠ 473 ᵍ | **17.0** | — | TODO |
-| 4 | gemma4-E2B bf16 | 79.2 (bf16→f32)ᵈ | **28.9** | 10.5 ᶠ | — | — |
-| 5 | Qwen3-8B bf16 | 219 (bf16→f32)ᵈ | **60.3** | 30.4 | smoke-verified ³ | TODO |
-| 6 | Llama-3.1-8B bf16 | 206 (bf16→f32)ᵈ | **58.6** | 29.4 | TODO | TODO |
+| 2 | gemma4-12B bf16 | 346 (f32) | **101** | 58.3 ¹⁵ | TODO | TODO |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | ⚠ 473 ¹⁶ | **17.0** | — | TODO |
+| 4 | gemma4-E2B bf16 | 79.2 (bf16→f32) ¹³ | **28.9** | 10.5 ¹⁵ | — | — |
+| 5 | Qwen3-8B bf16 | 219 (bf16→f32) ¹³ | **60.3** | 30.4 | smoke-verified ³ | TODO |
+| 6 | Llama-3.1-8B bf16 | 206 (bf16→f32) ¹³ | **58.6** | 29.4 | TODO | TODO |
 | 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | TODO |
-| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ʰ | **13.7** | — | TODO |
-| 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ʰ | 131.8 | — | TODO |
+| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ¹⁷ | **13.7** | — | TODO |
+| 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ¹⁷ | 131.8 | — | TODO |
 | 10 | DeepSeek-V2-Lite (maxtext) | ⚠ 50–105 GB ⁶ | TODO ⁶ | — | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 87 | **15.9** (fixed by 28ad2eb) ⁷ | — | — | — |
-| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ʰ (93 GB — not attempted, foregone) | TODO | — | TODO |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.5** (beats its bf16!) | ⚠ 339.5 @ **2.7 GB** ⁱ | (4-bit: see row 4 stacks) | — | — |
+| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ (93 GB — not attempted, foregone) | TODO | — | TODO |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.5** (beats its bf16!) | ⚠ 339.5 @ **2.7 GB** ¹⁸ | (4-bit: see row 4 stacks) | — | — |
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
@@ -111,6 +111,34 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
     algorithm, which XLA:CPU rejects (plain f16 dots work; the
     algorithm spec is an accelerator contract). A strip-workaround
     would enable a CPU reference; planned.
+13. CPU cells run what XLA:CPU supports: weights load bf16, matmuls
+    upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
+14. 26B-A4B CPU attempt per Oleg, behind the memory guard: killed at
+    34 GB RSS during load (projected ~150 GB at the observed 2.9×
+    keras-CPU ratio).
+15. Released mlx-lm 0.31.3 cannot run gemma4_unified (12B) or the
+    E-series KV-sharing layout (E2B) at all; these two cells measured
+    on mlx-lm git main (2026-08-03 install). The 12B/31B gemma-lib
+    decode improvements vs earlier entries (189→101, 374→363) come
+    from the dynamic-while body-compile fix landing in the sampler's
+    decode loop; old CPU 938 superseded by the uniform harness.
+16. MoE DENSE-EXPERT GAP — the largest measured: keras/XLA lowers
+    expert dispatch densely (streams all 51.6 GB/token) → 473 ms/tok
+    vs mlx-lm's gathered 17.0 (27.8×). A 4B-active MoE decodes slower
+    than dense 31B on our path. Top C++-era item alongside quantized
+    matmul.
+17. keras load path (random-init before checkpoint overwrite +
+    conversion transients) exceeds the machine above ~50 GB
+    checkpoints: R1-32B (65 GB) jetsam-killed; Qwen3.6-35B (72 GB)
+    entered swap-death (196 GB footprint); Mixtral (93 GB) not
+    attempted — foregone. gemma-lib's streaming loader handled
+    62.6 GB fine, so the fix is a streaming load for the keras path.
+18. Packed int4 memory saving IS real on metaljax (2.7 vs 10.2 GB —
+    the only sub-byte JAX path that keeps it), but decode pays 11.7×
+    vs bf16 (in-graph unpack re-materializes weights per matmul).
+    XLA:CPU fuses the same unpack into a small net WIN (67.5 vs 79.2
+    bf16). Either mx.quantized_matmul mapping or unpack-fusion
+    closes it.
 
 ## Bug ledger (found by this suite)
 
@@ -125,6 +153,6 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
 - **SD3.5 black image** (RESOLVED by 28ad2eb, same MLX bug): footnote 9.
 - **sentencepiece SIGABRT** (worked around): footnote 1.
 - **int8 dot_general int64 cliff** (known, measured): footnote 8.
-- **MoE dense-expert lowering** (open, measured 27.8×): footnote ᵍ.
-- **keras load-path memory** (open, blocks ≥60 GB keras rows): footnote ʰ.
-- **int4 unpack re-materialization on metal** (open, 11.7×): footnote ⁱ.
+- **MoE dense-expert lowering** (open, measured 27.8×): footnote 16.
+- **keras load-path memory** (open, blocks ≥60 GB keras rows): footnote 17.
+- **int4 unpack re-materialization on metal** (open, 11.7×): footnote 18.
