@@ -94,7 +94,21 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
 
     cls = getattr(keras_hub.models, bench["arch"])
     t0 = time.monotonic()
-    lm = cls.from_preset(bench["model"])
+    try:
+        lm = cls.from_preset(bench["model"])
+    except ValueError as e:
+        # Checkpoints that renamed keras-hub's hardcoded special tokens
+        # (DeepSeek R1 distills drop Qwen's <|endoftext|>): rebuild the
+        # tokenizer around the checkpoint's own EOS, then load the
+        # backbone separately.
+        if "Cannot find special token" not in str(e):
+            raise
+        from adapter_keras_extra import _bpe_tokenizer_with_eos_alias
+        pre_cls = cls.preprocessor_cls
+        tok, _ = _bpe_tokenizer_with_eos_alias(pre_cls.tokenizer_cls,
+                                               bench["model"])
+        backbone = cls.backbone_cls.from_preset(bench["model"])
+        lm = cls(backbone=backbone, preprocessor=pre_cls(tokenizer=tok))
     if quant:
         lm.quantize(quant)
     load_s = time.monotonic() - t0
