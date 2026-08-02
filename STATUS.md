@@ -5,7 +5,8 @@
 *Last updated: 2026-08-03 (block 4: big models, MoE, packed int4). Headline metric per cell: LLM rows =
 warm decode ms/token; vision = forward ms; diffusion = ms per step;
 training = ms per step. ⚠ = measured but contaminated by a since-diagnosed
-bug; ✗ = established impossible; TODO = not yet measured (llama.cpp
+bug (none currently — all such rows re-measured); ✗ = established
+impossible; TODO = not yet measured (llama.cpp
 column is informational and unscheduled). All values
 tentative until the final sequential re-run with finished instrumentation.*
 
@@ -13,14 +14,14 @@ tentative until the final sequential re-run with finished instrumentation.*
 |---|---|---|---|---|---|---|
 | 1 | gemma4-31B bf16 | ✗ f32=123 GB | **363** | 137 | 148.7 | TODO |
 | 2 | gemma4-12B bf16 | 346 (f32) | **101** | 58.3 ¹⁵ | 67.6 | TODO |
-| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | ⚠ 473 ¹⁶ | **17.0** | — | TODO |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **473** ¹⁶ | **17.0** | — | TODO |
 | 4 | gemma4-E2B bf16 | 79.2 (bf16→f32) ¹³ | **28.9** | 10.5 ¹⁵ | — | — |
 | 5 | Qwen3-8B bf16 | 219 (bf16→f32) ¹³ | **60.3** | 30.4 | 38.1 | TODO |
 | 6 | Llama-3.1-8B bf16 | 206 (bf16→f32) ¹³ | **58.6** | 29.4 | 35.5 | TODO |
 | 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | TODO |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ¹⁷ | **13.7** | — | TODO |
 | 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ¹⁷ | 131.8 | — | TODO |
-| 10 | DeepSeek-V2-Lite (maxtext) | ⚠ 50–105 GB ⁶ | TODO ⁶ | — | — | — |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | TODO ⁶ | — | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.5 | **15.8** ⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ (93 GB — not attempted, foregone) | TODO | — | TODO |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.5** ¹⁸ | 339.5 @ 2.7 GB ¹⁸ | — | — | — |
