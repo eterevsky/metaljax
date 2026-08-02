@@ -15,21 +15,21 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 2 | gemma4-12B bf16 | 346 (f32) | **101** | 58.3 ¹⁵ | 67.6 | TODO |
 | 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | ⚠ 473 ¹⁶ | **17.0** | — | TODO |
 | 4 | gemma4-E2B bf16 | 79.2 (bf16→f32) ¹³ | **28.9** | 10.5 ¹⁵ | — | — |
-| 5 | Qwen3-8B bf16 | 219 (bf16→f32) ¹³ | **60.3** | 30.4 | smoke-verified ³ | TODO |
-| 6 | Llama-3.1-8B bf16 | 206 (bf16→f32) ¹³ | **58.6** | 29.4 | TODO | TODO |
+| 5 | Qwen3-8B bf16 | 219 (bf16→f32) ¹³ | **60.3** | 30.4 | 38.1 | TODO |
+| 6 | Llama-3.1-8B bf16 | 206 (bf16→f32) ¹³ | **58.6** | 29.4 | 35.5 | TODO |
 | 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | TODO |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ¹⁷ | **13.7** | — | TODO |
 | 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ¹⁷ | 131.8 | — | TODO |
 | 10 | DeepSeek-V2-Lite (maxtext) | ⚠ 50–105 GB ⁶ | TODO ⁶ | — | — | — |
-| 11 | Qwen3-0.6B (maxtext decode) | 89.5 | **15.8** (5.7×) ⁷ | — | — | — |
+| 11 | Qwen3-0.6B (maxtext decode) | 89.5 | **15.8** ⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ (93 GB — not attempted, foregone) | TODO | — | TODO |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.5** (beats its bf16!) | ⚠ 339.5 @ **2.7 GB** ¹⁸ | (4-bit: see row 4 stacks) | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.5** ¹⁸ | 339.5 @ 2.7 GB ¹⁸ | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 146 | **48.3** ᵛ | — | — | — |
-| 15 | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
-| 16 | SigLIP 2 (fwd b1 ms) | 965 | **248** (3.9×; b32 4.4×) | — | TODO | — |
+| 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ needs quantized-matmul path ⁸ | — | — | — |
+| 16 | SigLIP 2 (fwd b1 ms) | 965 (b32: 23324) | **248** (b32: 5287) | — | TODO | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | TODO (mflux) | TODO | — |
-| 18 | LoRA E2B train (ms/step) | 2141 | **417** ᵗ (losses agree) | — | TODO ¹⁰ | — |
-| 19 | maxtext train 0.6B (first-step loss; ms/step in final run) | loss 247.8117 | loss **247.7775** (eager ≡ compiled bitwise; 1.4e-4 vs CPU) ¹¹ | — | — | — |
+| 18 | LoRA E2B train (ms/step) | 2141 | **417** ᵗ | — | TODO ¹⁰ | — |
+| 19 | maxtext train 0.6B (ms/step) | TODO ¹¹ | TODO ¹¹ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **28.0** (102.9 GB, load 12 s) | — | — |
 
 **Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
@@ -113,11 +113,12 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
    configuration black or guard-killed.
 10. torch MPS SDPA has no backward kernel (falls back to math attention) —
     any torch training comparison must disclose this.
-11. FIXED (52b90a2): the eager divergence was the command-buffer bug's
-    THIRD face — ops=400 landed a buffer boundary that corrupted one
-    RNG key in the init scan. ops now 800 (+2–3%); eager bit-identical
-    to compiled, 1.4e-4 vs CPU. All three of the week's correctness
-    mysteries were one MLX 0.32 bug via different budget alignments.
+11. Correctness FIXED (52b90a2): the eager loss divergence was the
+    command-buffer bug's THIRD face — ops=400 landed a buffer boundary
+    that corrupted one RNG key in the init scan; ops now 800 (+2–3%).
+    Validation: eager loss bitwise ≡ compiled (247.7775), 1.4e-4 vs
+    CPU (247.8117). Step TIMING not yet captured — comes with the
+    final sequential run.
 ᵗ tentative (pre-splat-fix agent run): official metal re-run
     guard-killed at 122 GB during the keras load transient (the
     documented initializer waste, footnote 17 ledger) — number stands
