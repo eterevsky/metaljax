@@ -11,8 +11,8 @@ tentative until the final sequential re-run with finished instrumentation.*
 
 | # | benchmark | jax CPU | metaljax | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|
-| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **363** | 137 | TODO | TODO |
-| 2 | gemma4-12B bf16 | 346 (f32) | **101** | 58.3 ¹⁵ | TODO | TODO |
+| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **363** | 137 | 148.7 | TODO |
+| 2 | gemma4-12B bf16 | 346 (f32) | **101** | 58.3 ¹⁵ | 67.6 | TODO |
 | 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | ⚠ 473 ¹⁶ | **17.0** | — | TODO |
 | 4 | gemma4-E2B bf16 | 79.2 (bf16→f32) ¹³ | **28.9** | 10.5 ¹⁵ | — | — |
 | 5 | Qwen3-8B bf16 | 219 (bf16→f32) ¹³ | **60.3** | 30.4 | smoke-verified ³ | TODO |
