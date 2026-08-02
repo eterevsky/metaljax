@@ -105,6 +105,18 @@ def dense_to_np(attr, ttype: ir.RankedTensorType):
             str(attr), shape,
             np.complex128 if el == "complex<f64>" else np.complex64)
 
+    return dense_text_to_np(str(attr), el, shape)
+
+
+def dense_text_to_np(s: str, el: str, shape: tuple):
+    """Decode a dense constant from its MLIR text form.
+
+    `el` is the element type as printed (``f32``, ``bf16``, ``i1``, ...) and
+    `shape` the shape to produce -- pass ``()`` to read just the value of a
+    splat, whose text form holds a single element whatever its type says.
+    """
+    import numpy as np
+
     import ml_dtypes
     name = _TEXT_NP_DTYPES.get(el)
     if name is None:
@@ -112,7 +124,6 @@ def dense_to_np(attr, ttype: ir.RankedTensorType):
     np_dtype = (np.dtype(getattr(ml_dtypes, name))
                 if hasattr(ml_dtypes, name) else np.dtype(name))
 
-    s = str(attr)
     if not s.startswith("dense<"):
         raise TypeError(f"unexpected constant attribute form: {s[:60]}")
     body = s[len("dense<"):s.index("> : ")]
@@ -146,6 +157,33 @@ def dense_to_np(attr, ttype: ir.RankedTensorType):
     if len(vals) == 1:
         return np.broadcast_to(np.array(vals[0], dtype=np_dtype), shape)
     return np.array(vals, dtype=np_dtype).reshape(shape)
+
+
+def splat_scalar_np(attr, ttype: ir.RankedTensorType):
+    """The single value of a SPLAT dense constant as a 0-d numpy array, or
+    None when the attribute is not a splat.
+
+    A splat carries one element however big its type is
+    (``dense<1.0> : tensor<151936x1024xf32>`` is 4 bytes of IR), and XLA
+    never materializes one: it broadcasts. Decoding it as a dense tensor
+    costs the full shape on the host AND on the device -- jax lowers
+    jax.random.normal with 23 full-shape splat coefficients, so every
+    keras weight initializer retained 23 copies of its output for the life
+    of the executable. Callers broadcast the scalar instead.
+
+    Reads the TEXT form, which is short for a splat by construction; the
+    python bindings materialize splats into full dense arrays.
+    """
+    try:
+        if not ir.DenseElementsAttr(attr).is_splat:
+            return None
+    except Exception:
+        # Attributes the bindings cannot even cast (complex dense attrs).
+        return None
+    el = str(ttype.element_type)
+    if el.startswith("complex"):
+        return None
+    return dense_text_to_np(str(attr), el, ())
 
 
 def complex_dense_from_text(text: str, shape: tuple,

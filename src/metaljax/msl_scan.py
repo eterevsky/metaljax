@@ -278,6 +278,20 @@ def _ttype(v: ir.Value) -> ir.RankedTensorType:
     return ir.RankedTensorType(v.type)
 
 
+def _const_scalar(attr, t: ir.RankedTensorType):
+    """The single value of a splat/rank-0 dense constant.
+
+    Never decodes the whole tensor: the bindings materialize a splat into a
+    full dense array, so a shape-sized splat cost that much host memory just
+    to read one number.
+    """
+    v = _ir.splat_scalar_np(attr, t)
+    if v is not None:
+        return v[()]
+    flat = _ir.dense_to_np(attr, t).reshape(-1)
+    return flat[0] if flat.size else 0
+
+
 _UNARY = {
     "stablehlo.negate": "(-{0})",
     "stablehlo.abs": "metal::abs({0})",
@@ -363,10 +377,8 @@ class _Analyzer:
                 if o.name == "stablehlo.constant":
                     attr = ir.DenseElementsAttr(o.attributes["value"])
                     if attr.is_splat or not tuple(t.shape):
-                        val = _ir.dense_to_np(o.attributes["value"], t)
-                        flat = val.reshape(-1)
-                        s = SymConst(flat[0] if flat.size else 0,
-                                     _dt(t.element_type), tuple(t.shape))
+                        v0 = _const_scalar(o.attributes["value"], t)
+                        s = SymConst(v0, _dt(t.element_type), tuple(t.shape))
             if s is None:
                 s = SymLeaf("whole", tuple(t.shape), _dt(t.element_type),
                             source=("free", v))
@@ -489,9 +501,7 @@ class _Analyzer:
             attr = ir.DenseElementsAttr(o.attributes["value"])
             if not attr.is_splat and tuple(t.shape):
                 raise _Unsupported("non-splat constant")
-            val = _ir.dense_to_np(o.attributes["value"], t)
-            flat = val.reshape(-1)
-            v0 = flat[0] if flat.size else 0
+            v0 = _const_scalar(o.attributes["value"], t)
             return [SymConst(v0, _dt(t.element_type), tuple(t.shape))]
 
         if name == "func.call":

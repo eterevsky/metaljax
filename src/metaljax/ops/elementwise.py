@@ -1,5 +1,6 @@
 """Elementwise StableHLO ops (unary, binary, compare, select, clamp)."""
 
+import os
 import re
 
 import mlx.core as mx
@@ -507,6 +508,12 @@ def _roundtrips_as_literal(v: float) -> bool:
     return float("%.7g" % v) == v
 
 
+# Splat constants (one value, whole-tensor type) become broadcast views
+# instead of materialized tensors. METALJAX_SPLAT_CONST=0 restores the old
+# behaviour for A/B testing.
+_SPLAT_BROADCAST = os.environ.get("METALJAX_SPLAT_CONST", "1") != "0"
+
+
 @register("stablehlo.constant")
 def _constant(interp, op, ins, env):
     from metaljax import _ir
@@ -517,6 +524,25 @@ def _constant(interp, op, ins, env):
         # op's text form instead.
         arr = _ir.complex_dense_from_text(str(op), tuple(t.shape))
         return dtypes.to_mx(arr)
+    shape = tuple(t.shape)
+    numel = 1
+    for d in shape:
+        numel *= d
+    if numel > 1 and _SPLAT_BROADCAST:
+        # Splat: one value, broadcast. Materializing it would cost the
+        # whole shape in device memory for the life of the executable --
+        # mx.compile keeps a compiled graph's constants alive, and jax's
+        # random.normal alone carries 23 full-shape splat coefficients
+        # (a keras 8B model retained ~127 GB of them). Broadcasting from a
+        # ONE-ELEMENT buffer, not a rank-0 one: MLX inlines rank-0
+        # constants as %.7g literals (see _roundtrips_as_literal).
+        scalar = _ir.splat_scalar_np(op.attributes["value"], t)
+        if scalar is not None:
+            out = dtypes.to_mx(scalar.reshape(1))
+            want = dtypes.mx_dtype_for(t.element_type)
+            if out.dtype != want:
+                out = out.astype(want)
+            return mx.broadcast_to(mx.reshape(out, (1,) * len(shape)), shape)
     arr = _ir.dense_to_np(op.attributes["value"], t)
     if (arr.ndim == 0 and arr.dtype.kind == "f"
             and not _roundtrips_as_literal(float(arr))):

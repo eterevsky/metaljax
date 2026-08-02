@@ -443,6 +443,75 @@ def _body_fn(interp, body_block, compile_body, repeat=1):
     return entry
 
 
+class _BodyRunner:
+    """Runs a while body, recovering from the ways MLX's compiled path can
+    fail at CALL time. Every recovery simply redoes the iteration: bodies
+    are pure, and a failed call leaves the caller's carry untouched.
+
+    - "Resource limit": Metal ran out of buffer handles mid-body. Purge the
+      cache and retry. BOUNDED: after two failures force the uncompiled
+      body (retrying an oversized mx.compile trace forever once livelocked
+      a worker for hours); if even that cannot fit, surface the error.
+    - anything else out of a COMPILED call (e.g. unordered_map::at on
+      graphs with unused inputs): fall back to the uncompiled body for the
+      rest of this program's life.
+    """
+
+    def __init__(self, interp, body_block, env, repeat=1):
+        self.interp = interp
+        self.block = body_block
+        self.env = env
+        self.repeat = repeat
+        self._limit_retries = 0
+        self._bind()
+
+    def _bind(self):
+        self.fn, free, self.compiled = _body_fn(
+            self.interp, self.block, compile_body=True, repeat=self.repeat)
+        self.captures = [self.env[v] for v in free]
+
+    def _drop_compiled(self):
+        # _body_fn consults _no_body_compile, so rebinding now yields the
+        # uncompiled body (and drops the compiled entry that failed).
+        self.interp._no_body_compile.add(self.block)
+        self.interp._body_cache.pop((self.block, True, self.repeat), None)
+        self._bind()
+
+    def step(self, vals):
+        """One iteration: the next carry, or None when it must be redone."""
+        try:
+            out = list(self.fn(*vals, *self.captures))
+            self._limit_retries = 0
+            return out
+        except (RuntimeError, IndexError, ValueError) as e:
+            if isinstance(e, RuntimeError) and "Resource limit" in str(e):
+                if _DEBUG:
+                    print("[metaljax] Metal buffer limit hit in while "
+                          "body; clearing cache and retrying", flush=True)
+                gc.collect()
+                mx.clear_cache()
+                self._limit_retries += 1
+                if self._limit_retries == 2 and self.compiled:
+                    self._drop_compiled()
+                elif self._limit_retries > 3:
+                    raise
+                return None
+            if not self.compiled:
+                raise
+            if _DEBUG:
+                print("[metaljax] compiled while body failed; "
+                      "retrying eagerly", flush=True)
+            self._drop_compiled()
+            return None
+
+    def run_one(self, vals):
+        """One iteration, retrying in place until it lands or gives up."""
+        while True:
+            out = self.step(vals)
+            if out is not None:
+                return out
+
+
 @register("stablehlo.while")
 def _while(interp, op, ins, env):
     cond_block = op.regions[0].blocks[0]
@@ -522,72 +591,34 @@ def _while(interp, op, ins, env):
                     print(f"[metaljax] chunked loop failed ({e}); "
                           f"falling back to single-step", flush=True)
                 interp._no_chunk.add(body_block)
-        fn, free, compiled = _body_fn(interp, body_block, compile_body=True)
-        captures = [env[v] for v in free]
+        runner = _BodyRunner(interp, body_block, env)
         vals = list(ins)
-        i = 0
-        limit_retries = 0
-        while i < trip:
-            try:
-                vals = list(fn(*vals, *captures))
-                limit_retries = 0
-            except (RuntimeError, IndexError, ValueError) as e:
-                if isinstance(e, RuntimeError) and "Resource limit" in str(e):
-                    # Metal ran out of buffer handles mid-body; `vals` is
-                    # only rebound on success, so purge the cache and redo
-                    # the iteration. BOUNDED: if the same iteration keeps
-                    # exhausting buffers (e.g. an oversized mx.compile
-                    # trace attempt), retrying the same path livelocks —
-                    # a worker once spun for hours re-tracing. After two
-                    # failures force the uncompiled body; if even that
-                    # can't fit, surface the error.
-                    if _DEBUG:
-                        print("[metaljax] Metal buffer limit hit in while "
-                              "body; clearing cache and retrying", flush=True)
-                    gc.collect()
-                    mx.clear_cache()
-                    limit_retries += 1
-                    if limit_retries == 2 and compiled:
-                        interp._no_body_compile.add(body_block)
-                        interp._body_cache.pop((body_block, True, 1), None)
-                        fn, free, compiled = _body_fn(
-                            interp, body_block, compile_body=False)
-                        captures = [env[v] for v in free]
-                    elif limit_retries > 3:
-                        raise
-                    continue
-                # MLX's compiled path can fail at call time (e.g.
-                # unordered_map::at on graphs with unused inputs). The body
-                # is pure and the call left `vals` untouched: redo this
-                # iteration with the uncompiled body.
-                if not compiled:
-                    raise
-                if _DEBUG:
-                    print("[metaljax] compiled while body failed; "
-                          "retrying eagerly", flush=True)
-                interp._no_body_compile.add(body_block)
-                interp._body_cache.pop((body_block, True, 1), None)
-                fn, free, compiled = _body_fn(
-                    interp, body_block, compile_body=True)
-                captures = [env[v] for v in free]
-                continue
-            i += 1
+        for i in range(1, trip + 1):
+            vals = runner.run_one(vals)
             if i % period == 0:
                 _loop_flush(vals, period * cost)
         return vals
 
     # Dynamic (non-counted) loop: evaluate the condition each iteration.
+    # The BODY still gets compiled — a data-dependent trip count says
+    # nothing about the body, and interpreting it op by op is what made
+    # LLM decode (one keras sampler step = a whole transformer forward)
+    # Python-dispatch-bound. The cond stays eager: it ends in .item().
     dyn_cost = _block_cost(interp, body_block)
+    runner = _BodyRunner(interp, body_block, env)
     if _DEBUG:
-        print(f"[metaljax] while(fallback-dynamic): cost={dyn_cost}",
-              flush=True)
+        print(f"[metaljax] while(fallback-dynamic): cost={dyn_cost} "
+              f"compiled={runner.compiled}", flush=True)
     vals = list(ins)
     while True:
         (pred,) = interp.run_block(cond_block, vals, env)
         if not bool(pred.item()):
             return vals
-        vals = interp.run_block(body_block, vals, env)
-        _loop_flush((), dyn_cost)
+        vals = runner.run_one(vals)
+        # Flush the carry, not nothing: the cond only forces the values it
+        # reads, so anything else in the carry (a KV cache) would pile up
+        # as unevaluated graph across iterations.
+        _loop_flush(vals, dyn_cost)
 
 
 def _run_chunked(interp, body_block, env, ins, trip, K, cost):

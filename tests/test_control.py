@@ -21,6 +21,45 @@ def test_while_loop():
     check(f, np.float32(3.0))
 
 
+# A data-dependent trip count says nothing about the body, so the body of a
+# dynamic while is compiled like any other. LLM decode is exactly this loop
+# (one transformer step per token, stopping on an end-of-sequence token):
+# interpreting the body op by op made it Python-dispatch-bound.
+_W = rng.standard_normal((8, 8)).astype(np.float32) * 0.3
+
+
+def _dynamic_while(x):
+    def cond(c):
+        h, i = c
+        # Not the counted pattern (an `and`, not a bare LT on the counter),
+        # yet bounded, so the test cannot hang.
+        return jnp.logical_and(i < 25, jnp.max(jnp.abs(h)) < 50.0)
+
+    def body(c):
+        h, i = c
+        return (jnp.tanh(h @ _W) * 3.0 + 0.5, i + 1)
+
+    return jax.lax.while_loop(cond, body, (x, jnp.int32(0)))
+
+
+def test_dynamic_while_matches_cpu():
+    check(_dynamic_while, rng.standard_normal(8).astype(np.float32),
+          rtol=1e-5, atol=1e-5)
+
+
+def test_dynamic_while_body_is_compiled():
+    from helpers import lower_bytes
+    from metaljax import Interpreter
+    from metaljax import dtypes as mdt
+
+    x = rng.standard_normal(8).astype(np.float32)
+    interp = Interpreter(lower_bytes(_dynamic_while, x))
+    interp(mdt.to_mx(x))
+    assert interp._body_cache, "no while body was executed"
+    assert any(compiled for _, _, compiled in interp._body_cache.values()), \
+        "the body of a dynamic while was interpreted op by op"
+
+
 def test_cond():
     def f(p, x):
         return jax.lax.cond(p, lambda a: a * 2.0, lambda a: a - 1.0, x)
