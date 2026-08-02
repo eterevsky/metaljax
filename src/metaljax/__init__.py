@@ -13,7 +13,18 @@ if _os.environ.get("METALJAX_MATMUL_PRECISION", "highest") == "highest":
 # How much work MLX packs into one Metal command buffer, by kernel count and
 # by bytes. Both are raised well above MLX's defaults (10 ops / 40 MB):
 #
-#  - ops: measured ~20% faster on launch-bound (small-kernel) workloads.
+#  - ops: 400 was measured ~20% faster than MLX's 10 on launch-bound
+#    (small-kernel) workloads, but 400 exactly is a CORRUPTING alignment:
+#    maxtext's qwen3 parameter init (a 28-layer scan interpreted op by op,
+#    flushed every 5 iterations) computed one layer's RNG key wrong there,
+#    so training started from different weights -- first-step loss 208.78
+#    where jax-CPU and our own compiled path both say 247.78. The same
+#    program is clean at 200, 800, 1600 and 5000 kernels per buffer, and at
+#    400 with any other flush cadence: it is where the boundaries land that
+#    decides, not how far apart they are (see the byte note below -- same
+#    bug, other budget). 800 costs ~2-3% against 400 (mid08 4.83 -> 4.93 ms,
+#    big15 55.9 -> 57.5, qwen3 decode 15.6 -> 16.0 ms/tok) and is pinned by
+#    tests/test_command_buffer.py, which replays that init scan.
 #  - bytes: BOUNDED both ways.
 #    Floor -- CORRECTNESS: splitting a single eval of an mx.compile'd graph
 #    into many command buffers corrupts results in MLX 0.32 (silently,
@@ -30,7 +41,7 @@ if _os.environ.get("METALJAX_MATMUL_PRECISION", "highest") == "highest":
 #    level 1). 512 MB restores intermediate recycling per commit.
 #
 # Override either by exporting a different value before importing metaljax.
-_os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "400")
+_os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "800")
 _os.environ.setdefault("MLX_MAX_MB_PER_BUFFER", "512")
 
 from metaljax.interpreter import Interpreter, UnsupportedOpError

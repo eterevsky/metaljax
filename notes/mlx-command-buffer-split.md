@@ -74,7 +74,7 @@ program triggers it, which is why the regression test ships that program.
 
 ## Fix
 
-`src/metaljax/__init__.py` raises `MLX_MAX_MB_PER_BUFFER` to 16384 (MB)
+`src/metaljax/__init__.py` raises `MLX_MAX_MB_PER_BUFFER` to 512 (bounded above after the wired-memory panics; see src/metaljax/__init__.py) (MB)
 before mlx loads, next to the existing `MLX_MAX_OPS_PER_BUFFER=400`. That
 leaves the kernel count as the only splitter, ~50x inside the measured safe
 region. Both remain overridable.
@@ -110,18 +110,92 @@ different results per call when `MLX_MAX_MB_PER_BUFFER` / `_OPS__` cut the
 command buffer every few kernels; correct at call 1 and when the graph's
 intermediates are retained." Repro material is the test asset above.
 
-## Unrelated finding, not fixed
+## Same bug, other budget: the op-by-op path at 400 kernels (2026-08, fixed)
 
-`maxtext-train-06b` (one training step, synthetic data) gets the FIRST loss
-wrong on the **uncompiled** path only:
+`maxtext-train-06b` (one training step, synthetic data) got the FIRST loss
+wrong on the **uncompiled** path only — the opposite polarity of everything
+above, which is why it was first written down as unrelated:
 
 | path | loss step 1 | loss step 3 |
 |---|---|---|
 | jax CPU | 247.8117 | 119.9826 |
 | metal, compiled (default) | 247.7775 | 120.0680 |
-| metal, `METALJAX_COMPILE=0` | **208.7800** | 124.6839 |
+| metal, `METALJAX_COMPILE=0` (before) | **208.7800** | 124.6839 |
+| metal, `METALJAX_COMPILE=0` (after) | 247.7775 | 130.4799 |
 
-The default (compiled) path matches CPU, so this is not what users hit, but
-something in op-by-op interpretation of that program is wrong. Not
-msl_scan (`METALJAX_MSL=0` gives byte-identical numbers) and not the data
-iterator (same synthetic batch). Not investigated further.
+It is this same MLX bug, reached through `MLX_MAX_OPS_PER_BUFFER=400`.
+
+### Where it goes wrong
+
+A compiled-vs-eager diff of every PJRT execute (both runs logging per-buffer
+sums) put the divergence in execute #10 — maxtext's **parameter init**, a
+program with no inputs and 66 outputs that neither run compiles (cost
+136k > trace budget). Its body is a 28-layer scan; the default run chunks it
+(K=4 compiled replays), `METALJAX_COMPILE=0` runs single steps and flushes
+every 5 iterations (`period = 25000 // cost`, cost 4877).
+
+Dumping that module gives a standalone repro (no maxtext, no jax:
+`Interpreter(...)`, run main to the `stablehlo.while`, iterate the body).
+There, with the loop's own cost/cadence:
+
+* flushing every 5 iterations disagrees with flushing every iteration —
+  and with flushing *never*, and with the chunked path, which all agree;
+* the whole difference is **one layer**: iteration 6 (the first in the
+  second flush window) computes a wrong RNG key, so that layer's weights
+  are drawn from a different stream. Layers 0-4 and 7-27 are bit-identical;
+* 8 iterations are clean at any cadence, 10 are not — the corrupted work
+  has to be followed by enough work in the same `eval`;
+* it needs the real parameter shapes: the same program with tensors
+  shrunk 4x does not reproduce.
+
+Not msl_scan (`METALJAX_MSL=0` identical — the body has no eligible loop),
+not splat constants (`METALJAX_SPLAT_CONST=0` identical), not donation of
+the carries (retaining every intermediate carry does not help), not MLX's
+buffer cache (`mx.set_cache_limit(0)` does not help).
+
+What does decide it is where MLX cuts command buffers:
+
+| `MLX_MAX_OPS_PER_BUFFER` | 200 | 400 | 800 | 1600 | 5000 | 10^9 |
+|---|---|---|---|---|---|---|
+| flush every 5 iterations | ok | **wrong** | ok | ok | ok | ok |
+
+and at 400, cadences 1, 2, 3, 4, 6 and 8 are all clean — only 5 is not.
+`MLX_BFS_MAX_WIDTH=8` (a different traversal order, same boundaries) is
+also clean. So this is not "splits closer than N are unsafe": a particular
+boundary lands between a producer and a consumer, and everything else about
+the graph decides whether that costs you.
+
+### Fix
+
+`MLX_MAX_OPS_PER_BUFFER` 400 -> 800. Not "never split": the byte budget is
+bounded above at 512 MB because unbounded command buffers panicked the
+machine (see `__init__.py`), and removing the kernel budget too costs
+~50% on decode (qwen3 16.1 -> 25.5 ms/tok, the GPU idles while the CPU
+encodes the whole graph) — so both budgets stay finite and the value is
+chosen by measurement.
+
+Cost of 400 -> 800, paired runs:
+
+| spec | 400 | 800 | 1600 |
+|---|---|---|---|
+| mid08 `bytes.emb.256\|mgru.256` 64 128 | 4.830 ms | 4.929 (+2.0%) | 4.912 |
+| big15 `bytes.emb.1024\|gru.1024` 32 128 | 55.90 ms | 57.47 (+2.8%) | 58.42 |
+| maxtext qwen3-0.6B decode | 15.58 ms/tok | 16.02 (+2.8%) | 16.59 |
+
+1600 is clean too and buys no correctness we can demonstrate, so the
+cheaper of the clean values wins.
+
+### Regression test
+
+`test_eager_scan_is_independent_of_flush_cadence` in
+`tests/test_command_buffer.py`, over `tests/data/qwen3_init_scan.mlir` (that
+init program, dumped as text). It runs 10 iterations of the scan body at the
+cadence `ops.control._while` would use and again with an `mx.eval` per
+iteration, and requires the carries to be bit-identical. ~3 s; fails with
+`MLX_MAX_OPS_PER_BUFFER=400`, passes at the shipped 800. The asset keeps the
+model's real shapes on purpose (shrunk, it stops reproducing).
+
+**Standing risk**: every finite budget is a draw in the same lottery. The
+two tests in that file are the only evidence that today's values are good
+draws; any change to them, to the flush cadence in `ops/control.py`, or to
+MLX itself needs both rerun.
