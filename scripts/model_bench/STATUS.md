@@ -22,7 +22,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ʰ (93 GB — not attempted, foregone) | TODO | — | TODO |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.5** (beats its bf16!) | ⚠ 339.5 @ **2.7 GB** ⁱ | (4-bit: see row 4 stacks) | — | — |
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
-| 14b | *qwix-int8 Qwen3-8B* | queued (~9 GB packed, ~1.7× decode) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
+| 14b | *qwix-int8 Qwen3-8B* | 2118 (maxtext; coherent) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 15 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
 | 16 | SD 3.5 Large (ms/diff-step) | ✗ keras requests F16_F16_F32 dot algorithm, unsupported on CPU (strip-workaround planned) | ⚠ 8577, BLACK IMAGE ⁹ | TODO (mflux) | TODO | — |
 | 17 | LoRA E2B train (ms/step) | 3287 | **417** (7.9×, losses agree) | — | TODO ¹⁰ | — |
