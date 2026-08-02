@@ -18,11 +18,123 @@ python scripts/model_bench/adapter_llamacpp.py --all
 
 It downloads the GGUF (pinned revision) into the shared
 `~/.cache/huggingface`, takes the suite-wide `/tmp/metaljax-bench.lock` for
-the timed section, runs `llama-bench`, then runs one greedy `llama-cli`
-generation as a coherence check, and appends a `backend="llamacpp"` record in
-the same JSONL shape `run_bench.py` emits.
+the timed section, runs `llama-bench`, then runs one greedy
+`llama-completion` generation as a coherence check, and appends a
+`backend="llamacpp"` record in the same JSONL shape `run_bench.py` emits.
 
-<!-- RESULTS -->
+Result records from the measurement run live outside the repo, in
+`~/.cache/metaljax-bench/llamacpp/`.
+
+## Results
+
+Measured 2026-08-03, M5 Max / 128 GB / macOS 26.5.2, build `221f0f6`
+(b10235). Every row: `-p 51 -n 128 -r 5`, all layers on Metal, f16 KV
+cache. All 11 rows completed and produced coherent greedy text.
+
+| row | quant | file GB | **decode ms/tok** | tg tok/s | prefill ms | pp tok/s | load s | mem GB |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| gemma4-12b-bf16 | BF16 | 23.83 | **44.21** | 22.62 | 104.4 | 488.7 | 0.12 | 24.0 |
+| gemma4-12b-q4 | Q4_0 QAT | 6.98 | **15.90** | 62.88 | 89.8 | 568.0 | 0.10 | 7.2 |
+| gemma4-31b-bf16 | BF16 | 61.41 | **111.21** | 8.99 | 241.0 | 211.6 | 0.25 | 61.7 |
+| gemma4-31b-q8 | Q8_0 | 32.64 | **63.95** | 15.64 | 203.6 | 250.4 | 0.22 | 33.0 |
+| gemma4-31b-q4 | Q4_0 QAT | 17.65 | **37.29** | 26.82 | 192.5 | 265.0 | 0.22 | 18.0 |
+| gemma4-26b-a4b-q4 | Q4_0 QAT | 14.44 | **7.86** | 127.15 | 49.3 | 1035.2 | 0.07 | 14.6 |
+| qwen3-8b-q8 | Q8_0 | 8.71 | **15.71** | 63.64 | 57.9 | 881.1 | 0.07 | 8.8 |
+| qwen3-8b-q4 | Q4_K_M | 5.03 | **10.22** | 97.83 | 57.0 | 894.0 | 0.08 | 5.1 |
+| llama31-8b-q8 | Q8_0 | 8.54 | **15.38** | 65.04 | 57.1 | 893.0 | 0.08 | 8.6 |
+| llama31-8b-q4 | Q4_K_M | 4.92 | **9.91** | 100.87 | 56.6 | 900.9 | 0.07 | 5.0 |
+| gpt-oss-20b-mxfp4 | MXFP4 native | 12.11 | **6.65** | 150.31 | 46.6 | 1093.8 | 0.08 | 12.2 |
+
+Run-to-run spread is small: an independent earlier pass over the same 11
+files reproduced every decode figure within 4% (most within 1%), and
+llama-bench's own inter-repetition stddev is under 1% except gpt-oss
+(2.9 tok/s on 150, ~2%).
+
+### Against the other columns
+
+Only the two BF16 rows are a like-for-like precision match with the
+metaljax / mlx-lm cells. Decode ms/token, lower is better:
+
+| STATUS row | jax CPU | metaljax | mlx-lm | **llama.cpp** | precision match? |
+|---|---:|---:|---:|---:|---|
+| gemma4-12B bf16 | 346 (f32) | 101 | 58.3 | **44.21** | ✅ all bf16 |
+| gemma4-31B bf16 | ✗ | 363 | 137 | **111.21** | ✅ all bf16 |
+| gpt-oss-20b | — | 220.4 | 8.8 | **6.65** | ✅ mlx-lm + llama.cpp both native MXFP4; metaljax dequantizes to bf16 |
+| gemma4-26B-A4B (MoE) | ✗ | 473 ⚠ | 17.0 | **7.86** | ❌ Q4_0 vs bf16 |
+| Qwen3-8B | 219 | 60.3 | 30.4 | **15.71** (Q8) / 10.22 (Q4) | ❌ 8-/4-bit vs bf16 |
+| Llama-3.1-8B | 206 | 58.6 | 29.4 | **15.38** (Q8) / 9.91 (Q4) | ❌ 8-/4-bit vs bf16 |
+
+On the honest bf16 comparisons llama.cpp is **2.3× metaljax at 12B and
+3.3× at 31B**, and it is ahead of mlx-lm by 1.32× and 1.23× — so the
+"same Metal library underneath" gap band in STATUS.md is not the floor;
+llama.cpp's hand-written Metal kernels beat MLX's on both bf16 rows.
+
+Two rows deserve separate emphasis:
+
+* **gpt-oss-20b** is the one row where llama.cpp and mlx-lm run the
+  *identical* numeric format (native MXFP4, no requantization). llama.cpp
+  wins 6.65 vs 8.8 (1.32×). The metaljax cell is 33× slower, but that is
+  the dequantize-to-bf16 penalty (41.8 GB resident vs 12.2), not a kernel
+  gap — it is the quantized-matmul roadmap item, priced.
+* **gemma4-26B-A4B** at 7.86 ms/tok is 60× the metaljax cell (473) and
+  2.2× mlx-lm. It corroborates STATUS footnote 16: the dense-expert
+  lowering, not the kernels, is what costs metaljax this row.
+
+### Effective bandwidth — a consistency check
+
+Dividing file size by decode time gives the memory traffic decode
+sustains. For the dense rows this should pin to the machine's practical
+bandwidth ceiling, and it does:
+
+| row | GB/s | | row | GB/s |
+|---|---:|---|---|---:|
+| qwen3-8b-q4 | 492 | | gemma4-12b-bf16 | 539 |
+| qwen3-8b-q8 | 554 | | gemma4-31b-q4 | 473 |
+| llama31-8b-q4 | 496 | | gemma4-31b-q8 | 510 |
+| llama31-8b-q8 | 555 | | gemma4-31b-bf16 | 552 |
+| gemma4-12b-q4 | 439 | | | |
+
+Every dense row lands in a 439–555 GB/s band regardless of model or
+quantization — the textbook signature of bandwidth-bound decode, and
+evidence the numbers are sound rather than accidentally fast.
+
+The two MoE rows break the pattern in the informative direction:
+**gpt-oss-20b 1821 GB/s** and **gemma4-26B-A4B 1837 GB/s**. Those rates
+are physically impossible on this machine, which proves llama.cpp touches
+only the active experts (~1/3 of the file) per token. That is exactly the
+gathered-dispatch behaviour metaljax lacks.
+
+### Depth sensitivity
+
+Caveat 2 below (llama-bench decodes from an empty context; the suite
+decodes after a 51-token prompt) is measurable and negligible. Re-running
+with `-d 51`:
+
+| row | default (d=0) | d=51 | delta |
+|---|---:|---:|---:|
+| qwen3-8b-q4 | 10.22 | 10.18 | −0.4% |
+| gemma4-12b-bf16 | 44.21 | 45.05 | +1.9% |
+| gemma4-31b-q4 | 37.29 | 37.30 | +0.0% |
+
+At these context lengths the KV cache is negligible next to the weights,
+so the two framings agree inside run-to-run noise. Reproduce with
+`--depth 51`.
+
+### Suggested STATUS.md cells
+
+bf16 where a bf16 GGUF exists, otherwise the nearest-precision quant,
+always labelled — never an unlabelled quantized number next to bf16:
+
+| STATUS row | cell |
+|---|---|
+| 1 gemma4-31B bf16 | `111` (bf16) |
+| 2 gemma4-12B bf16 | `44.2` (bf16) |
+| 3 gemma4-26B-A4B | `7.9` (Q4_0 QAT) |
+| 5 Qwen3-8B | `15.7` (Q8_0) |
+| 6 Llama-3.1-8B | `15.4` (Q8_0) |
+| 7 gpt-oss-20b | `6.7` (MXFP4 native) |
+
+
 
 ## Build
 
@@ -34,8 +146,13 @@ git clone --depth 200 https://github.com/ggml-org/llama.cpp.git
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DLLAMA_CURL=OFF \
       -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
 cmake --build build --config Release -j 8 \
-      --target llama-bench llama-cli llama-tokenize
+      --target llama-bench llama-completion llama-tokenize
 ```
+
+`llama-completion` is required, not optional. In current builds `llama-cli`
+is a full-screen interactive app: it renders a TUI, blocks on stdin, and
+never prints the perf block — piping it gives you ASCII-art banners instead
+of model output. The scriptable completion path is its own binary.
 
 | | |
 |---|---|
@@ -96,11 +213,23 @@ and llama.cpp has no compile step to amortise, unlike the JAX rows.
 After the timed section each row runs
 
 ```
-llama-cli -m <gguf> -st -p "<manifest prompt>" -n 128 --temp 0 --no-warmup -cnv
+llama-completion -m <gguf> -st -p "<manifest prompt>" -n 128 --temp 0 \
+                 --no-warmup --no-display-prompt --jinja -cnv
 ```
 
 (`--temp 0` = greedy, `-st` = single turn, `-cnv` = the model's own chat
-template) and stores the first 600 characters in `sanity_text`. Greedy
+template) and stores the first 600 characters in `sanity_text`.
+
+`--jinja` is load-bearing: **all six Gemma 4 rows abort without it** with
+`std::runtime_error: this custom template is not supported, try using
+--jinja` — before emitting a token. The first pass of this column silently
+recorded empty coherence checks for every Gemma row because of it.
+
+`load_s` also comes from this run (`common_perf_print: load time`), which is
+why it is quoted with the chat template and tokenizer initialisation
+included.
+
+Greedy
 *token-id* agreement with the JAX rows is not checked and cannot be: these
 are different weights (quantized) reached through a different tokenizer and
 chat template.

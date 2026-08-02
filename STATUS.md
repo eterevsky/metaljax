@@ -12,18 +12,18 @@ tentative until the final sequential re-run with finished instrumentation.*
 
 | # | benchmark | jax CPU | metaljax | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|
-| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **363** | 137 | 148.7 | TODO |
-| 2 | gemma4-12B bf16 | 346 (f32) | **101** | 58.3 ¹⁵ | 67.6 | TODO |
-| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **473** ¹⁶ | **17.0** | — | TODO |
+| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **363** | 137 | 148.7 | 111.2 ²⁰ |
+| 2 | gemma4-12B bf16 | 346 (f32) | **101** | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **473** ¹⁶ | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
 | 4 | gemma4-E2B bf16 | 79.2 (bf16→f32) ¹³ | **28.9** | 10.5 ¹⁵ | — | — |
-| 5 | Qwen3-8B bf16 | 219 (bf16→f32) ¹³ | **60.3** | 30.4 | 38.1 | TODO |
-| 6 | Llama-3.1-8B bf16 | 206 (bf16→f32) ¹³ | **58.6** | 29.4 | 35.5 | TODO |
-| 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | TODO |
-| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ¹⁷ | **13.7** | — | TODO |
-| 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ¹⁷ | 131.8 | — | TODO |
+| 5 | Qwen3-8B bf16 | 219 (bf16→f32) ¹³ | **60.3** | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
+| 6 | Llama-3.1-8B bf16 | 206 (bf16→f32) ¹³ | **58.6** | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
+| 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
+| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ¹⁷ | **13.7** | — | — |
+| 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ¹⁷ | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | — | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.5 | **15.8** ⁷ | — | — | — |
-| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **52.8** (93.4 GB) | — | TODO |
+| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.5** ¹⁸ | 339.5 @ 2.7 GB ¹⁸ | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 146 | **48.3** ᵛ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ needs quantized-matmul path ⁸ | — | — | — |
@@ -144,6 +144,14 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
     MLX cell: mflux is Flux-only; DiffusionKit supports the SD3 family
     but 3.5-Large weights are gated in its formats — no ungated MLX
     path exists, cell closed as not-runnable.
+20. llama.cpp build 221f0f63 (past the Gemma4 cutoff), llama-bench
+    -p 51 -n 128 -r 5, all-Metal, reproduced within 4% on two passes;
+    per-provider GGUF pins in README_llamacpp.md. Q8/Q4 marked where
+    no bf16 GGUF exists. Dense rows all pin to 439–555 GB/s effective
+    bandwidth (the bandwidth-bound signature); llama.cpp leads even
+    mlx-lm ~1.25x on bf16 — the kernel frontier on this hardware.
+    Deferred rows (35B/R1/Mixtral llama.cpp cells) dropped as
+    redundant with the covered comparison classes.
 13. CPU cells run what XLA:CPU supports: weights load bf16, matmuls
     upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
 14. 26B-A4B CPU attempt per Oleg, behind the memory guard: killed at

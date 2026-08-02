@@ -368,9 +368,13 @@ def run_row(row_id, args):
             rec["mem_gb"] = round(mem, 1)
 
         if not args.no_sanity:
+            # --jinja: Gemma 4's chat template is not one of the built-in
+            # formats ("this custom template is not supported, try using
+            # --jinja"), and without it llama-completion aborts before
+            # generating a single token.
             scmd = [cli_bin, "-m", gguf, "-st", "-p", prompt,
                     "-n", str(args.sanity_tokens), "--temp", "0",
-                    "--no-warmup", "--no-display-prompt",
+                    "--no-warmup", "--no-display-prompt", "--jinja",
                     "-no-cnv" if args.raw else "-cnv"]
             rec["sanity_cmd"] = " ".join(scmd)
             t0 = time.monotonic()
