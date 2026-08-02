@@ -1,6 +1,6 @@
 # Model benchmark suite — status
 
-*Last updated: 2026-08-03 (block 3: uniform-harness gemma rows + mlx-lm comparisons). Headline metric per cell: LLM rows =
+*Last updated: 2026-08-03 (block 4: big models, MoE, packed int4). Headline metric per cell: LLM rows =
 warm decode ms/token; vision = forward ms; diffusion = ms per step;
 training = ms per step. ⚠ = measured but contaminated by a since-diagnosed
 bug; ✗ = established impossible; TODO = not yet measured. All values
@@ -10,17 +10,17 @@ tentative until the final sequential re-run with finished instrumentation.*
 |---|---|---|---|---|---|---|
 | 1 | gemma4-31B bf16 | ✗ f32=123 GB | **363** | 137 | TODO | TODO |
 | 2 | gemma4-12B bf16 | 346 (f32) | **101** | needs git-main ᶠ | TODO | TODO |
-| 3 | gemma4-26B-A4B (MoE) | queued (try)ᵉ | TODO | TODO | — | TODO |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ᵉ | ⚠ 473 ᵍ | **17.0** | — | TODO |
 | 4 | gemma4-E2B bf16 | 79.2 (bf16→f32)ᵈ | **28.9** | needs git-main ᶠ | — | — |
 | 5 | Qwen3-8B bf16 | 219 (bf16→f32)ᵈ | **60.3** | 30.4 | smoke-verified ³ | TODO |
 | 6 | Llama-3.1-8B bf16 | 206 (bf16→f32)ᵈ | **58.6** | 29.4 | TODO | TODO |
 | 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | TODO |
-| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | TODO | TODO | — | TODO |
-| 9 | R1-Distill-32B | ✗ 131 GB | TODO ⁵ | TODO | — | TODO |
+| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ʰ | **13.7** | — | TODO |
+| 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ʰ | 131.8 | — | TODO |
 | 10 | DeepSeek-V2-Lite (maxtext) | ⚠ 50–105 GB ⁶ | TODO ⁶ | — | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 87 | **BROKEN ⁷** (82 w/o compile) | — | — | — |
-| 12 | Mixtral 8×7B bf16 | ✗ | TODO (93 GB, hosting ok) | TODO | — | TODO |
-| 13 | gemma4-E2B keras-int4 (packed) | TODO | TODO | TODO | — | TODO |
+| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ʰ (93 GB — not attempted, foregone) | TODO | — | TODO |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.5** (beats its bf16!) | ⚠ 339.5 @ **2.7 GB** ⁱ | (4-bit: see row 4 stacks) | — | — |
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
 | 14b | *qwix-int8 Qwen3-8B* | queued (~9 GB packed, ~1.7× decode) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 15 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
@@ -51,6 +51,22 @@ git-main mlx-lm venv. The 12B/31B gemma-lib decode improvements vs
 earlier entries (189→101, 374→363) come from the dynamic-while
 body-compile fix landing in the sampler's decode loop; old CPU 938
 superseded by the uniform harness (cache length now matched).
+
+ᵍ MoE DENSE-EXPERT GAP — the largest measured: keras/XLA lowers expert
+dispatch densely (streams all 51.6 GB/token) → 473 ms/tok vs mlx-lm's
+gathered 17.0 (27.8×). A 4B-active MoE decodes slower than dense 31B
+on our path. Top C++-era item alongside quantized matmul.
+ʰ keras load path (random-init before checkpoint overwrite +
+conversion transients) exceeds the machine above ~50 GB checkpoints:
+R1-32B (65 GB) jetsam-killed; Qwen3.6-35B (72 GB) entered swap-death
+(196 GB footprint, killed by hand); Mixtral (93 GB) not attempted —
+foregone. gemma-lib's streaming loader handled 62.6 GB fine, so the
+fix is a streaming load for the keras path (ledger).
+ⁱ Packed int4 memory saving IS real on metaljax (2.7 vs 10.2 GB —
+the only sub-byte JAX path that keeps it), but decode pays 11.7× vs
+bf16 (in-graph unpack re-materializes weights per matmul). XLA:CPU
+fuses the same unpack into a small net WIN (67.5 vs 79.2 bf16).
+Either mx.quantized_matmul mapping or unpack-fusion closes it.
 
 ## Footnotes
 
@@ -101,3 +117,6 @@ superseded by the uniform harness (cache length now matched).
 - **SD3.5 black image** (open): footnote 9.
 - **sentencepiece SIGABRT** (worked around): footnote 1.
 - **int8 dot_general int64 cliff** (known, measured): footnote 8.
+- **MoE dense-expert lowering** (open, measured 27.8×): footnote ᵍ.
+- **keras load-path memory** (open, blocks ≥60 GB keras rows): footnote ʰ.
+- **int4 unpack re-materialization on metal** (open, 11.7×): footnote ⁱ.
