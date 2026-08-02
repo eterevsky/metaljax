@@ -98,7 +98,7 @@
       ],
       "cpu": false,
       "note": "MoE flagship; CPU f32 144 GB exceeds RAM",
-      "arch": "Qwen3MoeCausalLM"
+      "arch": "Qwen3_5MoeCausalLM"
     },
     {
       "id": "r1-distill-32b",
