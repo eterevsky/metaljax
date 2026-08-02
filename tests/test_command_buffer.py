@@ -65,12 +65,16 @@ def _compiled(interp):
     return mx.compile(traced)
 
 
-def test_command_buffer_budgets_are_raised():
+def test_command_buffer_budgets_are_bounded():
     # Read by MLX once, at load; metaljax/__init__ sets them before mlx.core
-    # is imported. The kernel budget is a speed choice, the byte budget a
-    # correctness one -- see the module docstring.
+    # is imported. The kernel budget is a speed choice. The byte budget is
+    # BOUNDED BOTH WAYS: >=160 MB or MLX 0.32 corrupts split compiled
+    # graphs (this file's other tests); <=2048 MB or one command buffer can
+    # accumulate tens of GB of unpageable transient intermediates and panic
+    # the machine (SD3.5 MMDiT at 1024^2 did, twice) -- every intermediate
+    # lives until its command buffer completes.
     assert int(os.environ["MLX_MAX_OPS_PER_BUFFER"]) >= 64
-    assert int(os.environ["MLX_MAX_MB_PER_BUFFER"]) >= 4096
+    assert 160 <= int(os.environ["MLX_MAX_MB_PER_BUFFER"]) <= 2048
 
 
 def test_compiled_llm_step_is_correct_and_deterministic():
