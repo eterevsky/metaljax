@@ -24,7 +24,7 @@ tentative until the final sequential re-run with finished instrumentation.*
 | 14 | maxtext qwix-int8 0.6B | 146 (vs 87 bf16) | ⚠ 308 (vs 96 bf16) ⁸ | — | — | — |
 | 14b | *qwix-int8 Qwen3-8B* | queued (~9 GB packed, ~1.7× decode) | ✗ blocked: needs quantized-matmul path ⁸ | — | — | — |
 | 15 | SigLIP 2 (fwd b1 ms) | 597 | **91** (6.6×) | — | TODO | — |
-| 16 | SD 3.5 Large (ms/diff-step) | ✗ XLA:CPU can't run f16 dots | ⚠ 8577, BLACK IMAGE ⁹ | TODO (mflux) | TODO | — |
+| 16 | SD 3.5 Large (ms/diff-step) | ✗ keras requests F16_F16_F32 dot algorithm, unsupported on CPU (strip-workaround planned) | ⚠ 8577, BLACK IMAGE ⁹ | TODO (mflux) | TODO | — |
 | 17 | LoRA E2B train (ms/step) | 3287 | **417** (7.9×, losses agree) | — | TODO ¹⁰ | — |
 | 18 | maxtext train 0.6B (loss) | 228.42 | ⚠ mismatch ¹¹ | — | — | — |
 | 19 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | TODO (103 GB, fits) | — | — |
