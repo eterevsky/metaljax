@@ -68,6 +68,7 @@ for m in "${MODELS[@]}"; do
     # row is the -Chat variant, which is the same architecture; --hf_model_path
     # points the converter at the local Chat snapshot.
     qwen3-0.6b)     convert qwen3-0.6b     "Qwen/Qwen3-0.6B" ;;
+    qwen3-8b)       convert qwen3-8b       "Qwen/Qwen3-8B" ;;
     deepseek2-16b)  convert deepseek2-16b  "deepseek-ai/DeepSeek-V2-Lite-Chat" ;;
     *) echo "unknown model $m"; exit 1 ;;
   esac

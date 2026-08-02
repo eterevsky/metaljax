@@ -82,6 +82,11 @@ SPECS = {
         overrides=["sparse_matmul=true", "megablox=false", "capacity_factor=-1.0",
                    "mla_naive_kvcache=false"],
     ),
+    "qwix-int8-qwen3-8b": dict(
+        model_name="qwen3-8b",
+        ckpt="qwen3-8b",
+        overrides=["use_qwix_quantization=true", "quantization=int8"],
+    ),
     "maxtext-train-06b": dict(
         model_name="qwen3-0.6b",
         ckpt="qwen3-0.6b",
@@ -93,6 +98,7 @@ SPECS = {
 # which resolves out of ~/.cache/huggingface when present.
 TOKENIZERS = {
     "Qwen/Qwen3-0.6B": "Qwen/Qwen3-0.6B",
+    "Qwen/Qwen3-8B": "Qwen/Qwen3-8B",
     "deepseek-ai/DeepSeek-V2-Lite-Chat": "deepseek-ai/DeepSeek-V2-Lite-Chat",
 }
 
