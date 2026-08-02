@@ -1,0 +1,77 @@
+# MaxText dependency set for macOS / Apple silicon, accelerator-free.
+#
+# Hand-built from maxtext's src/dependencies/requirements/requirements_decoupled_jax_0_7.1.txt
+# (pip has no "cpu" extra, and the generated tpu/cuda12 extras pull libtpu /
+# nvidia wheels). Install it together with constraints_maxtext.txt so nothing
+# can move jax/jaxlib off 0.11.0 -- setup_maxtext.sh does this for you.
+#
+# REMOVED from the upstream list, with reasons:
+#   jax==0.7.1              metaljax pins jax==0.11.0 + jaxlib==0.11.0.
+#   tensorflow              CANNOT be co-installed: `import grain; import
+#                           tensorflow` (and the reverse order) SEGFAULTs on
+#                           macOS/arm64 -- both ship their own protobuf/absl
+#                           C++ symbols. grain is mandatory (imported by
+#                           maxtext.common.checkpointing); TF is only needed by
+#                           the TFDS input pipeline, and we run
+#                           dataset_type=synthetic. adapter_maxtext._stub_tensorflow
+#                           covers the one attribute the train module touches.
+#   tensorflow_text         no macOS/arm64 wheels at all.
+#   tensorflow_datasets     TFDS pipeline only.
+#   libtpu                  already marker-gated to linux/x86 upstream.
+#   git+tunix               post-training (GRPO/SFT) only.
+#   datasets, evaluate, nltk, matplotlib, pandas, jsonlines, tabulate,
+#   grpcio, parameterized, pytest
+#                           eval/plotting/test extras, unused by decode and by
+#                           the synthetic-data train step.
+#
+# ADDED over the upstream list (transitive imports that upstream gets from the
+# tpu/cuda extras, each one found by an ImportError on a clean venv):
+#   pathwaysutils   maxtext.utils.elastic_utils imports it unconditionally
+#                   (and it needs fastapi/uvicorn, so no --no-deps here)
+#   jinja2          maxtext.configs.types
+#   tokamax         maxtext.layers.attention_op (module-scope import)
+#   immutabledict,  tokamax's own deps -- tokamax is installed --no-deps
+#   einshape,       because its pinned jax would fight ours
+#   typeguard==2.13.3
+#                   tokamax/jaxtyping need the pre-3.0 typeguard API; 4.x
+#                   tries to ast.parse jaxtyping shape strings ("*B T H d")
+#                   and dies with SyntaxError at import
+#   drjax           maxtext.trainers.diloco (imported via train_utils)
+#   grain           maxtext.common.checkpointing
+#   pillow          maxtext.multimodal.utils
+#   sympy           maxtext.layers.engram
+
+absl-py>=2.3.1
+aqtp>=0.9.0
+chex>=0.1.90
+drjax>=0.2.0
+einshape>=1.0
+etils>=1.13.0
+flax>=0.12.0
+grain>=0.2.12
+huggingface_hub>=0.35.3
+immutabledict>=4.3.1
+jaxtyping>=0.3.3
+jinja2>=3.1.6
+ml_collections>=1.1.0
+ml_dtypes>=0.5.3
+numpy>=2.0.2
+omegaconf>=2.3.0
+optax>=0.2.6
+orbax-checkpoint>=0.11.25
+pathwaysutils>=0.1.7
+pillow>=11.3.0
+protobuf>=5.29.5
+psutil>=7.0.0
+PyYAML>=6.0.3
+qwix>=0.1.1
+Requests>=2.32.5
+safetensors>=0.6.2
+sentencepiece>=0.2.1
+setuptools>=80.9.0
+sympy>=1.14.0
+tensorstore>=0.1.76
+tiktoken>=0.12.0
+tqdm>=4.67.1
+transformers>=4.57.0
+typeguard==2.13.3
