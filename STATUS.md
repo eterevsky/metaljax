@@ -1,5 +1,7 @@
 # Model benchmark suite — status
 
+*(Harness and manifest: [scripts/model_bench/](scripts/model_bench/).)*
+
 *Last updated: 2026-08-03 (block 4: big models, MoE, packed int4). Headline metric per cell: LLM rows =
 warm decode ms/token; vision = forward ms; diffusion = ms per step;
 training = ms per step. ⚠ = measured but contaminated by a since-diagnosed
