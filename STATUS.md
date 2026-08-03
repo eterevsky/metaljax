@@ -24,7 +24,7 @@ ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | — | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **52.8** (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 336 @ 2.7 GB ¹⁸ | — | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ MLX command-buffer bug ⁸ | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | — | 29.8 (b32: 591) | — |
@@ -110,9 +110,12 @@ kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     would enable a CPU reference; planned.
 13. CPU cells run what XLA:CPU supports: weights load bf16, matmuls
     upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
-14. 26B-A4B CPU attempt per Oleg, behind the memory guard: killed at
-    34 GB RSS during load (projected ~150 GB at the observed 2.9×
-    keras-CPU ratio).
+14. 26B-A4B CPU: the model cannot fit — f32 26B is ~104 GB of weights
+    alone, and the observed keras-CPU load inflation (2.9×) projects a
+    ~150 GB peak on a 128 GB machine. The guard killed the load as soon
+    as the growth trajectory made that projection conclusive (34 GB and
+    climbing); the alternative was the Qwen3.6-style swap-death (196 GB
+    footprint) that froze the machine.
 15. Released mlx-lm 0.31.3 cannot run gemma4_unified (12B) or the
     E-series KV-sharing layout (E2B) at all; these two cells measured
     on mlx-lm git main (2026-08-03 install). The 12B/31B gemma-lib
@@ -131,11 +134,13 @@ kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     attempted — foregone. gemma-lib's streaming loader handled
     62.6 GB fine, so the fix is a streaming load for the keras path.
 18. Packed int4 memory saving IS real on metaljax (2.7 vs 10.2 GB —
-    the only sub-byte JAX path that keeps it), but decode pays 11.7×
-    vs bf16 (in-graph unpack re-materializes weights per matmul).
-    XLA:CPU fuses the same unpack into a small net WIN (67.5 vs 79.2
-    bf16). Either mx.quantized_matmul mapping or unpack-fusion
-    closes it.
+    the only sub-byte JAX path that keeps it). XLA:CPU fuses the
+    in-graph unpack into a small net WIN (67.5 vs 79.2 bf16). The
+    mx.quantized_matmul recognizer (5fd6b2a) + interleaved-group
+    K-permutation (f45bbbe) took metal 336 → 241 → 85.0 ms/tok
+    (all 777 quantized dots fuse; decode body compiles). The residual
+    1.25× vs CPU is the batch-1 GEMV kernel-launch floor (~2k Metal
+    dispatches/token; XLA:CPU launches nothing) — C++-era.
 19. torch SD3.5 via the ungated diffusers mirror
     adamo1139/stable-diffusion-3.5-large-ungated @5d868ff (official
     repo is gated); coherent images verified at both resolutions.
