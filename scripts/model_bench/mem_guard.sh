@@ -69,7 +69,16 @@ fire() {  # reason
 while kill -0 $CHILD 2>/dev/null; do
   SAMPLE=$(/usr/bin/top -l 1 -o mem -n 12 -stats pid,mem,command 2>/dev/null)
   FOOT=$(echo "$SAMPLE" | awk -v p=$CHILD '$1==p {print $2; exit}')
-  SYS=$(echo "$SAMPLE" | awk '/^PhysMem/ {print $2}')
+  # System pressure = CLAIMED memory (wired + anonymous + compressor), NOT
+  # top's PhysMem "used": that figure includes the reclaimable file cache,
+  # which a 60+ GB checkpoint read fills legitimately -- it false-tripped
+  # the ceiling at zero actual pressure (rows 8/9, 2026-08-03).
+  SYS=$(vm_stat 2>/dev/null | awk '
+      /page size of/ {ps=$8}
+      /Pages wired down/ {w=$4+0}
+      /Anonymous pages/ {a=$3+0}
+      /Pages occupied by compressor/ {c=$5+0}
+      END {printf "%.1fG", (w+a+c)*ps/1073741824}')
   RSSKB=$(ps -o rss= -p $CHILD 2>/dev/null | tr -d ' ')
   SWAP=$(/usr/sbin/sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}')
   NOW=$(date +%s)
