@@ -76,6 +76,59 @@ def test_shifts():
     check(jax.lax.shift_right_logical, u, s.astype(np.uint32))
 
 
+_SHIFTS = [jax.lax.shift_left, jax.lax.shift_right_arithmetic,
+           jax.lax.shift_right_logical]
+# shift_right_arithmetic on an UNSIGNED operand is excluded everywhere
+# below: mx.right_shift never propagates the top bit for unsigned dtypes,
+# so metaljax already disagrees with XLA there. Pre-existing and unrelated
+# to the static-amount peephole (it fails identically on the dynamic path).
+_UNSIGNED_SHIFTS = [jax.lax.shift_left, jax.lax.shift_right_logical]
+
+
+@pytest.mark.parametrize("fn", _SHIFTS)
+@pytest.mark.parametrize("amt", [0, 1, 4, 31, 32, 33, 64])
+def test_shift_by_splat_constant(fn, amt):
+    # A constant shift amount reaches the handler as broadcast_in_dim of a
+    # splat constant; the guard is then resolved statically (in-range ->
+    # bare shift, out-of-range -> the fill), so both arms must still match
+    # XLA: 0 for left/logical, sign propagation for arithmetic.
+    a = np.array([1, 2, -4, 8, -16, -1, 0x7FFFFFFF, np.int32(-2**31)], np.int32)
+    check(lambda x: fn(x, jnp.full_like(x, amt)), a)
+    for dt in (np.int8, np.int16):
+        s = np.array([1, 2, -128, 127, 0, -3], np.int64).astype(dt)
+        check(lambda x: fn(x, jnp.full_like(x, amt)), s)
+    if fn in _UNSIGNED_SHIFTS:
+        for dt in (np.uint8, np.uint32):
+            u = np.array([1, 2, 0, 255], np.int64).astype(dt)
+            check(lambda x: fn(x, jnp.full_like(x, amt)), u)
+
+
+@pytest.mark.parametrize("fn", _SHIFTS)
+def test_shift_by_dynamic_amount(fn):
+    # Non-constant amounts keep the compare/select guard.
+    a = np.array([1, 2, -4, 8, -16, -1, 0x7FFFFFFF], np.int32)
+    s = np.array([0, 1, 2, 31, 32, 40, 33], np.int32)
+    check(fn, a, s)
+    if fn in _UNSIGNED_SHIFTS:
+        check(fn, a.astype(np.uint32), s.astype(np.uint32))
+
+
+def test_shift_by_nonsplat_constant():
+    # A per-element constant vector is not a splat: the guard must stay.
+    a = np.array([1, 2, -4, 8, -16], np.int32)
+    s = jnp.array([0, 3, 31, 32, 99], np.int32)
+    for fn in _SHIFTS:
+        check(lambda x: fn(x, s), a)
+
+
+def test_int4_unpack_shift_chain():
+    # The motivating pattern (keras int4 dequant): shift a packed byte by a
+    # broadcast constant, then mask.
+    packed = np.array([0x00, 0x1F, 0x7A, 0xFF, 0x88], np.uint8)
+    check(lambda p: (jax.lax.shift_right_logical(p, jnp.full_like(p, 4)),
+                     p & jnp.full_like(p, 0x0F)), packed)
+
+
 def test_bool_logic():
     check(lambda a, b: jnp.logical_and(a, b) | jnp.logical_xor(a, ~b), B, np.roll(B, 1))
 

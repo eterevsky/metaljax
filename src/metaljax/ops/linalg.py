@@ -11,6 +11,60 @@ from metaljax import dtypes
 from metaljax.interpreter import register
 
 
+# f32 holds every integer up to 2**24 exactly, so a sum of integer products
+# is exact -- in ANY accumulation order -- as long as the sum of the products'
+# magnitudes stays within that range (every partial sum is bounded by it too).
+_F32_EXACT_INT = 1 << 24
+
+# Largest magnitude a value of this dtype can have. The emulated i4/ui4 live
+# in i8/ui8 storage and are covered by their storage type's (larger) bound.
+_INT_MAX_ABS = {mx.int8: 128, mx.uint8: 255}
+
+
+def _exact_f32_chunk(ld, rd):
+    """Contraction-dim chunk size that keeps an integer dot exact under f32
+    matmul, or None if these operands cannot use the f32 path.
+
+    MLX has no integer matmul at all, so the general fallback materializes a
+    whole [B, M, K, N] int64 outer product and reduces it in a second kernel
+    -- 8 bytes of traffic per multiply-accumulate. For 8-bit operands we can
+    instead run the real f32 matmul over K-slices short enough that no
+    partial sum can leave f32's exact-integer range, then accumulate the
+    (exact) per-chunk results in integer arithmetic. Wider operands have
+    products f32 cannot represent at all, so they keep the int64 path.
+    """
+    ml = _INT_MAX_ABS.get(ld)
+    mr = _INT_MAX_ABS.get(rd)
+    if ml is None or mr is None:
+        return None
+    # Round down to a power of two: i8xi8 -> 1024, i8xu8 -> 512, u8xu8 -> 256.
+    return 1 << ((_F32_EXACT_INT // (ml * mr)).bit_length() - 1)
+
+
+def _int_dot_via_f32(l3, r3, chunk, out_dtype):
+    """[B, M, K] x [B, K, N] integer dot as exact f32 matmuls over K-chunks.
+
+    Each chunk's f32 result is an exact integer; casting it to the integer
+    accumulator and adding wraps in two's complement exactly like XLA's
+    integer dot, which is defined modulo the result width.
+    """
+    k = l3.shape[2]
+    # 64-bit results must not wrap at 32 bits; everything narrower is
+    # congruent mod 2**32 to the true sum, and the final astype narrows it.
+    acc_dtype = mx.int64 if out_dtype.size == 8 else mx.int32
+    o3 = None
+    for s in range(0, k, chunk):
+        if k <= chunk:
+            lp, rp = l3, r3
+        else:
+            lp = l3[:, :, s:s + chunk]
+            rp = r3[:, s:s + chunk, :]
+        part = mx.matmul(lp.astype(mx.float32), rp.astype(mx.float32))
+        part = part.astype(acc_dtype)
+        o3 = part if o3 is None else o3 + part
+    return o3.astype(out_dtype)
+
+
 def _dot_dims(op):
     attr = op.attributes["dot_dimension_numbers"]
     try:
@@ -66,7 +120,13 @@ def _dot_general(interp, op, ins, env):
         # carries no data anyway, so construct it directly.
         return mx.zeros(batch + m + n, dtype=out_dtype)
 
-    if dtypes.is_int(out_dtype) or dtypes.is_bool(out_dtype):
+    chunk = (_exact_f32_chunk(l3.dtype, r3.dtype)
+             if dtypes.is_int(out_dtype) and prod(k) != 0 else None)
+    if chunk is not None:
+        # Narrow integer operands: exact, and orders of magnitude cheaper
+        # than materializing the outer product below.
+        o3 = _int_dot_via_f32(l3, r3, chunk, out_dtype)
+    elif dtypes.is_int(out_dtype) or dtypes.is_bool(out_dtype):
         # MLX matmul is float-only; do an explicit multiply-accumulate.
         acc = l3.astype(mx.int64) if not dtypes.is_bool(out_dtype) else l3
         prod_ = acc[:, :, :, None] * r3.astype(acc.dtype)[:, None, :, :]

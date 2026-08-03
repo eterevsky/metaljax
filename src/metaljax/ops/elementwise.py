@@ -376,17 +376,56 @@ def _logical_or_bitwise(logical, bitwise):
     return fn
 
 
-def _shift_guard(a, b, fn, overflow):
+def _static_splat_int(v) -> int | None:
+    """Value of an integer SSA value that is statically a splat constant
+    (possibly broadcast/reshaped to the operand's shape), else None.
+
+    Shift amounts are overwhelmingly compile-time constants -- keras' int4
+    unpack shifts by broadcast_in_dim(constant 4) -- and knowing the value
+    lets _shift_guard skip its whole compare/select machinery.
+    """
+    while isinstance(v, ir.OpResult):
+        o = v.owner.operation
+        if o.name in ("stablehlo.broadcast_in_dim", "stablehlo.reshape",
+                      "stablehlo.broadcast"):
+            v = o.operands[0]
+            continue
+        if o.name != "stablehlo.constant":
+            return None
+        try:
+            t = ir.RankedTensorType(o.results[0].type)
+            if not dtypes.is_int(dtypes.mx_dtype_for(t.element_type)):
+                return None
+            attr = o.attributes["value"]
+            val = _ir.splat_scalar_np(attr, t)
+            if val is None:
+                if tuple(t.shape):
+                    return None  # a real multi-valued constant
+                val = _ir.dense_to_np(attr, t)
+            return int(val)
+        except Exception:
+            return None
+    return None
+
+
+def _shift_guard(a, b, op, fn, overflow):
     # XLA: shifting by >= bit width yields 0 (logical/left) or the sign
     # fill (arithmetic); Metal shifts are mod-width (x86-style).
     w = a.dtype.size * 8
-    over = b.astype(mx.int32) >= w
-    base = fn(a, b)
     if overflow == "sign":
-        fill = fn(a, mx.array(w - 1, dtype=b.dtype).astype(b.dtype))
+        def fill():
+            return fn(a, mx.array(w - 1, dtype=b.dtype).astype(b.dtype))
     else:
-        fill = mx.zeros_like(a)
-    return mx.where(over, fill, base)
+        def fill():
+            return mx.zeros_like(a)
+    c = _static_splat_int(op.operands[1])
+    if c is not None and c >= 0:
+        # Static amount: emit one of the two arms, not both plus a select.
+        # (Negative amounts are left to the generic path, which keeps
+        # whatever the underlying shift does with them today.)
+        return fill() if c >= w else fn(a, b)
+    over = b.astype(mx.int32) >= w
+    return mx.where(over, fill(), fn(a, b))
 
 
 def _shift_right_logical(a, b):
@@ -411,14 +450,16 @@ _BINARY = {
     "xor": _logical_or_bitwise(
         lambda a, b: mx.not_equal(a, b), mx.bitwise_xor
     ),
-    "shift_left": lambda a, b: _shift_guard(a, b, mx.left_shift, "zero"),
-    "shift_right_logical": lambda a, b: _shift_guard(
-        a, b, _shift_right_logical, "zero"),
-    "shift_right_arithmetic": lambda a, b: _shift_guard(
-        a, b, mx.right_shift, "sign"),
+    "shift_left": lambda a, b, op: _shift_guard(a, b, op, mx.left_shift, "zero"),
+    "shift_right_logical": lambda a, b, op: _shift_guard(
+        a, b, op, _shift_right_logical, "zero"),
+    "shift_right_arithmetic": lambda a, b, op: _shift_guard(
+        a, b, op, mx.right_shift, "sign"),
 }
 
 _WRAP4 = {"add", "multiply", "subtract"}
+# Handlers that inspect the IR (the shift guards peephole static amounts).
+_NEEDS_OP = {"shift_left", "shift_right_logical", "shift_right_arithmetic"}
 
 
 def _maybe_wrap4(op, ins, out):
@@ -435,8 +476,9 @@ def _maybe_wrap4(op, ins, out):
 
 
 for _name, _fn in _BINARY.items():
-    def _h(interp, op, ins, env, _fn=_fn, _w=_name in _WRAP4):
-        out = _fn(ins[0], ins[1])
+    def _h(interp, op, ins, env, _fn=_fn, _w=_name in _WRAP4,
+           _o=_name in _NEEDS_OP):
+        out = _fn(ins[0], ins[1], op) if _o else _fn(ins[0], ins[1])
         if _w and out.dtype in (mx.int8, mx.uint8):
             out = _maybe_wrap4(op, ins, out)
         return _regrid(op, out) if out.dtype == mx.float16 else out

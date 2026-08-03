@@ -56,6 +56,113 @@ def test_int_matmul():
     check(jnp.matmul, a, b)
 
 
+def _idot(a, b, out=jnp.int32):
+    return jax.lax.dot_general(a, b, (((a.ndim - 1,), (0,)), ((), ())),
+                               preferred_element_type=out)
+
+
+# 8-bit operands take the chunked-f32 dot (MLX has no integer matmul); the
+# chunk is sized so no partial sum can leave f32's exact-integer range, so
+# every case below must match the CPU backend BITWISE, not approximately.
+# K is swept across the i8 chunk boundary (1024) and well past it.
+@pytest.mark.parametrize("K", [7, 256, 1024, 1040, 4096, 12288])
+@pytest.mark.parametrize("M", [1, 64])
+def test_int8_dot_exact(K, M):
+    a = rng.integers(-128, 128, (M, K)).astype(np.int8)
+    b = rng.integers(-128, 128, (K, 24)).astype(np.int8)
+    check(_idot, a, b)
+
+
+@pytest.mark.parametrize("K", [1024, 1040, 4096, 12288])
+def test_int8_dot_adversarial(K):
+    # Every element at an extreme, so the true |sum| is K * 128 * 127 or
+    # K * 128**2 -- far past 2**24, where a single unchunked f32 matmul
+    # starts losing whole integers.
+    for av, bv in ((-128, -128), (127, -128), (-128, 127), (127, 127)):
+        check(_idot, np.full((64, K), av, np.int8),
+              np.full((K, 8), bv, np.int8))
+
+
+def test_int8_dot_s32_wraparound():
+    # True sum 3,288,334,336 > 2**31: XLA's integer dot is defined modulo
+    # the result width, and the chunk accumulator has to wrap the same way.
+    K = 200704
+    a = np.full((4, K), -128, np.int8)
+    b = np.full((K, 3), -128, np.int8)
+    check(_idot, a, b)
+
+
+def test_int8_dot_narrow_result():
+    # preferred_element_type narrower than the accumulator: the result
+    # wraps to 8 bits.
+    a = rng.integers(-128, 128, (6, 2048)).astype(np.int8)
+    b = rng.integers(-128, 128, (2048, 5)).astype(np.int8)
+    check(lambda x, y: _idot(x, y, jnp.int8), a, b)
+    check(lambda x, y: _idot(x, y, jnp.int16), a, b)
+
+
+@pytest.mark.parametrize("K", [255, 256, 257, 12288])
+def test_uint8_dot_exact(K):
+    # u8 x u8 peaks at 255**2 per product, so the chunk is 256; the
+    # all-255 case is the worst input there is.
+    a = rng.integers(0, 256, (16, K)).astype(np.uint8)
+    b = rng.integers(0, 256, (K, 9)).astype(np.uint8)
+    check(lambda x, y: _idot(x, y, jnp.uint32), a, b)
+    check(lambda x, y: _idot(x, y, jnp.uint32),
+          np.full((8, K), 255, np.uint8), np.full((K, 4), 255, np.uint8))
+
+
+def test_mixed_sign_int8_dot():
+    # jax converts mixed-signedness operands to i32 before the dot, so the
+    # i8 x u8 chunk (512) is only reachable from a hand-written module.
+    from metaljax.interpreter import Interpreter
+    import mlx.core as mx
+
+    mod = """
+module {
+  func.func @main(%a: tensor<3x2048xi8>, %b: tensor<2048x5xui8>) -> tensor<3x5xi32> {
+    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (tensor<3x2048xi8>, tensor<2048x5xui8>) -> tensor<3x5xi32>
+    return %0 : tensor<3x5xi32>
+  }
+}
+"""
+    interp = Interpreter(mod)
+    for a, b in (
+        (np.full((3, 2048), -128, np.int8), np.full((2048, 5), 255, np.uint8)),
+        (rng.integers(-128, 128, (3, 2048)).astype(np.int8),
+         rng.integers(0, 256, (2048, 5)).astype(np.uint8)),
+    ):
+        (out,) = interp(mx.array(a), mx.array(b))
+        want = (a.astype(np.int64) @ b.astype(np.int64)).astype(np.int32)
+        np.testing.assert_array_equal(np.array(out), want)
+
+
+def test_int8_dot_batched_and_multi_contracting():
+    # The chunk slicing happens on the canonicalized [B, M, K] x [B, K, N]
+    # form, so batch dims and a multi-dimension contraction (qwix's output
+    # projection contracts [2,3] x [0,1]) must slice correctly too.
+    a = rng.integers(-128, 128, (3, 5, 2048)).astype(np.int8)
+    b = rng.integers(-128, 128, (3, 2048, 7)).astype(np.int8)
+    check(lambda x, y: jax.lax.dot_general(
+        x, y, (((2,), (1,)), ((0,), (0,))),
+        preferred_element_type=jnp.int32), a, b)
+    a2 = np.full((1, 4, 16, 128), -128, np.int8)
+    b2 = np.full((16, 128, 64), -128, np.int8)
+    check(lambda x, y: jax.lax.dot_general(
+        x, y, (((2, 3), (0, 1)), ((), ())),
+        preferred_element_type=jnp.int32), a2, b2)
+
+
+def test_int16_dot_stays_exact():
+    # i16 products (up to 2**30) are not f32-representable, so these keep
+    # the int64 outer-product path -- which must still be exact.
+    a = rng.integers(-32768, 32768, (5, 300)).astype(np.int16)
+    b = rng.integers(-32768, 32768, (300, 4)).astype(np.int16)
+    check(_idot, a, b)
+    check(_idot, np.full((5, 300), -32768, np.int16),
+          np.full((300, 4), -32768, np.int16))
+
+
 def test_mixed_precision_matmul():
     a = rng.standard_normal((4, 5)).astype(jnp.bfloat16)
     b = rng.standard_normal((5, 6)).astype(jnp.bfloat16)
