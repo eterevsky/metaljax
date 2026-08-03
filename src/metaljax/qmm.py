@@ -99,6 +99,7 @@ METALJAX_QMM=0 disables the whole recognizer.
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 import weakref
@@ -1400,6 +1401,15 @@ def prologue(interp, args) -> bool:
             try:
                 pk, fresh = _resolve(interp, m, args)
                 packed_any = packed_any or fresh
+                if fresh:
+                    # Packing one weight peaks ~10 GB active and leaves ~8 GB
+                    # in MLX's cache at gpt-oss scale; clearing only at the
+                    # END of the prologue let 24 layers of that accumulate
+                    # (the +14 GB/sample ramp that guard-killed the row-7
+                    # re-measure). Reclaim per pack: gc first, dead refcycles
+                    # pin buffers clear_cache cannot free (CLAUDE.md item 19).
+                    gc.collect()
+                    mx.clear_cache()
             except Exception as e:
                 m.disabled = True
                 changed = True
@@ -1492,6 +1502,30 @@ def emit_reads(m):
         from metaljax import moe as _moe
         return _moe.emit_reads(m)
     return (m.lhs,)
+
+
+def emit_bytes(m) -> int:
+    """Device bytes `emit` materializes BEYOND the root's own result.
+
+    ops.control._block_bytes charges every absorbed op nothing -- right, they
+    never run -- and the root its declared result, which for a quantized
+    matmul is the product itself. What that misses is the activation copy:
+    `emit` may transpose it, cast it to a float type and take a group
+    permutation of it before handing it to `quantized_matmul`. One copy of
+    the LHS is the bound, and it is charged whether or not this particular
+    match needs one (a few MB on decode shapes, and the direction to err in).
+
+    The packed weight and its scales are NOT counted: the packing prologue
+    owns them, they exist before the trace begins and outlive it, so they are
+    not part of what tracing this block materializes.
+
+    Keep in step with `emit`, like `emit_reads`.
+    """
+    if not isinstance(m, Match):
+        from metaljax import moe as _moe
+        return _moe.emit_bytes(m)
+    from metaljax.interpreter import value_bytes
+    return value_bytes(m.lhs)
 
 
 def emit(interp, m, env):

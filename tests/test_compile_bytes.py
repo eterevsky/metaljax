@@ -29,9 +29,9 @@ import jax
 import jax.numpy as jnp
 
 import helpers
-from metaljax import Interpreter, sdpa
+from metaljax import Interpreter, moe, qmm, sdpa
 from metaljax import dtypes as mdt
-from metaljax.interpreter import op_bytes, value_bytes
+from metaljax.interpreter import BYTES_UNKNOWN, op_bytes, value_bytes
 from metaljax.ops import control
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -206,6 +206,191 @@ def test_absorbed_attention_is_not_charged():
     finally:
         sdpa.ENABLED = old
     assert fused < literal / 2, (fused, literal)
+
+
+# --------------------------------------------------------------------------
+# what a fused ROOT materializes
+# --------------------------------------------------------------------------
+#
+# Charging absorbed ops nothing is right; charging their ROOT only its own
+# declared result is not, and on an expert-gather rewrite it is not close.
+# The dense region a MoE match absorbs is essentially the whole layer, so the
+# estimate collapsed onto the [tokens, hidden] output and reported ~nothing:
+# measured on gpt-oss-20b's decode program, 156 of 783 ops are absorbed and
+# they carry 99.97% of the block's declared result bytes (28.9 of 28.9 GB) --
+# estimate 10.4 MB against a first-call trace that really peaked at 55.8 MB,
+# and 71.1 MB against 107.1 MB once the prompt was 64 tokens rather than 11.
+# What actually runs is the gathered emission, in PAIR space (P = T*K rows),
+# and that is what `moe.emit_bytes` charges: 34.1 MB and 214.0 MB for those
+# same two programs, back on the safe side of measurement.
+
+
+def _moe_program(T, E=8, K=2, H=64, I=32):
+    import test_moe as tm
+
+    w = tm.make_weights(E, T, H, I, seed=T)
+    code = helpers.lower_bytes(lambda *a: tm.moe_block(*a, k=K), *tm._args(w))
+    interp = Interpreter(code)
+    with interp.context:
+        st = qmm.analyze(interp)   # the recognizer pass, IR only
+        blk = interp._main_block()
+        skip = st.skip if st.active else frozenset()
+        literal = sum(op_bytes(o.operation) for o in blk.operations
+                      if not (len(o.operation.results)
+                              and o.operation.results[0] in skip))
+        return control._block_bytes(interp, blk), literal, st
+
+
+@pytest.mark.skipif(not moe.ENABLED, reason="METALJAX_MOE=0")
+def test_absorbed_moe_root_is_charged_what_its_emission_builds():
+    nb, literal, st = _moe_program(T=8)
+    assert len(st.moe) == 1 and st.active
+    assert st.skip, "nothing absorbed: the recognizer did not fire"
+    # `literal` is what this block was worth before emit_bytes existed: every
+    # unabsorbed op's result, and nothing at all for the rewrite. (It is a
+    # few bytes under _block_bytes' own walk, which also recurses into the
+    # reduce/top_k region bodies -- hence the size-scaled bound below rather
+    # than a bare inequality.)
+    P, I = 8 * 2, 32
+    assert nb - literal >= P * 2 * I * 4, (nb, literal)
+
+
+@pytest.mark.skipif(not moe.ENABLED, reason="METALJAX_MOE=0")
+def test_moe_estimate_grows_with_the_pair_space():
+    """The absorbed region's cost is per (token, selected expert) pair, so
+    the estimate has to move with the token count. Charging the root its own
+    result made it nearly flat -- which is how a prefill 60x the size of a
+    decode step looked identical to the gate."""
+    small, lit_s, _ = _moe_program(T=4)
+    big, lit_b, _ = _moe_program(T=64)
+    grew = (big - lit_b) / max(small - lit_s, 1)
+    assert grew > 8, (small, lit_s, big, lit_b)
+
+
+# --------------------------------------------------------------------------
+# outputs no operation produces
+# --------------------------------------------------------------------------
+
+
+_PASSTHROUGH = """
+  func.func @main(%a: tensor<256x256xf32>) -> tensor<256x256xf32> {
+    return %a : tensor<256x256xf32>
+  }
+"""
+
+
+def test_passthrough_output_is_charged_at_program_level():
+    """`func.return %arg0` has no op to charge, but XLA's no-alias contract
+    makes engine.execute copy the result -- keras' streaming loader lowers
+    every variable move to exactly this, and each one really did copy 1.1 GB
+    of embedding while the estimate read 0.0 MB."""
+    interp = Interpreter(_PASSTHROUGH)
+    with interp.context:
+        blk = interp._main_block()
+        assert control._block_bytes(interp, blk) == 0   # no ops to charge
+        assert control.program_bytes(interp, blk) == 256 * 256 * 4
+
+
+# jax does not lower a while_loop's closed-over constants as region captures:
+# they become carries the body returns UNCHANGED (see qmm._hoist). A decode
+# loop's weights arrive that way, so a body's pass-throughs can be the whole
+# parameter set.
+_CARRIED = """
+  func.func @main(%a: tensor<4xf32>, %w: tensor<1024x1024xf32>)
+      -> tensor<4xf32> {
+    %z = stablehlo.constant dense<0> : tensor<i32>
+    %n = stablehlo.constant dense<10> : tensor<i32>
+    %r:3 = "stablehlo.while"(%z, %a, %w) ({
+      ^cond(%i: tensor<i32>, %c: tensor<4xf32>, %cw: tensor<1024x1024xf32>):
+        %p = stablehlo.compare LT, %i, %n : (tensor<i32>, tensor<i32>) -> tensor<i1>
+        stablehlo.return %p : tensor<i1>
+    }, {
+      ^body(%i: tensor<i32>, %c: tensor<4xf32>, %cw: tensor<1024x1024xf32>):
+        %one = stablehlo.constant dense<1> : tensor<i32>
+        %ni = stablehlo.add %i, %one : tensor<i32>
+        %nc = stablehlo.add %c, %c : tensor<4xf32>
+        stablehlo.return %ni, %nc, %cw
+            : tensor<i32>, tensor<4xf32>, tensor<1024x1024xf32>
+    }) : (tensor<i32>, tensor<4xf32>, tensor<1024x1024xf32>)
+       -> (tensor<i32>, tensor<4xf32>, tensor<1024x1024xf32>)
+    return %r#1 : tensor<4xf32>
+  }
+"""
+
+
+def test_passthrough_charge_stays_out_of_loop_bodies():
+    """A while body returns its carries, and jax turns a loop's closed-over
+    constants into exactly that. Charging those x trip would put 40 GB on a
+    ten-iteration loop over one 4 MB weight -- it would inflate every scan in
+    texmo and move the chunk sizing the command-buffer lottery is pinned to.
+    So the pass-through term is a whole-PROGRAM term only."""
+    from metaljax import msl_scan
+    old = msl_scan.ENABLED
+    try:
+        msl_scan.ENABLED = False
+        interp = Interpreter(_CARRIED)
+        with interp.context:
+            blk = interp._main_block()
+            body = list(blk.operations)[2].operation.regions[1].blocks[0]
+            # the carried weight IS a pass-through of the body's block args...
+            assert control._passthrough_bytes(body) == 1024 * 1024 * 4
+            # ...and the estimate the loop sites use does not see it.
+            whole = control._block_bytes(interp, blk)
+            assert whole < 10 * 1024 * 1024 * 4, whole
+            # main returns none of its own arguments, so nothing is added.
+            assert control.program_bytes(interp, blk) == whole
+    finally:
+        msl_scan.ENABLED = old
+
+
+# --------------------------------------------------------------------------
+# values the estimator cannot size
+# --------------------------------------------------------------------------
+
+
+def test_tuple_type_is_sized_through_its_leaves():
+    """A type the sizing code does not handle used to return 0 from a bare
+    `except`, which is indistinguishable from "carries no data"."""
+    interp = Interpreter(_PASSTHROUGH)
+    with interp.context:
+        from jaxlib.mlir import ir
+        from metaljax.interpreter import _type_bytes
+
+        with ir.Location.unknown():
+            f32 = ir.F32Type.get()
+            t = ir.TupleType.get_tuple([
+                ir.RankedTensorType.get([4, 4], f32),
+                ir.RankedTensorType.get([8], f32),
+            ])
+        assert _type_bytes(t) == (16 + 8) * 4
+
+
+def test_unsized_type_is_counted_not_silently_zero():
+    interp = Interpreter(_PASSTHROUGH)
+    with interp.context:
+        from jaxlib.mlir import ir
+        from metaljax.interpreter import _type_bytes
+
+        before = BYTES_UNKNOWN["unsized"]
+        assert _type_bytes(ir.Type.parse("tensor<*xf32>")) == 0
+        assert BYTES_UNKNOWN["unsized"] == before + 1
+
+
+def test_token_and_dynamic_zero_are_not_counted_as_unsized():
+    """The two zeros that are correct: a token really carries nothing, and a
+    symbolic dimension is a deliberate abstention (guessing it would invent
+    numbers on every shape-poly export)."""
+    interp = Interpreter(_PASSTHROUGH)
+    with interp.context:
+        from jaxlib.mlir import ir
+        from metaljax.interpreter import _type_bytes
+
+        before = dict(BYTES_UNKNOWN)
+        assert _type_bytes(ir.Type.parse("!stablehlo.token")) == 0
+        assert BYTES_UNKNOWN["unsized"] == before["unsized"]
+        assert _type_bytes(ir.Type.parse("tensor<?x4xf32>")) == 0
+        assert BYTES_UNKNOWN["unsized"] == before["unsized"]
+        assert BYTES_UNKNOWN["dynamic"] == before["dynamic"] + 1
 
 
 # --------------------------------------------------------------------------

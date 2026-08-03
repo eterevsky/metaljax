@@ -74,6 +74,17 @@ _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 # Observability, for tests and for the "did this fire?" question.
 FLUSH_STATS = {"flushes": 0, "bytes": 0}
 
+# Types `value_bytes` sized as zero for a reason other than "carries no
+# data", counted apart. A memory estimate that silently reports zero for
+# something it does not understand is worse than no estimate: `dynamic` is a
+# deliberate, documented abstention (shape-poly export, where guessing a
+# symbolic dim invents numbers), `unsized` is not -- it means a type the
+# sizing code did not anticipate, and it has to be visible rather than folded
+# into a total that then looks small. Counts are per sizing CALL, so memoized
+# lookups do not tick them; treat them as "did this happen at all", which is
+# what the METALJAX_DEBUG `unsized=` field reports.
+BYTES_UNKNOWN = {"dynamic": 0, "unsized": 0}
+
 
 def value_bytes(v: ir.Value, cache: dict | None = None) -> int:
     """Estimated device bytes of an SSA value.
@@ -84,6 +95,12 @@ def value_bytes(v: ir.Value, cache: dict | None = None) -> int:
     That is fine for a flush cadence -- it only makes the safety net fire
     earlier -- and it is exactly why such an estimate must never be used as a
     correctness gate (notes/mlx-command-buffer-split.md addendum).
+
+    Zero means one of three different things, and they are counted apart in
+    BYTES_UNKNOWN so a caller can tell them apart: a token (really carries no
+    data), a dynamic dimension (declining to guess), and a type this code
+    could not size at all (a bug, or a dialect extension -- it gets counted
+    and, under METALJAX_DEBUG, named).
 
     `cache` keys results by ir.Type. MLIR uniques types within a context, so
     one dict per block collapses thousands of these to a handful of real
@@ -96,22 +113,46 @@ def value_bytes(v: ir.Value, cache: dict | None = None) -> int:
         got = cache.get(t)
         if got is not None:
             return got
-    nb = 0
-    if not _ir.is_token(t):
-        try:
-            rt = ir.RankedTensorType(t)
-            n = 1
-            for d in rt.shape:
-                if d < 0:
-                    n = 0  # dynamic dim (shape-poly export): don't guess
-                    break
-                n *= d
-            nb = n * dtypes.np_dtype_for_mlir(rt.element_type).itemsize
-        except Exception:
-            nb = 0
+    nb = _type_bytes(t)
     if cache is not None:
         cache[t] = nb
     return nb
+
+
+def _type_bytes(t: ir.Type) -> int:
+    """`value_bytes` without the cache, so tuple elements can recurse."""
+    if _ir.is_token(t):
+        return 0
+    try:
+        rt = ir.RankedTensorType(t)
+    except Exception:
+        rt = None
+    if rt is not None:
+        n = 1
+        for d in rt.shape:
+            if d < 0:
+                # Dynamic dim (shape-poly export): don't guess. Deliberate,
+                # and it only makes a gate fire later there.
+                BYTES_UNKNOWN["dynamic"] += 1
+                return 0
+            n *= d
+        try:
+            return n * dtypes.np_dtype_for_mlir(rt.element_type).itemsize
+        except Exception:
+            pass
+    else:
+        try:
+            tup = ir.TupleType(t)
+        except Exception:
+            tup = None
+        if tup is not None:
+            # A tuple materializes its leaves; sizing it as 0 would hide them.
+            return sum(_type_bytes(tup.get_type(i))
+                       for i in range(tup.num_types))
+    BYTES_UNKNOWN["unsized"] += 1
+    if _DEBUG and BYTES_UNKNOWN["unsized"] <= 8:
+        print(f"[metaljax] byte estimate: cannot size type {t}", flush=True)
+    return 0
 
 
 def op_bytes(o: ir.Operation, cache: dict | None = None) -> int:

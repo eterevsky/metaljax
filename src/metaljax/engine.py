@@ -211,26 +211,33 @@ class MetalExecutable:
                 # program runs op by op, where last-use pruning and the
                 # byte-denominated flush bound it, which the compiled path
                 # does not (notes/eager-memory-2026-08.md).
-                nbytes = control._block_bytes(interp, blk)
+                nbytes = control.program_bytes(interp, blk)
                 self._can_compile = (
                     COMPILE_ENABLED
                     and interp.main_pure
                     and cost <= control._TRACE_BUDGET
-                    and control._bytes_ok(interp, blk, 1, f"main {self.name}")
+                    and control._bytes_ok(interp, blk, 1, f"main {self.name}",
+                                          whole=True)
                 )
                 if control._DEBUG:
                     # `bytes` is this program's estimated traced result data
-                    # (control._block_bytes: loops unrolled, splats
-                    # broadcast, absorbed ops free) — the quantity the gate
-                    # acts on, and it is traffic, so it reads ~2.8x what the
-                    # run peaks at. `eagerbytes` is the flat per-op sum the
-                    # eager flush meters (no loop unrolling), kept because
-                    # it says which programs that safety net can act on.
+                    # (control.program_bytes: loops unrolled, splats
+                    # broadcast, absorbed ops free but their fused roots
+                    # charged what `emit` builds, plus pass-through outputs)
+                    # — the quantity the gate acts on, and it is traffic, so
+                    # it reads ~2.8x what the run peaks at. `eagerbytes` is
+                    # the flat per-op sum the eager flush meters (no loop
+                    # unrolling), kept because it says which programs that
+                    # safety net can act on. `unsized` counts values no rule
+                    # could size: nonzero means `bytes` is a floor, not a
+                    # bound, and wants looking at.
+                    from metaljax.interpreter import BYTES_UNKNOWN
                     print(f"[metaljax] exec {self.name}: pure="
                           f"{interp.main_pure} cost={cost} "
                           f"bytes={nbytes / 2**20:.1f}MB "
                           f"eagerbytes="
                           f"{sum(interp.eager_plan(blk, interp._rewrite_plan(blk))[1]) / 2**20:.1f}MB "
+                          f"unsized={BYTES_UNKNOWN['unsized']} "
                           f"compile={self._can_compile}", flush=True)
         if not self._can_compile:
             return interp

@@ -1302,6 +1302,61 @@ def emit_reads(m):
     return tuple(m.reads) + (m.router.indices, m.router.weights)
 
 
+def _node_itemsize(node) -> int:
+    """Element size of the array `emit` builds for `node`."""
+    for _ in range(64):  # _View chains are short; the bound is paranoia
+        if isinstance(node, _Dot):
+            return node.out_dtype.size
+        if isinstance(node, _View):
+            node = node.src
+            continue
+        v = None
+        if isinstance(node, _Ext):
+            v = node.op.results[0] if node.op is not None else node.value
+        elif isinstance(node, _Elem):
+            v = node.op.results[0]
+        if v is None:
+            break
+        try:
+            t = ir.RankedTensorType(v.type)
+            return dtypes.np_dtype_for_mlir(t.element_type).itemsize
+        except Exception:
+            break
+    return 4  # unknown: charge the widest ordinary element rather than none
+
+
+def emit_bytes(m) -> int:
+    """Device bytes `emit` materializes, for the compile-memory estimate.
+
+    The dense expert graph this match replaces is ABSORBED -- charged nothing
+    by ops.control._block_bytes, correctly, because those ops never run. What
+    does run is this emission, and it is not free: every node of the plan
+    becomes an array in PAIR space, `P = T * K` rows rather than the dense
+    `E * T`. On a decode step (T=1) that is a rounding error; on a prefill it
+    is the dominant term of the whole program, and charging the root only its
+    own [T, out] result -- as this estimator did until the gpt-oss row was
+    measured -- put the estimate three orders of magnitude under the truth.
+
+    Deliberately loose in the safe direction: MLX makes several of these
+    (broadcast_to, reshape, transpose views out of `_emit_view`) without
+    copying, and the emission's own peak is bounded by liveness rather than
+    by the sum. An estimate that reads high only makes the gate fire early;
+    one that reads low is what this function exists to prevent.
+
+    Keep in step with `emit`, like `emit_reads`.
+    """
+    total = 0
+    for node in m.order:
+        lead = m.P if node.paired() else 1
+        total += (lead * _prod(_trailing(node.shape, node.ea, node.ta))
+                  * _node_itemsize(node))
+    # ...and the weighting and the reduction over K that follow the plan.
+    out = m.out
+    trail = _prod(_trailing(out.shape, out.ea, out.ta))
+    total += m.P * trail * max(m.sum_dtype.size, m.out_dtype.size)
+    return total
+
+
 def emit(interp, m, env):
     """The gathered expert dispatch, in place of the dense weighted sum."""
     r = m.router

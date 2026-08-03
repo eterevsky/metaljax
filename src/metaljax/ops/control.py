@@ -11,6 +11,7 @@ from metaljax.interpreter import (
     free_values,
     op_bytes,
     register,
+    value_bytes,
 )
 
 
@@ -319,9 +320,14 @@ def _block_bytes(interp, block) -> int:
     The byte analogue of `_block_cost`, and deliberately the same walk:
     loops unrolled (trip x body, pessimistic trip=1024 when the bound is not
     static), func.call/composite callees recursed into, ops a recognizer
-    absorbs charged nothing because they never execute, and a loop that
-    became one generated msl kernel charged only its outputs (its
-    per-timestep state lives in registers, not in buffers).
+    absorbs charged nothing because they never execute -- but its ROOT
+    charged what the emission in their place really does build
+    (`<recognizer>.emit_bytes`) -- and a loop that became one generated msl
+    kernel charged only its outputs (its per-timestep state lives in
+    registers, not in buffers).
+
+    A program's own pass-through outputs are NOT here; they belong to
+    `program_bytes`, which is what a whole-program decision uses.
 
     Why a second metric at all: `_block_cost` bounds how many OPS a trace may
     contain, which bounds the Metal live-BUFFER count -- it says nothing about
@@ -355,19 +361,44 @@ def _block_bytes(interp, block) -> int:
     interp._bytes_cache[block] = 0  # break cycles defensively
     total = 0
     # Both recognizers' absorbed ops, exactly as _block_cost skips them: they
-    # are not executed and never materialize a result. A ROOT is charged its
-    # own result (the fused dot/attention does produce that), which is why
-    # only `skip` is needed here and no per-root table.
+    # are not executed and never materialize a result.
+    #
+    # A ROOT is charged its own result AND whatever its `emit` builds on the
+    # way there (`<recognizer>.emit_bytes`). Charging it the result alone was
+    # a three-orders-of-magnitude hole on rewrite-heavy graphs: on gpt-oss's
+    # decode program 156 of 783 ops are absorbed and they carry 99.97% of the
+    # block's declared result bytes (28.9 of 28.9 GB), so the estimate came
+    # back at 10.4 MB -- a number no threshold can act on. A recognizer that
+    # declares no emit_bytes keeps the old accounting, which is right where
+    # the fused op really does materialize only its output (sdpa: the whole
+    # point of mx.fast.scaled_dot_product_attention is that the [B,H,T,T]
+    # scores it absorbs are never written).
     skip = set()
-    for st in (interp._qmm, sdpa.analyze(interp)):
-        if st is not None and st.active:
-            skip |= st.skip
+    extra: dict = {}
+    for st, mod in ((interp._qmm, qmm), (sdpa.analyze(interp), sdpa)):
+        if st is None or not st.active:
+            continue
+        skip |= st.skip
+        fn = getattr(mod, "emit_bytes", None)
+        if fn is None:
+            continue
+        for key, match in st.roots.items():
+            try:
+                extra[key] = extra.get(key, 0) + fn(match)
+            except Exception:
+                # A recognizer whose plan cannot be sized must not zero the
+                # block; leave the root charged its result and say so.
+                if _DEBUG:
+                    print("[metaljax] byte estimate: emit_bytes failed for a "
+                          f"{type(match).__name__} root", flush=True)
     tcache: dict = {}  # ir.Type -> bytes, per block (see value_bytes)
     for op in block.operations:
         o = op.operation
         if skip and len(o.results) and o.results[0] in skip:
             continue
         total += op_bytes(o, tcache)
+        if extra and len(o.results):
+            total += extra.get(o.results[0], 0)
         if o.name == "stablehlo.while":
             if _msl_plan_for(interp, o) is not None:
                 continue
@@ -393,6 +424,45 @@ def _block_bytes(interp, block) -> int:
     return total
 
 
+def _passthrough_bytes(block) -> int:
+    """Bytes of the block's results that no operation in it produces.
+
+    A program whose output IS one of its inputs still materializes that
+    output: XLA's no-alias contract makes engine.execute copy it (see the
+    `forwarded_outputs` pass there). The op walk cannot see this, because
+    there is no op -- `jit_stage`, the keras streaming loader's per-variable
+    move, is one `func.return %arg0` and was estimated at 0.0 MB while every
+    call really did copy 1.1 GB of embedding.
+
+    Charged at the WHOLE-PROGRAM level only, never inside `_block_bytes`'
+    recursion: a loop body returns its carries, most of which are block
+    arguments passed through untouched, and charging those per iteration
+    (x trip) would inflate every scan in texmo and move the chunk sizing
+    the command-buffer lottery is pinned to.
+    """
+    args = set(block.arguments)
+    if not args:
+        return 0
+    total = 0
+    tcache: dict = {}
+    for op in block.operations:
+        o = op.operation
+        if not o.name.endswith(".return") or o.results:
+            continue
+        # Counted once PER RETURNED POSITION, not per distinct value: two
+        # outputs may not share a buffer either, so returning one argument
+        # twice really is two copies.
+        for v in o.operands:
+            if v in args:
+                total += value_bytes(v, tcache)
+    return total
+
+
+def program_bytes(interp, block) -> int:
+    """`_block_bytes` for a whole program: the walk plus pass-through outputs."""
+    return _block_bytes(interp, block) + _passthrough_bytes(block)
+
+
 # Bytes a single mx.compile trace may materialize. The op-count budget above
 # bounds the live-buffer COUNT; this bounds their SIZE, and the two are
 # independent: every tensor of a command buffer stays allocated until it
@@ -415,6 +485,7 @@ def _block_bytes(interp, block) -> int:
 #
 #   pytest suite (589 tests)                       max   1.19 GB
 #   tests/data qwen3 prefill (shrunk, 8 layers)          1.99 GB
+#   gpt-oss-20b decode/prefill main, 2 layers     0.03-0.21 GB (see below)
 #   texmo whole-main, 8-step chunk (gate harness)  max   6.11 GB
 #     the same, scaled to the 20-step benchmark chunk   ~15.3 GB (derived)
 #   texmo training step, inner loop unrolled       max  27.4 GB (lstm.512 b32)
@@ -422,6 +493,17 @@ def _block_bytes(interp, block) -> int:
 #   ---- 64 GB ----
 #   Qwen3-8B prefill, 36 layers                        139.8 GB
 #   Qwen3 maxtext parameter init scan                  695.5 GB
+#
+# The gpt-oss row is in that list because it is where the estimator was found
+# to be UNDER-reporting rather than over: its expert-gather rewrite absorbs
+# 99.97% of the block's declared result bytes, and until the roots were
+# charged their emission (see _block_bytes) the whole program read 10.4 MB
+# against a measured 55.8 MB first-call trace. It now reads 34.1 MB there and
+# 214.0 MB at a 64-token prompt against 107.1 MB measured -- above the truth,
+# which is the side of it a gate can be built on. And the number stays small:
+# the memory wave that guard-kills that row is the qmm PACKING PROLOGUE
+# (~8 GB per weight, MLX's cache never cleared between matches), which runs
+# before any compile decision and which no trace budget can bound.
 #
 # (The last two are over the op budget as well, so they were already eager;
 # they are here as the scale of what must never be traced. The class this
@@ -441,19 +523,21 @@ _COMPILE_BYTES_MB = int(os.environ.get("METALJAX_COMPILE_BYTES_MB", "65536"))
 _COMPILE_BYTES = max(_COMPILE_BYTES_MB, 0) * 2**20
 
 
-def _bytes_ok(interp, block, mult=1, what="block") -> bool:
+def _bytes_ok(interp, block, mult=1, what="block", whole=False) -> bool:
     """Whether tracing `mult` copies of `block` fits the byte budget.
 
-    Every compile decision asks this: the whole-main compile (mult=1), a
-    compiled while body (mult=repeat), unrolling a counted loop into an
-    enclosing trace (mult=trip), and how many iterations one chunked replay
-    may hold. All four multiply the SAME per-block estimate, which is what
-    keeps them coherent -- a body that may be compiled per step is not
-    thereby licensed to be unrolled a thousand times into a trace.
+    Every compile decision asks this: the whole-main compile (mult=1,
+    whole=True), a compiled while body (mult=repeat), unrolling a counted
+    loop into an enclosing trace (mult=trip), and how many iterations one
+    chunked replay may hold. All four multiply the SAME per-block estimate,
+    which is what keeps them coherent -- a body that may be compiled per step
+    is not thereby licensed to be unrolled a thousand times into a trace.
+    `whole` adds the pass-through outputs, which only a program has.
     """
     if _COMPILE_BYTES <= 0:
         return True
-    nb = mult * _block_bytes(interp, block)
+    per = program_bytes(interp, block) if whole else _block_bytes(interp, block)
+    nb = mult * per
     if nb <= _COMPILE_BYTES:
         return True
     _note_gated(interp, block, nb, mult, what)
