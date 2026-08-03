@@ -8,12 +8,13 @@ run that gates a release or an optimization.*
 
 | date | version/commit | geomean vs prev | <100 | 100–500 | 500–1500 | 1500–3000 | checks | raw |
 |---|---|---|---:|---:|---:|---:|---|---|
-| 2026-08-02 | 0.11.1+fixes (8-step chunks, superseded methodology) | — | 1.10 | 0.74 | 0.91 | 1.01 | 163/163 | texmo-topconfs (overwritten) |
-| 2026-08-02 | 0.11.1+fixes, 256-step chunks (methodology baseline) | — | 0.97 | 0.66 | 0.73 | 0.80 | 163/163 | notes/data/texmo-topconfs-2026-08-02.jsonl |
-| 2026-08-02b | + buffer-cap 512 MB (correctness) | 0.980 | ~same | ~same | ~same | −4% | 163/163 | notes/data/texmo-topconfs-2026-08-02b.jsonl |
-| 2026-08-03 | 0.11.2 release gate (ops=800) | 1.008¹ | — | — | — | — | 163/163 | notes/data/texmo-topconfs-final.jsonl |
+| 2026-08-02 | 0.11.1+fixes, 256-step chunks, 512 MB buffer cap (baseline)¹ | — | 0.97 | 0.66 | 0.73 | 0.80 | 163/163 | notes/data/texmo-topconfs-2026-08-02{,b}.jsonl |
+| 2026-08-03 | 0.11.2 release gate (ops=800) | 1.008² | — | — | — | — | 163/163 | notes/data/texmo-topconfs-final.jsonl |
 
-¹ CPU control drifted +2.2% (quiet machine); the ops-800 cost (+2–3%
+¹ Two same-day runs merged: the buffer-cap correctness fix between
+them cost geomean 0.980 (−0.5% small configs → −4% largest class,
+partly ambient drift).
+² CPU control drifted +2.2% (quiet machine); the ops-800 cost (+2–3%
 expected) is absorbed within drift. This row is the C++-era anchor.
 
 Suite-wide context (0.11.2 anchor): metal wins 50/163 configs vs
