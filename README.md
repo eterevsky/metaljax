@@ -228,6 +228,7 @@ needs the Xcode command-line tools.
 | `METALJAX_COMPILE_OPTIONS` | *(unset)* | `jit(..., compiler_options={...})` entries are validated like XLA validates them (unknown name → `No such compile option`, wrong type → `is not a valid <type> value`) and then ignored, since metaljax has no XLA flag surface. Set `ignore` to skip the check and accept anything. |
 | `METALJAX_QMM` | `1` | Recognize weight-only quantized matmuls (integer codes plus a scale/zero-point map, dequantized and fed to a dot — what keras `quantize("int4")` and `jnp.int4` weights emit) and run them as one `mx.quantized_matmul` on a weight repacked once, instead of materializing the dequantized weight per call. Set `0` to execute such graphs literally. |
 | `METALJAX_QMM_SCALES` | `auto` | Width of the repacked scale/bias tables. `auto` keeps the model's own (bf16/f16) width whenever the folded bias is exactly representable in it, and widens to f32 otherwise so the reconstructed weight stays bit-exact — which costs 3–12% of the matmul at batch 1, since the tables are then 12.5% of the 4-bit weight instead of 6.25%. `source` always keeps the narrow width (faster; the bias rounds to ≤0.5 ULP); `f32` never narrows. |
+| `METALJAX_SDPA` | `1` | Recognize softmax attention (`softmax(Q@Kᵀ·s + mask) @ V`, in any of the layouts jax emits, including grouped-query attention and the deferred normalization real LLM lowerings use) and run it as one `mx.fast.scaled_dot_product_attention` instead of materializing the `[batch, heads, q, k]` logits five times over. Set `0` to execute such graphs literally. The fused kernel accumulates the softmax in f32 whatever the input dtype, so it is *more* accurate than the chain it replaces at f16/bf16 and ties at f32. |
 | `METALJAX_PLUGIN_PATH` | *(auto)* | Override the path to `libmetal_pjrt.dylib`. |
 
 ## Repository layout
@@ -241,6 +242,7 @@ src/metaljax/
                            reduction, control, gather
   engine.py                PJRT-facing compile/execute/buffer layer
   qmm.py                   quantized-matmul recognizer + exact repacking
+  sdpa.py                  fused-attention recognizer (mx.fast.sdpa)
   dtypes.py, _ir.py        dtype tables, MLIR context & attr decoding
 src/jax_plugins/metal/     backend registration (priority -1)
 plugin/

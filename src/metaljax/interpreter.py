@@ -10,7 +10,7 @@ import numpy as np
 
 from jaxlib.mlir import ir
 
-from metaljax import _ir, dtypes, qmm as _qmm
+from metaljax import _ir, dtypes, qmm as _qmm, sdpa as _sdpa
 
 # When enabled, pure programs/loop bodies are traced through mx.compile so
 # repeat executions replay a fused Metal graph instead of re-dispatching
@@ -49,6 +49,10 @@ def free_values(block: ir.Block) -> list[ir.Value]:
 REGISTRY: dict[str, Callable] = {}
 
 _TERMINATORS = ("func.return", "stablehlo.return")
+
+# Marks an op a recognizer absorbed: it is skipped, not executed and not
+# emitted. Roots carry an (emit, match) pair instead. See _rewrite_plan.
+_SKIP = object()
 
 # Ops through which f64 values may flow without any arithmetic: since f64
 # device storage is f32, these are bit-identical to CPU as long as every
@@ -156,6 +160,12 @@ class Interpreter:
         # metaljax.qmm.State: recognized quantized matmuls (None until the
         # engine analyzes the program; stays empty when nothing matches).
         self._qmm = None
+        # metaljax.sdpa.State: recognized fused attentions. Analyzed lazily
+        # on first use -- unlike qmm this rewrite needs nothing from the
+        # concrete buffers, so there is no packing prologue to hang it off.
+        self._sdpa = None
+        # (gate, merged rewrite table, per-block plans); see _rewrite_plan.
+        self._rewrite_cache = None
         if isinstance(module, ir.Module):
             if context is None:
                 raise ValueError("pass the ir.Context that owns the module")
@@ -368,6 +378,59 @@ class Interpreter:
     def run_func(self, func_op: ir.Operation, args: list[mx.array]) -> list[mx.array]:
         return self.run_block(func_op.regions[0].blocks[0], args)
 
+    def _rewrite_plan(self, block: ir.Block):
+        """Ops of `block` a recognizer rewrites or absorbs: `((index, entry),)`.
+
+        Both recognizers answer the same per-op question, and they are
+        disjoint by construction (sdpa drops any candidate overlapping a
+        quantized matmul), so they merge into ONE table. That table is then
+        resolved against a block once and replayed BY POSITION, which keeps
+        the hot loop from touching `op.results` for the ~99% of ops that are
+        neither a root nor absorbed: a decode program is thousands of ops per
+        layer and far too big to compile, so `run_block` is its execute path.
+        """
+        qst = self._qmm
+        if qst is not None and not (qst.active and qst.values):
+            # qmm needs its prologue to have packed (the bare Interpreter has
+            # none); without that, run every op literally.
+            qst = None
+        sst = self._sdpa
+        if sst is None:
+            sst = _sdpa.analyze(self)
+        if not sst.active:
+            sst = None
+        # Compared by IDENTITY, not equality: `State.rebuild` replaces `skip`
+        # and `roots` wholesale (qmm disables a match whose pack failed), so a
+        # new frozenset is exactly the signal that the plan is stale.
+        gate = (qst, None if qst is None else qst.skip,
+                sst, None if sst is None else sst.skip)
+        cache = self._rewrite_cache
+        if cache is None or not all(a is b for a, b in zip(cache[0], gate)):
+            table: dict = {}
+            for st, fuse in ((qst, _qmm.emit), (sst, _sdpa.emit)):
+                if st is None:
+                    continue
+                for k in st.skip:
+                    table.setdefault(k, _SKIP)
+                for k, match in st.roots.items():
+                    table.setdefault(k, (fuse, match))
+            cache = (gate, table, {})
+            self._rewrite_cache = cache
+        table, plans = cache[1], cache[2]
+        if not table:
+            return ()
+        plan = plans.get(block)
+        if plan is None:
+            found = []
+            for i, op in enumerate(block.operations):
+                res = op.operation.results
+                if len(res):
+                    entry = table.get(res[0])
+                    if entry is not None:
+                        found.append((i, entry))
+            plan = plans[block] = tuple(found)
+        return plan
+
     def run_block(
         self,
         block: ir.Block,
@@ -383,30 +446,28 @@ class Interpreter:
         for ba, v in zip(block_args, args):
             env[ba] = v
 
-        # Recognized quantized matmuls: the ops reconstructing the weight are
-        # not executed at all, and the dot itself becomes one fused op.
-        qst = self._qmm
-        if qst is not None and not (qst.active and qst.values):
-            # No rewrite, or nothing packed yet (the bare Interpreter has no
-            # packing prologue): run every op literally.
-            qst = None
+        # Recognized rewrites, resolved against this block ONCE (see
+        # _rewrite_plan): absorbed ops are not executed at all and each root
+        # becomes one fused op.
+        plan = self._rewrite_plan(block)
+        pi, nxt = 0, (plan[0][0] if plan else -1)
 
+        i = -1
         for op in block.operations:
+            i += 1
             o = op.operation
             name = o.name
             if name in _TERMINATORS:
                 return [env[v] for v in o.operands]
-            if qst is not None:
-                results = o.results
-                key = results[0] if len(results) else None
-                if key is not None:
-                    if key in qst.skip:
-                        continue
-                    match = qst.roots.get(key)
-                    if match is not None:
-                        for r, v in zip(results, _qmm.emit(self, match, env)):
-                            env[r] = v
-                        continue
+            if i == nxt:
+                entry = plan[pi][1]
+                pi += 1
+                nxt = plan[pi][0] if pi < len(plan) else -1
+                if entry is not _SKIP:
+                    fuse, match = entry
+                    for r, v in zip(o.results, fuse(self, match, env)):
+                        env[r] = v
+                continue
             handler = REGISTRY.get(name)
             if handler is None:
                 raise UnsupportedOpError(

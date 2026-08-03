@@ -4,7 +4,7 @@ import mlx.core as mx
 
 from jaxlib.mlir import ir
 
-from metaljax import _ir, dtypes, qmm
+from metaljax import _ir, dtypes, qmm, sdpa
 from metaljax.interpreter import (
     COMPILE_ENABLED,
     UnsupportedOpError,
@@ -256,17 +256,28 @@ def _block_cost(interp, block) -> int:
     # Ops absorbed into a recognized quantized matmul are never executed, and
     # the fused dot is one kernel. Charging the literal dequant chain (~83
     # units per matmul) is what pushed LLM decode bodies over the budget.
-    qst = interp._qmm
-    if qst is not None and not qst.active:
-        qst = None
+    # A recognized fused attention is ~15 ops of logits-sized work (dot,
+    # scale, mask, max, subtract, exp, sum, divide, dot, plus their
+    # broadcasts) collapsing to one kernel, so charging it literally would
+    # keep prefill and decode bodies out of the trace budget for no reason.
+    # Both recognizers are merged into one skip set and one cost table --
+    # they are disjoint by construction, and one lookup beats four.
+    skip = set()
+    roots = {}
+    for st, unit in ((interp._qmm, 2), (sdpa.analyze(interp), 3)):
+        if st is None or not st.active:
+            continue
+        skip |= st.skip
+        roots.update(dict.fromkeys(st.roots, unit))
     for op in block.operations:
         o = op.operation
-        if qst is not None and len(o.results):
+        if roots and len(o.results):
             key = o.results[0]
-            if key in qst.skip:
+            if key in skip:
                 continue
-            if key in qst.roots:
-                cost += 2  # one matmul
+            unit = roots.get(key)
+            if unit is not None:
+                cost += unit
                 continue
         cost += 1
         if o.name == "stablehlo.while":
@@ -433,15 +444,20 @@ def _captures(interp, env, free):
     matmul it contains. The packed arrays MUST travel as explicit inputs:
     mx.compile bakes arrays captured from an enclosing scope by value, so a
     repack would never reach an already-compiled body."""
-    st = interp._qmm
-    skip = st.skip if st is not None and st.active else ()
+    # EVERY recognizer's skip set, not just qmm's: `free_values` is purely
+    # syntactic, so an op absorbed in the enclosing block still shows up as
+    # a capture of the body, and reading it from `env` would raise.
+    skip = set()
+    for st in (interp._qmm, sdpa.analyze(interp)):
+        if st is not None and st.active:
+            skip |= st.skip
     caps = []
     for v in free:
         a = env.get(v)
         if a is None and v in skip:
-            # A weight-reconstruction op that jax hoisted out of the loop:
-            # it was skipped in the enclosing block, and every consumer of
-            # it inside the body is skipped too, so nothing can read this.
+            # A reconstruction op that jax hoisted out of the loop: it was
+            # skipped in the enclosing block, and every consumer of it
+            # inside the body is skipped too, so nothing can read this.
             # Substituting keeps the compiled body's arity stable.
             a = _ABSORBED
         elif a is None:
