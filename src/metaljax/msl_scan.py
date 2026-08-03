@@ -3215,7 +3215,11 @@ class Plan:
             elif src[0] == "hoist":
                 buf = hoisted(src[1])
             else:
-                buf = env[src[1]]
+                # `hoisted` is env[...] when the value is bound, and
+                # recomputes it from the IR when it is not -- which happens
+                # when the enclosing block skipped the defining op (the
+                # quantized-matmul rewrite absorbs whole subgraphs).
+                buf = hoisted(src[1])
             norm = self._weight_norms.get(sid)
             if norm is not None:
                 shape, strides, offset, perm = norm
@@ -3283,7 +3287,7 @@ class Plan:
             if kind == "buffer":
                 leaf = spec[1]
                 src = (ins[leaf.source[1]] if leaf.source[0] == "carry"
-                       else env[leaf.source[1]])
+                       else hoisted(leaf.source[1]))
                 a = leaf.idx.a
                 b2 = a * self.start + leaf.idx.b
                 if a == 1:

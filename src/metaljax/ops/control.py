@@ -4,7 +4,7 @@ import mlx.core as mx
 
 from jaxlib.mlir import ir
 
-from metaljax import _ir, dtypes
+from metaljax import _ir, dtypes, qmm
 from metaljax.interpreter import (
     COMPILE_ENABLED,
     UnsupportedOpError,
@@ -243,8 +243,21 @@ def _block_cost(interp, block) -> int:
         return cached
     interp._cost_cache[block] = 1  # break cycles defensively
     cost = 0
+    # Ops absorbed into a recognized quantized matmul are never executed, and
+    # the fused dot is one kernel. Charging the literal dequant chain (~83
+    # units per matmul) is what pushed LLM decode bodies over the budget.
+    qst = interp._qmm
+    if qst is not None and not qst.active:
+        qst = None
     for op in block.operations:
         o = op.operation
+        if qst is not None and len(o.results):
+            key = o.results[0]
+            if key in qst.skip:
+                continue
+            if key in qst.roots:
+                cost += 2  # one matmul
+                continue
         cost += 1
         if o.name == "stablehlo.while":
             if _msl_plan_for(interp, o) is not None:
@@ -401,6 +414,33 @@ def _anchor_outputs(outs, args, underived):
     return tuple(outs)
 
 
+# Stand-in for a capture the quantized-matmul rewrite absorbed (see below).
+_ABSORBED = mx.zeros((), mx.uint8)
+
+
+def _captures(interp, env, free):
+    """A body's captured values, plus the packed weights of any quantized
+    matmul it contains. The packed arrays MUST travel as explicit inputs:
+    mx.compile bakes arrays captured from an enclosing scope by value, so a
+    repack would never reach an already-compiled body."""
+    st = interp._qmm
+    skip = st.skip if st is not None and st.active else ()
+    caps = []
+    for v in free:
+        a = env.get(v)
+        if a is None and v in skip:
+            # A weight-reconstruction op that jax hoisted out of the loop:
+            # it was skipped in the enclosing block, and every consumer of
+            # it inside the body is skipped too, so nothing can read this.
+            # Substituting keeps the compiled body's arity stable.
+            a = _ABSORBED
+        elif a is None:
+            a = env[v]  # missing for some other reason: raise as before
+        caps.append(a)
+    caps.extend(qmm.values(interp))
+    return caps
+
+
 def _body_fn(interp, body_block, compile_body, repeat=1):
     """Cached executor for `repeat` iterations of a while body:
     fn(*vals, *captures) -> vals."""
@@ -409,12 +449,17 @@ def _body_fn(interp, body_block, compile_body, repeat=1):
     if entry is None:
         free = free_values(body_block)
         nvals = len(list(body_block.arguments))
+        nfree = nvals + len(free)
 
         def raw(*flat):
             vals = list(flat[:nvals])
-            captures = dict(zip(free, flat[nvals:]))
-            for _ in range(repeat):
-                vals = interp.run_block(body_block, vals, captures)
+            captures = dict(zip(free, flat[nvals:nfree]))
+            token = qmm.push(interp, flat[nfree:])
+            try:
+                for _ in range(repeat):
+                    vals = interp.run_block(body_block, vals, captures)
+            finally:
+                qmm.pop(interp, token)
             return tuple(vals)
 
         fn = raw
@@ -468,7 +513,7 @@ class _BodyRunner:
     def _bind(self):
         self.fn, free, self.compiled = _body_fn(
             self.interp, self.block, compile_body=True, repeat=self.repeat)
-        self.captures = [self.env[v] for v in free]
+        self.captures = _captures(self.interp, self.env, free)
 
     def _drop_compiled(self):
         # _body_fn consults _no_body_compile, so rebinding now yields the
@@ -553,7 +598,7 @@ def _while(interp, op, ins, env):
                 print(f"[metaljax] while(unroll-in-trace): trip={trip} "
                       f"cost={_block_cost(interp, body_block)}", flush=True)
             fn, free, _ = _body_fn(interp, body_block, compile_body=False)
-            captures = [env[v] for v in free]
+            captures = _captures(interp, env, free)
             vals = list(ins)
             for _ in range(trip):
                 vals = list(fn(*vals, *captures))
@@ -623,7 +668,7 @@ def _while(interp, op, ins, env):
 
 def _run_chunked(interp, body_block, env, ins, trip, K, cost):
     fn, free, _ = _body_fn(interp, body_block, compile_body=True, repeat=K)
-    captures = [env[v] for v in free]
+    captures = _captures(interp, env, free)
     vals = list(ins)
     # Async-flush each chunk (a blocking sync per chunk serializes CPU and
     # GPU); block only often enough to bound pending buffers (~4-5 live
@@ -638,7 +683,7 @@ def _run_chunked(interp, body_block, env, ins, trip, K, cost):
     rem = trip % K
     if rem:
         fn1, free1, _ = _body_fn(interp, body_block, compile_body=True)
-        captures1 = [env[v] for v in free1]
+        captures1 = _captures(interp, env, free1)
         for _ in range(rem):
             vals = list(fn1(*vals, *captures1))
     _loop_flush(vals, (trip % max(sync_every * K, 1)) * cost)

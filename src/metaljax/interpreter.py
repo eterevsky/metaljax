@@ -10,7 +10,7 @@ import numpy as np
 
 from jaxlib.mlir import ir
 
-from metaljax import _ir, dtypes
+from metaljax import _ir, dtypes, qmm as _qmm
 
 # When enabled, pure programs/loop bodies are traced through mx.compile so
 # repeat executions replay a fused Metal graph instead of re-dispatching
@@ -153,6 +153,9 @@ class Interpreter:
         self._msl_pending: list = []
         self._fft_cache: dict = {}     # block -> contains a stablehlo.fft?
         self._in_trace = False  # True while mx.compile is tracing our code
+        # metaljax.qmm.State: recognized quantized matmuls (None until the
+        # engine analyzes the program; stays empty when nothing matches).
+        self._qmm = None
         if isinstance(module, ir.Module):
             if context is None:
                 raise ValueError("pass the ir.Context that owns the module")
@@ -380,11 +383,30 @@ class Interpreter:
         for ba, v in zip(block_args, args):
             env[ba] = v
 
+        # Recognized quantized matmuls: the ops reconstructing the weight are
+        # not executed at all, and the dot itself becomes one fused op.
+        qst = self._qmm
+        if qst is not None and not (qst.active and qst.values):
+            # No rewrite, or nothing packed yet (the bare Interpreter has no
+            # packing prologue): run every op literally.
+            qst = None
+
         for op in block.operations:
             o = op.operation
             name = o.name
             if name in _TERMINATORS:
                 return [env[v] for v in o.operands]
+            if qst is not None:
+                results = o.results
+                key = results[0] if len(results) else None
+                if key is not None:
+                    if key in qst.skip:
+                        continue
+                    match = qst.roots.get(key)
+                    if match is not None:
+                        for r, v in zip(results, _qmm.emit(self, match, env)):
+                            env[r] = v
+                        continue
             handler = REGISTRY.get(name)
             if handler is None:
                 raise UnsupportedOpError(

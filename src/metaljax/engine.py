@@ -18,7 +18,7 @@ import numpy as np
 
 from jaxlib.mlir import ir
 
-from metaljax import _ir, dtypes
+from metaljax import _ir, dtypes, qmm
 from metaljax.interpreter import Interpreter
 
 # PJRT_Buffer_Type enum values (pjrt_c_api.h, PJRT API 0.114).
@@ -172,6 +172,21 @@ class MetalExecutable:
                 self._sync_inputs = self.interpreter.main_has_fft
         return self._sync_inputs
 
+    def invalidate_traces(self):
+        """Drop everything derived from the program's rewritten structure.
+
+        Called when the quantized-matmul recognizer changes its mind at
+        execute time (a first-execute check failed, or a repack picked a
+        different group size): op costs, compiled bodies and the compiled
+        main were all built around the previous rewrite.
+        """
+        interp = self.interpreter
+        interp._body_cache.clear()
+        interp._cost_cache.clear()
+        interp._traceable_cache.clear()
+        self._compiled = None
+        self._can_compile = None
+
     def runner(self):
         """The callable executing this program, mx.compile'd when possible."""
         from metaljax.interpreter import COMPILE_ENABLED
@@ -197,8 +212,14 @@ class MetalExecutable:
             with interp.context:
                 underived = control._underived_outputs(
                     interp._main_block(), [])
+            nargs = self.num_params
 
-            def traced(*a):
+            def traced(*flat):
+                a = flat[:nargs]
+                # Packed quantized weights arrive as real inputs, not as
+                # constants captured from the prologue: mx.compile bakes
+                # captured arrays by value and would never see a repack.
+                token = qmm.push(interp, flat[nargs:])
                 prev = interp._in_trace
                 interp._in_trace = True
                 try:
@@ -206,8 +227,14 @@ class MetalExecutable:
                     return control._anchor_outputs(outs, a, underived)
                 finally:
                     interp._in_trace = prev
+                    qmm.pop(interp, token)
 
-            self._compiled = mx.compile(traced)
+            compiled = mx.compile(traced)
+
+            def call(*a):
+                return compiled(*a, *qmm.values(interp))
+
+            self._compiled = call
         return self._compiled
 
 
@@ -280,6 +307,12 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
     args = [b.data for b in buffers]
     if args and ex.sync_inputs:
         mx.eval(*args)
+    # Quantized weights are repacked here, eagerly, on concrete buffers:
+    # packing cannot happen inside an mx.compile trace, and the result is
+    # cached on the source buffers' identity so this is a no-op from the
+    # second execute on.
+    if qmm.ENABLED and qmm.prologue(ex.interpreter, args):
+        ex.invalidate_traces()
     # NB retries happen AFTER the except block: the in-flight exception's
     # traceback pins every array of the failed attempt (a failed
     # whole-main trace can hold hundreds of thousands of buffers), so a
