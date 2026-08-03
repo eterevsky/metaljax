@@ -26,7 +26,7 @@ ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 336 @ 2.7 GB ¹⁸ | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | — | — | — |
-| 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ needs quantized-matmul path ⁸ | — | — | — |
+| 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ MLX command-buffer bug ⁸ | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | — | 29.8 (b32: 591) | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
 | 18 | LoRA E2B train (ms/step) | 2048 | **407** | — | 135.6 ¹⁰ | — |
@@ -67,11 +67,20 @@ kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
 7. FIXED (28ad2eb): was MLX 0.32 corrupting compiled graphs split
    across Metal command buffers at the 40 MB byte default; byte cap
    raised. 3/3 runs byte-identical to CPU at 15.9 ms/tok.
-8. int8 is functionally exact on both backends (tokens verified) but a
-   pessimization everywhere today: jax-CPU 1.7× slower than its bf16,
-   metal 3.2× at decode and ~16× at prefill (the int64 outer-product
-   materialization scales with batch×seq). Nobody has a fast int path on
-   this hardware — the case for mapping onto `mx.quantized_matmul`.
+8. int8 is functionally exact on both backends (tokens verified). The
+   old int64 outer-product pessimization was fixed 2026-08-03 (chunked
+   exact f32 dot, fdc7cde): 0.6B decode 48.5 → 31.8, prefill 1255 →
+   37.7. The 8B row then ran for the first time (~330 ms/tok, no OOM)
+   but produces garbage: the MLX 0.32 command-buffer split corruption
+   at 8B scale. Single-variable proof: byte budget alone flips the
+   outcome — 512 (default) corrupts decode replays (bf16 AND int8;
+   first call clean, replays differ per process; correct under
+   METALJAX_COMPILE=0), 2048 gives correct output with a benign KV
+   curve — but 2048 has NO stability margin: an 8B load at 2048
+   kernel-panicked the machine (watchdog timeout, wired-memory class)
+   after an identical run had succeeded. No safe budget exists for
+   this shape class; blocked on the MLX upstream fix. Repro:
+   notes/data/qwen3_8b_prefill_36layer.mlir (0.3 s).
 9. Blocked on two independent walls, both fully diagnosed. (a) MEMORY:
    we lower attention unfused (matmul-softmax-matmul), so SD3.5's
    attention logits are ~12 GB/block at 1024² — peak live set ~90 GB in

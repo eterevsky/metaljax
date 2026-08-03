@@ -30,8 +30,15 @@ if _os.environ.get("METALJAX_MATMUL_PRECISION", "highest") == "highest":
 #    into many command buffers corrupts results in MLX 0.32 (silently,
 #    differently on every call; see notes/mlx-command-buffer-split.md).
 #    Corruption appears with splits <=80 MB apart and is gone by 160 MB on
-#    the shipped repro; 512 keeps a 3x margin, and perf is flat from
-#    128 MB up (big15 55.5-56.1 ms across 128..16384).
+#    the shipped repro -- but the safe band scales with TENSOR SIZE, not
+#    absolute bytes: at Qwen3-8B shapes (100 MB weight slices, ~8-10 GB per
+#    flush window) 512 MB cuts every ~2-5 kernels and corrupts decode
+#    replays (2026-08-03: bf16 AND qwix int8 8B both garbage at 512/768/
+#    1024/1536, correct at 2048; per-layer KV deltas uncorrelated vs CPU at
+#    512, textbook-benign at 2048; repro
+#    notes/data/qwen3_8b_prefill_36layer.mlir corrupts in 0.3 s). Perf is
+#    flat from 128 MB up (big15 55.5-56.1 ms across 128..16384; 8B decode
+#    within 5% between 512 and 2048).
 #    Ceiling -- STABILITY: every intermediate tensor of a command buffer
 #    stays allocated until the buffer completes, so an unbounded budget let
 #    one commit accumulate ~90 GB of transient attention logits (SD3.5
@@ -39,6 +46,18 @@ if _os.environ.get("METALJAX_MATMUL_PRECISION", "highest") == "highest":
 #    memory -- the kernel starved and the MACHINE PANICKED (twice; flight
 #    recorder showed 18 GB -> 90+ GB in the final second at pressure
 #    level 1). 512 MB restores intermediate recycling per commit.
+#
+# THE 8B-CLASS BIND (2026-08-03): no safe budget exists for Qwen3-8B-shaped
+# maxtext workloads. 512 corrupts their compiled decode replays (bf16 AND
+# qwix int8; per-layer KV deltas uncorrelated vs CPU; correct under
+# METALJAX_COMPILE=0). 2048 gives correct output in short-prefill probes --
+# but has NO stability margin: a 4096 probe wedged an 8B checkpoint load at
+# a 120 GB wired footprint, and a subsequent 8B load at 2048 (same config
+# that had just succeeded) kernel-panicked the machine (watchdog timeout).
+# Raising the default is a nondeterministic machine-killer; the default
+# stays 512 and the 8B class is unsupported until MLX fixes the split
+# corruption upstream. Repro: notes/data/qwen3_8b_prefill_36layer.mlir
+# (weights as args, corrupts in 0.3 s at 512, clean at 2048).
 #
 # Override either by exporting a different value before importing metaljax.
 _os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "800")

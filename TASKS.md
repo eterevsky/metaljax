@@ -22,15 +22,24 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
 
 ## Correctness & upstream
 
-- **MLX command-buffer corruption — upstream report.** All three faces
-  (byte-budget splits corrupt compiled graphs; ops-boundary alignment
-  corrupts eager scans; unbounded buffers wire transient intermediates
-  until the machine panics) with shipping repro assets
+- **MLX command-buffer corruption — upstream report (URGENT: now
+  blocks a whole model class).** All three faces (byte-budget splits
+  corrupt compiled graphs; ops-boundary alignment corrupts eager
+  scans; unbounded buffers wire transient intermediates until the
+  machine panics) with shipping repro assets
   (tests/data/qwen3_prefill_shrunk.mlir, qwen3_init_scan.mlir,
-  notes/mlx-command-buffer-split.md). Draft the issue for Oleg to
-  file. Until fixed upstream, every finite budget is a lottery draw —
+  notes/data/qwen3_8b_prefill_36layer.mlir — the strongest one:
+  real-shape 36-layer 8B prefill, corrupts in 0.3 s at the shipped
+  512 MB budget, clean at 2048; notes/mlx-command-buffer-split.md).
+  2026-08-03: the safe band scales with tensor size — Qwen3-8B-shaped
+  maxtext workloads have NO safe budget (512 corrupts replays, 2048
+  nondeterministically kernel-panics the machine at load — 4th panic;
+  STATUS row 15 / footnote 8). Draft the issue for Oleg to file.
+  Until fixed upstream, every finite budget is a lottery draw —
   tests/test_command_buffer.py pins the shipped values; rerun both
   tests on ANY change to the budgets, the flush cadence, or MLX.
+  DO NOT run 8B-class maxtext on metal at raised budgets without a
+  memory watchdog and Oleg's sign-off.
 - **Quantized-decode correctness criterion**: token-stream equality is
   not usable for quantized models (notes/int8-divergence-verdict.md);
   compare_tokens.py encodes the policy — extend the logit-ladder
