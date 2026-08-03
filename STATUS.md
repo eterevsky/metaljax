@@ -2,35 +2,35 @@
 
 *(Harness and manifest: [scripts/model_bench/](scripts/model_bench/).)*
 
-*Last updated: 2026-08-03 (block 4: big models, MoE, packed int4). Headline metric per cell: LLM rows =
-warm decode ms/token; vision = forward ms; diffusion = ms per step;
-training = ms per step. ⚠ = measured but contaminated by a since-diagnosed
-bug (none currently — all such rows re-measured); ✗ = established
-impossible; TODO = not yet measured (llama.cpp
-column is informational and unscheduled). All values
-tentative until the final sequential re-run with finished instrumentation.*
+*Last updated: 2026-08-03 — FINAL for the 0.11.2 baseline: all cells
+from the sequential release-gate run at shipped defaults (ops=800,
+bytes=512 MB), token agreement audited (4 bf16 rows exact; 2 certified
+tie-flips within 1–2 bf16 ULPs, see footnote 21; quantized rows per the
+int8 certification). Headline metric per cell: LLM rows = warm decode
+ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
+✗ = established impossible (with the measured reason).*
 
 | # | benchmark | jax CPU | metaljax | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|
-| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **363** | 137 | 148.7 | 111.2 ²⁰ |
-| 2 | gemma4-12B bf16 | 346 (f32) | **101** | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
-| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **473** ¹⁶ | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
-| 4 | gemma4-E2B bf16 | 79.2 (bf16→f32) ¹³ | **28.9** | 10.5 ¹⁵ | — | — |
-| 5 | Qwen3-8B bf16 | 219 (bf16→f32) ¹³ | **60.3** | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
-| 6 | Llama-3.1-8B bf16 | 206 (bf16→f32) ¹³ | **58.6** | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
-| 7 | gpt-oss-20b | TODO ⁴ | **220.4** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
+| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | 137 | 148.7 | 111.2 ²⁰ |
+| 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **284** ¹⁶ | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
+| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | 10.5 ¹⁵ | — | — |
+| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
+| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
+| 7 | gpt-oss-20b | ✗ ⁴ | **222** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ¹⁷ | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ¹⁷ | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | — | — | — |
-| 11 | Qwen3-0.6B (maxtext decode) | 89.5 | **15.8** ⁷ | — | — | — |
+| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **52.8** (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.5** ¹⁸ | 339.5 @ 2.7 GB ¹⁸ | — | — | — |
-| 14 | maxtext qwix-int8 0.6B | 146 | **48.3** ᵛ | — | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 336 @ 2.7 GB ¹⁸ | — | — | — |
+| 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ᵛ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ needs quantized-matmul path ⁸ | — | — | — |
-| 16 | SigLIP 2 (fwd b1 ms) | 965 (b32: 23324) | **248** (b32: 5287) | — | 29.8 (b32: 591) | — |
+| 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | — | 29.8 (b32: 591) | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
-| 18 | LoRA E2B train (ms/step) | 2141 | **417** ᵗ | — | 135.6 ¹⁰ | — |
-| 19 | maxtext train 0.6B (ms/step) | TODO ¹¹ | TODO ¹¹ | — | — | — |
+| 18 | LoRA E2B train (ms/step) | 2048 | **407** | — | 135.6 ¹⁰ | — |
+| 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **28.0** (102.9 GB, load 12 s) | — | — |
 
 **Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
@@ -84,8 +84,9 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
    13.9× → 1.0×. These three rows re-run first after the gate.
 3. torch-MPS adapter validated (greedy tokens ≡ torch-CPU, 32/32);
    timings deliberately deferred.
-4. CPU projected ~126 GB (panic-adjacent); keras dequantizes the
-   MXFP4-native repo to bf16 (~42 GB). Re-assess after splat fix.
+4. CPU: dequantized-bf16 working set projected ~126 GB (panic
+   territory) — established infeasible; keras dequantizes the
+   MXFP4-native repo to bf16 (~42 GB).
 5. Tokenizer EOS fix verified (DeepSeek removed keras's hardcoded
    `<|endoftext|>`); first generation run pending, serialized.
 6. maxtext memory model: sparse path still wants 50–83 GB for a 16B MoE
@@ -122,10 +123,6 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
     Validation: eager loss bitwise ≡ compiled (247.7775), 1.4e-4 vs
     CPU (247.8117). Step TIMING not yet captured — comes with the
     final sequential run.
-ᵗ tentative (pre-splat-fix agent run): official metal re-run
-    guard-killed at 122 GB during the keras load transient (the
-    documented initializer waste, footnote 17 ledger) — number stands
-    until the keras streaming load lands.
 12. keras's mixed-precision layers request the F16_F16_F32 dot
     algorithm, which XLA:CPU rejects (plain f16 dots work; the
     algorithm spec is an accelerator contract). A strip-workaround
@@ -144,6 +141,13 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
     MLX cell: mflux is Flux-only; DiffusionKit supports the SD3 family
     but 3.5-Large weights are gated in its formats — no ungated MLX
     path exists, cell closed as not-runnable.
+21. Release-gate token audit: greedy streams metal-vs-CPU are exact on
+    12B, Qwen3-8B, E2B-int4, and the maxtext rows; E2B-bf16 and
+    Llama-8B diverge at their FIRST generated token via certified
+    tie-flips — competing logits within 1–2 bf16 ULPs (Llama: exactly
+    tied 11.875/11.875 on metal), the same benign class as the int8
+    certification. gpt-oss/26B/31B have no CPU counterpart (recorded
+    only).
 20. llama.cpp build 221f0f63 (past the Gemma4 cutoff), llama-bench
     -p 51 -n 128 -r 5, all-Metal, reproduced within 4% on two passes;
     per-provider GGUF pins in README_llamacpp.md. Q8/Q4 marked where
