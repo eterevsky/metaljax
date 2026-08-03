@@ -450,7 +450,9 @@ def test_interleaved_groups_in_a_decode_loop():
         jf = jax.jit(f)
         got = np.asarray(jf(*moved)).astype(np.float32)
         assert qmm.stats() == {"recognized": 1, "packs": 1, "fallbacks": 0,
-                               "perms": 1}, qmm.stats()
+                               "perms": 1, "mxfp4": 0, "batched": 0,
+                               "shared": 0}, \
+            qmm.stats()
         got2 = np.asarray(jf(*moved)).astype(np.float32)
     np.testing.assert_array_equal(got, got2)
     want = _run(f, args, _cpu())
@@ -712,7 +714,8 @@ def test_disabled_by_env(monkeypatch):
     qmm.reset_stats()
     got = _run(lambda *a: dense_sub(*a, columns=cols), args, _metal())
     assert qmm.stats() == {"recognized": 0, "packs": 0, "fallbacks": 0,
-                           "perms": 0}
+                           "perms": 0, "mxfp4": 0, "batched": 0,
+                           "shared": 0}
     want = _run(lambda *a: dense_sub(*a, columns=cols), args, _cpu())
     np.testing.assert_allclose(got, want, rtol=2e-2, atol=1e-1)
 

@@ -85,7 +85,8 @@
         "mlx"
       ],
       "arch": "GptOssCausalLM",
-      "note": "MXFP4-native repo; keras dequantizes"
+      "native_quant": "mxfp4",
+      "note": "MXFP4-native repo; loaded packed (scripts/model_bench/mxfp4_gpt_oss.py) and fused to mx.quantized_matmul(mode=mxfp4). METALJAX_BENCH_NATIVE_QUANT=0 restores the dequantize-at-load path (41.8 GB)."
     },
     {
       "id": "qwen36-35b-a3b",

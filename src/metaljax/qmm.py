@@ -17,11 +17,21 @@ This module recognizes the pattern structurally at compile time, repacks the
 codes ONCE into MLX's affine layout at the first execute, and replaces the
 whole chain with a single `mx.quantized_matmul`.
 
-Two forms are recognized (both emitted by keras 3.15):
+Three forms are recognized:
 
   sub-channel / asymmetric   dot(x, [reshape/transpose](mul(sub(cvt(codes),
                                                     cvt(zeros)), scales)))
   per-channel / symmetric    divide(dot(x, cvt(codes)), broadcast(scale))
+  MXFP4 (OCP micro-scaling)  dot(x, [reshape](mul(decode(codes),
+                                                  broadcast(2**(e8m0-127)))))
+
+The first two are what keras 3.15 emits; the third is what an MXFP4
+checkpoint (gpt-oss, and the whole OCP-MX family) looks like once the
+nibble unpack and the E2M1 value decode are done IN the graph instead of at
+load time. MXFP4's 16 codes are a NON-UNIFORM grid (0, +-0.5, +-1, +-1.5,
++-2, +-3, +-4, +-6 times a per-32 power-of-two scale), so no affine
+`scale * (q - zp)` can represent it -- MLX has a separate `mode="mxfp4"`
+kernel, and this module packs for it separately.
 
 The chain between the integer codes and the dot is NOT pattern-matched op by
 op (keras' nibble unpack is a dozen ops of `and`/`shift`/`xor`/`concatenate`
@@ -52,6 +62,12 @@ Any check failing permanently disables that one dot (it falls back to
 executing the chain literally, which is what happened before this module
 existed).
 
+A dot with BATCHING dimensions (an einsum over a stack of per-expert
+weights, `etm,ehm->eth`) is fused too: `mx.quantized_matmul` broadcasts over
+leading dimensions, so the pack keeps them and the operands are reshaped to
+`[B, M, K]` / `[B, N, K]`. METALJAX_QMM_BATCH=0 restores the old
+batching-dims-are-a-reject behaviour.
+
 Packing is exact: `w = scale * (q - zp)` maps onto MLX's affine dequant
 `w = scales * q_hat + biases` with an unsigned `q_hat = q + offset` and
 `biases = -scale * (offset + zp)`; MLX's kernel evaluates that as a single
@@ -61,6 +77,13 @@ signed-code convention) whenever the codes fit it, so a zero-point-free
 quantization keeps a power-of-two bias. Scales/biases are kept in the source
 dtype when that downcast is lossless and widened to f32 otherwise -- see
 METALJAX_QMM_SCALES.
+
+MXFP4 packing is exact by construction and needs none of that care: the
+codes are read back off the e2m1 grid by exact equality and the scale is
+recovered as an exact power of two (its f32 exponent field IS the e8m0
+byte), so `values * scale` is reproduced bit for bit -- in f32 and, because
+an e2m1 value carries a single mantissa bit, in bf16/f16 as well. Anything
+not exactly on the grid rejects the dot.
 
 Packing needs CONCRETE buffers and must never run inside an `mx.compile`
 trace, so it happens in an eager prologue (`prologue()`, called by
@@ -108,9 +131,20 @@ _MAX_REPACKS = int(os.environ.get("METALJAX_QMM_REPACKS", "8"))
 # +6.25%). "source" always narrows (faster, bias rounded to <=0.5 ULP);
 # "f32" never narrows.
 _SCALE_WIDTH = os.environ.get("METALJAX_QMM_SCALES", "auto")
+# Fuse dots that carry batching dimensions (a stack of per-expert weights).
+_BATCH = os.environ.get("METALJAX_QMM_BATCH", "1") != "0"
+
+# OCP MXFP4: one shared power-of-two scale per 32 elements of a row, and a
+# 4-bit E2M1 element (sign | 2-bit exponent, bias 1 | 1-bit mantissa). The
+# magnitudes below are indexed by the low three bits of the code; the sign
+# bit is bit 3. MLX's `mode="mxfp4"` kernel uses exactly this encoding, and
+# so does the HF checkpoint format -- see `mxfp4_codes`.
+_E2M1_MAGS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_MXFP4_GROUP = 32
 
 # Diagnostics (tests assert on these; nothing else reads them).
-STATS = {"recognized": 0, "packs": 0, "fallbacks": 0, "perms": 0}
+STATS = {"recognized": 0, "packs": 0, "fallbacks": 0, "perms": 0,
+         "mxfp4": 0, "batched": 0, "shared": 0}
 
 
 def stats() -> dict:
@@ -211,6 +245,77 @@ def _lossless(x: mx.array, dtype) -> bool:
 
 
 # --------------------------------------------------------------------------
+# MXFP4
+# --------------------------------------------------------------------------
+
+
+def _uint_view(dtype):
+    """The unsigned integer type `dtype`'s bit pattern fits, or None."""
+    return {mx.float32: mx.uint32, mx.bfloat16: mx.uint16,
+            mx.float16: mx.uint16}.get(dtype)
+
+
+def mxfp4_codes(values: mx.array) -> mx.array:
+    """4-bit MXFP4 codes for values that lie EXACTLY on the E2M1 grid.
+
+    Raises `_Reject` on the first value that does not. Works on the bit
+    pattern rather than on the numbers so that the sign of a zero survives
+    (code 8 is -0.0, code 0 is +0.0) and so that "exactly" means exactly:
+    the grid magnitudes are converted into `values`' own dtype and compared
+    as integers, which no float comparison can round into agreement.
+    """
+    uint = _uint_view(values.dtype)
+    if uint is None:
+        raise _Reject(f"MXFP4 values in {values.dtype}")
+    bits = mx.contiguous(values).view(uint)
+    width = 32 if uint == mx.uint32 else 16
+    sign = mx.right_shift(bits, mx.array(width - 1, uint))
+    mag = mx.bitwise_and(bits, mx.array((1 << (width - 1)) - 1, uint))
+    grid = np.array(mx.array(_E2M1_MAGS, dtype=values.dtype).view(uint))
+    if len(set(grid.tolist())) != len(_E2M1_MAGS):
+        raise _Reject(f"the E2M1 grid is not distinct in {values.dtype}")
+    codes = mx.zeros(mag.shape, mx.uint8)
+    ok = mag == mx.array(int(grid[0]), uint)
+    for i in range(1, len(_E2M1_MAGS)):
+        hit = mag == mx.array(int(grid[i]), uint)
+        codes = mx.where(hit, mx.array(i, mx.uint8), codes)
+        ok = mx.bitwise_or(ok, hit)
+    codes = mx.bitwise_or(codes, mx.left_shift(sign.astype(mx.uint8),
+                                               mx.array(3, mx.uint8)))
+    # One reduction, one sync: the per-element masks die with this call.
+    good = mx.all(ok)
+    mx.eval(codes, good)
+    if not bool(good.item()):
+        raise _Reject("weight values are not on the MXFP4 (E2M1) grid")
+    return codes
+
+
+def mxfp4_scale_bytes(scales: mx.array) -> mx.array:
+    """E8M0 bytes for per-group scales that are EXACT powers of two.
+
+    An E8M0 scale is `2**(byte - 127)`, i.e. an f32 with a zero mantissa --
+    so the byte is just the f32 exponent field, and requiring the mantissa
+    (and the sign) to be zero is the whole verification.
+
+    Exponent fields 0 and 255 are rejected rather than encoded: field 0
+    means zero or a subnormal (never an exact power of two we could name)
+    and field 255 means an infinity or a NaN. Byte 255 is also NaN in E8M0
+    itself, so there is nothing to lose.
+    """
+    bits = mx.contiguous(scales.astype(mx.float32)).view(mx.uint32)
+    exp = mx.bitwise_and(mx.right_shift(bits, _u32(23)), _u32(0xFF))
+    bad = mx.any(mx.bitwise_or(
+        mx.bitwise_and(bits, _u32(0x807FFFFF)) != _u32(0),   # sign or mantissa
+        mx.bitwise_or(exp == _u32(0), exp == _u32(0xFF))))
+    out = exp.astype(mx.uint8)
+    mx.eval(out, bad)
+    if bool(bad.item()):
+        raise _Reject("MXFP4 group scales are not exact positive powers of "
+                      "two")
+    return out
+
+
+# --------------------------------------------------------------------------
 # regrouping an interleaved contraction axis
 # --------------------------------------------------------------------------
 
@@ -241,7 +346,7 @@ def _bits_u32(x):
 
 
 def _column_keys(x) -> np.ndarray:
-    """Per-column digest of `x` ([N, K]) as a numpy uint32 `[K, 2]`.
+    """Per-column digest of `x` ([..., K]) as a numpy uint32 `[K, 2]`.
 
     Equal columns always digest equally; distinct columns collide with
     probability ~2^-64, and a collision can only MERGE two groups -- which
@@ -249,7 +354,9 @@ def _column_keys(x) -> np.ndarray:
     legitimate. The digest is a sum of per-row terms in wrapping uint32, so
     it does not depend on the order MLX reduces in.
     """
-    n, k = x.shape
+    k = x.shape[-1]
+    x = mx.reshape(x, (-1, k))
+    n = x.shape[0]
     step = max(1, min(n, _KEY_CHUNK // max(k, 1)))
     h1 = mx.zeros((k,), mx.uint32)
     h2 = mx.zeros((k,), mx.uint32)
@@ -309,8 +416,8 @@ def _regroup(k: int, maps) -> np.ndarray | None:
 
 
 def _take_k(x, perm):
-    """`x[:, perm]`, materialized (these are full-weight-size maps)."""
-    out = mx.contiguous(mx.take(x, perm, axis=1))
+    """`x[..., perm]`, materialized (these are full-weight-size maps)."""
+    out = mx.contiguous(mx.take(x, perm, axis=-1))
     mx.eval(out)
     return out
 
@@ -441,12 +548,14 @@ class Match:
 
     __slots__ = ("root", "key", "lhs", "codes", "zero", "scale", "recip",
                  "post", "bcast_dims", "ops", "arg_indices", "required",
-                 "lperm", "rfree", "rc", "rshape", "mshape", "nshape",
-                 "M", "K", "N", "out_dtype", "disabled", "slot", "gs", "bits",
-                 "packs", "repacks", "name", "sub_range", "has_perm")
+                 "lperm", "rperm", "rshape", "bshape", "mshape", "nshape",
+                 "B", "M", "K", "N", "out_dtype", "disabled", "slot", "gs",
+                 "bits", "packs", "repacks", "name", "sub_range", "has_perm",
+                 "mode", "nvals", "swapped")
 
     def __init__(self):
         self.recip = False
+        self.mode = "affine"
         self.zero = None
         self.sub_range = None
         self.post = []
@@ -456,18 +565,23 @@ class Match:
         self.arg_indices = ()
         self.disabled = False
         self.slot = -1
+        self.nvals = 0
         self.gs = 0
         self.bits = 0
         self.has_perm = False
         self.packs = []
         self.repacks = 0
         self.name = "?"
+        self.bshape = []
+        self.B = 1
+        self.swapped = False
 
 
 class _Pack:
-    __slots__ = ("refs", "w", "scales", "biases", "perm", "gs", "bits")
+    __slots__ = ("refs", "w", "scales", "biases", "perm", "gs", "bits", "mode")
 
-    def __init__(self, leaves, w, scales, biases, perm, gs, bits):
+    def __init__(self, leaves, w, scales, biases, perm, gs, bits,
+                 mode="affine"):
         # Weak references: identity is what we care about, and pinning a
         # multi-GB weight buffer alive because we packed a copy of it would
         # be its own bug. A dead referent simply misses and repacks.
@@ -475,6 +589,21 @@ class _Pack:
         self.w, self.scales, self.biases = w, scales, biases
         self.perm = perm
         self.gs, self.bits = gs, bits
+        self.mode = mode
+
+    def arrays(self):
+        """The packed arrays, in the order `emit` reads them back.
+
+        Variable length: MXFP4 has no bias table, and a permutation is only
+        carried when the groups were interleaved. `Match.nvals` records how
+        many slots this pack occupies in the traced-input list.
+        """
+        out = [self.w, self.scales]
+        if self.biases is not None:
+            out.append(self.biases)
+        if self.perm is not None:
+            out.append(self.perm)
+        return out
 
     def matches(self, leaves) -> bool:
         if len(leaves) != len(self.refs):
@@ -582,38 +711,54 @@ def _closure(values, main_args, ops, arg_indices, register=()):
         stack.extend(o.operands)
 
 
-def _finish(ctx, m, root, absorb, dot, required=(), register=()):
+def _finish(ctx, m, root, absorb, dot, qside=1, required=(), register=()):
+    """Fill in `m` for a dot whose operand `qside` is the quantized one."""
     lb, rb, lc, rc = _dot_dims(dot)
-    if lb or rb:
+    (qb, qc), (ab, ac) = (((rb, rc), (lb, lc)) if qside == 1
+                          else ((lb, lc), (rb, rc)))
+    if (qb or ab) and not _BATCH:
         raise _Reject("batching dimensions")
-    lhs, rhs = dot.operands
-    if _el(lhs) not in _FLOAT_ELS:
-        raise _Reject(f"lhs element type {_el(lhs)}")
+    quant, act = dot.operands[qside], dot.operands[1 - qside]
+    if _el(act) not in _FLOAT_ELS:
+        raise _Reject(f"activation element type {_el(act)}")
     out_el = _el(root.results[0])
     if out_el not in _FLOAT_ELS:
         raise _Reject(f"result element type {out_el}")
-    lshape, rshape = _shape(lhs), _shape(rhs)
-    lfree = [d for d in range(len(lshape)) if d not in lc]
-    rfree = [d for d in range(len(rshape)) if d not in rc]
-    M, K, N = (_prod(lshape[d] for d in lfree), _prod(lshape[d] for d in lc),
-               _prod(rshape[d] for d in rfree))
-    if M == 0 or K == 0 or N == 0:
+    qshape, ashape = _shape(quant), _shape(act)
+    if [ashape[d] for d in ab] != [qshape[d] for d in qb]:
+        raise _Reject("batching dimensions disagree")
+    afree = [d for d in range(len(ashape)) if d not in ac and d not in ab]
+    qfree = [d for d in range(len(qshape)) if d not in qc and d not in qb]
+    B = _prod(ashape[d] for d in ab)
+    M, K, N = (_prod(ashape[d] for d in afree), _prod(ashape[d] for d in ac),
+               _prod(qshape[d] for d in qfree))
+    if B == 0 or M == 0 or K == 0 or N == 0:
         raise _Reject("empty matmul")
     if K % _GROUP_SIZES[-1]:
         raise _Reject(f"K={K} is not a multiple of {_GROUP_SIZES[-1]}")
-    if K != _prod(rshape[d] for d in rc):
+    if K != _prod(qshape[d] for d in qc):
         raise _Reject("contracting dimensions disagree")
 
     m.root = root
     m.key = _okey(root)
-    m.lhs = lhs
-    m.lperm = lfree + lc
-    m.rfree, m.rc, m.rshape = rfree, rc, rshape
-    m.mshape = [lshape[d] for d in lfree]
-    m.nshape = [rshape[d] for d in rfree]
-    m.M, m.K, m.N = M, K, N
+    m.lhs = act
+    m.swapped = qside == 0
+    # dot_general's result is laid out batch dims, then LHS free, then RHS
+    # free. `quantized_matmul` on [B, M, K] x [B, N, K] returns [B, M, N],
+    # which is that layout when the quantized operand is the rhs and its
+    # transpose when it is the lhs (jax lowers `th,emh->etm` that way).
+    m.lperm = ab + afree + ac
+    m.rperm = qb + qfree + qc
+    m.rshape = qshape
+    m.bshape = [ashape[d] for d in ab]
+    m.mshape = [ashape[d] for d in afree]
+    m.nshape = [qshape[d] for d in qfree]
+    m.B, m.M, m.K, m.N = B, M, K, N
     m.out_dtype = dtypes.mx_result_dtype(root.results[0])
-    m.name = f"{m.M}x{m.K}x{m.N}"
+    m.name = (f"{m.M}x{m.K}x{m.N}" if not m.bshape
+              else f"{'x'.join(map(str, m.bshape))}|{m.M}x{m.K}x{m.N}")
+    if m.swapped:
+        m.name += "'"
 
     main_args, donated = ctx
     arg_indices = set()
@@ -630,28 +775,112 @@ def _finish(ctx, m, root, absorb, dot, required=(), register=()):
     return m
 
 
+def _has_int_leaf(v, limit=64):
+    """True if `v`'s subtree bottoms out on an integer tensor somewhere.
+
+    A weight-reconstruction chain always does -- the codes are integers,
+    however elaborately they are unpacked. Nothing else about the chain is
+    inspected: this is only a cheap guard that keeps the MXFP4 branch from
+    adopting an ordinary `x @ (w * mask)` and paying a full-weight-size
+    evaluation to find out.
+    """
+    stack, seen = [v], set()
+    while stack and len(seen) < limit:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if _is_int(cur):
+            return True
+        o = _owner(cur)
+        if o is None or o.name in _OPAQUE:
+            continue
+        stack.extend(o.operands)
+    return False
+
+
+def _split_scaled(mul):
+    """(values, scale) for a `values * broadcast(per-group scale)` product.
+
+    Both operands are floats in the MXFP4 form -- the E2M1 decode has
+    already turned the codes into numbers -- so the split is made
+    structurally: the scale is the operand BROADCAST from a tensor holding
+    exactly one value per 32, which is the only group size MXFP4 has.
+
+    That exact 32 is what keeps this from adopting an RMS norm. `x *
+    broadcast(rsqrt(...))` has the same shape as an MXFP4 reconstruction and
+    reaches an integer leaf too (the token ids under the embedding gather),
+    but its scale is broadcast one-per-ROW, so the ratio is the row length
+    rather than 32.
+    """
+    cands = []
+    total = _prod(_shape(mul.results[0]))
+    for i in (0, 1):
+        v = mul.operands[i]
+        if _el(v) not in _FLOAT_ELS:
+            raise _Reject(f"multiply operand element type {_el(v)}")
+        base, dims = _bcast_chain(v)
+        if dims is None:
+            continue
+        n = _prod(_shape(base))
+        if n and n * _MXFP4_GROUP == total:
+            cands.append((n, i))
+    if not cands:
+        raise _Reject("neither multiply operand broadcasts one scale per "
+                      f"{_MXFP4_GROUP} values")
+    if len(cands) == 2:
+        raise _Reject("cannot tell the scale operand from the values")
+    return mul.operands[1 - cands[0][1]], mul.operands[cands[0][1]]
+
+
 def _try_affine(ctx, dot):
-    """dot(x, [shape ops](mul(sub(cvt(codes), cvt(zeros)), scales)))."""
-    rhs = dot.operands[1]
-    base, post = _strip_shape(rhs)
+    """The weight-times-scale forms, on whichever operand carries them.
+
+    jax puts the quantized weight on the RHS for a plain projection but on
+    the LHS for an einsum like `th,emh->etm` (the expert gate/up
+    projection), so both sides are tried. The RHS goes first: it is the
+    common case, and trying it first keeps every already-recognized graph on
+    exactly the path it was on before.
+    """
+    reject = None
+    for qside in (1, 0):
+        try:
+            return _try_affine_side(ctx, dot, qside)
+        except _Reject as e:
+            reject = reject or e
+    raise reject
+
+
+def _try_affine_side(ctx, dot, qside):
+    """dot(x, [shape ops](mul(sub(cvt(codes), cvt(zeros)), scales))), or the
+    MXFP4 form dot(x, [shape ops](mul(decode(codes), broadcast(scale))))."""
+    qop = dot.operands[qside]
+    base, post = _strip_shape(qop)
     mul = _owner(base)
     if mul is None or mul.name != "stablehlo.multiply":
-        raise _Reject("rhs is not a multiply")
+        raise _Reject("the operand is not a multiply")
     parsed = scale = None
     for i in (0, 1):
         parsed = _parse_codes(mul.operands[i])
         if parsed is not None:
             scale = mul.operands[1 - i]
             break
+    m = Match()
     if parsed is None:
-        raise _Reject("neither multiply operand is an integer code tensor")
+        # No integer operand: MXFP4's grid is non-uniform, so its codes have
+        # become floats before the scale is applied.
+        values, scale = _split_scaled(mul)
+        if not _has_int_leaf(values):
+            raise _Reject("the scaled operand holds no integer codes")
+        m.mode = "mxfp4"
+        m.codes = values
+    else:
+        m.codes, m.zero, m.sub_range = parsed
     if _el(scale) not in _FLOAT_ELS:
         raise _Reject(f"scale element type {_el(scale)}")
-    m = Match()
-    m.codes, m.zero, m.sub_range = parsed
     m.scale = scale
     m.post = [o for o in post if o.name in _SHAPE_OPS]
-    _finish(ctx, m, dot, [rhs], dot, required=(mul,))
+    _finish(ctx, m, dot, [qop], dot, qside=qside, required=(mul,))
     return m
 
 
@@ -833,7 +1062,7 @@ def _replay(x, post):
 
 
 def _to_nk(x, m):
-    """A rhs-shaped tensor as the [N, K] matrix `mx.quantized_matmul` wants.
+    """A rhs-shaped tensor as the [(B,) N, K] matrix `quantized_matmul` wants.
 
     Materialized on the spot: these are full-weight-sized reconstructions
     (a 262k-vocab head is ~800 MB per map), and leaving them lazy would keep
@@ -842,16 +1071,24 @@ def _to_nk(x, m):
     x = _replay(x, m.post)
     if list(x.shape) != m.rshape:
         raise _Reject(f"expected rhs shape {m.rshape}, got {list(x.shape)}")
-    out = mx.contiguous(mx.reshape(mx.transpose(x, m.rfree + m.rc),
-                                   (m.N, m.K)))
+    shape = (m.bshape + [m.N, m.K]) if m.bshape else [m.N, m.K]
+    out = mx.contiguous(mx.reshape(mx.transpose(x, m.rperm), shape))
     mx.eval(out)
     return out
 
 
 def _group_const(x, gs) -> bool:
-    n, k = x.shape
-    v = mx.reshape(x, (n, k // gs, gs))
+    k = x.shape[-1]
+    v = mx.reshape(x, (-1, k // gs, gs))
     return bool(mx.all(v == v[:, :, :1]).item())
+
+
+def _group_heads(x, gs):
+    """The first element of each group: `[..., K] -> [..., K/gs]`."""
+    k = x.shape[-1]
+    lead = list(x.shape[:-1])
+    return mx.contiguous(
+        mx.reshape(x, lead + [k // gs, gs])[..., 0])
 
 
 def _pick_group(k, scale_map, zero_map):
@@ -865,6 +1102,116 @@ def _pick_group(k, scale_map, zero_map):
     return None
 
 
+# Packs that are still alive, grouped by a digest of their contents. jax
+# lowers a decode loop's PREFILL and its while body as two separate dots
+# over one set of weights, so a model's whole packed weight set would
+# otherwise be built and held twice (measured on gpt-oss-20b: 2 x 10.2 GB).
+# Entries are weak: a pack lives exactly as long as some Match holds it.
+_SHARED = {}
+_MAX_SHARED = int(os.environ.get("METALJAX_QMM_SHARE", "512"))
+
+
+def _digest(a) -> int:
+    """A cheap content digest of a packed array (order-independent sum)."""
+    u = _bits_u32(a) if a.dtype in _FLOAT_MX else a.astype(mx.uint32)
+    u = mx.reshape(u, (-1,))
+    idx = mx.arange(u.size).astype(mx.uint32)
+    h = mx.sum(_mix(u ^ _mix(idx)))
+    mx.eval(h)
+    return int(h.item()) ^ (a.size << 8) ^ hash(str(a.dtype))
+
+
+def _share(pk):
+    """Alias `pk`'s arrays onto an identical earlier pack's, if there is one.
+
+    Content-addressed on purpose: the digest only narrows the search, and
+    nothing is aliased until the arrays compare EQUAL element for element.
+    Two chains that happen to reconstruct the same weight therefore share
+    one copy, and two that do not can never be confused -- no structural
+    reasoning about the graphs is involved.
+    """
+    arrays = pk.arrays()
+    key = (pk.mode, pk.gs, pk.bits, len(arrays),
+           tuple(tuple(a.shape) for a in arrays), _digest(arrays[0]))
+    bucket = _SHARED.get(key)
+    if bucket is not None:
+        for i, refs in enumerate(bucket):
+            other = [r() for r in refs]
+            if any(o is None for o in other):
+                continue
+            if all(a.dtype == b.dtype and bool(mx.all(a == b).item())
+                   for a, b in zip(arrays, other)):
+                pk.w, pk.scales = other[0], other[1]
+                rest = list(other[2:])
+                if pk.biases is not None:
+                    pk.biases = rest.pop(0)
+                if pk.perm is not None:
+                    pk.perm = rest.pop(0)
+                bucket.insert(0, bucket.pop(i))
+                STATS["shared"] += 1
+                return pk
+    if len(_SHARED) > _MAX_SHARED:
+        _SHARED.clear()          # coarse, and only ever costs a repack
+    bucket = _SHARED.setdefault(key, [])
+    # Drop entries whose packs have died with the executable that held them,
+    # so a long-running worker that keeps requantizing fresh weights does
+    # not accumulate dead references.
+    bucket[:] = [refs for refs in bucket if all(r() is not None
+                                                for r in refs)]
+    bucket.insert(0, [weakref.ref(a) for a in arrays])
+    return pk
+
+
+def _record_pack(m, pk):
+    pk = _share(pk)
+    STATS["packs"] += 1
+    if pk.perm is not None:
+        STATS["perms"] += 1
+    if pk.mode == "mxfp4":
+        STATS["mxfp4"] += 1
+    if m.bshape:
+        STATS["batched"] += 1
+    if _DEBUG:
+        print(f"[metaljax] qmm: packed {m.name} mode={pk.mode} "
+              f"bits={pk.bits} group={pk.gs} scales={pk.scales.dtype}"
+              f"{' regrouped' if pk.perm is not None else ''}", flush=True)
+    return pk
+
+
+def _build_mxfp4_pack(m, values, scale_map, leaves):
+    """Verify and repack an MXFP4 weight from its two evaluated factors.
+
+    Both arrive full weight size, so each is dropped the moment the small
+    per-group form has been derived from it.
+    """
+    gs = _MXFP4_GROUP
+    if m.K % gs:
+        raise _Reject(f"K={m.K} is not a multiple of {gs}")
+    perm = None
+    if not _group_const(scale_map, gs):
+        # The same interleaving story as the affine path: permuting the
+        # contraction axis on BOTH operands leaves the dot unchanged.
+        perm = _regroup(m.K, (scale_map,))
+        if perm is not None:
+            perm = mx.array(perm)
+            scale_map = _take_k(scale_map, perm)
+            values = _take_k(values, perm)
+        if not _group_const(scale_map, gs):
+            raise _Reject("MXFP4 scales are not constant within a group "
+                          f"of {gs}")
+    sbytes = mxfp4_scale_bytes(_group_heads(scale_map, gs))
+    scale_map = None
+    codes = mxfp4_codes(values)
+    values = None
+    # The E2M1 nibble order is MLX's: element i of a row occupies bits
+    # [4i, 4i+4) of the little-endian uint32 stream, the same layout the
+    # affine 4-bit packer emits.
+    w = pack_codes(codes, 4)
+    codes = None
+    mx.eval(w, sbytes)
+    return _Pack(leaves, w, sbytes, None, perm, gs, 4, mode="mxfp4")
+
+
 def _build_pack(interp, m, args, leaves):
     # One environment per operand subtree: they share only cheap prefixes
     # (the group-index cast), while each one's intermediates are full weight
@@ -872,6 +1219,11 @@ def _build_pack(interp, m, args, leaves):
     def evaluate(value):
         env = dict(zip(interp._main_block().arguments, args))
         return _to_nk(_eval(interp, value, env), m)
+
+    if m.mode == "mxfp4":
+        return _record_pack(
+            m, _build_mxfp4_pack(m, evaluate(m.codes), evaluate(m.scale),
+                                 leaves))
 
     codes = evaluate(m.codes)
     lo = int(mx.min(codes).item())
@@ -947,15 +1299,12 @@ def _build_pack(interp, m, args, leaves):
             raise _Reject(
                 f"scales/zeros are not constant within any group{note}")
         scale_dtype = scale_map.dtype
-        scales = mx.contiguous(
-            mx.reshape(scale_map, (m.N, m.K // gs, gs))[:, :, 0])
+        scales = _group_heads(scale_map, gs)
         zeros = None
         if zero_map is not None:
             # In f32 throughout: the zero map may be an integer tensor, and
             # MLX refuses to compare one against out-of-range literals.
-            zeros = mx.contiguous(
-                mx.reshape(zero_map, (m.N, m.K // gs, gs))[:, :, 0]
-            ).astype(mx.float32)
+            zeros = _group_heads(zero_map, gs).astype(mx.float32)
             if not bool(mx.all(zeros == mx.round(zeros)).item()):
                 raise _Reject("zero points are not integers")
             if bool(mx.any(mx.abs(zeros) > 32768).item()):
@@ -978,14 +1327,7 @@ def _build_pack(interp, m, args, leaves):
     # Materialize: a lazy packed weight would pin the whole reconstruction
     # graph (and its full-size intermediates) for the life of the cache.
     mx.eval(w, scales, biases)
-    STATS["packs"] += 1
-    if perm is not None:
-        STATS["perms"] += 1
-    if _DEBUG:
-        print(f"[metaljax] qmm: packed {m.name} bits={bits} group={gs} "
-              f"offset={offset} scales={scales.dtype}"
-              f"{' regrouped' if perm is not None else ''}", flush=True)
-    return _Pack(leaves, w, scales, biases, perm, gs, bits)
+    return _record_pack(m, _Pack(leaves, w, scales, biases, perm, gs, bits))
 
 
 def _resolve(interp, m, args):
@@ -1035,20 +1377,22 @@ def prologue(interp, args) -> bool:
                     print(f"[metaljax] qmm: {m.name} falls back to the "
                           f"literal chain ({e})", flush=True)
                 continue
-            has_perm = pk.perm is not None
-            if (m.gs, m.bits, m.has_perm) != (pk.gs, pk.bits, has_perm):
-                # gs/bits are baked into any trace built earlier, and the
-                # presence of a permutation changes the traced arity.
+            if (m.mode, m.gs, m.bits, m.has_perm) != (
+                    pk.mode, pk.gs, pk.bits, pk.perm is not None):
+                # mode/gs/bits are baked into any trace built earlier, and
+                # the presence of a permutation (or of a bias table) changes
+                # the traced arity.
                 changed = changed or m.gs != 0
-                m.gs, m.bits, m.has_perm = pk.gs, pk.bits, has_perm
+                m.mode, m.gs, m.bits = pk.mode, pk.gs, pk.bits
+                m.has_perm = pk.perm is not None
             m.slot = len(values)
-            values.extend((pk.w, pk.scales, pk.biases))
-            if has_perm:
-                # The permutation travels as an input like the weights do,
-                # not baked: a repack against different weights may well
-                # produce a different one, and mx.compile would keep the
-                # first forever.
-                values.append(pk.perm)
+            # The packed arrays travel as inputs like the weights do, not
+            # baked: a repack against different weights may well produce a
+            # different permutation, and mx.compile would keep the first
+            # one forever.
+            arrays = pk.arrays()
+            m.nvals = len(arrays)
+            values.extend(arrays)
         if changed:
             st.rebuild()
     st.values = values
@@ -1088,23 +1432,28 @@ def pop(interp, token):
 def emit(interp, m, env):
     """One `mx.quantized_matmul` in place of the whole dequant-and-dot."""
     st = interp._qmm
-    w = st.values[m.slot]
-    scales = st.values[m.slot + 1]
-    biases = st.values[m.slot + 2]
+    vals = st.values[m.slot:m.slot + m.nvals]
+    w, scales = vals[0], vals[1]
+    biases = vals[2] if m.mode == "affine" else None
     x = env[m.lhs]
     if m.lperm != list(range(len(x.shape))):
         x = mx.transpose(x, m.lperm)
-    x = mx.reshape(x, (m.M, m.K))
+    x = mx.reshape(x, ([m.B, m.M, m.K] if m.bshape else [m.M, m.K]))
     if x.dtype not in _FLOAT_MX:
         x = x.astype(m.out_dtype)
     if m.has_perm:
         # The weight was packed with its contraction axis permuted (its
         # groups were interleaved); permuting BOTH operands identically
         # leaves the dot itself unchanged.
-        x = mx.take(x, st.values[m.slot + 3], axis=-1)
+        x = mx.take(x, vals[-1], axis=-1)
     y = mx.quantized_matmul(x, w, scales, biases, transpose=True,
-                            group_size=m.gs, bits=m.bits)
-    y = mx.reshape(y, m.mshape + m.nshape)
+                            group_size=m.gs, bits=m.bits, mode=m.mode)
+    if m.swapped:
+        # The dot had the weight on its LHS, so its result is [..., N, M].
+        y = mx.swapaxes(y, -1, -2)
+        y = mx.reshape(y, m.bshape + m.nshape + m.mshape)
+    else:
+        y = mx.reshape(y, m.bshape + m.mshape + m.nshape)
     if y.dtype != m.out_dtype:
         y = y.astype(m.out_dtype)
     return [y]

@@ -101,6 +101,19 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
     stream = os.environ.get("BENCH_STREAM_LOAD", "1") == "1"
     stream_info = extra.install_streaming_load() if stream else None
 
+    # Checkpoints whose weights are natively sub-byte: load them PACKED and
+    # let the model dequantize in the graph, where metaljax's recognizer
+    # folds the chain into one quantized matmul. Without this the keras
+    # loader expands them to bfloat16 (gpt-oss-20b: 13.8 GB -> 41.8 GB).
+    native = bench.get("native_quant")
+    if native == "mxfp4":
+        import mxfp4_gpt_oss
+        print("[bench] native MXFP4 loading: "
+              f"{'on' if mxfp4_gpt_oss.install() else 'OFF (env override)'}",
+              flush=True)
+    elif native:
+        raise ValueError(f"unknown native_quant {native!r}")
+
     cls = getattr(keras_hub.models, bench["arch"])
     t0 = time.monotonic()
     try:
