@@ -55,7 +55,10 @@ def configs_from_csv(path):
         for row in csv.DictReader(f):
             if row["mode"] != "scan" or row.get("error"):
                 continue
-            key = (row["spec"], int(row["batch"]), int(row["length"]))
+            # texmo renamed the raw_fold tokenset to fold (2026-08); older
+            # suite CSVs still carry the old spec strings.
+            spec = row["spec"].replace(".raw_fold", ".fold")
+            key = (spec, int(row["batch"]), int(row["length"]))
             seen.setdefault(key, row["name"])
     return [(name, *key) for key, name in seen.items()]
 
