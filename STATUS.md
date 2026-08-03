@@ -18,7 +18,7 @@ ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
 | 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | 10.5 ¹⁵ | — | — |
 | 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
 | 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
-| 7 | gpt-oss-20b | ✗ ⁴ | **222** (41.8 GB, dequant bf16) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
+| 7 | gpt-oss-20b | ✗ ⁴ | **39.6** (23.9 GB, native MXFP4) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ¹⁷ | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ¹⁷ | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | — | — | — |
