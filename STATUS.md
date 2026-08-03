@@ -28,7 +28,7 @@ ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ MLX command-buffer bug ⁸ | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | — | 29.8 (b32: 591) | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512² ⁹ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
 | 18 | LoRA E2B train (ms/step) | 2048 | **407** | — | 135.6 ¹⁰ | — |
 | 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **28.0** (102.9 GB, load 12 s) | — | — |
@@ -87,19 +87,20 @@ kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
    engine-side eval-forcing mode (small-scale-validated first) or the
    MLX upstream fix. Repro:
    notes/data/qwen3_8b_prefill_36layer.mlir (0.3 s).
-9. Blocked on two independent walls, both fully diagnosed. (a) MEMORY:
-   we lower attention unfused (matmul-softmax-matmul), so SD3.5's
-   attention logits are ~12 GB/block at 1024² — peak live set ~90 GB in
-   ANY execution mode (guard-killed compiled, eager, and at 20 steps
-   even 512²: intermediates pin across steps under large command-buffer
-   caps). Fix: map onto mx.fast.scaled_dot_product_attention (C++-era).
-   (b) CORRECTNESS: with small command buffers MLX 0.32 corrupts
-   compiled graphs (the footnote-7 bug), and diffusion's GB-sized
-   kernels force small-kernel-count buffers at any byte cap that is
-   memory-safe — the two constraints are unsatisfiable for this graph
-   shape until MLX fixes the corruption. Evidence: 512²/2-step
-   diagnostic at 16 GB cap = correct full-range image; every larger
-   configuration black or guard-killed.
+9. RESOLVED 2026-08-03, both walls. (a) MEMORY: attention now fuses
+   (sdpa recognizer; 5–8 GB/block logits → ~0.15 GB) and the eager
+   memory stack bounds the rest — 512²/20 steps peaks at 18.1 GB.
+   Fusion measured worth 1.30× (1389 vs 1803 ms/step). (b) The
+   "correctness wall" was MISATTRIBUTED to the command-buffer bug:
+   every historical black image (1024², 20-step 512², incl.
+   METALJAX_COMPILE=0) was a HARNESS bug — keras-hub's scheduler
+   stores sigmas as a plain attribute, jit bakes them as constants,
+   and the 4-step warmup executable was reused at 20 steps → OOB
+   take → NaN sigmas → clip-to-zero pixels. jax-CPU reproduces the
+   same black image. Fixed: per-step-count samplers + fail-closed
+   image check + diffusion-appropriate prompt; backend exonerated
+   (OOB-NaN propagation verified bit-matching CPU). Image verified
+   against the torch-MPS reference. 1024² measurement pending.
 10. torch MPS SDPA has no backward kernel — substantiated by autograd
     node inspection (math fallback), disclosed in the record. Loss
     series not comparable across stacks (different preprocessing);

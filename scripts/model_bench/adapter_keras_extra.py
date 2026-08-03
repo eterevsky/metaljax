@@ -698,17 +698,72 @@ def run_keras_vision(bench, backend, prompt=None, n_decode=None,
 
 # -------------------------------------------------------- 2. SD 3.5 Large
 
+def _sd3_sampler_per_step_count(t2i):
+    """`gen(text, steps)` that never reuses a sampler traced for other steps.
+
+    THE BUG THIS EXISTS FOR -- the SD3.5 all-zero image (2026-08-03).
+    keras-hub's `FlowMatchEulerDiscreteScheduler.set_sigmas` keeps the
+    sigma schedule in a PLAIN TENSOR attribute (`scheduler.sigmas`), not a
+    keras `Variable`, so `jax.jit` bakes it into the traced program as a
+    CONSTANT -- while `num_steps` is a traced *argument*, so
+    `TextToImage.make_generate_function`'s cached executable is reused at
+    any other step count without retracing.
+
+    This bench warmed up at `short = num_steps // 5` steps, baking a
+    `short + 1` entry table; the timed `num_steps`-step run then reused
+    that executable, and its `ops.take(sigmas, step)` read indices
+    `short+1 .. num_steps` out of bounds.  `jnp.take` FILLS out-of-bounds
+    reads with NaN (identically on jax-CPU and on metal -- verified), so
+    every sigma from iteration `short` on was NaN, the latents went NaN,
+    the VAE output went NaN, and `cast(round(clip(x, 0, 1) * 255),
+    "uint8")` turned the whole image into EXACT zeros.  20-step runs were
+    black; 2-step runs (where `short == num_steps`) were fine -- which is
+    why it read like a backend corruption for a week.  Nothing about the
+    backend is involved: the same sequence is black on jax-CPU too.
+
+    Keeping one traced sampler per step count is the whole fix: swap
+    `generate_function` in, and let `generate()` trace a fresh one (after
+    its own `configure_scheduler`) the first time a count is seen.
+    """
+    cache = {}
+
+    def gen(text, steps):
+        t2i.generate_function = cache.get(steps)
+        img = t2i.generate(text, num_steps=steps)
+        cache[steps] = t2i.generate_function
+        return img
+
+    return gen
+
+
+def _check_image(img, what):
+    """Fail closed on a degenerate sample (the all-zero-image class)."""
+    import numpy as np
+
+    a = np.asarray(img)
+    if a.size == 0 or float(a.std()) == 0.0:
+        val = a.flat[0] if a.size else "n/a"
+        raise RuntimeError(
+            f"{what}: degenerate image -- every pixel is {val}. NaN latents "
+            "cast to uint8 look exactly like this; refusing to report the "
+            "run as ok")
+
+
 def run_keras_diffusion(bench, backend, prompt=None, n_decode=None,
                         num_steps=None, image_size=None, marginal=True):
     """Stable Diffusion 3.5 Large: one image, `num_steps` diffusion steps.
 
-    Metrics: load_s; warmup_s (first generate -- compiles the sampler);
+    Metrics: load_s; warmup_s (first generate -- compiles the sampler at
+    `short` steps); warmup_long_s (compiles it at `num_steps`);
     ms_per_diffusion_step = warm total / num_steps.  When `marginal` is
     set we also time a short generate and report
     `ms_per_diffusion_step_marginal` = (t_long - t_short) / (n_long -
     n_short), which removes the fixed text-encode + VAE-decode cost.
-    `num_steps` is a traced argument of the jitted sampler, so the second
-    call does NOT recompile.
+
+    Every step count gets its OWN traced sampler (see
+    `_sd3_sampler_per_step_count` -- sharing one across step counts is
+    what produced the all-zero images), so each count is compiled once,
+    untimed, and only then timed.
     """
     keras = _keras_bf16()
     import keras_hub
@@ -716,8 +771,14 @@ def run_keras_diffusion(bench, backend, prompt=None, n_decode=None,
     preset = bench["model"]
     num_steps = num_steps or _int_env("BENCH_DIFFUSION_STEPS", 20)
     image_size = image_size or _int_env("BENCH_IMAGE_SIZE", 1024)
-    text = prompt or ("a photograph of an astronaut riding a horse on the "
-                      "surface of Mars, golden hour, 50mm")
+    # NOT `prompt`: run_bench.py passes the manifest's *LLM* prompt (a
+    # paragraph about memory bandwidth) to every adapter, and feeding that
+    # to a diffusion model yields saturated colour-band garbage -- valid
+    # pixel statistics, no picture, so the output stops being usable as a
+    # correctness oracle. Diffusion gets an image prompt of its own.
+    text = (os.environ.get("BENCH_IMAGE_PROMPT") or bench.get("prompt")
+            or "a photograph of an astronaut riding a horse on the "
+               "surface of Mars, golden hour, 50mm")
 
     # Same streaming-load shim as the LM path: without it the build phase
     # materializes every initializer's threefry chain (~30x the largest
@@ -737,14 +798,23 @@ def run_keras_diffusion(bench, backend, prompt=None, n_decode=None,
             uninstall_streaming_load()
     load_s = time.monotonic() - t0
 
+    gen = _sd3_sampler_per_step_count(t2i)
     short = max(2, num_steps // 5)
-    img, warmup_s = _timed(t2i.generate, text, num_steps=short)
-    total, dt_long = _timed(t2i.generate, text, num_steps=num_steps)
+    warm, warmup_s = _timed(gen, text, short)
+    _check_image(warm, f"warmup generate ({short} steps)")
+    if short != num_steps:
+        # Trace/compile the long sampler once, untimed: `dt_long` has to
+        # stay a WARM number, and every step count now traces its own.
+        _, warmup_long_s = _timed(gen, text, num_steps)
+    else:
+        warmup_long_s = 0.0
+    total, dt_long = _timed(gen, text, num_steps)
 
     import numpy as np
 
     img = np.asarray(total)
-    out = dict(load_s=load_s, warmup_s=warmup_s,
+    _check_image(img, f"timed generate ({num_steps} steps)")
+    out = dict(load_s=load_s, warmup_s=warmup_s, warmup_long_s=warmup_long_s,
                num_steps=num_steps, image_size=image_size,
                generate_ms=1000 * dt_long,
                ms_per_diffusion_step=1000 * dt_long / num_steps,
@@ -763,7 +833,7 @@ def run_keras_diffusion(bench, backend, prompt=None, n_decode=None,
         except Exception as e:  # pragma: no cover
             out["image_dump_error"] = f"{type(e).__name__}: {e}"[:120]
     if marginal:
-        _, dt_short = _timed(t2i.generate, text, num_steps=short)
+        _, dt_short = _timed(gen, text, short)
         out["short_steps"] = short
         out["ms_per_diffusion_step_marginal"] = (
             1000 * (dt_long - dt_short) / max(num_steps - short, 1))

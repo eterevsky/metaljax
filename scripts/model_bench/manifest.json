@@ -200,6 +200,7 @@
       "path": "keras_diffusion",
       "model": "stable_diffusion_3.5_large",
       "size_gb": 18.0,
+      "prompt": "a photograph of an astronaut riding a horse on the surface of Mars, golden hour, 50mm",
       "backends": [
         "metaljax"
       ]

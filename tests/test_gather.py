@@ -97,6 +97,43 @@ def test_one_hot_indexing_grad():
         return jnp.sum(t[ids] ** 2)
     check(jax.grad(loss), table, rtol=1e-5, atol=1e-6)
 
+
+def test_gather_oob_modes():
+    # jnp.take's DEFAULT out-of-bounds policy is "fill" (NaN for floats,
+    # not a clamp) -- this is what turns a stale lookup table into NaN
+    # rather than into the table's last entry, and CPU does exactly the
+    # same. Diagnosing the SD3.5 all-zero image depended on it, so pin all
+    # three modes against CPU.
+    t = np.array([1.0, 0.75, 0.5, 0.25, 0.0], np.float32)
+    i = np.array([0, 4, 5, 7, 20], np.int32)
+    check(lambda t, i: jnp.take(t, i), t, i)                    # fill (NaN)
+    check(lambda t, i: jnp.take(t, i, mode="clip"), t, i)
+    check(lambda t, i: jnp.take(t, i, mode="fill", fill_value=-1.0), t, i)
+    check(lambda t, i: jnp.take(t, i), t.astype(np.int32), i)   # int fill
+
+
+def test_gather_oob_in_counted_loop():
+    # The SD3.5 sampler shape, minimized: a counted loop whose body looks
+    # up a schedule table that is SHORTER than the trip count (keras-hub
+    # bakes `scheduler.sigmas` as a jit constant while `num_steps` stays
+    # traced, so a sampler compiled for 4 steps and replayed for 20 reads
+    # past the end). Every sigma from index 5 on is NaN, and the NaN has
+    # to propagate through the carry exactly as it does on CPU -- our
+    # counted-loop/msl paths must not "helpfully" clamp or drop it.
+    t = np.array([1.0, 0.75, 0.5, 0.25, 0.0], np.float32)
+
+    def sampler(t, n):
+        def body(i, carry):
+            sigma = jnp.take(t, jnp.expand_dims(i, 0))
+            nxt = jnp.take(t, jnp.expand_dims(i + 1, 0))
+            return carry + (nxt - sigma) * carry
+
+        return jax.lax.fori_loop(0, n, body, jnp.ones((1,), np.float32))
+
+    check(sampler, t, np.int32(4))    # in bounds -> finite
+    check(sampler, t, np.int32(20))   # past the end -> NaN, like CPU
+
+
 def test_scatter_oob_dropped():
     # XLA semantics: out-of-bounds scatter updates are DROPPED, not
     # clamped. jnp.nonzero/where pad with fill_value == size (clamps onto

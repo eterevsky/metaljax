@@ -100,7 +100,7 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   Release protocol: treat any single-run gate FAIL as rerun-first;
   0.11.3's step-3 gate should run 2-3x (the automation already
   re-runs cheaply) and big10 sits on the soak watchlist.
-- **SD3.5 all-zero image (2026-08-03 night)**: 512²/20 steps now COMPLETES
+- **SD3.5 all-zero image — RESOLVED as a harness bug** (see STATUS fn 9; both engine suspects cleared by bisection): 512²/20 steps now COMPLETES
   at 18.1 GB peak (memory stack works) but pixels are all zero. Suspects:
   (a) flush-cadence shift on rewrite-carrying blocks (225408b changed
   absorbed-op byte charging → sync points moved → command-buffer lottery
