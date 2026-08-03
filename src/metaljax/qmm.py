@@ -111,7 +111,14 @@ from jaxlib.mlir import ir
 
 from metaljax import _ir, dtypes
 
-ENABLED = os.environ.get("METALJAX_QMM", "1") != "0"
+# The quantized-matmul recognizer itself.
+QMM_ENABLED = os.environ.get("METALJAX_QMM", "1") != "0"
+# engine.execute gates the whole eager recognizer prologue on `ENABLED`, and
+# metaljax.moe's expert gather shares that prologue (its verification has to
+# run outside any trace), so either recognizer being on has to turn it on.
+# The flag is read here rather than imported to keep moe -> qmm the only
+# direction of the dependency.
+ENABLED = QMM_ENABLED or os.environ.get("METALJAX_MOE", "1") != "0"
 _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 
 # mx.quantize supports these only, and requires K % group_size == 0.
@@ -551,10 +558,14 @@ class Match:
                  "lperm", "rperm", "rshape", "bshape", "mshape", "nshape",
                  "B", "M", "K", "N", "out_dtype", "disabled", "slot", "gs",
                  "bits", "packs", "repacks", "name", "sub_range", "has_perm",
-                 "mode", "nvals", "swapped")
+                 "mode", "nvals", "swapped", "absorbed")
 
     def __init__(self):
         self.recip = False
+        # Set by metaljax.moe when an expert-gather rewrite takes over this
+        # dot: the weight is still packed here, but the dense
+        # quantized_matmul is never emitted (gather_qmm replaces it).
+        self.absorbed = False
         self.mode = "affine"
         self.zero = None
         self.sub_range = None
@@ -612,12 +623,20 @@ class _Pack:
 
 
 class State:
-    """Per-program recognizer state."""
+    """Per-program recognizer state (quantized matmuls AND MoE gathers).
 
-    __slots__ = ("matches", "skip", "roots", "values", "active")
+    `moe` holds metaljax.moe.Match objects. They share this state because
+    they share the machinery: the same skip set, the same root dispatch in
+    the interpreter, and -- when an expert dot was quantized -- the same
+    packed weights, which a gathered dispatch reads instead of the dense
+    `quantized_matmul` it replaces.
+    """
+
+    __slots__ = ("matches", "skip", "roots", "values", "active", "moe")
 
     def __init__(self):
         self.matches = []
+        self.moe = []
         self.skip = frozenset()
         self.roots = {}
         self.values = []
@@ -625,10 +644,15 @@ class State:
 
     def rebuild(self):
         live = [m for m in self.matches if not m.disabled]
-        self.roots = {m.key: m for m in live}
+        self.roots = {m.key: m for m in live if not m.absorbed}
         skip = set()
         for m in live:
             skip.update(m.ops)
+        for g in self.moe:
+            if g.disabled:
+                continue
+            self.roots[g.key] = g
+            skip.update(g.skip_keys)
         self.skip = frozenset(skip)
         self.active = bool(self.roots)
 
@@ -980,10 +1004,10 @@ def analyze(interp) -> State:
         return st
     st = State()
     interp._qmm = st
-    if not ENABLED:
-        return st
     try:
         with interp.context:
+            if not QMM_ENABLED:
+                raise _Reject("METALJAX_QMM=0")
             ctx = ({a: i for i, a in
                     enumerate(interp._main_block().arguments)},
                    set(interp.donated_args))
@@ -1010,10 +1034,17 @@ def analyze(interp) -> State:
             if _DEBUG and st.matches:
                 print(f"[metaljax] qmm: {len(st.matches)} quantized "
                       f"matmul(s) recognized", flush=True)
+    except _Reject:
+        st.matches = []                      # METALJAX_QMM=0
     except Exception as e:  # analysis must never break a program
         if _DEBUG:
             print(f"[metaljax] qmm: analysis failed ({e})", flush=True)
         st.matches = []
+    # Expert-gather rewrites are found on top of the quantized ones: a MoE
+    # dispatch whose dots were packed here reuses those packs and marks them
+    # absorbed (see metaljax.moe).
+    from metaljax import moe as _moe
+    _moe.analyze(interp, st)
     st.rebuild()
     return st
 
@@ -1357,7 +1388,7 @@ def prologue(interp, args) -> bool:
     st = interp._qmm
     if st is None:
         st = analyze(interp)
-    if not st.matches:
+    if not st.matches and not st.moe:
         return False
     changed = False
     values = []
@@ -1393,6 +1424,11 @@ def prologue(interp, args) -> bool:
             arrays = pk.arrays()
             m.nvals = len(arrays)
             values.extend(arrays)
+    # Expert-gather matches are verified here too (eagerly, before any
+    # trace): the check syncs with the host, which a traced emit cannot.
+    from metaljax import moe as _moe
+    changed = _moe.prologue(interp, st) or changed
+    with interp.context:
         if changed:
             st.rebuild()
     st.values = values
@@ -1429,8 +1465,21 @@ def pop(interp, token):
         interp._qmm.values = token[0]
 
 
+def pack_arrays(interp, m):
+    """This match's packed arrays, as `emit` sees them (traced inside a
+    trace). Shared with metaljax.moe, which reads the pack of a dot it has
+    taken over rather than emitting the dense quantized_matmul."""
+    st = interp._qmm
+    return st.values[m.slot:m.slot + m.nvals]
+
+
 def emit(interp, m, env):
     """One `mx.quantized_matmul` in place of the whole dequant-and-dot."""
+    if not isinstance(m, Match):
+        # An expert-gather match (metaljax.moe.Match): same root dispatch,
+        # different rewrite. Kept here so the interpreter has one hook.
+        from metaljax import moe as _moe
+        return _moe.emit(interp, m, env)
     st = interp._qmm
     vals = st.values[m.slot:m.slot + m.nvals]
     w, scales = vals[0], vals[1]

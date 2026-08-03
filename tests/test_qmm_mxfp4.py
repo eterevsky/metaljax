@@ -51,7 +51,7 @@ from metaljax import qmm
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
-needs_qmm = pytest.mark.skipif(not qmm.ENABLED, reason="METALJAX_QMM=0")
+needs_qmm = pytest.mark.skipif(not qmm.QMM_ENABLED, reason="METALJAX_QMM=0")
 needs_batch = pytest.mark.skipif(not qmm._BATCH, reason="METALJAX_QMM_BATCH=0")
 
 # The E2M1 grid, indexed by the 4-bit code (bit 3 is the sign).
@@ -503,7 +503,7 @@ def _fallback(f, args, route):
     got = _run(f, args, _metal())
     st = qmm.stats()
     assert st["packs"] == 0, st
-    if qmm.ENABLED:
+    if qmm.QMM_ENABLED:
         if route == "structural":
             assert st["recognized"] == 0, st
         else:

@@ -573,7 +573,9 @@ class Interpreter:
         layer and far too big to compile, so `run_block` is its execute path.
         """
         qst = self._qmm
-        if qst is not None and not (qst.active and qst.values):
+        # `qst.moe` (expert-gather rewrites, metaljax.moe) needs no packed
+        # weights of its own -- a float MoE has an empty `values`.
+        if qst is not None and not (qst.active and (qst.values or qst.moe)):
             # qmm needs its prologue to have packed (the bare Interpreter has
             # none); without that, run every op literally.
             qst = None

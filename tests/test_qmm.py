@@ -36,7 +36,7 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 # METALJAX_QMM=0 turns the whole rewrite off: the numeric comparisons below
 # still run (the literal chain must be right too), the ones that assert the
 # rewrite happened do not.
-needs_qmm = pytest.mark.skipif(not qmm.ENABLED, reason="METALJAX_QMM=0")
+needs_qmm = pytest.mark.skipif(not qmm.QMM_ENABLED, reason="METALJAX_QMM=0")
 
 
 def _metal():
@@ -259,7 +259,7 @@ def _compare(f, args, exact, packs=1, perms=None):
     qmm.reset_stats()
     got = _run(f, args, _metal())
     want = _run(f, args, _cpu())
-    if qmm.ENABLED:
+    if qmm.QMM_ENABLED:
         assert qmm.stats()["packs"] == packs, qmm.stats()
         if perms is not None:
             assert qmm.stats()["perms"] == perms, qmm.stats()
@@ -587,7 +587,7 @@ def _fallback_case(f, args, exact):
     got = _run(f, args, _metal())
     st = qmm.stats()
     assert st["packs"] == 0, st
-    if qmm.ENABLED:
+    if qmm.QMM_ENABLED:
         assert st["fallbacks"] >= 1, st
     want = _run(f, args, _cpu())
     np.testing.assert_allclose(got, want, rtol=2e-2,
@@ -710,6 +710,11 @@ def test_disabled_by_env(monkeypatch):
     x = (np.random.default_rng(19).standard_normal((2, rows)) * 0.4).astype("bfloat16")
     args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
             jnp.asarray(g_idx), jnp.asarray(x))
+    # METALJAX_QMM=0 maps to QMM_ENABLED (the quantized-recognizer gate);
+    # qmm.ENABLED is the shared prologue gate that MoE also rides on. On the
+    # merged tree sdpa's overlap check reaches qmm.analyze even when the
+    # prologue is off, so the recognizer gate is the one that must hold.
+    monkeypatch.setattr(qmm, "QMM_ENABLED", False)
     monkeypatch.setattr(qmm, "ENABLED", False)
     qmm.reset_stats()
     got = _run(lambda *a: dense_sub(*a, columns=cols), args, _metal())
