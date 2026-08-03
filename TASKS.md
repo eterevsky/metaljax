@@ -90,3 +90,13 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
 - gpt-oss CPU: dequantized working set ~126 GB — infeasible.
 - eager-path scan flush cadence: values pinned by tests; revisit only
   with the MLX fix.
+- **big10-b8l256 (gru.1024) intermittent inf — lottery class, first wild
+  texmo sighting** (2026-08-03): one gate run produced inf in 18/20
+  outputs in suite context; standalone passes, full-gate rerun 104/104,
+  and engine decisions are byte-identical with METALJAX_COMPILE_BYTES_MB
+  on/off (the bytes gate never touches this config). Classified as the
+  MLX command-buffer nondeterministic corruption at SHIPPED budgets —
+  goes into the upstream report as the first spontaneous texmo draw.
+  Release protocol: treat any single-run gate FAIL as rerun-first;
+  0.11.3's step-3 gate should run 2-3x (the automation already
+  re-runs cheaply) and big10 sits on the soak watchlist.
