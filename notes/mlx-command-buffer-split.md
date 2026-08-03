@@ -249,3 +249,17 @@ execute outputs), developed and validated at SMALL scale first; a single
 supervised 8B verification only after that lands, with Oleg's explicit
 sign-off. Otherwise the row waits for the MLX upstream fix
 (notes/mlx-command-buffer-upstream-issue.md is filing-ready).
+
+**Panic #6 (2026-08-03, rows 8/9 attempt):** the guard itself worked — R1's
+ramp was killed cleanly at projected 96 GB (claimed fell 91.7 -> 4.9 GB) —
+but swap had reached 9 GB during the ramp, and the chain launched the
+second ~70 GB load (Qwen3.6-35B) onto the still-degraded system, which
+kernel-panicked with no guard record. Two lessons now policy: (a) the
+danger is OUR stack's allocation ramps, not static residency (mlx-lm holds
+93.4 GB resident fine on this machine); (b) NEVER chain big runs — any
+big run needs a system-recovered precheck (swap and claimed back to
+baseline) — and no run with >50 GB expected claim until the eval-forcing
+work (TASKS: eager-phase memory discipline) bounds the transient waves.
+Rows 8/9 join 10/15 behind that work: their LOADS are fixed (the 35B
+ported all 1026 weights streamed at ~70 GB), warmup transients are what
+remain lethal.

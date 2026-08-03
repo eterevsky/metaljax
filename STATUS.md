@@ -19,8 +19,8 @@ ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
 | 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
 | 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
 | 7 | gpt-oss-20b | ✗ ⁴ | **39.6** (23.9 GB, native MXFP4) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
-| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ keras load ¹⁷ | **13.7** | — | — |
-| 9 | R1-Distill-32B | ✗ 131 GB | ✗ keras load ¹⁷ | 131.8 | — | — |
+| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | **13.7** | — | — |
+| 9 | R1-Distill-32B | ✗ 131 GB | ✗ warmup transients ¹⁷ | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | — | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **52.8** (93.4 GB) | — | — |
@@ -133,12 +133,17 @@ kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     vs mlx-lm's gathered 17.0 (27.8×). A 4B-active MoE decodes slower
     than dense 31B on our path. Top C++-era item alongside quantized
     matmul.
-17. keras load path (random-init before checkpoint overwrite +
-    conversion transients) exceeds the machine above ~50 GB
-    checkpoints: R1-32B (65 GB) jetsam-killed; Qwen3.6-35B (72 GB)
-    entered swap-death (196 GB footprint); Mixtral (93 GB) not
-    attempted — foregone. gemma-lib's streaming loader handled
-    62.6 GB fine, so the fix is a streaming load for the keras path.
+17. The keras LOAD ceiling is fixed (streaming loader, 30c9717: init
+    never materializes; E2B peak 25→9.5 GB; Qwen3.6-35B ports all
+    1026 weights, ~70 GB resident). What remains lethal is the phase
+    AFTER load on 60 GB+ models: warmup/compile transient ramps drove
+    swap to 9 GB (R1, guard-killed at 95 GB budget) and a chained
+    second load onto that degraded system caused kernel panic #6.
+    mlx-lm holds 93.4 GB resident fine — the danger is our stack's
+    allocation ramps, not static residency. Rows 8/9 (and 12) wait
+    for the eager-phase eval-forcing work (TASKS), same as rows
+    10/15; big-run moratorium >50 GB expected claim until it lands,
+    and big runs are never chained without a system-recovered check.
 18. Packed int4 memory saving IS real on metaljax (2.7 vs 10.2 GB —
     the only sub-byte JAX path that keeps it). XLA:CPU fuses the
     in-graph unpack into a small net WIN (67.5 vs 79.2 bf16). The
