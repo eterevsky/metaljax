@@ -229,7 +229,8 @@ class MetalExecutable:
                     print(f"[metaljax] exec {self.name}: pure="
                           f"{interp.main_pure} cost={cost} "
                           f"bytes={nbytes / 2**20:.1f}MB "
-                          f"eagerbytes={sum(interp.eager_plan(blk)[1]) / 2**20:.1f}MB "
+                          f"eagerbytes="
+                          f"{sum(interp.eager_plan(blk, interp._rewrite_plan(blk))[1]) / 2**20:.1f}MB "
                           f"compile={self._can_compile}", flush=True)
         if not self._can_compile:
             return interp

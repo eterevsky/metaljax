@@ -1278,6 +1278,30 @@ def _emit_dot(ctx, node):
     return mx.reshape(y, [P] + list(node.mshape) + list(node.nshape))
 
 
+def emit_reads(m):
+    """The `env` values `emit` (below) reads, for liveness pruning.
+
+    `_Planner.reads` already is that list, and by construction: `_external`
+    records every value the plan gathers on the way into the region
+    (`_emit_ext`, and `_emit_dot`'s ungathered-rows shortcut), and `_dot`
+    records a dense per-expert weight that stays outside it (`gather_mm`
+    indexes it in place). The router's two tensors are read by `emit` itself
+    and are tracked separately -- `_analyze_root` adds them to `protect` for
+    the same reason.
+
+    Everything else the emission touches comes from somewhere `env` is not:
+    a packed expert weight from `qmm.pack_arrays`, and a constant or iota
+    bound inside a callee from re-running its handler on an empty
+    environment.
+
+    Keep this in step with `emit`: a missing entry lets the interpreter drop
+    a value the gathered dispatch still reads. METALJAX_PRUNE_VERIFY=1
+    checks it at run time (metaljax.interpreter._CheckedEnv);
+    tests/test_eager_prune.py runs this recognizer under it.
+    """
+    return tuple(m.reads) + (m.router.indices, m.router.weights)
+
+
 def emit(interp, m, env):
     """The gathered expert dispatch, in place of the dense weighted sum."""
     r = m.router

@@ -135,7 +135,7 @@ tests; revisit only with the MLX fix").
   threshold from. Warmup programs cross into the eager (covered) regime once
   they exceed the 20k op trace budget, which for maxtext-shaped models is
   somewhere above 40 layers.
-* Pruning is disabled for programs the quantized-matmul rewrite is active in:
+* Pruning is plan-aware: recognizer matches declare emit_reads and liveness is computed against the rewritten schedule (originally pruning was disabled on rewrite-carrying blocks):
   it reads the operands of ops it *skips* when it emits the fused dot, so a
   static last use can fall on a skipped op. Those programs keep the old
   retention (and run compiled anyway).

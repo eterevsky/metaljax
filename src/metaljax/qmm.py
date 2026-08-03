@@ -1473,6 +1473,27 @@ def pack_arrays(interp, m):
     return st.values[m.slot:m.slot + m.nvals]
 
 
+def emit_reads(m):
+    """The `env` values `emit` (below) reads, for liveness pruning.
+
+    Exactly one: the activation operand. Everything else the fused dot needs
+    -- the packed weight, the scales, the bias table and the group
+    permutation -- travels in `State.values` (see `pack_arrays`), which the
+    packing prologue owns and `env` never holds. The dequantized weight the
+    literal dot would have read is produced by ops this rewrite ABSORBS, so
+    it is never in `env` at all.
+
+    Keep this in step with `emit`: a missing entry lets the interpreter drop
+    a value the fused op still reads. METALJAX_PRUNE_VERIFY=1 checks it at
+    run time (metaljax.interpreter._CheckedEnv); tests/test_eager_prune.py
+    runs this recognizer under it, with a negative control.
+    """
+    if not isinstance(m, Match):
+        from metaljax import moe as _moe
+        return _moe.emit_reads(m)
+    return (m.lhs,)
+
+
 def emit(interp, m, env):
     """One `mx.quantized_matmul` in place of the whole dequant-and-dot."""
     if not isinstance(m, Match):

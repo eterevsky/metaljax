@@ -1390,6 +1390,27 @@ def _mask_array(m, env):
     return _apply(mask, m.mask_rec)
 
 
+def emit_reads(m):
+    """The `env` values `emit` (below) reads, for liveness pruning.
+
+    Q, K and V, plus the mask's BASE when there is one -- the value
+    `_mask_array` turns into the additive form. `_mask_array`'s cache entry
+    is keyed by a tuple, not by an ir.Value, so nothing prunes it and it is
+    not listed here; but the base is read again on every cache MISS (one per
+    block), so it has to stay live to the last attention in the block, which
+    is exactly what listing it as a use of each root achieves.
+
+    Keep this in step with `emit`: a missing entry lets the interpreter drop
+    a value the fused attention still reads. METALJAX_PRUNE_VERIFY=1 checks
+    it at run time (metaljax.interpreter._CheckedEnv); tests/test_eager_prune.py
+    runs every spelling tests/test_sdpa.py recognizes under it, plus a
+    negative control per entry of this tuple.
+    """
+    if m.mask is None:
+        return (m.q, m.k, m.v)
+    return (m.q, m.k, m.v, m.mask[1])
+
+
 def emit(interp, m, env):
     """One `mx.fast.scaled_dot_product_attention` in place of the chain."""
     q = _apply(env[m.q], m.q_rec)

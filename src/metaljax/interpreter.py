@@ -27,7 +27,10 @@ COMPILE_ENABLED = os.environ.get("METALJAX_COMPILE", "1") != "0"
 # program's footprint by the length of its op chain. Two mechanisms bound it:
 #
 #   * liveness pruning -- a value leaves `env` after its last use in the block
-#     (METALJAX_ENV_PRUNE=0 restores the old retain-everything behaviour);
+#     (METALJAX_ENV_PRUNE=0 restores the old retain-everything behaviour).
+#     "Last use" is read off the plan the block will actually run, not off the
+#     literal IR: absorbed ops use nothing and roots use what `emit` reads.
+#     See Interpreter.eager_plan;
 #   * a byte-denominated flush -- once this much estimated result data has
 #     been produced with no sync point, settle what is still live so the
 #     pending graph, and the Metal buffers it pins, stay bounded.
@@ -51,6 +54,13 @@ COMPILE_ENABLED = os.environ.get("METALJAX_COMPILE", "1") != "0"
 FLUSH_MB = int(os.environ.get("METALJAX_EAGER_FLUSH_MB", "1024"))
 FLUSH_BYTES = max(FLUSH_MB, 0) * 2**20
 _ENV_PRUNE = os.environ.get("METALJAX_ENV_PRUNE", "1") != "0"
+# Self-check for the plan-aware half of the liveness analysis (below): the
+# environment remembers what pruning dropped and raises instead of a bare
+# KeyError if anything -- a recognizer's `emit`, above all -- reads it back.
+# The recognizers' `emit_reads` sets are hand-derived from their `emit`
+# implementations, and this is what proves them complete. Off by default: it
+# puts a Python-level __getitem__ on the interpreter's hottest lookup.
+_PRUNE_VERIFY = os.environ.get("METALJAX_PRUNE_VERIFY", "") == "1"
 # Blocking eval costs a full command-buffer roundtrip (~190us); async_eval
 # only submits. Checkpoints block by default so the budget means what it
 # says: with N async checkpoints in flight the peak is N x the budget
@@ -177,6 +187,60 @@ def flush_eval(arrays, hard: bool):
 
 class UnsupportedOpError(NotImplementedError):
     pass
+
+
+class PrunedValueError(KeyError):
+    """A value liveness pruning let go of was read back afterwards.
+
+    Only ever raised under METALJAX_PRUNE_VERIFY=1. It means the liveness
+    analysis and the code that reads `env` disagree -- in practice, that a
+    recognizer's `emit_reads` does not list everything its `emit` reads.
+    """
+
+
+_MISSING = object()
+
+
+class _CheckedEnv(dict):
+    """`env` that records what pruning dropped instead of forgetting it.
+
+    A plain dict turns a use-after-free into a KeyError somewhere far away
+    (or, if the value happens to be a nested block's capture, into a silently
+    wrong answer via ops.control._captures' _ABSORBED substitution). This
+    keeps the key and says exactly what happened.
+    """
+
+    __slots__ = ("pruned",)
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.pruned = set()
+
+    def _check(self, key):
+        if key in self.pruned:
+            raise PrunedValueError(
+                f"read of a value liveness pruning dropped: {key!r}")
+
+    def __getitem__(self, key):
+        self._check(key)
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        self._check(key)
+        return dict.get(self, key, default)
+
+    def __setitem__(self, key, value):
+        if self.pruned:
+            self.pruned.discard(key)
+        dict.__setitem__(self, key, value)
+
+    def pop(self, key, default=None):
+        got = dict.pop(self, key, _MISSING)
+        if got is _MISSING:
+            return default
+        self.pruned.add(key)
+        return got
+
 
 
 def free_values(block: ir.Block) -> list[ir.Value]:
@@ -548,19 +612,45 @@ class Interpreter:
 
     # --- eager execution plan (liveness + result bytes) ---
 
-    def eager_plan(self, block: ir.Block):
+    def eager_plan(self, block: ir.Block, rewrites=()):
         """(drop_after, out_bytes) for op-by-op execution of `block`.
 
         drop_after[i] lists the values whose last use is operation i, so the
         eager loop can let go of them; out_bytes[i] is the estimated device
-        data operation i produces. Cached per block (ir.Block identity is
-        pointer-stable across traversals).
+        data operation i produces.
 
         A value's uses are its consumers' operands PLUS the captures of any
         nested region, which is live for the whole of the op owning it. A
         result nothing reads is dropped immediately. Values inherited from an
         enclosing block may be dropped too: `run_block` works on a copy of
         the parent's environment, so only this block's reference goes away.
+
+        `rewrites` is the block's recognizer plan (see `_rewrite_plan`), and
+        the analysis is not valid without it, because the plan changes what
+        the block executes:
+
+        * an ABSORBED op never runs. It reads none of its operands and none
+          of its region's captures (sdpa absorbs the softmax's reduces, which
+          do carry regions), and it produces no result, so it contributes no
+          uses and gets no drop entries -- a static last use must never fall
+          on one, or the value it names would be retained for the whole
+          block. It is charged no bytes either, exactly as
+          ops.control._block_bytes charges absorbed ops nothing.
+        * a ROOT runs `emit` instead of itself, so its uses are what `emit`
+          reads out of `env` (`<recognizer>.emit_reads`), NOT the literal
+          operands -- the dequantized weight of a quantized matmul is never
+          read, while the activation of a dot two hundred ops back is.
+
+        Getting that second set wrong is a use-after-free, so it is derived
+        from the `emit` implementations and checked at run time under
+        METALJAX_PRUNE_VERIFY=1 (see `_CheckedEnv`).
+
+        Cached per block (ir.Block identity is pointer-stable across
+        traversals) AND per plan IDENTITY: `State.rebuild` replaces `skip`
+        and `roots` wholesale when qmm disables a match whose packing failed,
+        and `_rewrite_plan` then hands out a fresh tuple. A liveness map
+        computed against the previous plan would prune ops the new one still
+        executes, which is the same use-after-free by another route.
 
         NB `out_bytes` deliberately stays the plain `value_bytes` sum and does
         NOT use `op_bytes`' splat correction. It meters a flush CADENCE, and
@@ -571,21 +661,33 @@ class Interpreter:
         must not invent gigabytes that would turn compilation off, uses
         `op_bytes` instead.
         """
-        plan = self._live_cache.get(block)
-        if plan is not None:
-            return plan
+        cached = self._live_cache.get(block)
+        if cached is not None and cached[0] is rewrites:
+            return cached[1], cached[2]
         ops = [o.operation for o in block.operations]
+        skipped = frozenset(i for i, e in rewrites if e is _SKIP)
+        reads = {i: e[2] for i, e in rewrites if e is not _SKIP}
         last: dict = {}
         out_bytes: list[int] = []
         tcache: dict = {}
         for i, o in enumerate(ops):
-            for v in o.operands:
-                last[v] = i
-            if o.regions:
-                for v in _op_captures(o):
+            if i in skipped:
+                out_bytes.append(0)  # never executed, never materialized
+                continue
+            rd = reads.get(i)
+            if rd is None:
+                for v in o.operands:
+                    last[v] = i
+                if o.regions:
+                    for v in _op_captures(o):
+                        last[v] = i
+            else:
+                for v in rd:
                     last[v] = i
             out_bytes.append(sum(value_bytes(r, tcache) for r in o.results))
         for i, o in enumerate(ops):
+            if i in skipped:
+                continue
             for r in o.results:
                 if r not in last:
                     last[r] = i  # never read: let go as soon as it exists
@@ -595,9 +697,8 @@ class Interpreter:
             by_index.setdefault(i, []).append(v)
         for i, vs in by_index.items():
             drops[i] = tuple(vs)
-        plan = (drops, out_bytes)
-        self._live_cache[block] = plan
-        return plan
+        self._live_cache[block] = (rewrites, drops, out_bytes)
+        return drops, out_bytes
 
     def _eager_flush(self, env: dict):
         """Byte-denominated sync point: settle everything still live.
@@ -629,6 +730,11 @@ class Interpreter:
     def _rewrite_plan(self, block: ir.Block):
         """Ops of `block` a recognizer rewrites or absorbs: `((index, entry),)`.
 
+        An entry is `_SKIP` (absorbed) or `(emit, match, emit_reads)`, where
+        `emit_reads` is the tuple of values `emit` will read out of `env` --
+        resolved once here, with the rest of the plan, because liveness
+        pruning needs it on every block that carries a rewrite.
+
         Both recognizers answer the same per-op question, and they are
         disjoint by construction (sdpa drops any candidate overlapping a
         quantized matmul), so they merge into ONE table. That table is then
@@ -657,13 +763,14 @@ class Interpreter:
         cache = self._rewrite_cache
         if cache is None or not all(a is b for a, b in zip(cache[0], gate)):
             table: dict = {}
-            for st, fuse in ((qst, _qmm.emit), (sst, _sdpa.emit)):
+            for st, fuse, reads in ((qst, _qmm.emit, _qmm.emit_reads),
+                                    (sst, _sdpa.emit, _sdpa.emit_reads)):
                 if st is None:
                     continue
                 for k in st.skip:
                     table.setdefault(k, _SKIP)
                 for k, match in st.roots.items():
-                    table.setdefault(k, (fuse, match))
+                    table.setdefault(k, (fuse, match, tuple(reads(match))))
             cache = (gate, table, {})
             self._rewrite_cache = cache
         table, plans = cache[1], cache[2]
@@ -688,8 +795,12 @@ class Interpreter:
         parent_env: dict | None = None,
     ) -> list[mx.array]:
         # StableHLO regions may capture values from enclosing scopes, so seed
-        # the environment with the parent's bindings.
-        env: dict = dict(parent_env) if parent_env else {}
+        # the environment with the parent's bindings. (Inlined rather than
+        # factored out: an eagerly interpreted loop calls this per iteration.)
+        if _PRUNE_VERIFY:
+            env: dict = _CheckedEnv(parent_env) if parent_env else _CheckedEnv()
+        else:
+            env = dict(parent_env) if parent_env else {}
         block_args = list(block.arguments)
         if len(block_args) != len(args):
             raise ValueError(f"block expects {len(block_args)} args, got {len(args)}")
@@ -711,14 +822,15 @@ class Interpreter:
         drops = out_bytes = None
         pruning = flushing = False
         if eager:
-            drops, out_bytes = self.eager_plan(block)
+            # The plan is part of the liveness question, not an obstacle to
+            # it: a rewritten block's uses are the ones `emit` makes, and
+            # `eager_plan` is told which those are. (It used to disable
+            # pruning outright on any block carrying a rewrite, which turned
+            # it off exactly where it was needed most -- a diffusion sampler
+            # body is 16.5k ops with an attention in every layer.)
+            drops, out_bytes = self.eager_plan(block, plan)
             flushing = FLUSH_BYTES > 0
-            # Liveness is computed from the literal IR, but recognizer
-            # rewrites (qmm/sdpa) read the operands of ops they SKIP when
-            # they emit the fused op further down the block -- a static
-            # last use can fall on a skipped op. Retain everything on any
-            # block with an active rewrite plan.
-            pruning = _ENV_PRUNE and not plan
+            pruning = _ENV_PRUNE
         acc = 0
 
         for i, op in enumerate(block.operations):
@@ -730,29 +842,32 @@ class Interpreter:
                 entry = plan[pi][1]
                 pi += 1
                 nxt = plan[pi][0] if pi < len(plan) else -1
-                if entry is not _SKIP:
-                    fuse, match = entry
-                    for r, v in zip(o.results, fuse(self, match, env)):
-                        env[r] = v
-                continue
-            handler = REGISTRY.get(name)
-            if handler is None:
-                raise UnsupportedOpError(
-                    f"op '{name}' not implemented by metaljax.\n  {str(o).splitlines()[0]}"
-                )
-            ins = [env[v] for v in o.operands]
-            out = handler(self, o, ins, env)
-            results = list(o.results)
-            if isinstance(out, mx.array):
-                out = [out]
-            elif out is None:
-                out = []
-            if len(out) != len(results):
-                raise RuntimeError(
-                    f"handler for '{name}' returned {len(out)} values, op has {len(results)} results"
-                )
-            for r, v in zip(results, out):
-                env[r] = v
+                if entry is _SKIP:
+                    continue  # absorbed: no result, and no drops land here
+                fuse, match = entry[0], entry[1]
+                for r, v in zip(o.results, fuse(self, match, env)):
+                    env[r] = v
+            else:
+                handler = REGISTRY.get(name)
+                if handler is None:
+                    raise UnsupportedOpError(
+                        f"op '{name}' not implemented by metaljax.\n  {str(o).splitlines()[0]}"
+                    )
+                ins = [env[v] for v in o.operands]
+                out = handler(self, o, ins, env)
+                results = list(o.results)
+                if isinstance(out, mx.array):
+                    out = [out]
+                elif out is None:
+                    out = []
+                if len(out) != len(results):
+                    raise RuntimeError(
+                        f"handler for '{name}' returned {len(out)} values, op has {len(results)} results"
+                    )
+                for r, v in zip(results, out):
+                    env[r] = v
+            # Roots take this tail too: a value whose last use is the fused
+            # op has to be let go there like any other.
             if pruning:
                 for v in drops[i]:
                     env.pop(v, None)
