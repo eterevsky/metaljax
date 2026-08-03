@@ -115,3 +115,11 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   legit working set ~50–60 GB (4× pixels). Retry at budget ~70,
   ceiling ~85, single non-chained run; same caps (COMPILE_BYTES_MB
   16384). Next-session queue, with rows 3/9/8.
+- **qmm pack transient (row 7 re-measure blocker)**: per-pack prologue
+  reclaim (02808b3) fixed the ACCUMULATION (base now stable ~28-31 GB
+  vs the old ramp-to-death) but individual packs still spike 9-15 GB
+  in a single guard sample — trajectory-killed at budgets 45 and 55.
+  Do NOT budget-creep; shrink the transient itself (chunked/streamed
+  packing over weight slices — the pack is a reinterpretation for
+  mxfp4, its transient should be near-zero; investigate why it is
+  not). Then row 7 re-measures toward the ~24 ms/tok MoE projection.
