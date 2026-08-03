@@ -100,3 +100,13 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   Release protocol: treat any single-run gate FAIL as rerun-first;
   0.11.3's step-3 gate should run 2-3x (the automation already
   re-runs cheaply) and big10 sits on the soak watchlist.
+- **SD3.5 all-zero image (2026-08-03 night)**: 512²/20 steps now COMPLETES
+  at 18.1 GB peak (memory stack works) but pixels are all zero. Suspects:
+  (a) flush-cadence shift on rewrite-carrying blocks (225408b changed
+  absorbed-op byte charging → sync points moved → command-buffer lottery
+  redraw on the eager sampler); (b) an sdpa value bug specific to the
+  MMDiT joint-attention shape. A/B levers: METALJAX_SDPA=0,
+  METALJAX_EAGER_FLUSH_MB sweep, 2-step repro at 16 GB cap.
+- **bytes estimator returns 0 for gpt-oss programs** → compile gate never
+  fires → trace wave guard-kills row 7 re-measure. Debug shows
+  bytes=0.0MB on its mains. Estimator bug for this graph class.
