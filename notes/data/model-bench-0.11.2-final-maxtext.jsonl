@@ -1,0 +1,42 @@
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] jetstream: dependency missing; using stubs.
+[maxtext] qwen3-06b-maxtext / metaljax -> ' Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of'
+RESULT {"load_s": 5.675868040998466, "warmup_s": 2.2399894169993786, "prefill_ms": 27.256874998784042, "decode_ms_tok": 16.01840411110191, "out_tokens": 64, "prompt_tokens": 5, "text": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of"}
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] jetstream: dependency missing; using stubs.
+[maxtext] qwen3-06b-maxtext / cpu -> ' Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of'
+RESULT {"load_s": 1.6565163750001375, "warmup_s": 2.4212087920004706, "prefill_ms": 137.1377499999653, "decode_ms_tok": 89.68888160315045, "out_tokens": 64, "prompt_tokens": 5, "text": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of"}
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] jetstream: dependency missing; using stubs.
+[maxtext] maxtext-qwix-int8 / metaljax -> ' Paris. The capital of France is also the capital of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country'
+RESULT {"load_s": 4.395213624999087, "warmup_s": 4.289746999998897, "prefill_ms": 1239.276083000732, "decode_ms_tok": 48.5226263174679, "out_tokens": 64, "prompt_tokens": 5, "text": " Paris. The capital of France is also the capital of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country of the country"}
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] jetstream: dependency missing; using stubs.
+[maxtext] maxtext-qwix-int8 / cpu -> ' Paris. The capital of France is also the capital of the French Republic. The capital of France is also the capital of the French government. The capital of France is also the capital of the French government. The capital of France is also the capital of the French government. The capital of France is also the capital of the'
+RESULT {"load_s": 2.06971245800014, "warmup_s": 3.11228866700003, "prefill_ms": 179.09941600009915, "decode_ms_tok": 143.40424933332196, "out_tokens": 64, "prompt_tokens": 5, "text": " Paris. The capital of France is also the capital of the French Republic. The capital of France is also the capital of the French government. The capital of France is also the capital of the French government. The capital of France is also the capital of the French government. The capital of France is also the capital of the"}
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] jetstream: dependency missing; using stubs.
+[DECOUPLED NO-OP] mldiagnostics: using stub.
+[DECOUPLED NO-OP] mldiagnostics: using stub.
+[DECOUPLED NO-OP] ml_goodput_measurement: dependency missing; using stub. (ModuleNotFoundError)
+[DECOUPLED NO-OP] mldiagnostics: using stub.
+[DECOUPLED NO-OP] workload_monitor: using stub.
+[DECOUPLED NO-OP] vertex_tensorboard: using stub.
+[maxtext-train] maxtext-train-06b / metaljax step_ms=440.0 loss 228.3945 -> 87.0428
+RESULT {"load_s": 2.2477460840000276, "warmup_s": 1.0441568330006703, "step_ms": 439.9763230003373, "steps": 4, "loss": 87.0428237915039, "loss_first": 228.39447021484375, "seq_len": 256, "batch": 1}
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] gcs_storage: using stubs.
+[DECOUPLED NO-OP] jetstream: dependency missing; using stubs.
+[DECOUPLED NO-OP] mldiagnostics: using stub.
+[DECOUPLED NO-OP] mldiagnostics: using stub.
+[DECOUPLED NO-OP] ml_goodput_measurement: dependency missing; using stub. (ModuleNotFoundError)
+[DECOUPLED NO-OP] mldiagnostics: using stub.
+[DECOUPLED NO-OP] workload_monitor: using stub.
+[DECOUPLED NO-OP] vertex_tensorboard: using stub.
+[maxtext-train] maxtext-train-06b / cpu step_ms=1402.0 loss 228.4169 -> 87.1013
+RESULT {"load_s": 0.7217424999998912, "warmup_s": 2.4895195000008243, "step_ms": 1401.9516042499163, "steps": 4, "loss": 87.101318359375, "loss_first": 228.41685485839844, "seq_len": 256, "batch": 1}
