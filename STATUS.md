@@ -25,7 +25,7 @@ ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 336 @ 2.7 GB ¹⁸ | — | — | — |
-| 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ᵛ | — | — | — |
+| 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ needs quantized-matmul path ⁸ | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | — | 29.8 (b32: 591) | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | ✗ blocked ⁹ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
@@ -37,40 +37,12 @@ ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
 (143.6→16.4 GB); Llama-8B 228→58.6 (127→16.1 GB); gpt-oss 2090→220.4
 (224→41.8 GB). All three now beat jax-CPU 3.4–3.7×.
 
-ᵈ CPU cells run what XLA:CPU supports: weights load bf16, matmuls
-upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
-ᵉ Per Oleg: attempt behind the memory guard; observed keras-CPU RSS is
-~2.9× checkpoint → ~150 GB projected, expect a guard kill but measure.
-
 **mlx-lm gap band (same Metal library underneath — the C++-rewrite
-target):** bf16 dense decode 2.0–2.6× (Qwen3-8B 60.3 vs 30.4; Llama
-58.6 vs 29.4; 12B 101 vs git-main-pending; 31B 363 vs 137); gpt-oss
-25× (native-MXFP4 quantized_matmul + our dispatch, the two roadmap
-items compounded). metaljax prefill trails ~6×; load ~20–30×
-(mlx-lm mmaps quantized/bf16 weights directly).
-
-ᶠ Released mlx-lm 0.31.3 cannot run gemma4_unified (12B) or the
-E-series KV-sharing layout (E2B) at all; these two cells measured on
-mlx-lm git main (2026-08-03 install). The 12B/31B gemma-lib decode improvements vs
-earlier entries (189→101, 374→363) come from the dynamic-while
-body-compile fix landing in the sampler's decode loop; old CPU 938
-superseded by the uniform harness (cache length now matched).
-
-ᵍ MoE DENSE-EXPERT GAP — the largest measured: keras/XLA lowers expert
-dispatch densely (streams all 51.6 GB/token) → 473 ms/tok vs mlx-lm's
-gathered 17.0 (27.8×). A 4B-active MoE decodes slower than dense 31B
-on our path. Top C++-era item alongside quantized matmul.
-ʰ keras load path (random-init before checkpoint overwrite +
-conversion transients) exceeds the machine above ~50 GB checkpoints:
-R1-32B (65 GB) jetsam-killed; Qwen3.6-35B (72 GB) entered swap-death
-(196 GB footprint, killed by hand); Mixtral (93 GB) not attempted —
-foregone. gemma-lib's streaming loader handled 62.6 GB fine, so the
-fix is a streaming load for the keras path (ledger).
-ⁱ Packed int4 memory saving IS real on metaljax (2.7 vs 10.2 GB —
-the only sub-byte JAX path that keeps it), but decode pays 11.7× vs
-bf16 (in-graph unpack re-materializes weights per matmul). XLA:CPU
-fuses the same unpack into a small net WIN (67.5 vs 79.2 bf16).
-Either mx.quantized_matmul mapping or unpack-fusion closes it.
+target):** bf16 dense decode 1.7–2.6× (Qwen3-8B 60.4 vs 30.4; Llama
+57.3 vs 29.4; 12B 97.1 vs 58.3; 31B 350 vs 137); gpt-oss 25×
+(native-MXFP4 quantized_matmul + our dispatch compounded); MoE 16.7×
+(284 vs 17.0). llama.cpp leads mlx-lm a further ~1.25× on bf16 — the
+kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
 
 ## Footnotes
 
@@ -127,7 +99,7 @@ Either mx.quantized_matmul mapping or unpack-fusion closes it.
     algorithm, which XLA:CPU rejects (plain f16 dots work; the
     algorithm spec is an accelerator contract). A strip-workaround
     would enable a CPU reference; planned.
-ᵛ CERTIFIED BENIGN (notes/int8-divergence-verdict.md): the token
+22. CERTIFIED BENIGN (notes/int8-divergence-verdict.md): the token
     divergence vs int8-CPU is an exact logit tie on metal (14.5 vs
     14.5) at a step whose CPU margin is 7 bf16 ULPs = 1.3σ of the
     quantization noise; the s8 dot+dequant is bit-identical on real
