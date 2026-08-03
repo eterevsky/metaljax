@@ -62,11 +62,9 @@ for plat in metal cpu; do
   drop
 done
 
-# texmo topconfs re-baseline at shipped defaults (the geomean anchor)
-grab
-echo "=== topconfs re-baseline"
-/Users/oleg/metaljax/.venv/bin/python scripts/texmo_topconfs.py \
-  top_confs.jsonl --out notes/data/texmo-topconfs-final.jsonl || true
-drop
+# NB the texmo topconfs sweep moved to the release-gate step 3
+# (scripts/release/texmo_gate.sh) — it must NOT run here: writing
+# notes/data/texmo-topconfs-final.jsonl in place would clobber the perf
+# anchor that step 3 compares against.
 
 echo FINAL_RUN_DONE

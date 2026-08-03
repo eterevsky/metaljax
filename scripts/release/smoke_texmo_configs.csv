@@ -1,0 +1,4 @@
+system,platform,device_kind,name,source,spec,precision,weights,num_layers,batch,length,mode,steps,first_s,step_s,ms_step,ktok_s,error
+m5-metal,metal,Apple M5 Max,db00-b16l128,db,bits.1+bp|,fp32,5,0,16,128,scan,20,0.16142541600129334,0.0003394562500034226,0.3395,6033.178060440339,
+m5-metal,metal,Apple M5 Max,db04-b16l128,db,"tokens.32.raw_fold.emb.1|split.add(dense.1.tanh, pass)",fp32,67,2,16,128,scan,20,0.07679574999929173,0.0002684104001673404,0.2684,7630.106727321947,
+m5-metal,metal,Apple M5 Max,db09-b16l128,db,tokens.32.raw_fold.emb.8|mingru.4-latent.8.2,fp32,465,2,16,128,scan,20,0.3381114170042565,0.011134029199820362,11.134,183.94059897319497,
