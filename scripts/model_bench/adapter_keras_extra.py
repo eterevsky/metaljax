@@ -719,9 +719,22 @@ def run_keras_diffusion(bench, backend, prompt=None, n_decode=None,
     text = prompt or ("a photograph of an astronaut riding a horse on the "
                       "surface of Mars, golden hour, 50mm")
 
+    # Same streaming-load shim as the LM path: without it the build phase
+    # materializes every initializer's threefry chain (~30x the largest
+    # variable transiently -- SD3.5 ramped +32.7 GB per 0.5 s sample and
+    # was guard-killed before a single checkpoint byte mattered).
+    stream = os.environ.get("BENCH_STREAM_LOAD", "1") == "1"
+    if stream:
+        install_streaming_load()
     t0 = time.monotonic()
-    t2i = keras_hub.models.StableDiffusion3TextToImage.from_preset(
-        preset, image_shape=(image_size, image_size, 3))
+    try:
+        t2i = keras_hub.models.StableDiffusion3TextToImage.from_preset(
+            preset, image_shape=(image_size, image_size, 3))
+        if stream:
+            finalize_streaming_load(t2i)
+    finally:
+        if stream:
+            uninstall_streaming_load()
     load_s = time.monotonic() - t0
 
     short = max(2, num_steps // 5)
