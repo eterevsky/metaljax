@@ -200,6 +200,23 @@ def dense_perchannel(packed, scale, x, columns):
     return (x @ w.astype(x.dtype)) / scale
 
 
+def einsum_out_proj(packed, scale, zero, g_idx, x, n, h, d):
+    """keras EinsumDense._int4_call for an attention output projection.
+
+    `btnh,nhd->btd`: the kernel is stored (and grouped) as [n*h, d] in
+    n-major order, then reshaped to [n, h, d]. jax lowers this einsum with
+    `contracting_dims = [3, 2] x [1, 0]` -- the REVERSED pairing -- so the
+    recognizer's canonical K axis runs h-major and the quantization groups
+    arrive interleaved.
+    """
+    w = _unpack_nibbles(packed, d)
+    g = g_idx.astype(jnp.int32)
+    s = jnp.take(scale, g, axis=0)
+    z = jnp.take(zero, g, axis=0)
+    wf = (w.astype(x.dtype) - z.astype(x.dtype)) * s
+    return jnp.einsum("btnh,nhd->btd", x, jnp.reshape(wf, (n, h, d)))
+
+
 def einsum_sub(packed, scale, zero, g_idx, x, out_shape):
     """keras EinsumDense._int4_call: dequantize, reshape, then einsum."""
     columns = int(np.prod(out_shape))
@@ -236,7 +253,7 @@ def _run(f, args, device):
         return np.asarray(jax.jit(f)(*moved)).astype(np.float32)
 
 
-def _compare(f, args, exact, packs=1):
+def _compare(f, args, exact, packs=1, perms=None):
     """Run on metal + CPU; both must match the exact f32 dequant reference,
     and metal must be no worse than CPU."""
     qmm.reset_stats()
@@ -244,6 +261,8 @@ def _compare(f, args, exact, packs=1):
     want = _run(f, args, _cpu())
     if qmm.ENABLED:
         assert qmm.stats()["packs"] == packs, qmm.stats()
+        if perms is not None:
+            assert qmm.stats()["perms"] == perms, qmm.stats()
     scale = np.abs(exact).max()
     err_metal = np.abs(got - exact).max() / scale
     err_cpu = np.abs(want - exact).max() / scale
@@ -350,6 +369,212 @@ def test_group_permuting_g_idx_is_still_exact():
 
 
 # --------------------------------------------------------------------------
+# interleaved groups: recovering the permutation
+# --------------------------------------------------------------------------
+
+
+def _canonical_scale_map(group_of_row, n, h, d=4):
+    """The [N, K] scale map the recognizer materializes for `btnh,nhd->btd`.
+
+    Canonical column j = hi * n + ni (h-major, the reversed contracting-dim
+    pairing) reads storage row r = ni * h + hi (n-major, keras' layout).
+    """
+    import mlx.core as mx
+    j = np.arange(n * h)
+    r = (j % n) * h + (j // n)
+    scale = np.arange(1, group_of_row.max() + 2, dtype=np.float32)[:, None]
+    scale = scale * np.arange(1, d + 1, dtype=np.float32)[None, :]   # [ng, d]
+    return mx.array(scale[group_of_row][r].T)                    # [d, K]
+
+
+def _out_proj_case(n, h, d, block=128, seed=70, g_idx=None):
+    rows = n * h
+    q, packed, scale, zero, g_idx, wref = _quantize(
+        rows, d, block, "bfloat16", seed=seed, g_idx=g_idx)
+    x = (np.random.default_rng(seed + 1).standard_normal((1, 2, n, h))
+         * 0.3).astype("bfloat16")
+    args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
+            jnp.asarray(g_idx), jnp.asarray(x))
+    exact = np.einsum("btnh,nhd->btd", x.astype(np.float32),
+                      wref.reshape(n, h, d))
+    return args, exact
+
+
+@needs_qmm
+def test_einsum_out_projection_interleaved_groups():
+    """The gemma/keras attention output projection: groups interleaved by the
+    reversed contracting-dim pairing. Used to fall back; now regroups."""
+    n, h, d = 8, 32, 96
+    args, exact = _out_proj_case(n, h, d)
+    _compare(lambda *a: einsum_out_proj(*a, n=n, h=h, d=d), args, exact,
+             perms=1)
+
+
+@needs_qmm
+@pytest.mark.parametrize("n,h,block", [(4, 64, 128), (16, 32, 64),
+                                       (2, 128, 128)])
+def test_einsum_out_projection_shapes(n, h, block):
+    d = 64
+    args, exact = _out_proj_case(n, h, d, block=block, seed=80 + n)
+    _compare(lambda *a: einsum_out_proj(*a, n=n, h=h, d=d), args, exact,
+             perms=1)
+
+
+@needs_qmm
+def test_interleaved_groups_in_a_decode_loop():
+    """The same layer inside a data-dependent while: the permutation has to
+    travel into the compiled body with the packed weights."""
+    n, h = 8, 32                    # n*h = 256: two groups of 128, interleaved
+    d = n * h                       # square, so the loop can carry the state
+    rows = n * h
+    q, packed, scale, zero, g_idx, wref = _quantize(rows, d, 128, "bfloat16",
+                                                    seed=90)
+    x = (np.random.default_rng(91).standard_normal((1, 2, n, h))
+         * 0.3).astype("bfloat16")
+    steps = 8
+
+    def f(packed_, scale_, zero_, g_idx_, x_, k):
+        def body(state):
+            i, hs = state
+            y = einsum_out_proj(packed_, scale_, zero_, g_idx_, hs, n, h, d)
+            y = jnp.tanh(y * jnp.bfloat16(0.3))
+            return i + 1, jnp.reshape(y, (1, 2, n, h))
+        return jax.lax.while_loop(lambda s: s[0] < k, body, (0, x_))[1]
+
+    args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
+            jnp.asarray(g_idx), jnp.asarray(x), jnp.int32(steps))
+    qmm.reset_stats()
+    dev = _metal()
+    with jax.default_device(dev):
+        moved = [jax.device_put(a, dev) for a in args]
+        jf = jax.jit(f)
+        got = np.asarray(jf(*moved)).astype(np.float32)
+        assert qmm.stats() == {"recognized": 1, "packs": 1, "fallbacks": 0,
+                               "perms": 1}, qmm.stats()
+        got2 = np.asarray(jf(*moved)).astype(np.float32)
+    np.testing.assert_array_equal(got, got2)
+    want = _run(f, args, _cpu())
+    np.testing.assert_allclose(got, want, rtol=3e-2, atol=3e-2)
+
+
+@needs_qmm
+def test_second_weight_set_with_a_different_permutation():
+    """Two weight sets whose groups interleave DIFFERENTLY through one
+    executable. The permutation travels as a graph input, so the second
+    call must not reuse the first one's."""
+    n, h, d = 8, 32, 64
+    rows = n * h
+    # (a) groups along the stored (n-major) axis; (b) groups by the parity of
+    # the h index -- a different interleaving, hence a different permutation.
+    alt = (np.arange(rows) % 2).astype(np.float32)
+    parts = [_out_proj_case(n, h, d, seed=100),
+             _out_proj_case(n, h, d, seed=110, g_idx=alt)]
+    # The premise: the recognizer really does derive two different
+    # permutations for these (checked on the maps it would build).
+    perms = [qmm._regroup(rows, (_canonical_scale_map(g, n, h), None))
+             for g in (np.arange(rows) // 128, alt.astype(np.int64))]
+    assert all(p is not None for p in perms)
+    assert not np.array_equal(*perms)
+    qmm.reset_stats()
+    dev = _metal()
+    f = jax.jit(lambda *a: einsum_out_proj(*a, n=n, h=h, d=d))
+    outs = []
+    with jax.default_device(dev):
+        for args, _exact in parts:
+            moved = [jax.device_put(a, dev) for a in args]
+            outs.append(np.asarray(f(*moved)).astype(np.float32))
+    assert qmm.stats()["packs"] == 2 and qmm.stats()["perms"] == 2, qmm.stats()
+    for (args, exact), got in zip(parts, outs):
+        np.testing.assert_allclose(got, exact, rtol=3e-2,
+                                   atol=3e-2 * np.abs(exact).max())
+    assert not np.allclose(outs[0], outs[1])
+
+
+def _maps(scale, zero=None):
+    import mlx.core as mx
+    return (mx.array(scale),
+            None if zero is None else mx.array(zero))
+
+
+def test_regroup_clusters_interleaved_columns():
+    """The clustering itself: stride-interleaved groups become runs."""
+    import mlx.core as mx
+    rng = np.random.default_rng(120)
+    k, ngroups, rows = 256, 2, 8
+    order = np.arange(k) % ngroups          # stride-2 interleave
+    gvals = rng.standard_normal((rows, ngroups)).astype(np.float32)
+    scale = gvals[:, order]
+    zero = np.arange(ngroups, dtype=np.float32)[order] * np.ones((rows, 1),
+                                                                 np.float32)
+    smap, zmap = _maps(scale, zero)
+    assert qmm._pick_group(k, smap, zmap) is None
+    perm = qmm._regroup(k, (smap, zmap))
+    assert perm is not None
+    assert sorted(perm.tolist()) == list(range(k))
+    pi = mx.array(perm)
+    assert qmm._pick_group(k, qmm._take_k(smap, pi),
+                           qmm._take_k(zmap, pi)) == 128
+
+
+def test_regroup_merges_duplicate_group_columns():
+    """Two groups whose scale AND zero columns are identical cluster into one
+    double-length run. Harmless: every value in the run is equal, so any
+    group size dividing it reconstructs exactly."""
+    import mlx.core as mx
+    rng = np.random.default_rng(121)
+    k, rows = 384, 8
+    gvals = rng.standard_normal((rows, 3)).astype(np.float32)
+    gvals[:, 2] = gvals[:, 0]               # group 2 duplicates group 0
+    order = np.arange(k) % 3
+    smap, zmap = _maps(gvals[:, order])
+    perm = qmm._regroup(k, (smap, zmap))
+    assert perm is not None
+    pi = mx.array(perm)
+    permuted = qmm._take_k(smap, pi)
+    assert qmm._pick_group(k, permuted, None) == 128
+    # the merged run is 256 long and constant, so the pack is still exact
+    want = np.array(smap)[:, perm]
+    np.testing.assert_array_equal(np.array(permuted), want)
+
+
+def test_regroup_rejects_uneven_runs():
+    """Cluster lengths with no common legal group size -> no permutation."""
+    rng = np.random.default_rng(122)
+    k, rows = 256, 4
+    ids = np.concatenate([np.zeros(129), np.ones(127)]).astype(np.int64)
+    gvals = rng.standard_normal((rows, 2)).astype(np.float32)
+    smap, _ = _maps(gvals[:, ids])
+    assert qmm._regroup(k, (smap, None)) is None
+    # ... and a map whose every column differs
+    smap, _ = _maps(rng.standard_normal((rows, k)).astype(np.float32))
+    assert qmm._regroup(k, (smap, None)) is None
+
+
+def test_regroup_short_circuits_on_already_grouped_maps():
+    """An already-contiguous map must keep the identity (no-take) path."""
+    rng = np.random.default_rng(123)
+    k, rows = 256, 4
+    gvals = rng.standard_normal((rows, 2)).astype(np.float32)
+    smap, _ = _maps(np.repeat(gvals, 128, axis=1))
+    assert qmm._pick_group(k, smap, None) == 128
+    assert qmm._regroup(k, (smap, None)) is None
+
+
+@needs_qmm
+def test_identity_permutation_is_the_zero_overhead_path():
+    """A dot whose groups are already contiguous carries no permutation."""
+    rows, cols = 256, 128
+    q, packed, scale, zero, g_idx, wref = _quantize(rows, cols, 128,
+                                                    "bfloat16", seed=124)
+    x = (np.random.default_rng(125).standard_normal((4, rows))
+         * 0.5).astype("bfloat16")
+    args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
+            jnp.asarray(g_idx), jnp.asarray(x))
+    exact = x.astype(np.float32) @ wref
+    _compare(lambda *a: dense_sub(*a, columns=cols), args, exact, perms=0)
+
+
+# --------------------------------------------------------------------------
 # fallbacks: still correct, just not rewritten
 # --------------------------------------------------------------------------
 
@@ -367,11 +592,28 @@ def _fallback_case(f, args, exact):
                                atol=1e-2 * np.abs(exact).max())
 
 
-def test_fallback_shuffled_g_idx():
-    """A g_idx that mixes groups breaks group-constancy -> literal chain."""
+def test_shuffled_g_idx_is_regrouped():
+    """A g_idx that scatters each group's members across the axis still has
+    equal-sized groups of identical (scale, zero) columns: the permutation
+    recovers them (it used to fall back to the literal chain)."""
     rows, cols, block = 256, 64, 128
     rng = np.random.default_rng(12)
     g_idx = rng.permutation(np.arange(rows) // block).astype(np.float32)
+    q, packed, scale, zero, g_idx, wref = _quantize(
+        rows, cols, block, "bfloat16", seed=13, g_idx=g_idx)
+    x = (rng.standard_normal((2, rows)) * 0.4).astype("bfloat16")
+    args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
+            jnp.asarray(g_idx), jnp.asarray(x))
+    _compare(lambda *a: dense_sub(*a, columns=cols), args,
+             x.astype(np.float32) @ wref, perms=1)
+
+
+def test_fallback_uneven_group_sizes():
+    """Groups of different sizes cannot be made to line up on any legal group
+    boundary -> literal chain."""
+    rows, cols, block = 256, 64, 128
+    rng = np.random.default_rng(12)
+    g_idx = (np.arange(rows) >= 129).astype(np.float32)   # 129 / 127
     q, packed, scale, zero, g_idx, wref = _quantize(
         rows, cols, block, "bfloat16", seed=13, g_idx=g_idx)
     x = (rng.standard_normal((2, rows)) * 0.4).astype("bfloat16")
@@ -469,7 +711,8 @@ def test_disabled_by_env(monkeypatch):
     monkeypatch.setattr(qmm, "ENABLED", False)
     qmm.reset_stats()
     got = _run(lambda *a: dense_sub(*a, columns=cols), args, _metal())
-    assert qmm.stats() == {"recognized": 0, "packs": 0, "fallbacks": 0}
+    assert qmm.stats() == {"recognized": 0, "packs": 0, "fallbacks": 0,
+                           "perms": 0}
     want = _run(lambda *a: dense_sub(*a, columns=cols), args, _cpu())
     np.testing.assert_allclose(got, want, rtol=2e-2, atol=1e-1)
 
@@ -602,6 +845,60 @@ def test_trace_budget_restored_by_the_rewrite():
         finally:
             qmm.ENABLED = True
         assert plain._can_compile is False  # ... and would not without this
+    finally:
+        control._TRACE_BUDGET = budget
+    want = _run(f, args, _cpu())
+    np.testing.assert_allclose(outs[0].astype(np.float32), want,
+                               rtol=5e-2, atol=5e-2)
+    np.testing.assert_allclose(outs_plain[0].astype(np.float32), want,
+                               rtol=5e-2, atol=5e-2)
+
+
+@needs_qmm
+def test_trace_budget_restored_for_interleaved_groups():
+    """The real regression this fixes: a decode body of attention-projection
+    layers whose groups are interleaved stayed EAGER because every one of
+    them fell back to the literal chain."""
+    from metaljax.interpreter import COMPILE_ENABLED
+    from metaljax.ops import control
+
+    if not COMPILE_ENABLED:
+        pytest.skip("METALJAX_COMPILE=0: nothing is traced")
+
+    n, h = 8, 32                     # two interleaved groups per layer
+    d = n * h                        # square: the layers stack
+    layers = 10
+    parts = [_quantize(n * h, d, 128, "bfloat16", seed=140 + i)
+             for i in range(layers)]
+    x = (np.random.default_rng(141).standard_normal((1, 2, n, h))
+         * 0.3).astype("bfloat16")
+
+    def f(ws, x_):
+        hs = x_
+        for packed_, scale_, zero_, g_ in ws:
+            y = einsum_out_proj(packed_, scale_, zero_, g_, hs, n, h, d)
+            hs = jnp.reshape(jnp.tanh(y * jnp.bfloat16(0.2)), (1, 2, n, h))
+        return hs
+
+    ws = [(jnp.asarray(p[1]), jnp.asarray(p[2]), jnp.asarray(p[3]),
+           jnp.asarray(p[4])) for p in parts]
+    args = (ws, jnp.asarray(x))
+
+    budget = control._TRACE_BUDGET
+    try:
+        control._TRACE_BUDGET = layers * 20
+        qmm.reset_stats()
+        ex, outs = _run_program(f, args)
+        assert qmm.stats()["packs"] == layers, qmm.stats()
+        assert qmm.stats()["perms"] == layers, qmm.stats()
+        assert ex._can_compile is True
+        qmm.reset_stats()
+        try:
+            qmm.ENABLED = False
+            plain, outs_plain = _run_program(f, args)
+        finally:
+            qmm.ENABLED = True
+        assert plain._can_compile is False
     finally:
         control._TRACE_BUDGET = budget
     want = _run(f, args, _cpu())

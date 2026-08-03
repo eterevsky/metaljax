@@ -38,6 +38,16 @@ once on concrete buffers with the interpreter's own op handlers:
     argument);
   * zero points must be integers.
 
+A dot whose groups are INTERLEAVED along the canonical contraction axis is
+still fused, by permuting that axis (see `_regroup`). Permuting the
+contraction axis identically on both operands leaves the dot unchanged, so
+whenever the group members can be brought together by a permutation the
+weight packs exactly and the activations are gathered through the same
+permutation at run time. keras' EinsumDense produces exactly this: an
+attention projection `btnh,nhd->btd` lowers with `contracting_dims =
+[3, 2] x [1, 0]`, so the canonical K axis runs h-major while keras' groups
+run along its own n-major flattening of the same axis.
+
 Any check failing permanently disables that one dot (it falls back to
 executing the chain literally, which is what happened before this module
 existed).
@@ -66,11 +76,13 @@ METALJAX_QMM=0 disables the whole recognizer.
 
 from __future__ import annotations
 
+import math
 import os
 import weakref
 from collections import deque
 
 import mlx.core as mx
+import numpy as np
 
 from jaxlib.mlir import ir
 
@@ -98,7 +110,7 @@ _MAX_REPACKS = int(os.environ.get("METALJAX_QMM_REPACKS", "8"))
 _SCALE_WIDTH = os.environ.get("METALJAX_QMM_SCALES", "auto")
 
 # Diagnostics (tests assert on these; nothing else reads them).
-STATS = {"recognized": 0, "packs": 0, "fallbacks": 0}
+STATS = {"recognized": 0, "packs": 0, "fallbacks": 0, "perms": 0}
 
 
 def stats() -> dict:
@@ -196,6 +208,111 @@ def pack_exact(codes: mx.array, scales: mx.array, zeros, bits: int,
 
 def _lossless(x: mx.array, dtype) -> bool:
     return bool(mx.all(x.astype(dtype).astype(mx.float32) == x).item())
+
+
+# --------------------------------------------------------------------------
+# regrouping an interleaved contraction axis
+# --------------------------------------------------------------------------
+
+# Rows hashed per pass. The scale/zero maps are full weight size, so the
+# digest must not materialize a second copy of one.
+_KEY_CHUNK = 1 << 22
+
+_MIX = 2246822519
+
+
+def _u32(v):
+    return mx.array(v, mx.uint32)
+
+
+def _mix(u):
+    """A cheap 32-bit avalanche (multiply-xorshift), elementwise."""
+    u = u * _u32(_MIX)
+    return u ^ mx.right_shift(u, _u32(15))
+
+
+def _bits_u32(x):
+    """`x` widened to uint32 injectively (equal values -> equal words)."""
+    if x.dtype in _FLOAT_MX:
+        # f32 is the widest float MLX has, and bf16/f16 -> f32 is exact, so
+        # this distinguishes every distinct value (including -0.0 vs 0.0).
+        return x.astype(mx.float32).view(mx.uint32)
+    return x.astype(mx.uint32)
+
+
+def _column_keys(x) -> np.ndarray:
+    """Per-column digest of `x` ([N, K]) as a numpy uint32 `[K, 2]`.
+
+    Equal columns always digest equally; distinct columns collide with
+    probability ~2^-64, and a collision can only MERGE two groups -- which
+    the exact group-constancy check downstream rejects if the merge was not
+    legitimate. The digest is a sum of per-row terms in wrapping uint32, so
+    it does not depend on the order MLX reduces in.
+    """
+    n, k = x.shape
+    step = max(1, min(n, _KEY_CHUNK // max(k, 1)))
+    h1 = mx.zeros((k,), mx.uint32)
+    h2 = mx.zeros((k,), mx.uint32)
+    for lo in range(0, n, step):
+        u = _bits_u32(mx.contiguous(x[lo:lo + step]))
+        rows = mx.reshape(mx.arange(lo, lo + u.shape[0]).astype(mx.uint32),
+                          (-1, 1))
+        r = _mix(rows * _u32(0x9E3779B9) + _u32(1))
+        v = _mix(u)
+        h1 = h1 + mx.sum(v * mx.bitwise_or(r, _u32(1)), axis=0)
+        h2 = h2 + mx.sum(_mix(v ^ r), axis=0)
+        # Settle each pass so the chunk's intermediates die with it.
+        mx.eval(h1, h2)
+    return np.stack([np.array(h1), np.array(h2)], axis=1)
+
+
+def _regroup(k: int, maps) -> np.ndarray | None:
+    """A permutation of the contraction axis that un-interleaves the groups.
+
+    Quantization groups are, by definition, runs of columns sharing one
+    (scale, zero) pair. When they are interleaved along the canonical K axis
+    the pack cannot read them off contiguous slices -- but permuting K on
+    BOTH dot operands is exact, so clustering the columns by their (scale,
+    zero) column pair and sorting by cluster recovers a layout that packs.
+
+    Returns None when no permutation can help (run lengths admit no legal
+    group size) or when the columns are already grouped, in which case the
+    caller's own search has already had its chance and the identity
+    permutation must stay the zero-overhead path.
+    """
+    keys = np.concatenate([_column_keys(x) for x in maps if x is not None],
+                          axis=1)
+    # Stable first-occurrence ids: `np.unique` returns them in sorted-key
+    # order, which would reshuffle whole groups for no reason.
+    _, first, inv = np.unique(keys, axis=0, return_index=True,
+                              return_inverse=True)
+    inv = np.asarray(inv).reshape(-1)
+    order = np.argsort(first)
+    rank = np.empty(len(order), np.int64)
+    rank[order] = np.arange(len(order))
+    ids = rank[inv]
+    # Every cluster becomes a contiguous run of its own length; a legal group
+    # size must divide all of them (then it also divides every run's offset,
+    # since the runs are laid out end to end). Duplicate (scale, zero)
+    # columns merge two groups into one double-length run -- harmless, the
+    # values in it are identical by construction.
+    runs = np.bincount(ids)
+    g = 0
+    for length in runs:
+        g = math.gcd(g, int(length))
+    if not any(g and g % s == 0 for s in _GROUP_SIZES):
+        return None
+    perm = np.argsort(ids, kind="stable").astype(np.int32)
+    if np.array_equal(perm, np.arange(k, dtype=np.int32)):
+        return None
+    return perm
+
+
+def _take_k(x, perm):
+    """`x[:, perm]`, materialized (these are full-weight-size maps)."""
+    out = mx.contiguous(mx.take(x, perm, axis=1))
+    mx.eval(out)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -326,7 +443,7 @@ class Match:
                  "post", "bcast_dims", "ops", "arg_indices", "required",
                  "lperm", "rfree", "rc", "rshape", "mshape", "nshape",
                  "M", "K", "N", "out_dtype", "disabled", "slot", "gs", "bits",
-                 "packs", "repacks", "name", "sub_range")
+                 "packs", "repacks", "name", "sub_range", "has_perm")
 
     def __init__(self):
         self.recip = False
@@ -341,20 +458,22 @@ class Match:
         self.slot = -1
         self.gs = 0
         self.bits = 0
+        self.has_perm = False
         self.packs = []
         self.repacks = 0
         self.name = "?"
 
 
 class _Pack:
-    __slots__ = ("refs", "w", "scales", "biases", "gs", "bits")
+    __slots__ = ("refs", "w", "scales", "biases", "perm", "gs", "bits")
 
-    def __init__(self, leaves, w, scales, biases, gs, bits):
+    def __init__(self, leaves, w, scales, biases, perm, gs, bits):
         # Weak references: identity is what we care about, and pinning a
         # multi-GB weight buffer alive because we packed a copy of it would
         # be its own bug. A dead referent simply misses and repacks.
         self.refs = [weakref.ref(a) for a in leaves]
         self.w, self.scales, self.biases = w, scales, biases
+        self.perm = perm
         self.gs, self.bits = gs, bits
 
     def matches(self, leaves) -> bool:
@@ -735,6 +854,17 @@ def _group_const(x, gs) -> bool:
     return bool(mx.all(v == v[:, :, :1]).item())
 
 
+def _pick_group(k, scale_map, zero_map):
+    """The largest legal group size these maps are constant within."""
+    for g in _GROUP_SIZES:
+        if k % g:
+            continue
+        if _group_const(scale_map, g) and (
+                zero_map is None or _group_const(zero_map, g)):
+            return g
+    return None
+
+
 def _build_pack(interp, m, args, leaves):
     # One environment per operand subtree: they share only cheap prefixes
     # (the group-index cast), while each one's intermediates are full weight
@@ -763,6 +893,7 @@ def _build_pack(interp, m, args, leaves):
         offset = -lo
 
     scale_dtype = None
+    perm = None
     if m.recip:
         s = _eval(interp, m.scale,
                   dict(zip(interp._main_block().arguments, args)))
@@ -790,16 +921,31 @@ def _build_pack(interp, m, args, leaves):
     else:
         scale_map = evaluate(m.scale)
         zero_map = evaluate(m.zero) if m.zero is not None else None
-        gs = None
-        for g in _GROUP_SIZES:
-            if m.K % g:
-                continue
-            if _group_const(scale_map, g) and (
-                    zero_map is None or _group_const(zero_map, g)):
-                gs = g
-                break
+        gs = _pick_group(m.K, scale_map, zero_map)
+        note = ""
         if gs is None:
-            raise _Reject("scales/zeros are not constant within any group")
+            # The groups may still be there, interleaved: recover the
+            # permutation that makes them contiguous and re-verify EXACTLY
+            # (the clustering is only a proposal -- `_pick_group` on the
+            # permuted maps is what the pack's exactness rests on).
+            perm = _regroup(m.K, (scale_map, zero_map))
+            if perm is not None:
+                perm = mx.array(perm)
+                # Rebind as each permuted copy lands: these are full weight
+                # size, and holding the originals as well would raise the
+                # peak by one whole map each. Nothing below reads the
+                # unpermuted ones -- a failed verification rejects the dot.
+                scale_map = _take_k(scale_map, perm)
+                if zero_map is not None:
+                    zero_map = _take_k(zero_map, perm)
+                codes = _take_k(codes, perm)
+                gs = _pick_group(m.K, scale_map, zero_map)
+                if gs is None:
+                    perm = None
+                    note = " (even regrouped)"
+        if gs is None:
+            raise _Reject(
+                f"scales/zeros are not constant within any group{note}")
         scale_dtype = scale_map.dtype
         scales = mx.contiguous(
             mx.reshape(scale_map, (m.N, m.K // gs, gs))[:, :, 0])
@@ -833,10 +979,13 @@ def _build_pack(interp, m, args, leaves):
     # graph (and its full-size intermediates) for the life of the cache.
     mx.eval(w, scales, biases)
     STATS["packs"] += 1
+    if perm is not None:
+        STATS["perms"] += 1
     if _DEBUG:
         print(f"[metaljax] qmm: packed {m.name} bits={bits} group={gs} "
-              f"offset={offset} scales={scales.dtype}", flush=True)
-    return _Pack(leaves, w, scales, biases, gs, bits)
+              f"offset={offset} scales={scales.dtype}"
+              f"{' regrouped' if perm is not None else ''}", flush=True)
+    return _Pack(leaves, w, scales, biases, perm, gs, bits)
 
 
 def _resolve(interp, m, args):
@@ -886,12 +1035,20 @@ def prologue(interp, args) -> bool:
                     print(f"[metaljax] qmm: {m.name} falls back to the "
                           f"literal chain ({e})", flush=True)
                 continue
-            if (m.gs, m.bits) != (pk.gs, pk.bits):
-                # Baked into any trace built earlier.
+            has_perm = pk.perm is not None
+            if (m.gs, m.bits, m.has_perm) != (pk.gs, pk.bits, has_perm):
+                # gs/bits are baked into any trace built earlier, and the
+                # presence of a permutation changes the traced arity.
                 changed = changed or m.gs != 0
-                m.gs, m.bits = pk.gs, pk.bits
+                m.gs, m.bits, m.has_perm = pk.gs, pk.bits, has_perm
             m.slot = len(values)
             values.extend((pk.w, pk.scales, pk.biases))
+            if has_perm:
+                # The permutation travels as an input like the weights do,
+                # not baked: a repack against different weights may well
+                # produce a different one, and mx.compile would keep the
+                # first forever.
+                values.append(pk.perm)
         if changed:
             st.rebuild()
     st.values = values
@@ -940,6 +1097,11 @@ def emit(interp, m, env):
     x = mx.reshape(x, (m.M, m.K))
     if x.dtype not in _FLOAT_MX:
         x = x.astype(m.out_dtype)
+    if m.has_perm:
+        # The weight was packed with its contraction axis permuted (its
+        # groups were interleaved); permuting BOTH operands identically
+        # leaves the dot itself unchanged.
+        x = mx.take(x, st.values[m.slot + 3], axis=-1)
     y = mx.quantized_matmul(x, w, scales, biases, transpose=True,
                             group_size=m.gs, bits=m.bits)
     y = mx.reshape(y, m.mshape + m.nshape)
