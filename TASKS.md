@@ -110,3 +110,8 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
 - **bytes estimator returns 0 for gpt-oss programs** → compile gate never
   fires → trace wave guard-kills row 7 re-measure. Debug shows
   bytes=0.0MB on its mains. Estimator bug for this graph class.
+- **SD3.5 1024² retry**: 512² banked (1389 ms/step, fn 9); 1024² guard-
+  killed clean at the 55 GB budget with the ramp still climbing —
+  legit working set ~50–60 GB (4× pixels). Retry at budget ~70,
+  ceiling ~85, single non-chained run; same caps (COMPILE_BYTES_MB
+  16384). Next-session queue, with rows 3/9/8.
