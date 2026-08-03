@@ -199,3 +199,53 @@ model's real shapes on purpose (shrunk, it stops reproducing).
 two tests in that file are the only evidence that today's values are good
 draws; any change to them, to the flush cadence in `ops/control.py`, or to
 MLX itself needs both rerun.
+
+---
+
+## Addendum 2026-08-03 (post-0.11.2): accounting ground truth + the 8B bind
+
+**What the budgets actually count** (decompiled from libmlx.dylib 0.32.0,
+verified against live objects; the probe tools were lost to a tmp wipe —
+offsets were build-specific — but the semantics are these):
+
+    needs_commit() == buffer_ops_  > MLX_MAX_OPS_PER_BUFFER
+                   || (buffer_sizes_ >> 20) > MLX_MAX_MB_PER_BUFFER
+    set_input_array(a):  if first sighting of a.buffer().ptr() in this
+                         command buffer: buffer_sizes_ += a.data_size()
+    set_output_array(a): delegates to set_input_array first
+
+So the "MB" budget accumulates `data_size()` — **ELEMENTS, not bytes**
+(512 "MB" ≈ 1 GiB of bf16, 2 GiB of f32) — of every **distinct buffer**,
+inputs and outputs alike, deduped per command buffer; a broadcast/stride-0
+view charges its base region (1 element for a splat).
+
+**Split count does NOT predict corruption.** Live-counter measurements on
+tests/data/qwen3_prefill_shrunk.mlir: correct at 2 splits (budget 512) and
+at 17 splits (80), wrong at 33 (40). Qwen3-8B: correct at >=39 splits
+(2048), garbage at >=158 (512). What corrupts is *which* boundary lands
+between a particular producer/consumer — not statically predictable, so a
+static byte/element compile gate is NOT a correctness mechanism (that
+design was refuted before implementation). Also: mx.compile fuses
+elementwise chains, so static traffic estimates overshoot ~2x (1186 vs
+592 Mi measured on the shrunk repro).
+
+**Row-15 (qwix 8B) mitigation attempt ledger, all 2026-08-03, all at
+otherwise-default settings:**
+
+| configuration | outcome |
+|---|---|
+| compiled, budget 512 (shipped) | runs; OUTPUT GARBAGE (replay corruption) |
+| compiled, budget 2048 | correct in probes; then KERNEL PANIC #4 at load (nondeterministic, wired-memory class) |
+| METALJAX_COMPILE=0, 512 | load balloons 67 GB in ~27 s; watchdog-killed |
+| METALJAX_BODY_COMPILE=0 (new flag), 512 | 100 GB balloon at load; killed |
+| + LOOP_CLEAR_COST=2000, CLEAR_PERIOD=100 | 109 GB; killed — clear_cache cannot reclaim REFERENCED lazy-graph intermediates; uncompiled bodies leave the whole load DAG unevaluated and pinned |
+| body-off, prefill 8, watchdog 110 GB | KERNEL PANIC #5 — memory slope 20-40 GB per 5 s outruns any userspace watchdog |
+
+**Policy (hard):** 8B-class maxtext on metal is EMBARGOED on this
+machine. Every configuration tried is wrong, ballooning, or lethal. The
+one remaining our-side path is engine-side evaluation forcing for
+uncompiled phases (bytes-denominated loop flush + periodic mx.eval of
+execute outputs), developed and validated at SMALL scale first; a single
+supervised 8B verification only after that lands, with Oleg's explicit
+sign-off. Otherwise the row waits for the MLX upstream fix
+(notes/mlx-command-buffer-upstream-issue.md is filing-ready).

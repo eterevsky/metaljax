@@ -151,6 +151,16 @@ import os
 # Governs: which loops may unroll into an enclosing trace, which loop
 # bodies get compiled, and whether the whole program is compiled.
 _TRACE_BUDGET = int(os.environ.get("METALJAX_TRACE_BUDGET", "20000"))
+# METALJAX_BODY_COMPILE=0 keeps everything compiled EXCEPT while-loop
+# bodies. This is the targeted mitigation for the MLX command-buffer
+# corruption (notes/mlx-command-buffer-split.md): the corruption bites
+# REPLAYED compiled bodies (first call clean, replays diverge), while
+# compiled mains/prefill measure deterministic — and full
+# METALJAX_COMPILE=0 also un-compiles the load path, whose eager
+# conversion transients balloon (8B load: 67 GB in ~30 s vs ~18 GB
+# compiled). Bodies run uncompiled; msl kernels and everything else
+# keep their normal paths.
+_BODY_COMPILE = os.environ.get("METALJAX_BODY_COMPILE", "1") != "0"
 # Max loop iterations unrolled per compiled chunk in the eager-loop path.
 # Bounds both trace time and MLX's fused-kernel argument count (long
 # unrolled elementwise chains can exhaust Metal kernel argument buffers).
@@ -467,6 +477,7 @@ def _body_fn(interp, body_block, compile_body, repeat=1):
         if (
             compile_body
             and COMPILE_ENABLED
+            and _BODY_COMPILE
             and body_block not in interp._no_body_compile
             and interp.block_is_pure(body_block)
             and repeat * _block_cost(interp, body_block) <= _TRACE_BUDGET

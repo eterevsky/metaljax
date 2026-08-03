@@ -78,8 +78,14 @@ kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
    METALJAX_COMPILE=0), 2048 gives correct output with a benign KV
    curve — but 2048 has NO stability margin: an 8B load at 2048
    kernel-panicked the machine (watchdog timeout, wired-memory class)
-   after an identical run had succeeded. No safe budget exists for
-   this shape class; blocked on the MLX upstream fix. Repro:
+   after an identical run had succeeded. Eager-mode mitigations at the
+   default budget all ballooned (67–109 GB at load: uncompiled bodies
+   pin the whole lazy load DAG) and the final attempt kernel-panicked
+   the machine a second time — full attempt ledger in
+   notes/mlx-command-buffer-split.md (2026-08-03 addendum). 8B-class
+   maxtext is EMBARGOED on this machine; the row waits for either an
+   engine-side eval-forcing mode (small-scale-validated first) or the
+   MLX upstream fix. Repro:
    notes/data/qwen3_8b_prefill_36layer.mlir (0.3 s).
 9. Blocked on two independent walls, both fully diagnosed. (a) MEMORY:
    we lower attention unfused (matmul-softmax-matmul), so SD3.5's
