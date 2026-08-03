@@ -410,6 +410,73 @@ from initializers, so it is not cheap either.
 
 ---
 
+## 6b. Streaming weight load — `install_streaming_load` (STATUS fn 17)
+
+**The finding.** `from_preset` builds the model with random initializers
+first and only then streams the checkpoint over it.  On this backend that
+build phase is not "one spare copy of the weights", it is
+
+    peak = sum(weights) + ~30x the LARGEST single variable
+
+because a `GlorotUniform`/`RandomUniform` initializer lowers to a threefry
+chain and our interpreter holds every intermediate of it live at once —
+and that garbage is only reclaimed by a `gc.collect()` + `mx.clear_cache()`
+that keras never performs.  Measured, all on metal:
+
+| model | weights | build-phase peak | ratio |
+|---|---|---|---|
+| Qwen3-0.6B | 1.11 GB | 8.11 GB | 7.3x |
+| gemma4-E2B | 9.51 GB | >=25 GB (guard-killed on a 71 GB trajectory) | >=2.6x |
+
+The ramp is violent: E2B went **1.8 -> 25.0 GB inside one 0.5 s sample**
+(~46 GB/s).  That is what jetsam-killed R1-Distill-32B and swap-killed
+Qwen3.6-35B-A3B.  The *port* phase was never the problem — it is already
+per-tensor and its curve is flat (device memory tracks ported bytes
+exactly).
+
+**The fix** (`adapter_keras_extra.install_streaming_load`, wired into
+`run_bench.py:run_keras_lm` and `run_keras_lm_smoke`, default on,
+`BENCH_STREAM_LOAD=0` opts out): variables are built with a shape, a dtype
+and *no value* — the state keras' own `_deferred_initialize` uses — and the
+loader's `assign()` puts the checkpoint tensor straight in.  Peak becomes
+`sum(weights) + one tensor`:
+
+| model | weights | streamed peak | ratio | load_s (was) |
+|---|---|---|---|---|
+| Qwen3-0.6B | 1.11 GB | 1.17 GB | 1.05x | 2.5 (4.3) |
+| gemma4-E2B | 9.51 GB | 9.51 GB | 1.0007x | 12.7 (n/a) |
+| Llama-3.1-8B | 14.96 GB | 16.06 GB | 1.07x | 28.0 |
+
+Numerics are unchanged, checked three ways: identical weight hash over all
+596 M parameters (stock vs streamed vs stock-after-uninstall), identical
+prefill logits, and `selftest_streaming_load()` (tiny Qwen3, seconds, CPU)
+which also covers the `.weights.h5` loader the Kaggle presets use.  NB a
+greedy `generate()` chain is **not** a valid identity check on this
+backend: two *unpatched* runs of Qwen3-0.6B already diverge (decode replay
+nondeterminism, STATUS fn 8) — compare weights or a single forward pass.
+
+Two corner cases are handled and *counted*: a variable read during the
+build is materialised on the spot with its real initializer
+(`build_read_count`), and a variable no loader ever wrote is initialised by
+`finalize_streaming_load()` — which prints a WARNING naming the paths if
+any of them are model weights (only keras metric/seed variables showed up
+on every model tested).
+
+**Version fragility.** The shim patches `keras.src.backend.Variable`:
+`_initialize_with_initializer(self, initializer)`, the `value` property,
+and `_direct_assign(self, value)`.  All three are checked at install time
+(existence, signature, `value` still being a property, no active keras
+distribution) and `install_streaming_load()` raises a message naming the
+attribute that moved rather than silently doing nothing.  Verified against
+keras 3.15.1 / keras-hub 0.30.0.
+
+Run any big load under `scripts/model_bench/mem_guard.sh <budget_gb> <log>
+<cmd...>`: it samples the process footprint ~2x/s and kills on the budget,
+on a machine-wide ceiling (`GUARD_SYS_GB`, default 100), **and on
+trajectory** — at 46 GB/s a threshold-only watchdog is decoration.
+
+---
+
 ## 7. Still open / commands for a serialised run
 
 1. **SD 3.5 Large black image** (§4).  Stage-by-stage finite check,
@@ -450,9 +517,12 @@ that file also contains two early `lora-gemma4-e2b` rows with `ok:false`
 `TypeError`) — those are iterations while the adapter was being written,
 not results; the final `ok:true` rows supersede them.
 
-Nothing else in `scripts/model_bench/` was touched; `run_bench.py` and
-`manifest.json` are unmodified.  No new python packages were installed
-into the benchmark venv.
+`manifest.json` is unmodified and no new python packages were installed
+into the benchmark venv.  `run_bench.py` was later touched once, for the
+streaming load (§6b): `run_keras_lm` installs the shim around
+`from_preset` and records the resulting counters in the jsonl row under
+`stream_load`.  `mem_guard.sh` (the watchdog/profiler used to measure it)
+is also new.
 
 Environment knobs used by the adapters:
 
@@ -462,6 +532,9 @@ Environment knobs used by the adapters:
 | `BENCH_DIFFUSION_STEPS` | 20 | diffusion steps |
 | `BENCH_IMAGE_SIZE` | 1024 | diffusion image side |
 | `BENCH_IMAGE_OUT` | unset | path to dump the generated PNG |
+| `BENCH_STREAM_LOAD` | 1 | 0 = build random weights first (the old path) |
+| `BENCH_STREAM_CLEAR_GB` | 8 | gc + `mx.clear_cache()` every N GB assigned |
+| `GUARD_SYS_GB` | 100 | `mem_guard.sh` machine-wide kill ceiling |
 | `BENCH_LORA_STEPS` | 8 | warm train steps |
 | `BENCH_SMOKE_WEIGHTS` | 1 | set 0 to check class/config mapping only |
 | `BENCH_SPM_PATCH` | 1 | set 0 to disable the sentencepiece workaround |

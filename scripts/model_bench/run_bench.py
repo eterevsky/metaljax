@@ -88,9 +88,18 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
     # poisons pip sentencepiece: SentencePieceProcessor.Init SIGABRTs
     # ("mutex lock failed") — that killed the gemma4-e2b rows. The shim
     # routes the native call through the tf-text tokenizer instead.
-    from adapter_keras_extra import patch_sentencepiece_native
-    patch_sentencepiece_native()
+    import adapter_keras_extra as extra
+    extra.patch_sentencepiece_native()
     import keras_hub
+
+    # Stream the checkpoint into the model instead of building a full set of
+    # random weights first (see install_streaming_load): that build phase is
+    # what put the >=50 GB rows over the machine — the peak is not
+    # "weights + weights", it is "weights + ~30x the largest variable",
+    # because our interpreter holds every intermediate of the initializer's
+    # threefry chain live at once. Weights land bit-identical either way.
+    stream = os.environ.get("BENCH_STREAM_LOAD", "1") == "1"
+    stream_info = extra.install_streaming_load() if stream else None
 
     cls = getattr(keras_hub.models, bench["arch"])
     t0 = time.monotonic()
@@ -109,6 +118,11 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
                                                bench["model"])
         backbone = cls.backbone_cls.from_preset(bench["model"])
         lm = cls(backbone=backbone, preprocessor=pre_cls(tokenizer=tok))
+    if stream:
+        # Any variable the checkpoint did not cover gets its real random
+        # init here, loudly; then keras goes back to stock for quantize().
+        stream_info = extra.finalize_streaming_load(lm)
+        extra.uninstall_streaming_load()
     if quant:
         try:
             lm.quantize(quant)
@@ -139,7 +153,7 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
     decode_ms = (1000 * dt - prefill_ms) / max(n_new - 1, 1)
     return dict(load_s=load_s, warmup_s=warmup_s, prefill_ms=prefill_ms,
                 decode_ms_tok=decode_ms, out_tokens=n_new, token_ids=ids,
-                prompt_tokens=plen)
+                prompt_tokens=plen, stream_load=stream_info)
 
 
 def run_mlx(bench, backend, prompt, n_decode):

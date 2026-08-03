@@ -44,6 +44,7 @@ what silently drops the gemma4 rows from the main suite.
 
 import argparse
 import gc
+import inspect
 import json
 import os
 import resource
@@ -181,6 +182,356 @@ def _keras_bf16():
 
     keras.config.set_dtype_policy("bfloat16")
     return keras
+
+
+# ------------------------------------------------------- streaming weight load
+
+_STREAM = {
+    "installed": False,
+    "deferred": 0,        # variables whose random init we skipped
+    "assigned": 0,        # variables a loader wrote a real tensor into
+    "assigned_gb": 0.0,
+    "build_reads": [],    # variables read BEFORE a value was assigned
+    "build_read_count": 0,
+    "completed": [],      # variables no loader ever wrote (random-initialised)
+    "completed_count": 0,
+    "clears": 0,
+}
+# Deferred variables, as weakrefs -- keras Variables define `__eq__`
+# elementwise and are therefore unhashable, so no set/dict keyed by the
+# variable itself is possible (and id()-keyed sets are a trap: CPython
+# reuses freed addresses).  A flat list is enough; finalize filters it.
+_PENDING = None
+
+
+def install_streaming_load(clear_every_gb=None):
+    """Build keras models without ever materialising the random init.
+
+    THE PROBLEM (STATUS.md footnote 17).  `Backbone.from_preset` builds the
+    model first -- every variable runs its initializer -- and only then
+    deletes those values (`keras_hub...jax_memory_cleanup`) and streams the
+    checkpoint over them.  On this backend the build phase is not "one extra
+    copy of the weights", it is far worse: a `GlorotUniform`/`RandomUniform`
+    initializer lowers to a threefry chain, our interpreter keeps every
+    intermediate of that chain live at once, and the executable's garbage is
+    only reclaimed by a `gc.collect()` + `mx.clear_cache()` that keras never
+    performs.  MEASURED on this machine (bf16 variables):
+
+        variable     device peak during its own init      ratio
+        32 MB        1.28 GB                              ~40x
+        512 MB       14.5 GB                              ~29x
+
+    i.e. building a model costs `sum(weights) + ~30x the LARGEST variable`,
+    transiently.  A 65 GB checkpoint with a 1.4 GB embedding table therefore
+    peaks around 95-110 GB before a single checkpoint byte is read -- which
+    is exactly where R1-Distill-32B was jetsam-killed and Qwen3.6-35B-A3B
+    entered swap-death.
+
+    THE FIX.  Keras already has the concept of a variable that has a shape
+    and a dtype but no value yet (that is what `_deferred_initialize` and
+    the stateless-scope path use).  We put every variable in that state at
+    build time: `_initialize_with_initializer` records the initializer and
+    returns, allocating nothing.  The loaders (the safetensors converter,
+    the `.weights.h5` reader, both) then `assign()` the checkpoint tensor
+    per variable, exactly as before, and the peak becomes
+
+        sum(weights already assigned) + one tensor + host staging
+
+    NUMERICS.  Unchanged: every variable a loader writes ends up holding
+    the checkpoint bytes it always did, and nothing else changes -- the only
+    thing that disappears is a random draw that was overwritten anyway.  Two
+    escape hatches keep that true in the corners:
+
+      * a variable READ during the build (rare, e.g. a layer that derives
+        something from its own kernel) is materialised on demand, with its
+        real initializer, at the moment of the read;
+      * a variable NO loader writes is initialised for real by
+        `finalize_streaming_load()`.
+
+    Both are counted and reported, so a checkpoint that leaves variables
+    random-initialised says so out loud instead of quietly serving a
+    different model.  (RNG draw ORDER differs from the eager path for those
+    two classes only; anything the checkpoint covers is bit-identical.)
+
+    `clear_every_gb` (env BENCH_STREAM_CLEAR_GB, default 8) forces a
+    `gc.collect()` + `mx.clear_cache()` every N GB of assigned weights so
+    the host-staging copies MLX caches cannot accumulate across a 90 GB
+    load.  BENCH_STREAM_LOAD=0 disables the whole shim.
+
+    Returns a dict describing what was patched; raises RuntimeError with a
+    precise message if keras' internals moved (never silently no-ops).
+    """
+    import weakref
+
+    from keras.src import backend as keras_backend
+    from keras.src.backend.common import variables as kv
+    from keras.src.backend.common.stateless_scope import in_stateless_scope
+
+    global _PENDING
+    if _STREAM["installed"]:
+        return dict(streaming_load_report(), already_installed=True)
+
+    # The concrete leaf class every keras variable is instantiated from
+    # (`keras.src.backend.Variable` -> JaxVariable -> the common Variable).
+    # Patching the leaf shadows the backend's own overrides, so the shim
+    # sees the variable no matter which layer of that chain implements what.
+    var_cls = keras_backend.Variable
+    for attr in ("_initialize_with_initializer", "_direct_assign", "value",
+                 "assign"):
+        if not hasattr(var_cls, attr):
+            raise RuntimeError(
+                f"streaming load: keras {_keras_version()} has no "
+                f"Variable.{attr} -- the load path moved; re-check "
+                f"install_streaming_load() against this keras version")
+    sig = list(inspect.signature(
+        var_cls._initialize_with_initializer).parameters)
+    if sig != ["self", "initializer"]:
+        raise RuntimeError(
+            "streaming load: Variable._initialize_with_initializer"
+            f"{sig} is not (self, initializer) -- re-check the shim")
+    if not isinstance(kv.Variable.value, property):
+        raise RuntimeError("streaming load: Variable.value is no longer a "
+                           "property -- re-check the shim")
+    import keras
+
+    if keras.distribution.distribution() is not None:
+        raise RuntimeError("streaming load: a keras distribution is active; "
+                           "the shim bypasses the sharded-init paths")
+
+    _PENDING = []
+    orig_init_with = var_cls._initialize_with_initializer
+    orig_value = kv.Variable.value
+    orig_direct = var_cls._direct_assign
+
+    def _materialize(self):
+        """Run the real initializer, once, for a deferred variable."""
+        init = self._mj_init
+        self._mj_init = None
+        self._initializer = None
+        orig_init_with(self, init)
+
+    def deferred_init(self, initializer):
+        # `_shape`/`_dtype` are already set by Variable.__init__; leaving
+        # `_value = None` with an initializer on the side is exactly the
+        # state keras' own deferred/stateless path uses.
+        self._mj_init = initializer
+        self._initializer = initializer
+        self._value = None
+        _STREAM["deferred"] += 1
+        try:
+            _PENDING.append(weakref.ref(self))
+        except TypeError:      # a backend Variable that cannot be weakref'd
+            _PENDING.append(lambda v=self: v)
+
+    @property
+    def value(self):
+        if (self._value is None and getattr(self, "_mj_init", None) is not None
+                and not in_stateless_scope()):
+            if len(_STREAM["build_reads"]) < 32:
+                _STREAM["build_reads"].append(self.path)
+            _STREAM["build_read_count"] += 1
+            _materialize(self)
+        return orig_value.fget(self)
+
+    def direct_assign(self, value):
+        orig_direct(self, value)
+        if getattr(self, "_mj_init", None) is not None:
+            self._mj_init = None
+            self._initializer = None
+        _STREAM["assigned"] += 1
+        _STREAM["assigned_gb"] += _var_gb(self)
+        if _STREAM["assigned_gb"] >= _STREAM["_next_clear"]:
+            _STREAM["_next_clear"] += _STREAM["_clear_gb"]
+            _stream_clear()
+
+    # Remember which of these the leaf class owned, so uninstall restores
+    # the class exactly (they are inherited today; a future keras may not).
+    owned = {a: (a in vars(var_cls)) for a in
+             ("_initialize_with_initializer", "value", "_direct_assign")}
+    var_cls._mj_init = None          # class-level default
+    var_cls._initialize_with_initializer = deferred_init
+    var_cls.value = value
+    var_cls._direct_assign = direct_assign
+    var_cls._metaljax_stream_orig = (orig_init_with, orig_value, orig_direct,
+                                     owned)
+
+    if clear_every_gb is None:
+        clear_every_gb = float(os.environ.get("BENCH_STREAM_CLEAR_GB", "8"))
+    _STREAM["_clear_gb"] = max(float(clear_every_gb), 0.25)
+    _STREAM["_next_clear"] = _STREAM["_clear_gb"]
+    _STREAM["installed"] = True
+    return {"installed": True, "keras": _keras_version(),
+            "variable_cls": f"{var_cls.__module__}.{var_cls.__name__}",
+            "clear_every_gb": _STREAM["_clear_gb"]}
+
+
+def _keras_version():
+    import keras
+
+    return keras.__version__
+
+
+def _var_gb(v):
+    n = 1
+    for d in v.shape:
+        n *= int(d)
+    try:
+        import numpy as np
+
+        itemsize = np.dtype(v.dtype).itemsize
+    except TypeError:  # exotic/quantized dtype strings
+        itemsize = 2
+    return n * itemsize / 2**30
+
+
+def _stream_clear():
+    """Drop MLX's freed-buffer cache (host-staging copies) mid-load."""
+    gc.collect()
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return
+    mx.clear_cache()
+    _STREAM["clears"] += 1
+
+
+def finalize_streaming_load(model=None):
+    """Give every still-valueless variable its real random init.
+
+    A checkpoint that does not cover the whole model is not an error (keras
+    behaves the same way), but it IS worth shouting about: those variables
+    are the only ones whose numbers differ from the eager path.
+    """
+    if not _STREAM["installed"]:
+        return dict(_STREAM)
+    pending = [ref() for ref in (_PENDING or ())]
+    weight_ids = set()
+    if model is not None:
+        pending += list(model.weights)
+        weight_ids = {id(w) for w in model.weights}
+    done = 0
+    left_weights = []
+    for v in pending:
+        # `_mj_init` is cleared by assign/materialize, so this both filters
+        # and de-duplicates (a variable can appear twice in `pending`).
+        if v is None or getattr(v, "_mj_init", None) is None:
+            continue
+        if v._value is not None:
+            v._mj_init = None
+            continue
+        if len(_STREAM["completed"]) < 32:
+            _STREAM["completed"].append(v.path)
+        if id(v) in weight_ids:
+            left_weights.append(v.path)
+        done += 1
+        init, v._mj_init, v._initializer = v._mj_init, None, None
+        type(v)._metaljax_stream_orig[0](v, init)
+    _STREAM["completed_count"] = done
+    _STREAM["completed_weights"] = left_weights
+    if left_weights:
+        # This is the one case that changes what the model computes: a
+        # MODEL WEIGHT the checkpoint did not cover. Never let it pass
+        # quietly -- the eager path would have random-initialised it too,
+        # but with a different draw.
+        print(f"  [stream-load] WARNING: {len(left_weights)} MODEL WEIGHT(S) "
+              f"were not in the checkpoint and are randomly initialised: "
+              f"{left_weights[:6]}", flush=True)
+    elif done:
+        # Metric accumulators, seed-generator state, and friends: keras
+        # initialises these to constants, so nothing observable changed.
+        print(f"  [stream-load] {done} non-weight variable(s) (metrics/seed "
+              f"state) initialised after the load: {_STREAM['completed'][:4]}",
+              flush=True)
+    _stream_clear()
+    return streaming_load_report()
+
+
+def streaming_load_report():
+    return {k: v for k, v in _STREAM.items() if not k.startswith("_")}
+
+
+def selftest_streaming_load(preset_dir=None):
+    """Prove the shim is a no-op on the weights, on a 1 MB model.
+
+    Builds a tiny Qwen3 backbone, saves it as a keras preset, and reloads it
+    three times -- stock, shimmed, stock again -- comparing a hash of every
+    weight and a forward pass.  Cheap (CPU, seconds), and it covers the
+    `.weights.h5` loader that the Kaggle-hosted rows (Mixtral) use, which no
+    downloadable checkpoint on this machine exercises otherwise.
+    """
+    import hashlib
+    import tempfile
+
+    keras = _keras_bf16()
+    import numpy as np
+
+    from keras_hub.models import Qwen3Backbone
+
+    def digest(model):
+        h = hashlib.blake2b(digest_size=16)
+        for w in sorted(model.weights, key=lambda v: v.path):
+            a = np.ascontiguousarray(np.asarray(w))
+            h.update(w.path.encode())
+            h.update(str(a.dtype).encode())
+            h.update(a.view(np.uint8).reshape(-1).tobytes())
+        return h.hexdigest()
+
+    cfg = dict(vocabulary_size=512, num_layers=2, num_query_heads=4,
+               num_key_value_heads=2, head_dim=16, hidden_dim=64,
+               intermediate_dim=128)
+    tmp = preset_dir or tempfile.mkdtemp(prefix="mj-stream-selftest-")
+    Qwen3Backbone(**cfg).save_to_preset(tmp)
+
+    x = {"token_ids": np.arange(8, dtype="int32")[None, :],
+         "padding_mask": np.ones((1, 8), dtype="int32")}
+
+    base = Qwen3Backbone.from_preset(tmp)
+    h_base, y_base = digest(base), np.asarray(base.predict_on_batch(x))
+    del base
+    gc.collect()
+
+    info = install_streaming_load()
+    shimmed = Qwen3Backbone.from_preset(tmp)
+    report = finalize_streaming_load(shimmed)
+    h_shim, y_shim = digest(shimmed), np.asarray(shimmed.predict_on_batch(x))
+    del shimmed
+    gc.collect()
+    uninstall_streaming_load()
+
+    after = Qwen3Backbone.from_preset(tmp)
+    h_after = digest(after)
+
+    ok = (h_base == h_shim == h_after) and np.array_equal(y_base, y_shim)
+    out = dict(ok=bool(ok), hash_stock=h_base, hash_streamed=h_shim,
+               hash_after_uninstall=h_after,
+               forward_identical=bool(np.array_equal(y_base, y_shim)),
+               install=info, report=report, preset_dir=tmp)
+    if not ok:
+        raise AssertionError(f"streaming load changed the weights: {out}")
+    return out
+
+
+def uninstall_streaming_load():
+    """Restore keras (tests run several loads in one process)."""
+    if not _STREAM["installed"]:
+        return
+    from keras.src import backend as keras_backend
+
+    var_cls = keras_backend.Variable
+    orig_init_with, orig_value, orig_direct, owned = \
+        var_cls._metaljax_stream_orig
+    for attr, orig in (("_initialize_with_initializer", orig_init_with),
+                       ("value", orig_value),
+                       ("_direct_assign", orig_direct)):
+        if owned[attr]:
+            setattr(var_cls, attr, orig)
+        else:
+            delattr(var_cls, attr)     # unshadow the inherited definition
+    del var_cls._metaljax_stream_orig
+    del var_cls._mj_init
+    _STREAM.update(installed=False, deferred=0, assigned=0, assigned_gb=0.0,
+                   build_reads=[], build_read_count=0, completed=[],
+                   completed_count=0, clears=0)
 
 
 def _mem_gb(backend):
@@ -599,6 +950,8 @@ def run_keras_lm_smoke(bench, backend, prompt=None, n_decode=5):
     cls = getattr(keras_hub.models, arch)
     pre_cls = cls.preprocessor_cls
     note, alias = "from_preset", None
+    stream = os.environ.get("BENCH_STREAM_LOAD", "1") == "1" and load_weights
+    stream_info = install_streaming_load() if stream else None
     t0 = time.monotonic()
 
     # Build the preprocessor FIRST -- it is cheap, and it is where
@@ -619,6 +972,9 @@ def run_keras_lm_smoke(bench, backend, prompt=None, n_decode=5):
     backbone = cls.backbone_cls.from_preset(preset,
                                             load_weights=load_weights)
     lm = cls(backbone=backbone, preprocessor=pre)
+    if stream:
+        stream_info = finalize_streaming_load(lm)
+        uninstall_streaming_load()
     load_s = time.monotonic() - t0
 
     plen = len(lm.preprocessor.tokenizer(text))
@@ -628,7 +984,7 @@ def run_keras_lm_smoke(bench, backend, prompt=None, n_decode=5):
     ids = [int(t) for t in lm.preprocessor.tokenizer(out)]
     return dict(load_s=load_s, warmup_s=gen_s, load_weights=load_weights,
                 backbone_cls=type(lm.backbone).__name__, load_path=note,
-                eos_alias=alias,
+                eos_alias=alias, stream_load=stream_info,
                 end_token_id=getattr(lm.preprocessor.tokenizer,
                                      "end_token_id", None),
                 generated=out, token_ids=ids[:64],
