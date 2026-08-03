@@ -40,6 +40,16 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   tests on ANY change to the budgets, the flush cadence, or MLX.
   DO NOT run 8B-class maxtext on metal at raised budgets without a
   memory watchdog and Oleg's sign-off.
+  2026-08-03 (later): PURE-MLX repro achieved via mx.export_function —
+  notes/data/mlx-cbuf-repro/ (repro_a/b.py + .mlxfn, only mlx+numpy;
+  corrupts at MLX's STOCK defaults). Issue draft ready for Oleg:
+  notes/mlx-command-buffer-upstream-issue.md.
+- **test_command_buffer canaries are stale** (found 2026-08-03): the
+  corrupting ops alignment MOVED 400 → 200 after fdc7cde's shift
+  peephole changed the threefry lowering — our own commits reshuffle
+  the lottery, and the shipped ops=800 is currently pinned by nothing.
+  Re-pin the canary values (and consider a sweep-style canary) before
+  the 0.11.3 gate.
 - **Quantized-decode correctness criterion**: token-stream equality is
   not usable for quantized models (notes/int8-divergence-verdict.md);
   compare_tokens.py encodes the policy — extend the logit-ladder
