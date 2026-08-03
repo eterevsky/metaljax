@@ -99,35 +99,6 @@ kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     algorithm, which XLA:CPU rejects (plain f16 dots work; the
     algorithm spec is an accelerator contract). A strip-workaround
     would enable a CPU reference; planned.
-22. CERTIFIED BENIGN (notes/int8-divergence-verdict.md): the token
-    divergence vs int8-CPU is an exact logit tie on metal (14.5 vs
-    14.5) at a step whose CPU margin is 7 bf16 ULPs = 1.3σ of the
-    quantization noise; the s8 dot+dequant is bit-identical on real
-    data; even CPU-int8 vs CPU-bf16 flips the same token. Timing valid
-    (3.1× vs bf16 — the int64 cliff). NB token-stream equality is not
-    a usable correctness criterion for quantized decode; use the
-    logit-delta ladder.
-19. torch SD3.5 via the ungated diffusers mirror
-    adamo1139/stable-diffusion-3.5-large-ungated @5d868ff (official
-    repo is gated); coherent images verified at both resolutions.
-    MLX cell: mflux is Flux-only; DiffusionKit supports the SD3 family
-    but 3.5-Large weights are gated in its formats — no ungated MLX
-    path exists, cell closed as not-runnable.
-21. Release-gate token audit: greedy streams metal-vs-CPU are exact on
-    12B, Qwen3-8B, E2B-int4, and the maxtext rows; E2B-bf16 and
-    Llama-8B diverge at their FIRST generated token via certified
-    tie-flips — competing logits within 1–2 bf16 ULPs (Llama: exactly
-    tied 11.875/11.875 on metal), the same benign class as the int8
-    certification. gpt-oss/26B/31B have no CPU counterpart (recorded
-    only).
-20. llama.cpp build 221f0f63 (past the Gemma4 cutoff), llama-bench
-    -p 51 -n 128 -r 5, all-Metal, reproduced within 4% on two passes;
-    per-provider GGUF pins in README_llamacpp.md. Q8/Q4 marked where
-    no bf16 GGUF exists. Dense rows all pin to 439–555 GB/s effective
-    bandwidth (the bandwidth-bound signature); llama.cpp leads even
-    mlx-lm ~1.25x on bf16 — the kernel frontier on this hardware.
-    Deferred rows (35B/R1/Mixtral llama.cpp cells) dropped as
-    redundant with the covered comparison classes.
 13. CPU cells run what XLA:CPU supports: weights load bf16, matmuls
     upcast per-op (bf16→f32); the 12B row is full f32 (gemma-lib path).
 14. 26B-A4B CPU attempt per Oleg, behind the memory guard: killed at
@@ -156,6 +127,35 @@ kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     XLA:CPU fuses the same unpack into a small net WIN (67.5 vs 79.2
     bf16). Either mx.quantized_matmul mapping or unpack-fusion
     closes it.
+19. torch SD3.5 via the ungated diffusers mirror
+    adamo1139/stable-diffusion-3.5-large-ungated @5d868ff (official
+    repo is gated); coherent images verified at both resolutions.
+    MLX cell: mflux is Flux-only; DiffusionKit supports the SD3 family
+    but 3.5-Large weights are gated in its formats — no ungated MLX
+    path exists, cell closed as not-runnable.
+20. llama.cpp build 221f0f63 (past the Gemma4 cutoff), llama-bench
+    -p 51 -n 128 -r 5, all-Metal, reproduced within 4% on two passes;
+    per-provider GGUF pins in README_llamacpp.md. Q8/Q4 marked where
+    no bf16 GGUF exists. Dense rows all pin to 439–555 GB/s effective
+    bandwidth (the bandwidth-bound signature); llama.cpp leads even
+    mlx-lm ~1.25x on bf16 — the kernel frontier on this hardware.
+    Deferred rows (35B/R1/Mixtral llama.cpp cells) dropped as
+    redundant with the covered comparison classes.
+21. Release-gate token audit: greedy streams metal-vs-CPU are exact on
+    12B, Qwen3-8B, E2B-int4, and the maxtext rows; E2B-bf16 and
+    Llama-8B diverge at their FIRST generated token via certified
+    tie-flips — competing logits within 1–2 bf16 ULPs (Llama: exactly
+    tied 11.875/11.875 on metal), the same benign class as the int8
+    certification. gpt-oss/26B/31B have no CPU counterpart (recorded
+    only).
+22. CERTIFIED BENIGN (notes/int8-divergence-verdict.md): the token
+    divergence vs int8-CPU is an exact logit tie on metal (14.5 vs
+    14.5) at a step whose CPU margin is 7 bf16 ULPs = 1.3σ of the
+    quantization noise; the s8 dot+dequant is bit-identical on real
+    data; even CPU-int8 vs CPU-bf16 flips the same token. Timing valid
+    (3.1× vs bf16 — the int64 cliff). NB token-stream equality is not
+    a usable correctness criterion for quantized decode; use the
+    logit-delta ladder.
 
 ## Bug ledger (found by this suite)
 
