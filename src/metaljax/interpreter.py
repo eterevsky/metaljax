@@ -104,6 +104,54 @@ def value_bytes(v: ir.Value, cache: dict | None = None) -> int:
     return nb
 
 
+def op_bytes(o: ir.Operation, cache: dict | None = None) -> int:
+    """Estimated device bytes operation `o` materializes.
+
+    `value_bytes` summed over the results, with one exception that is not a
+    refinement but a correction: a SPLAT constant carries ONE value however
+    big its type says it is (``dense<1.0> : tensor<151936x1024xf32>`` is four
+    bytes of IR), and ops.elementwise._constant broadcasts it from a
+    one-element buffer rather than materializing the shape. Charging such a
+    constant its nominal size is not conservatism, it is an invented gigabyte:
+    jax lowers a single `random.normal` with 23 full-shape splat
+    coefficients, so a program that touches no real data at all could be
+    made to look multi-GB.
+
+    Everything else is charged its declared result size. Views MLX produces
+    without copying (broadcast_in_dim, reshape, transpose, slice) and the
+    elementwise chains mx.compile fuses are deliberately NOT modelled -- see
+    _block_bytes in ops/control.py for why the overshoot is the right
+    direction for a memory gate.
+    """
+    total = 0
+    for r in o.results:
+        total += value_bytes(r, cache)
+    if o.name == "stablehlo.constant" and total and _splat_broadcast():
+        try:
+            t = ir.RankedTensorType(o.results[0].type)
+            if ir.DenseElementsAttr(o.attributes["value"]).is_splat:
+                # one element, broadcast (mx.broadcast_to over a 1-elem buffer)
+                total = dtypes.np_dtype_for_mlir(t.element_type).itemsize
+        except Exception:
+            pass  # complex dense attrs the bindings cannot even cast, etc.
+    return total
+
+
+def _splat_broadcast() -> bool:
+    """Whether splat constants really do broadcast from one element.
+
+    Read from the handler that decides it (ops.elementwise) instead of
+    re-reading the environment here, so METALJAX_SPLAT_CONST=0 keeps the
+    estimate and the runtime telling the same story. Imported lazily:
+    metaljax.ops imports this module.
+    """
+    try:
+        from metaljax.ops import elementwise
+        return elementwise._SPLAT_BROADCAST
+    except Exception:
+        return True
+
+
 def flush_eval(arrays, hard: bool):
     """Settle `arrays`, recovering once from Metal buffer exhaustion.
 
@@ -264,6 +312,14 @@ class Interpreter:
         self._pure_cache: dict = {}    # block -> bool
         self._traceable_cache: dict = {}  # while body block -> bool
         self._cost_cache: dict = {}    # block -> approx op count when traced
+        self._bytes_cache: dict = {}   # block -> approx result bytes when traced
+        # Blocks the compile-decision byte gate has declined at least once.
+        # A RECORD, not an authority: the decision depends on how many copies
+        # of the block a site would trace (1 main, `repeat` per body, `trip`
+        # unrolled), so every site asks control._bytes_ok rather than reading
+        # this. It exists so METALJAX_DEBUG reports a gate once instead of per
+        # call, and so tests can assert the gate did (or did not) fire.
+        self._bytes_gated: set = set()
         self._no_chunk: set = set()    # body blocks where chunking failed
         self._no_body_compile: set = set()  # bodies whose compiled fn failed
         self._msl_cache: dict = {}     # (body block, trip, start) -> Plan | None
@@ -505,6 +561,15 @@ class Interpreter:
         result nothing reads is dropped immediately. Values inherited from an
         enclosing block may be dropped too: `run_block` works on a copy of
         the parent's environment, so only this block's reference goes away.
+
+        NB `out_bytes` deliberately stays the plain `value_bytes` sum and does
+        NOT use `op_bytes`' splat correction. It meters a flush CADENCE, and
+        cadences are pinned by measurement here (notes/eager-memory-2026-08.md)
+        and by the MLX command-buffer lottery (moving a sync point changes
+        results, notes/mlx-command-buffer-split.md); over-counting a splat only
+        makes the safety net fire earlier. The compile-decision gate, which
+        must not invent gigabytes that would turn compilation off, uses
+        `op_bytes` instead.
         """
         plan = self._live_cache.get(block)
         if plan is not None:

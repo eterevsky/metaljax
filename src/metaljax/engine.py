@@ -153,6 +153,8 @@ class MetalExecutable:
         interp._body_cache.clear()      # compiled bodies embed the kernel
         interp._traceable_cache.clear()  # an msl plan made a loop traceable
         interp._cost_cache.clear()      # ...and cost it as one kernel (8)
+        interp._bytes_cache.clear()     # ...and charged only its outputs
+        interp._bytes_gated.clear()     # decisions taken under the old plans
         self._compiled = None
         self._can_compile = None        # re-decide with the new costs
 
@@ -183,6 +185,10 @@ class MetalExecutable:
         interp = self.interpreter
         interp._body_cache.clear()
         interp._cost_cache.clear()
+        # Absorbed ops are charged nothing, so a changed rewrite changes the
+        # byte estimate exactly as it changes the op count.
+        interp._bytes_cache.clear()
+        interp._bytes_gated.clear()
         interp._traceable_cache.clear()
         self._compiled = None
         self._can_compile = None
@@ -195,24 +201,35 @@ class MetalExecutable:
         interp = self.interpreter
         if self._can_compile is None:
             with interp.context:
+                blk = interp._main_block()
+                cost = control._block_cost(interp, blk)
+                # Two independent budgets. `cost` bounds how many ops one
+                # mx.compile trace may hold (and so the Metal live-buffer
+                # count); `bytes` bounds how much those buffers hold, which
+                # op count says nothing about — a jitted parameter init is
+                # 365 ops and 15 GB of traffic. Over either budget the
+                # program runs op by op, where last-use pruning and the
+                # byte-denominated flush bound it, which the compiled path
+                # does not (notes/eager-memory-2026-08.md).
+                nbytes = control._block_bytes(interp, blk)
                 self._can_compile = (
                     COMPILE_ENABLED
                     and interp.main_pure
-                    and control._block_cost(interp, interp._main_block())
-                    <= control._TRACE_BUDGET
+                    and cost <= control._TRACE_BUDGET
+                    and control._bytes_ok(interp, blk, 1, f"main {self.name}")
                 )
                 if control._DEBUG:
-                    # `bytes` is the static sum of this block's result sizes
-                    # (interpreter.value_bytes): what an eager run produces,
-                    # and roughly 2x what a compiled trace materializes since
-                    # mx.compile fuses elementwise chains. It is what the
-                    # eager flush meters, so logging it says which programs
-                    # the safety net can act on.
-                    blk = interp._main_block()
+                    # `bytes` is this program's estimated traced result data
+                    # (control._block_bytes: loops unrolled, splats
+                    # broadcast, absorbed ops free) — the quantity the gate
+                    # acts on, and it is traffic, so it reads ~2.8x what the
+                    # run peaks at. `eagerbytes` is the flat per-op sum the
+                    # eager flush meters (no loop unrolling), kept because
+                    # it says which programs that safety net can act on.
                     print(f"[metaljax] exec {self.name}: pure="
-                          f"{interp.main_pure} cost="
-                          f"{control._block_cost(interp, blk)} "
-                          f"bytes={sum(interp.eager_plan(blk)[1])} "
+                          f"{interp.main_pure} cost={cost} "
+                          f"bytes={nbytes / 2**20:.1f}MB "
+                          f"eagerbytes={sum(interp.eager_plan(blk)[1]) / 2**20:.1f}MB "
                           f"compile={self._can_compile}", flush=True)
         if not self._can_compile:
             return interp

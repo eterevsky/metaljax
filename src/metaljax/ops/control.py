@@ -9,6 +9,7 @@ from metaljax.interpreter import (
     COMPILE_ENABLED,
     UnsupportedOpError,
     free_values,
+    op_bytes,
     register,
 )
 
@@ -312,6 +313,173 @@ def _block_cost(interp, block) -> int:
     return cost
 
 
+def _block_bytes(interp, block) -> int:
+    """Approximate device bytes materialized when this block is TRACED.
+
+    The byte analogue of `_block_cost`, and deliberately the same walk:
+    loops unrolled (trip x body, pessimistic trip=1024 when the bound is not
+    static), func.call/composite callees recursed into, ops a recognizer
+    absorbs charged nothing because they never execute, and a loop that
+    became one generated msl kernel charged only its outputs (its
+    per-timestep state lives in registers, not in buffers).
+
+    Why a second metric at all: `_block_cost` bounds how many OPS a trace may
+    contain, which bounds the Metal live-BUFFER count -- it says nothing about
+    how much memory those buffers hold. A program can sit far inside the op
+    budget and still make the compiled path hold gigabytes, and the compiled
+    peak grows with the program while the eager one does not. One jitted
+    `random.normal` -- 365 ops, the maxtext/keras load shape -- at four sizes,
+    peak MLX memory compiled vs the same program refused:
+
+        output   4 MB    16 MB    64 MB   256 MB
+        compiled 0.18 GB  0.72 GB  2.87 GB 10.00 GB
+        eager       --    0.80 GB  1.19 GB  3.25 GB
+
+    That last column is the 256 MB init the eager-memory note had to leave at
+    "9.75 GB compiled either way": bounding it is what this gate is for.
+
+    This is a TRAFFIC estimate (every result the block produces), not a
+    live-set one, so it reads 3-6x higher than what actually lands: 5.0x on
+    every size of that init, 2.8x on three texmo training chunks (11.92 vs
+    4.26 GB, 35.87 vs 12.31, 41.90 vs 14.82). mx.compile fusing elementwise
+    chains and MLX making broadcasts/reshapes/transposes/slices as views is
+    where the slack comes from; modelling that is not attempted, and the
+    threshold is calibrated against this estimator rather than against ground
+    truth. What the estimate must NOT do is invent bytes that exist in no
+    regime -- see `interpreter.op_bytes` on splat constants -- because those
+    turn compilation off for programs that are perfectly small.
+    """
+    cached = interp._bytes_cache.get(block)
+    if cached is not None:
+        return cached
+    interp._bytes_cache[block] = 0  # break cycles defensively
+    total = 0
+    # Both recognizers' absorbed ops, exactly as _block_cost skips them: they
+    # are not executed and never materialize a result. A ROOT is charged its
+    # own result (the fused dot/attention does produce that), which is why
+    # only `skip` is needed here and no per-root table.
+    skip = set()
+    for st in (interp._qmm, sdpa.analyze(interp)):
+        if st is not None and st.active:
+            skip |= st.skip
+    tcache: dict = {}  # ir.Type -> bytes, per block (see value_bytes)
+    for op in block.operations:
+        o = op.operation
+        if skip and len(o.results) and o.results[0] in skip:
+            continue
+        total += op_bytes(o, tcache)
+        if o.name == "stablehlo.while":
+            if _msl_plan_for(interp, o) is not None:
+                continue
+            counted = _analyze_counted(interp, o)
+            body = o.regions[1].blocks[0]
+            trip = 1024
+            if counted is not None and isinstance(counted[1], int):
+                start = _static_start(o, counted[0])
+                if start is not None:
+                    trip = max(counted[1] - start, 1)
+            total += trip * _block_bytes(interp, body)
+        elif o.name in ("func.call", "stablehlo.composite"):
+            attr = "callee" if o.name == "func.call" else "decomposition"
+            fn = interp.funcs.get(_callee_name(o, attr))
+            if fn is not None:
+                total += _block_bytes(interp, fn.regions[0].blocks[0])
+        else:
+            # if/case: charge every branch (which one runs is data).
+            for region in o.regions:
+                for b in region.blocks:
+                    total += _block_bytes(interp, b)
+    interp._bytes_cache[block] = total
+    return total
+
+
+# Bytes a single mx.compile trace may materialize. The op-count budget above
+# bounds the live-buffer COUNT; this bounds their SIZE, and the two are
+# independent: every tensor of a command buffer stays allocated until it
+# completes, so a program well inside 20k ops can still hold tens of GB.
+# The class this catches is high-bytes/low-op-count: big-model load, warmup
+# and conversion programs (a 30B+ checkpoint conversion is a few thousand
+# converts moving 70+ GB; a jitted init lowers 64 MB of weights into ~15 GB
+# of traffic at 365 ops) and diffusion sampler bodies. Declining to compile
+# hands the program to the eager path, whose peak IS bounded -- by last-use
+# pruning and the byte-denominated flush (notes/eager-memory-2026-08.md).
+#
+# THE DEFAULT IS MEASURED, and it is much larger than it looks like it should
+# be, because this estimator counts TRAFFIC (see _block_bytes) while what
+# lands is the live set -- 3-6x less, depending on shape. 64 GB here means a
+# compiled program may hold roughly 10 GB (init-shaped) to 23 GB (texmo
+# training chunk) before it is pushed onto the eager path.
+#
+# The distribution it was picked from -- every compile decision metaljax says
+# YES to today, logged at all four gate sites while the workload ran:
+#
+#   pytest suite (589 tests)                       max   1.19 GB
+#   tests/data qwen3 prefill (shrunk, 8 layers)          1.99 GB
+#   texmo whole-main, 8-step chunk (gate harness)  max   6.11 GB
+#     the same, scaled to the 20-step benchmark chunk   ~15.3 GB (derived)
+#   texmo training step, inner loop unrolled       max  27.4 GB (lstm.512 b32)
+#   texmo chunked replay at K=16                   max  41.9 GB (db17 b256 L512)
+#   ---- 64 GB ----
+#   Qwen3-8B prefill, 36 layers                        139.8 GB
+#   Qwen3 maxtext parameter init scan                  695.5 GB
+#
+# (The last two are over the op budget as well, so they were already eager;
+# they are here as the scale of what must never be traced. The class this
+# gate adds cover for is the one the op budget misses -- see above.)
+#
+# 64 GB is 1.5x above the largest program metaljax compiles today and 2.1x
+# below the smallest it must refuse. Headroom on the low side is not
+# politeness: firing the gate on a texmo body would also change K, and with
+# it where a loop's sync points fall -- which is a correctness lottery on
+# MLX 0.32, not just a perf question (notes/mlx-command-buffer-split.md).
+# For the record, tightening is CHEAP where it was measured (db17 K 16->4:
+# 7.271 -> 7.257 ms/step, i.e. free; lstm.512 b32 with its whole training
+# step refused: 29.60 -> 29.85 ms/step, +0.8%), so a workload that needs a
+# tighter bound can have one -- but it should be measured, not assumed, and
+# both tests/test_command_buffer.py cases rerun. 0 disables the gate.
+_COMPILE_BYTES_MB = int(os.environ.get("METALJAX_COMPILE_BYTES_MB", "65536"))
+_COMPILE_BYTES = max(_COMPILE_BYTES_MB, 0) * 2**20
+
+
+def _bytes_ok(interp, block, mult=1, what="block") -> bool:
+    """Whether tracing `mult` copies of `block` fits the byte budget.
+
+    Every compile decision asks this: the whole-main compile (mult=1), a
+    compiled while body (mult=repeat), unrolling a counted loop into an
+    enclosing trace (mult=trip), and how many iterations one chunked replay
+    may hold. All four multiply the SAME per-block estimate, which is what
+    keeps them coherent -- a body that may be compiled per step is not
+    thereby licensed to be unrolled a thousand times into a trace.
+    """
+    if _COMPILE_BYTES <= 0:
+        return True
+    nb = mult * _block_bytes(interp, block)
+    if nb <= _COMPILE_BYTES:
+        return True
+    _note_gated(interp, block, nb, mult, what)
+    return False
+
+
+def _bytes_chunks(interp, block) -> int:
+    """How many copies of `block` a single trace may hold (>=1 always: the
+    single-step path is gated by `_bytes_ok` in _body_fn instead)."""
+    if _COMPILE_BYTES <= 0:
+        return 1 << 30
+    return max(1, _COMPILE_BYTES // max(_block_bytes(interp, block), 1))
+
+
+def _note_gated(interp, block, nb, mult, what):
+    """Record a fired gate on the interpreter (see Interpreter._bytes_gated)
+    and report it once per block, not once per call."""
+    seen = interp._bytes_gated
+    first = block not in seen
+    seen.add(block)
+    if _DEBUG and first:
+        print(f"[metaljax] compile bytes gate: {what} would trace "
+              f"{nb / 2**20:.0f} MB (x{mult}) > {_COMPILE_BYTES_MB} MB "
+              f"(METALJAX_COMPILE_BYTES_MB); running eagerly", flush=True)
+
+
 def _msl_plan_for(interp, op):
     """Build (and cache) an msl_scan Plan for a statically-counted loop,
     or None. Used by purity/cost analysis and by _while dispatch."""
@@ -379,6 +547,12 @@ def _while_traceable(interp, op) -> bool:
             if (
                 trip * _block_cost(interp, body_block) <= _TRACE_BUDGET
                 and interp.block_is_pure(body_block)
+                # trip copies of the body land in the enclosing trace, and
+                # the tracer holds every one of their intermediates. Asked
+                # LAST, so a gate that fires means "everything else said
+                # compile" -- which is what makes the debug line, and the
+                # `_bytes_gated` record, mean something.
+                and _bytes_ok(interp, body_block, trip, "unroll-in-trace")
             ):
                 ok = True
     interp._traceable_cache[body_block] = ok
@@ -497,6 +671,9 @@ def _body_fn(interp, body_block, compile_body, repeat=1):
             and body_block not in interp._no_body_compile
             and interp.block_is_pure(body_block)
             and repeat * _block_cost(interp, body_block) <= _TRACE_BUDGET
+            # `repeat` iterations are traced into ONE graph, so the byte
+            # budget covers the whole chunk, not one iteration.
+            and _bytes_ok(interp, body_block, repeat, "while body")
         ):
             underived = _underived_outputs(body_block, free)
 
@@ -646,11 +823,17 @@ def _while(interp, op, ins, env):
         )
         K = 1
         if chunkable:
-            K = max(1, min(trip, _TRACE_BUDGET // max(cost, 1), _CHUNK_MAX))
+            # ...and no more iterations than the byte budget allows either:
+            # a chunk's intermediates are all live until it completes. K
+            # falling to 1 hands the body to the single-step path, whose
+            # own compile is gated in _body_fn.
+            K = max(1, min(trip, _TRACE_BUDGET // max(cost, 1), _CHUNK_MAX,
+                           _bytes_chunks(interp, body_block)))
         period = max(1, min(64, 25_000 // max(cost, 1)))
         if _DEBUG:
             print(f"[metaljax] while: trip={trip} cost={cost} K={K} "
-                  f"period={period} pure={interp.block_is_pure(body_block)}",
+                  f"period={period} pure={interp.block_is_pure(body_block)} "
+                  f"bytes/iter={_block_bytes(interp, body_block) / 2**20:.1f}MB",
                   flush=True)
         if K > 1:
             try:
