@@ -202,9 +202,17 @@ class MetalExecutable:
                     <= control._TRACE_BUDGET
                 )
                 if control._DEBUG:
+                    # `bytes` is the static sum of this block's result sizes
+                    # (interpreter.value_bytes): what an eager run produces,
+                    # and roughly 2x what a compiled trace materializes since
+                    # mx.compile fuses elementwise chains. It is what the
+                    # eager flush meters, so logging it says which programs
+                    # the safety net can act on.
+                    blk = interp._main_block()
                     print(f"[metaljax] exec {self.name}: pure="
                           f"{interp.main_pure} cost="
-                          f"{control._block_cost(interp, interp._main_block())} "
+                          f"{control._block_cost(interp, blk)} "
+                          f"bytes={sum(interp.eager_plan(blk)[1])} "
                           f"compile={self._can_compile}", flush=True)
         if not self._can_compile:
             return interp

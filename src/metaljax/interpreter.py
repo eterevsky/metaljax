@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 from typing import Callable
 
@@ -16,6 +17,114 @@ from metaljax import _ir, dtypes, qmm as _qmm, sdpa as _sdpa
 # repeat executions replay a fused Metal graph instead of re-dispatching
 # op by op from Python. Disable for debugging.
 COMPILE_ENABLED = os.environ.get("METALJAX_COMPILE", "1") != "0"
+
+# --- eager-phase memory safety net -----------------------------------------
+# An eagerly interpreted block used to keep EVERY intermediate it produced in
+# `env` until the block returned. MLX frees an intermediate as soon as nothing
+# references it -- measured on a 20-op chain over 128 MB arrays: peak 0.25 GB
+# with only the result referenced, 2.62 GB with every step held. That
+# retention, not laziness, is what multiplied an eagerly interpreted
+# program's footprint by the length of its op chain. Two mechanisms bound it:
+#
+#   * liveness pruning -- a value leaves `env` after its last use in the block
+#     (METALJAX_ENV_PRUNE=0 restores the old retain-everything behaviour);
+#   * a byte-denominated flush -- once this much estimated result data has
+#     been produced with no sync point, settle what is still live so the
+#     pending graph, and the Metal buffers it pins, stay bounded.
+#
+# The two only work TOGETHER: flushing without pruning materializes every
+# retained intermediate at once instead of letting MLX free them as it walks
+# the graph (measured on the 0.6B maxtext load: 75 GB and still climbing,
+# watchdog-killed, versus 17 GB with neither and 3.5 GB with both).
+#
+# NB the deliberately-omitted third mechanism: denominating a LOOP's flush
+# cadence in bytes as well. It measured no better than the shipped op-count
+# cadence here (6.63 GB either way) and it changes where existing sync points
+# fall, which reshuffles the MLX command-buffer lottery -- it produced a
+# stable but WRONG token stream on qwen3-0.6B decode. See
+# notes/mlx-command-buffer-split.md; loop cadences stay as they are until MLX
+# is fixed upstream.
+#
+# The default is deliberately generous: it must never fire on workloads that
+# are already fast (a texmo train step moves kilobytes to a few megabytes per
+# block). METALJAX_EAGER_FLUSH_MB=0 disables the flush entirely.
+FLUSH_MB = int(os.environ.get("METALJAX_EAGER_FLUSH_MB", "1024"))
+FLUSH_BYTES = max(FLUSH_MB, 0) * 2**20
+_ENV_PRUNE = os.environ.get("METALJAX_ENV_PRUNE", "1") != "0"
+# Blocking eval costs a full command-buffer roundtrip (~190us); async_eval
+# only submits. Checkpoints block by default so the budget means what it
+# says: with N async checkpoints in flight the peak is N x the budget
+# (measured 4.0 GB at budget 1024 MB and N=4, 1.1 GB at N=1). The blocking
+# cost is one roundtrip per budget's worth of data produced -- unmeasurable
+# next to producing it, and the flush never fires on small workloads anyway.
+# METALJAX_EAGER_FLUSH_SYNC=N blocks at every Nth checkpoint instead.
+_FLUSH_SYNC_EVERY = int(os.environ.get("METALJAX_EAGER_FLUSH_SYNC", "1"))
+_DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
+
+# Observability, for tests and for the "did this fire?" question.
+FLUSH_STATS = {"flushes": 0, "bytes": 0}
+
+
+def value_bytes(v: ir.Value, cache: dict | None = None) -> int:
+    """Estimated device bytes of an SSA value.
+
+    Static, straight from the IR: element count x dtype size. mx.compile
+    fuses elementwise chains, so summing this over a block overestimates what
+    is ever simultaneously live (~2x, measured on the qwen3 prefill repro).
+    That is fine for a flush cadence -- it only makes the safety net fire
+    earlier -- and it is exactly why such an estimate must never be used as a
+    correctness gate (notes/mlx-command-buffer-split.md addendum).
+
+    `cache` keys results by ir.Type. MLIR uniques types within a context, so
+    one dict per block collapses thousands of these to a handful of real
+    computations -- and each one is several Python-level MLIR calls, which
+    measured as ~200 ms of extra first-call latency on a texmo chunk before
+    it was memoized.
+    """
+    t = v.type
+    if cache is not None:
+        got = cache.get(t)
+        if got is not None:
+            return got
+    nb = 0
+    if not _ir.is_token(t):
+        try:
+            rt = ir.RankedTensorType(t)
+            n = 1
+            for d in rt.shape:
+                if d < 0:
+                    n = 0  # dynamic dim (shape-poly export): don't guess
+                    break
+                n *= d
+            nb = n * dtypes.np_dtype_for_mlir(rt.element_type).itemsize
+        except Exception:
+            nb = 0
+    if cache is not None:
+        cache[t] = nb
+    return nb
+
+
+def flush_eval(arrays, hard: bool):
+    """Settle `arrays`, recovering once from Metal buffer exhaustion.
+
+    Same contract as ops.control._loop_flush: programs are pure, so clearing
+    the cache and retrying is safe. gc first -- dead refcycles pin buffers
+    that clear_cache cannot free (CLAUDE.md item 19).
+    """
+    try:
+        if hard:
+            mx.eval(*arrays)
+        else:
+            mx.async_eval(*arrays)
+    except RuntimeError as e:
+        if "Resource limit" not in str(e):
+            raise
+        if _DEBUG:
+            print("[metaljax] Metal buffer limit hit at eager flush; "
+                  "clearing cache and retrying", flush=True)
+        gc.collect()
+        mx.clear_cache()
+        mx.eval(*arrays)
 
 
 class UnsupportedOpError(NotImplementedError):
@@ -43,6 +152,17 @@ def free_values(block: ir.Block) -> list[ir.Value]:
 
     walk(block)
     return list(free)
+
+
+def _op_captures(o: ir.Operation) -> list[ir.Value]:
+    """Values an op's nested regions read from enclosing scopes. Such a value
+    is live for as long as the op runs, even though it is not an operand."""
+    caps: dict = {}
+    for region in o.regions:
+        for b in region.blocks:
+            for v in free_values(b):
+                caps[v] = None
+    return list(caps)
 
 
 # op name -> handler(interp, op: ir.Operation, ins: list[mx.array], env) -> list[mx.array] | mx.array
@@ -156,6 +276,7 @@ class Interpreter:
         # a Metal build error raises here instead of in an async worker.
         self._msl_pending: list = []
         self._fft_cache: dict = {}     # block -> contains a stablehlo.fft?
+        self._live_cache: dict = {}    # block -> (drop-after lists, result bytes)
         self._in_trace = False  # True while mx.compile is tracing our code
         # metaljax.qmm.State: recognized quantized matmuls (None until the
         # engine analyzes the program; stays empty when nothing matches).
@@ -369,6 +490,68 @@ class Interpreter:
         with self.context:
             return self.block_has_fft(self._main_block())
 
+    # --- eager execution plan (liveness + result bytes) ---
+
+    def eager_plan(self, block: ir.Block):
+        """(drop_after, out_bytes) for op-by-op execution of `block`.
+
+        drop_after[i] lists the values whose last use is operation i, so the
+        eager loop can let go of them; out_bytes[i] is the estimated device
+        data operation i produces. Cached per block (ir.Block identity is
+        pointer-stable across traversals).
+
+        A value's uses are its consumers' operands PLUS the captures of any
+        nested region, which is live for the whole of the op owning it. A
+        result nothing reads is dropped immediately. Values inherited from an
+        enclosing block may be dropped too: `run_block` works on a copy of
+        the parent's environment, so only this block's reference goes away.
+        """
+        plan = self._live_cache.get(block)
+        if plan is not None:
+            return plan
+        ops = [o.operation for o in block.operations]
+        last: dict = {}
+        out_bytes: list[int] = []
+        tcache: dict = {}
+        for i, o in enumerate(ops):
+            for v in o.operands:
+                last[v] = i
+            if o.regions:
+                for v in _op_captures(o):
+                    last[v] = i
+            out_bytes.append(sum(value_bytes(r, tcache) for r in o.results))
+        for i, o in enumerate(ops):
+            for r in o.results:
+                if r not in last:
+                    last[r] = i  # never read: let go as soon as it exists
+        drops: list[tuple] = [()] * len(ops)
+        by_index: dict = {}
+        for v, i in last.items():
+            by_index.setdefault(i, []).append(v)
+        for i, vs in by_index.items():
+            drops[i] = tuple(vs)
+        plan = (drops, out_bytes)
+        self._live_cache[block] = plan
+        return plan
+
+    def _eager_flush(self, env: dict):
+        """Byte-denominated sync point: settle everything still live.
+
+        Only what `env` still holds needs to survive -- pruned intermediates
+        are already unreferenced, so MLX frees them as the evaluation walks
+        the graph instead of materializing the whole chain at once.
+        """
+        arrays = [a for a in env.values() if isinstance(a, mx.array)]
+        if not arrays:
+            return
+        FLUSH_STATS["flushes"] += 1
+        hard = (_FLUSH_SYNC_EVERY > 0
+                and FLUSH_STATS["flushes"] % _FLUSH_SYNC_EVERY == 0)
+        if _DEBUG:
+            print(f"[metaljax] eager flush #{FLUSH_STATS['flushes']}: "
+                  f"{len(arrays)} live values, hard={hard}", flush=True)
+        flush_eval(arrays, hard)
+
     # --- execution ---
 
     def __call__(self, *args: mx.array) -> list[mx.array]:
@@ -452,9 +635,26 @@ class Interpreter:
         plan = self._rewrite_plan(block)
         pi, nxt = 0, (plan[0][0] if plan else -1)
 
-        i = -1
-        for op in block.operations:
-            i += 1
+        # Pruning/flushing are for eagerly interpreted programs only. Inside
+        # an mx.compile trace the values are tracers -- there is nothing to
+        # evaluate and nothing to free, MLX manages the traced tape itself --
+        # so a program that compiles never even builds the eager plan, and
+        # pays nothing for any of this.
+        eager = not self._in_trace
+        drops = out_bytes = None
+        pruning = flushing = False
+        if eager:
+            drops, out_bytes = self.eager_plan(block)
+            flushing = FLUSH_BYTES > 0
+            # Liveness is computed from the literal IR, but recognizer
+            # rewrites (qmm/sdpa) read the operands of ops they SKIP when
+            # they emit the fused op further down the block -- a static
+            # last use can fall on a skipped op. Retain everything on any
+            # block with an active rewrite plan.
+            pruning = _ENV_PRUNE and not plan
+        acc = 0
+
+        for i, op in enumerate(block.operations):
             o = op.operation
             name = o.name
             if name in _TERMINATORS:
@@ -486,4 +686,13 @@ class Interpreter:
                 )
             for r, v in zip(results, out):
                 env[r] = v
+            if pruning:
+                for v in drops[i]:
+                    env.pop(v, None)
+            if flushing:
+                acc += out_bytes[i]
+                if acc >= FLUSH_BYTES:
+                    FLUSH_STATS["bytes"] += acc
+                    acc = 0
+                    self._eager_flush(env)
         raise RuntimeError("block ended without a terminator")
