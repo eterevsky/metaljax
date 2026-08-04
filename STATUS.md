@@ -16,7 +16,7 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 |---|---|---|---|---|---|---|
 | 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | 137 | 148.7 | 111.2 ²⁰ |
 | 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
-| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **284** ¹⁶ | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
 | 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | 10.5 ¹⁵ | — | — |
 | 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
 | 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
@@ -43,9 +43,9 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 target):** bf16 dense decode 1.7–2.6× (Qwen3-8B 60.4 vs 30.4; Llama
 57.3 vs 29.4; 12B 97.1 vs 58.3; 31B 350 vs 137); gpt-oss 2.5×
 (22.2 vs 8.8 — MXFP4 quantized_matmul + expert gather on both sides,
-footnote 23); MoE-dense 16.7× (284 vs 17.0, row 3 re-measure with the
-gather path pending). llama.cpp leads mlx-lm a further ~1.25× on bf16 —
-the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
+footnote 23); MoE 2.6× (44.3 vs 17.0, decode gather landed — footnote
+16). llama.cpp leads mlx-lm a further ~1.25× on bf16 — the kernel
+frontier. metaljax prefill trails ~6×; load ~20–30×.
 
 ## Footnotes
 
@@ -137,11 +137,22 @@ the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     decode improvements vs earlier entries (189→101, 374→363) come
     from the dynamic-while body-compile fix landing in the sampler's
     decode loop; old CPU 938 superseded by the uniform harness.
-16. MoE DENSE-EXPERT GAP — the largest measured: keras/XLA lowers
-    expert dispatch densely (streams all 51.6 GB/token) → 473 ms/tok
-    vs mlx-lm's gathered 17.0 (27.8×). A 4B-active MoE decodes slower
-    than dense 31B on our path. Top C++-era item alongside quantized
-    matmul.
+16. MoE DENSE-EXPERT GAP — CLOSED in two steps. Was the largest
+    measured: keras/XLA lowers expert dispatch densely (streams all
+    51.6 GB/token) → 473→284 ms/tok vs mlx-lm's gathered 17.0. The
+    expert-gather recognizer (2310aa2) first moved only PREFILL here:
+    its broadcast classifier tested "is the full expert/token axis"
+    before "is a unit axis", and at T=1 — every decode step — the
+    unit token axis bound as the real one, rejecting the per-expert
+    scale chain, so decode stayed dense at 292 while prefill fused.
+    Branch order swapped (3432dc0): 30 decode dispatches (E128/K8/T1)
+    gather per executable, decode **44.3** ms/tok (6.4×), mem
+    unchanged 51.6 GB, 2.6× behind mlx-lm (was 16.7×). Tokens vs the
+    dense run agree 53/64 then flip — gathered sum runs K=8 terms
+    where dense ran 128 with 120 exact zeros; footnote-22 ladder
+    class. gpt-oss (row 7) re-verified neutral: 22.3 ms/tok, and the
+    cross-executable pack-build cache (a3d25f0) cut its build_s
+    200→8.5 s (wall 307→96 s; row 3 build_s 51→11 s).
 17. The keras LOAD ceiling is fixed (streaming loader, 30c9717: init
     never materializes; E2B peak 25→9.5 GB; Qwen3.6-35B ports all
     1026 weights, ~70 GB resident). What remains lethal is the phase
@@ -241,8 +252,9 @@ the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
 - **SD3.5 black image** (RESOLVED by 28ad2eb, same MLX bug): footnote 9.
 - **sentencepiece SIGABRT** (worked around): footnote 1.
 - **int8 dot_general int64 cliff** (known, measured): footnote 8.
-- **MoE dense-expert lowering** (FIXED for row 7, 2310aa2 expert
-  gather: 39.6→22.2; row 3 re-measure pending): footnote 16.
+- **MoE dense-expert lowering** (FIXED: 2310aa2 expert gather +
+  3432dc0 T=1 broadcast classification — row 7 39.6→22.2, row 3
+  284→44.3): footnote 16.
 - **Per-shape executable builds timed as prefill/decode** (FIXED in the
   harness, build-absorb + build_s column): footnote 23. Underlying
   per-executable pack rebuild (~0.9 s × 94/shape) open — build cache in
