@@ -8,6 +8,9 @@
 #
 #   * its own footprint crosses <budget_gb>, or
 #   * the whole machine crosses GUARD_SYS_GB (default 100 of 128), or
+#   * its RSS crosses GUARD_RSS_GB (default 110; 0 disables) — RSS counts
+#     the mmap'd checkpoint pages footprint ignores, and panic #7 wedged
+#     the machine at RSS 101.9 with footprint 53 and every metric "ok", or
 #   * its projected footprint one sample ahead — measured slope times the
 #     sample period, doubled — would cross the budget.
 #
@@ -45,6 +48,7 @@ if [ $# -lt 3 ]; then
 fi
 BUDGET_GB=$1; LOG=$2; shift 2
 SYS_GB=${GUARD_SYS_GB:-100}
+RSS_CAP_GB=${GUARD_RSS_GB:-110}
 PERIOD=${GUARD_PERIOD:-0.5}
 
 "$@" &
@@ -53,7 +57,7 @@ trap 'kill -TERM $CHILD 2>/dev/null; exit 130' INT TERM
 
 mkdir -p "$(dirname "$LOG")"
 : > "$LOG"
-echo "# guard budget_gb=$BUDGET_GB sys_gb=$SYS_GB period=$PERIOD pid=$CHILD cmd=$*" >> "$LOG"
+echo "# guard budget_gb=$BUDGET_GB sys_gb=$SYS_GB rss_gb=$RSS_CAP_GB period=$PERIOD pid=$CHILD cmd=$*" >> "$LOG"
 KILLED=0
 PREV=0
 PREV_T=$(date +%s)
@@ -98,9 +102,17 @@ while kill -0 $CHILD 2>/dev/null; do
 
   if [ $KILLED = 0 ]; then
     VERDICT=$(awk -v f="$FOOT_GB" -v p="$PREV" -v b="$BUDGET_GB" \
-                  -v s="$SYS_USED" -v sb="$SYS_GB" -v per="$PERIOD" 'BEGIN{
+                  -v s="$SYS_USED" -v sb="$SYS_GB" -v per="$PERIOD" \
+                  -v r="$RSS_GB" -v rb="$RSS_CAP_GB" 'BEGIN{
         if (f > b) { printf "footprint %.2f GB > budget %s GB", f, b; exit }
         if (s > sb) { printf "system %.1f GB used > %s GB", s, sb; exit }
+        # RSS counts the mapped checkpoint pages footprint does not.
+        # Kernel panic #7: a streamed load wedged the machine with
+        # footprint 53 GB but RSS at 101.9 -- file-backed pages are
+        # "reclaimable", so no memory metric looked unhealthy while the
+        # VM fought a reclaim storm. RSS is the leading indicator for
+        # that class; GUARD_RSS_GB (default 110) caps it.
+        if (rb > 0 && r > rb) { printf "rss %.2f GB > GUARD_RSS_GB %s", r, rb; exit }
         d = f - p;                       # growth since the last sample
         if (d > 0 && f + 2*d > b)
           printf "projected %.2f GB (+%.2f GB/sample) crosses budget %s GB", f+2*d, d, b;

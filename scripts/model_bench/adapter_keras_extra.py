@@ -196,6 +196,14 @@ _STREAM = {
     "completed": [],      # variables no loader ever wrote (random-initialised)
     "completed_count": 0,
     "clears": 0,
+    # --- load-phase fingerprint (BENCH_STREAM_MARK / _SYNC, see _stream_mark)
+    "marks": 0,            # progress lines printed
+    "syncs": 0,            # explicit mx.synchronize() calls
+    "sync_s": 0.0,         # wall time inside them
+    "clear_s": 0.0,        # wall time inside gc.collect()+mx.clear_cache()
+    "max_assign_ms": 0.0,  # slowest single assign of the whole load
+    "max_assign_path": "",
+    "wall_s": 0.0,         # first assign -> last assign
 }
 # Deferred variables, as weakrefs -- keras Variables define `__eq__`
 # elementwise and are therefore unhashable, so no set/dict keyed by the
@@ -257,6 +265,28 @@ def install_streaming_load(clear_every_gb=None):
     `gc.collect()` + `mx.clear_cache()` every N GB of assigned weights so
     the host-staging copies MLX caches cannot accumulate across a 90 GB
     load.  BENCH_STREAM_LOAD=0 disables the whole shim.
+
+    LOAD-PHASE FINGERPRINT (kernel panic #7, 2026-08-04).  A machine wedge
+    during a streamed load leaves nothing behind: the flight log stops
+    mid-line and the load itself is silent between "start" and "done", so
+    there is no way to say WHERE in the load it died.  Two env knobs fix
+    that, both off by default and both O(1) per assign:
+
+      BENCH_STREAM_MARK=N   print a timestamped progress line every N
+                            assigns (epoch, elapsed, count, assigned GB,
+                            GB/s since the last mark, slowest single
+                            assign in the interval, MLX active memory).
+                            The epoch column merges 1:1 against
+                            mem_guard.sh's flight log.
+      BENCH_STREAM_SYNC=N   `mx.synchronize()` every N assigns -- the
+                            queue-depth lever: if the wedge is queued GPU
+                            work piling up behind rapid host->device
+                            copies, bounding the queue should change the
+                            failure (and costs assign throughput).
+
+    Per-assign timing is unconditional (one `time.monotonic()` pair per
+    tensor, nanoseconds against a multi-MB copy) so `max_assign_ms` is
+    always in the report.
 
     Returns a dict describing what was patched; raises RuntimeError with a
     precise message if keras' internals moved (never silently no-ops).
@@ -334,15 +364,28 @@ def install_streaming_load(clear_every_gb=None):
         return orig_value.fget(self)
 
     def direct_assign(self, value):
+        t0 = time.monotonic()
         orig_direct(self, value)
+        dt = time.monotonic() - t0
         if getattr(self, "_mj_init", None) is not None:
             self._mj_init = None
             self._initializer = None
         _STREAM["assigned"] += 1
         _STREAM["assigned_gb"] += _var_gb(self)
+        if dt > _STREAM["_mark_slowest"]:
+            _STREAM["_mark_slowest"] = dt
+            _STREAM["_mark_slowest_path"] = self.path
+        if dt * 1000 > _STREAM["max_assign_ms"]:
+            _STREAM["max_assign_ms"] = dt * 1000
+            _STREAM["max_assign_path"] = self.path
         if _STREAM["assigned_gb"] >= _STREAM["_next_clear"]:
             _STREAM["_next_clear"] += _STREAM["_clear_gb"]
             _stream_clear()
+        n = _STREAM["assigned"]
+        if _STREAM["_sync_every"] and n % _STREAM["_sync_every"] == 0:
+            _stream_sync()
+        if _STREAM["_mark_every"] and n % _STREAM["_mark_every"] == 0:
+            _stream_mark()
 
     # Remember which of these the leaf class owned, so uninstall restores
     # the class exactly (they are inherited today; a future keras may not).
@@ -359,10 +402,19 @@ def install_streaming_load(clear_every_gb=None):
         clear_every_gb = float(os.environ.get("BENCH_STREAM_CLEAR_GB", "8"))
     _STREAM["_clear_gb"] = max(float(clear_every_gb), 0.25)
     _STREAM["_next_clear"] = _STREAM["_clear_gb"]
+    _STREAM["_mark_every"] = _int_env("BENCH_STREAM_MARK", 0)
+    _STREAM["_sync_every"] = _int_env("BENCH_STREAM_SYNC", 0)
+    _STREAM["_t0"] = time.monotonic()
+    _STREAM["_mark_t"] = _STREAM["_t0"]
+    _STREAM["_mark_gb"] = 0.0
+    _STREAM["_mark_slowest"] = 0.0
+    _STREAM["_mark_slowest_path"] = ""
     _STREAM["installed"] = True
     return {"installed": True, "keras": _keras_version(),
             "variable_cls": f"{var_cls.__module__}.{var_cls.__name__}",
-            "clear_every_gb": _STREAM["_clear_gb"]}
+            "clear_every_gb": _STREAM["_clear_gb"],
+            "mark_every": _STREAM["_mark_every"],
+            "sync_every": _STREAM["_sync_every"]}
 
 
 def _keras_version():
@@ -386,6 +438,7 @@ def _var_gb(v):
 
 def _stream_clear():
     """Drop MLX's freed-buffer cache (host-staging copies) mid-load."""
+    t0 = time.monotonic()
     gc.collect()
     try:
         import mlx.core as mx
@@ -393,6 +446,50 @@ def _stream_clear():
         return
     mx.clear_cache()
     _STREAM["clears"] += 1
+    _STREAM["clear_s"] += time.monotonic() - t0
+
+
+def _stream_sync():
+    """Wait for the device (BENCH_STREAM_SYNC): bound the queued GPU work."""
+    t0 = time.monotonic()
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return
+    mx.synchronize()
+    _STREAM["syncs"] += 1
+    _STREAM["sync_s"] += time.monotonic() - t0
+
+
+def _active_gb():
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return -1.0
+    return mx.get_active_memory() / 2**30
+
+
+def _stream_mark():
+    """One progress line (BENCH_STREAM_MARK): where in the load are we?
+
+    The `t=` column is wall-clock epoch seconds, the same clock
+    mem_guard.sh stamps its samples with, so a truncated pair of logs can
+    still be aligned to the second.
+    """
+    now = time.monotonic()
+    gb = _STREAM["assigned_gb"]
+    dt = max(now - _STREAM["_mark_t"], 1e-9)
+    rate = (gb - _STREAM["_mark_gb"]) / dt
+    print(f"  [stream-mark] t={time.time():.3f} +{now - _STREAM['_t0']:7.2f}s "
+          f"n={_STREAM['assigned']:5d} gb={gb:7.3f} rate={rate:6.3f}GB/s "
+          f"slowest={_STREAM['_mark_slowest'] * 1000:8.1f}ms "
+          f"({_STREAM['_mark_slowest_path']}) active={_active_gb():6.2f}GB "
+          f"clears={_STREAM['clears']} syncs={_STREAM['syncs']}", flush=True)
+    _STREAM["marks"] += 1
+    _STREAM["_mark_t"] = now
+    _STREAM["_mark_gb"] = gb
+    _STREAM["_mark_slowest"] = 0.0
+    _STREAM["_mark_slowest_path"] = ""
 
 
 def finalize_streaming_load(model=None):
@@ -443,6 +540,9 @@ def finalize_streaming_load(model=None):
               f"state) initialised after the load: {_STREAM['completed'][:4]}",
               flush=True)
     _stream_clear()
+    _STREAM["wall_s"] = time.monotonic() - _STREAM.get("_t0", time.monotonic())
+    if _STREAM["_mark_every"]:
+        _stream_mark()          # final position, so the log ends with one
     return streaming_load_report()
 
 
@@ -531,7 +631,9 @@ def uninstall_streaming_load():
     del var_cls._mj_init
     _STREAM.update(installed=False, deferred=0, assigned=0, assigned_gb=0.0,
                    build_reads=[], build_read_count=0, completed=[],
-                   completed_count=0, clears=0)
+                   completed_count=0, clears=0, marks=0, syncs=0, sync_s=0.0,
+                   clear_s=0.0, max_assign_ms=0.0, max_assign_path="",
+                   wall_s=0.0)
 
 
 def _mem_gb(backend):

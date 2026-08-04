@@ -95,28 +95,42 @@ predicted peak memory, and only then retry the big model.
   71.9 GB assigned). Same class as panic #4 (load-time wedge with
   memory fine); distinct from #5/#6 (memory ramps). Distinguishing
   feature vs R1-32B — which streamed 61 GB clean TWICE the same day:
-  assign rate ~1.2 GB/s over ~1500+ mostly-small MoE expert tensors
-  (vs R1's 0.6 GB/s over 771) → working hypothesis: GPU command-queue
-  pileup during rapid small assigns starves userspace. Residual
-  uncertainty: two worktree agents were live at the time (both under
-  lock discipline, so row 8 should have been the only GPU user).
+  assign rate ~1.2 GB/s (vs R1's 0.6). HYPOTHESIS REVISED by the
+  small-rung ladder (2026-08-04, scripts/model_bench/wedge_repro.py):
+  (a) row 8 is NOT many-small-tensors — experts arrive PRE-BATCHED,
+  80 giant assigns (1.0 GB expert banks) carry 95% of the bytes;
+  (b) the GPU-queue theory does not hold — mx.synchronize() after
+  EVERY assign costs 22 ms total and the per-assign device work is
+  ~0.0008 ms (the bytes move host-side in keras-hub's converter);
+  (c) the leading indicator is FILE-BACKED PAGES: RSS runs 2.3× the
+  checkpoint (mmap'd shards + anonymous weights), extrapolating to
+  ~133 GB of mapped pages at row-8 scale on a 128 GB machine —
+  matching the panic flight log exactly (RSS 101.9, footprint 53,
+  compressor 7%). Refined hypothesis: VM reclaim/page-cache storm
+  under a sustained ~1.2 GB/s mmap read+copy. mem_guard now kills on
+  GUARD_RSS_GB (default 110) — the metric that WAS unhealthy.
+  Residual uncertainty: two worktree agents were live at the time
+  (both under lock discipline, so row 8 should have been the only
+  GPU user).
 - **PAUSED rows**: 8 (Qwen3.6-35B — the wedge), 12 (Mixtral 93.4 GB,
   same streamed-keras class, never attempted), 15/10 (maxtext 8B
   class, already embargoed after panics #4/#5).
-- **Ladder protocol** (per row, before any big retry):
-  1. Same-arch repro at SMALL size — smallest same-arch HF checkpoint,
-     or a synthetic one: build the backbone from a shrunken config,
-     save HF-safetensors, stream-load through the identical path
-     (arbitrary size dial on the exact code path).
-  2. Predict peak (weights + shim overhead) BEFORE the run; guarded
-     run must match the prediction; soak ×3 (the wedge class is
-     plausibly nondeterministic).
-  3. Step up (~4-8 GB → ~20-30 GB → full), one supervised run at full
-     size only after the ladder is green.
-  4. Instrument the load: per-N-tensors phase markers (a wedge must
-     leave a fingerprint), and test whether tighter sync bounds the
-     queue (BENCH_STREAM_CLEAR_GB smaller / explicit mx.synchronize
-     cadence) at small scale first.
+- **Ladder protocol** (per row, before any big retry) — SMALL RUNG
+  GREEN 2026-08-04: scripts/model_bench/wedge_repro.py builds
+  synthetic same-arch (Qwen3_5MoeCausalLM) HF-safetensors checkpoints
+  at any size (shape formulas verified 1026/1026 against the real
+  35B); wedge_run.sh is the lock+precheck+guard wrapper;
+  BENCH_STREAM_MARK gives the load a phase fingerprint. Small
+  (4.45 GB): predicted peak 6.13, measured 5.88, 7/7 guarded runs
+  clean, assign rate meets row 8's. Peak model (calibrated on R1:
+  predicted 65.3 vs 65.0 measured): weights + 1.2 GB + 2× largest
+  tensor. NEXT: two ~17 GB mid rungs A/B-ing assign SIZE vs count —
+  `mid` (div=2, largest 0.47 GB, budget 24) and `wide` (div=1 ×9
+  layers, real 1.0 GB expert banks, budget 26), soak ×3 each with
+  GUARD_RSS_GB; then row 8 retry ONLY on green (predicted peak 68.6,
+  upper 76.6 — its old 95 budget was correctly sized; the wedge was
+  never a budget event) with a page-cache lever if the mid rungs
+  implicate file-backed pressure.
 - **Still allowed** (never implicated, repeatedly clean same-day):
   gpt-oss class ≤25 GB (10+ clean runs), gemma4-26b 51.6 GB (3 clean),
   SD3.5 34 GB, texmo gates, pytest, agents' synthetic validations.
