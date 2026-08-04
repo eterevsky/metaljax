@@ -69,10 +69,14 @@ _PRUNE_VERIFY = os.environ.get("METALJAX_PRUNE_VERIFY", "") == "1"
 # next to producing it, and the flush never fires on small workloads anyway.
 # METALJAX_EAGER_FLUSH_SYNC=N blocks at every Nth checkpoint instead.
 _FLUSH_SYNC_EVERY = int(os.environ.get("METALJAX_EAGER_FLUSH_SYNC", "1"))
+# Cache bytes a hard flush may leave behind before returning them to the OS
+# (see _eager_flush); 0 clears at every hard flush.
+_FLUSH_CLEAR_BYTES = int(os.environ.get("METALJAX_FLUSH_CLEAR_MB",
+                                        "2048")) * 2**20
 _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 
 # Observability, for tests and for the "did this fire?" question.
-FLUSH_STATS = {"flushes": 0, "bytes": 0}
+FLUSH_STATS = {"flushes": 0, "bytes": 0, "cache_clears": 0}
 
 # Types `value_bytes` sized as zero for a reason other than "carries no
 # data", counted apart. A memory estimate that silently reports zero for
@@ -747,6 +751,17 @@ class Interpreter:
         Only what `env` still holds needs to survive -- pruned intermediates
         are already unreferenced, so MLX frees them as the evaluation walks
         the graph instead of materializing the whole chain at once.
+
+        "Frees" into MLX's CACHE, though, whose byte bound is the memory
+        limit -- so on an eager phase whose traffic is many times its live
+        set, claimed memory is the traffic, not the live set (the qmm pack
+        story again, engine-wide this time: the qwix-8B maxtext restore
+        phase ramped 24 -> 48 GB at ~8 GB/s through 895 flushes whose live
+        sets were 1-36 values). A hard flush that leaves more than
+        METALJAX_FLUSH_CLEAR_MB (2048) sitting in the cache returns it to
+        the OS. Cache reuse does not move command-buffer split points, so
+        this does not reshuffle the corruption lottery the flush cadences
+        are pinned against.
         """
         arrays = [a for a in env.values() if isinstance(a, mx.array)]
         if not arrays:
@@ -758,6 +773,9 @@ class Interpreter:
             print(f"[metaljax] eager flush #{FLUSH_STATS['flushes']}: "
                   f"{len(arrays)} live values, hard={hard}", flush=True)
         flush_eval(arrays, hard)
+        if hard and mx.get_cache_memory() > _FLUSH_CLEAR_BYTES:
+            FLUSH_STATS["cache_clears"] += 1
+            mx.clear_cache()
 
     # --- execution ---
 

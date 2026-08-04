@@ -120,6 +120,20 @@ predicted peak memory, and only then retry the big model.
 - **PAUSED rows**: 8 (Qwen3.6-35B — the wedge), 12 (Mixtral 93.4 GB,
   same streamed-keras class, never attempted), 15/10 (maxtext 8B
   class, already embargoed after panics #4/#5).
+- **Row 15 mitigation attempt, 2026-08-04 (Oleg-authorized, 5 guarded
+  runs, zero incidents)**: METALJAX_BODY_COMPILE=0 at safe-band
+  budgets. Phase 1 (Orbax restore) ballooning FIXED — the eager
+  flush now returns cache above METALJAX_FLUSH_CLEAR_MB to the OS
+  (the qmm _NoCache lesson engine-wide; 24→48 GB monotone became a
+  6–23 GB sawtooth). Phase 2 (post-restore jit materialization)
+  still demands >60 GB and climbs +4–7 GB/sample at every kill
+  (45/45/60 budgets); next step would enter the 67–109 GB zone from
+  the panic-#5 ledger — STOPPED per protocol. Row 15 ships blocked:
+  compiled path = MLX corruption (upstream), mitigation path =
+  phase-2 transient (attribute + fix post-0.11.3; the guard contains
+  it reliably). Side fixes landed: step-tolerant trajectory rule,
+  maxtext path wired in run_bench (was never landed from
+  README_maxtext.md).
 - **Ladder protocol** (per row, before any big retry) — SMALL RUNG
   GREEN 2026-08-04: scripts/model_bench/wedge_repro.py builds
   synthetic same-arch (Qwen3_5MoeCausalLM) HF-safetensors checkpoints
