@@ -449,9 +449,12 @@ def test_interleaved_groups_in_a_decode_loop():
         moved = [jax.device_put(a, dev) for a in args]
         jf = jax.jit(f)
         got = np.asarray(jf(*moved)).astype(np.float32)
+        # blocked == 0: an interleaved weight is packed from a whole
+        # evaluation whatever METALJAX_QMM_BLOCK says, because the
+        # permutation is a property of the entire contraction axis.
         assert qmm.stats() == {"recognized": 1, "packs": 1, "fallbacks": 0,
                                "perms": 1, "mxfp4": 0, "batched": 0,
-                               "shared": 0}, \
+                               "shared": 0, "blocked": 0}, \
             qmm.stats()
         got2 = np.asarray(jf(*moved)).astype(np.float32)
     np.testing.assert_array_equal(got, got2)
@@ -720,7 +723,7 @@ def test_disabled_by_env(monkeypatch):
     got = _run(lambda *a: dense_sub(*a, columns=cols), args, _metal())
     assert qmm.stats() == {"recognized": 0, "packs": 0, "fallbacks": 0,
                            "perms": 0, "mxfp4": 0, "batched": 0,
-                           "shared": 0}
+                           "shared": 0, "blocked": 0}
     want = _run(lambda *a: dense_sub(*a, columns=cols), args, _cpu())
     np.testing.assert_allclose(got, want, rtol=2e-2, atol=1e-1)
 
@@ -944,3 +947,134 @@ def test_cost_model_charges_the_fused_dot():
     assert len(st.matches) == 1
     assert fused <= 8, fused
     assert literal > 60, literal
+
+
+# --------------------------------------------------------------------------
+# row-blocked packing
+# --------------------------------------------------------------------------
+
+
+def _packs_of(monkeypatch, f, args, block_elems):
+    """Run `f` on metal with a given block size; return the packs it built.
+
+    The content-addressed pack table is cleared first: two runs of the same
+    weight produce identical packs, which `_share` would otherwise ALIAS --
+    and comparing an array against itself proves nothing. `args` are host
+    arrays so that each run's `device_put` lands on fresh buffers and really
+    repacks.
+    """
+    built = []
+    orig = qmm._build_pack
+
+    def spy(interp, m, argv, leaves):
+        pk = orig(interp, m, argv, leaves)
+        built.append([np.array(a) for a in pk.arrays()])
+        return pk
+
+    qmm._SHARED.clear()
+    monkeypatch.setattr(qmm, "_BLOCK_ELEMS", block_elems)
+    monkeypatch.setattr(qmm, "_build_pack", spy)
+    qmm.reset_stats()
+    out = _run(f, args, _metal())
+    monkeypatch.undo()
+    return built, out, qmm.stats()
+
+
+def _affine_grouped(rows, k, gs, seed, interleave):
+    """An `[N, K]` sub-channel weight with the group axis SPLIT out.
+
+    What a packed checkpoint stores: codes `[N, K/gs, gs]` (or, interleaved,
+    `[N, gs, K/gs]`) and one scale/zero pair per group, broadcast over the
+    group and reshaped back to `[N, K]`. Unlike keras' own layout -- which
+    stores K first, and so cannot be blocked by rows at all -- this
+    contracts the LAST axis, which is what the blocked pack applies to.
+    `interleave` puts the group axis INSIDE, scattering each group's columns
+    across K at stride K/gs.
+    """
+    rng = np.random.default_rng(seed)
+    ng = k // gs
+    q = rng.integers(-8, 8, size=(rows, k)).astype(np.int8)
+    scale = ((rng.random((rows, ng)).astype(np.float32) + 0.5) * 0.05)
+    zero = rng.integers(-3, 4, size=(rows, ng)).astype(np.int8)
+    g = (np.arange(k) % ng) if interleave else (np.arange(k) // gs)
+    ref = (np.take(scale, g, axis=1)
+           * (q.astype(np.float32) - np.take(zero, g, axis=1)))
+    return q, scale, zero, ref
+
+
+def _affine_chain(q, scale, zero, x, interleave):
+    n, k = q.shape
+    ng = scale.shape[1]
+    # The group index is the LAST axis of the split when the groups are
+    # interleaved (K = within * ng + group) and the middle one when they are
+    # contiguous (K = group * gs + within).
+    split = (n, k // ng, ng) if interleave else (n, ng, k // ng)
+    axis = 1 if interleave else 2
+    qg = jnp.reshape(q, split).astype(x.dtype)
+    s = jnp.expand_dims(scale.astype(x.dtype), axis)
+    z = jnp.expand_dims(zero.astype(x.dtype), axis)
+    w = jnp.reshape((qg - z) * s, (n, k))
+    return jnp.einsum("tk,nk->tn", x, w)
+
+
+@needs_qmm
+def test_blocked_affine_pack_is_bit_identical(monkeypatch):
+    """Packing an affine weight block by block is packing, exactly.
+
+    Same claim as the MXFP4 side (tests/test_qmm_mxfp4.py): the codes, the
+    per-group scale and bias tables and the dot's result must be the same
+    bits as a whole evaluation gives. The affine path walks the code subtree
+    TWICE when blocked -- the offset that makes the codes unsigned is one
+    number for the whole weight -- so this also pins that the second walk
+    sees what the first did.
+    """
+    n, k, gs, t = 256, 128, 64, 3
+    q, scale, zero, ref = _affine_grouped(n, k, gs, 21, interleave=False)
+    x = (np.random.default_rng(22).standard_normal((t, k))
+         * 0.3).astype("bfloat16")
+    args = (q, scale, zero, x)
+
+    def f(*a):
+        return _affine_chain(*a, interleave=False)
+
+    whole, out_w, st_w = _packs_of(monkeypatch, f, args, 1 << 40)
+    small, out_b, st_b = _packs_of(monkeypatch, f, args, 1 << 10)
+    assert st_w["packs"] == st_b["packs"] == 1, (st_w, st_b)
+    assert st_w["blocked"] == 0 and st_b["blocked"] == 1, (st_w, st_b)
+    for a, b in zip(whole[0], small[0]):
+        assert a.dtype == b.dtype and a.shape == b.shape
+        np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(out_w, out_b)
+    exact = np.asarray(x, np.float32) @ ref.T
+    np.testing.assert_allclose(out_b, exact, rtol=3e-2, atol=3e-2)
+
+
+@needs_qmm
+def test_blocked_affine_falls_back_when_groups_interleave(monkeypatch):
+    """Groups scattered along K: the blocked pass gives up, the pack stands.
+
+    The permutation that un-interleaves them is a property of the whole
+    contraction axis, so no single block of rows can find it. `_NotBlockable`
+    sends the weight back to a whole evaluation, where `_regroup` does --
+    and the packed weight is the one the unblocked path would have produced
+    anyway.
+    """
+    n, k, gs, t = 128, 128, 64, 2
+    q, scale, zero, ref = _affine_grouped(n, k, gs, 23, interleave=True)
+    x = (np.random.default_rng(24).standard_normal((t, k))
+         * 0.3).astype("bfloat16")
+    args = (q, scale, zero, x)
+
+    def f(*a):
+        return _affine_chain(*a, interleave=True)
+
+    whole, out_w, st_w = _packs_of(monkeypatch, f, args, 1 << 40)
+    small, out_b, st_b = _packs_of(monkeypatch, f, args, 1 << 8)
+    assert st_w["packs"] == st_b["packs"] == 1, (st_w, st_b)
+    assert st_w["perms"] == st_b["perms"] == 1, (st_w, st_b)
+    assert st_b["blocked"] == 0 and st_b["fallbacks"] == 0, st_b
+    for a, b in zip(whole[0], small[0]):
+        np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(out_w, out_b)
+    exact = np.asarray(x, np.float32) @ ref.T
+    np.testing.assert_allclose(out_b, exact, rtol=3e-2, atol=3e-2)

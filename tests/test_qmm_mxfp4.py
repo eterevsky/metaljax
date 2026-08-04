@@ -625,3 +625,141 @@ def test_fallback_group_size_is_not_32():
     # and MXFP4 has exactly one group size. No weight is ever evaluated.
     _fallback(f, (jnp.asarray(blocks), jnp.asarray(sb), jnp.asarray(x)),
               route="structural")
+
+
+# --------------------------------------------------------------------------
+# row-blocked packing
+# --------------------------------------------------------------------------
+
+
+def _packs_of(monkeypatch, f, args, block_elems):
+    """Run `f` on metal with a given block size; return the packs it built.
+
+    The content-addressed pack table is cleared first: two runs of the same
+    weight produce identical packs, which `_share` would otherwise ALIAS --
+    and comparing an array against itself proves nothing.
+    """
+    import mlx.core as mx
+    from metaljax import qmm as q
+
+    built = []
+    orig = q._build_pack
+
+    def spy(interp, m, argv, leaves):
+        pk = orig(interp, m, argv, leaves)
+        built.append([np.array(a) for a in pk.arrays()])
+        return pk
+
+    q._SHARED.clear()
+    monkeypatch.setattr(q, "_BLOCK_ELEMS", block_elems)
+    monkeypatch.setattr(q, "_build_pack", spy)
+    q.reset_stats()
+    mx.clear_cache()
+    mx.reset_peak_memory()
+    base = mx.get_active_memory()
+    out = _run(f, args, _metal())
+    peak = mx.get_peak_memory() - base
+    monkeypatch.undo()
+    return built, out, q.stats(), peak
+
+
+@needs_qmm
+@pytest.mark.parametrize("form", ["dense", "experts"])
+def test_blocked_pack_is_bit_identical(monkeypatch, form):
+    """Packing block by block is packing, exactly.
+
+    The reconstruction is evaluated one slice of the weight's leading axis
+    at a time (`qmm._Source`) so that a multi-GB chain never materializes
+    whole; the packed codes, the E8M0 scale bytes and the dot's result must
+    all be the SAME BITS as a whole evaluation produces.
+    """
+    e, n, k, t = 4, 128, 256, 3
+    rng = np.random.default_rng(11)
+    shape = (n, k) if form == "dense" else (e, n, k)
+    _codes, blocks, sb, _w = _random_mxfp4(shape, rng)
+    xshape = (t, k) if form == "dense" else (e, t, k)
+    x = (rng.standard_normal(xshape) * 0.4).astype("bfloat16")
+    fn = dense_mxfp4 if form == "dense" else experts_mxfp4
+    # Host arrays, so that each run's `device_put` lands on FRESH buffers
+    # and the second one really repacks (packs are cached on their source
+    # buffers' identity).
+    args = (blocks, sb, x)
+
+    def f(*a):
+        return fn(*a, k=k)
+
+    whole, out_w, st_w, _ = _packs_of(monkeypatch, f, args, 1 << 40)
+    small, out_b, st_b, _ = _packs_of(monkeypatch, f, args, 1 << 10)
+    assert st_w["packs"] == st_b["packs"] == 1, (st_w, st_b)
+    assert st_w["blocked"] == 0 and st_b["blocked"] == 1, (st_w, st_b)
+    assert len(whole) == len(small) == 1
+    for a, b in zip(whole[0], small[0]):
+        assert a.dtype == b.dtype and a.shape == b.shape
+        np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(out_w, out_b)
+
+
+@needs_qmm
+def test_blocked_pack_bounds_the_transient(monkeypatch):
+    """The point of blocking: the pack costs a block, not a weight.
+
+    An MXFP4 chain is several times wider than the weight it reconstructs
+    (jax's `take` wrapper alone carries three int32 copies of the index
+    tensor), so a whole evaluation of gpt-oss-20b's gate_up projection
+    peaked at 7.7 GB of live buffers and spiked claimed memory by 15.9 GB --
+    which is what kept killing the benchmark row. The bound asserted here is
+    deliberately loose (half of the whole-evaluation peak); the real ratio
+    at this size is ~8x, and on the real checkpoint it was 5x on live
+    buffers and 10x on claimed.
+    """
+    e, n, k, t = 8, 2048, 1024, 2
+    rng = np.random.default_rng(12)
+    _codes, blocks, sb, _w = _random_mxfp4((e, n, k), rng)
+    x = (rng.standard_normal((e, t, k)) * 0.4).astype("bfloat16")
+    args = (blocks, sb, x)
+
+    def f(*a):
+        return experts_mxfp4(*a, k=k)
+
+    _w_packs, out_w, st_w, peak_whole = _packs_of(monkeypatch, f, args,
+                                                  1 << 40)
+    _b_packs, out_b, st_b, peak_blocked = _packs_of(monkeypatch, f, args,
+                                                    1 << 18)
+    assert st_w["blocked"] == 0 and st_b["blocked"] == 1, (st_w, st_b)
+    np.testing.assert_array_equal(out_w, out_b)
+    assert peak_blocked < peak_whole / 2, (peak_blocked, peak_whole)
+    # ... and in absolute terms it tracks the BLOCK (one expert here), not
+    # the weight: ~15x a block's bf16 bytes at this shape, which is the
+    # width of the chain plus the packed result accumulating.
+    block_bytes = n * k * 2
+    assert peak_blocked < 24 * block_bytes, (peak_blocked, block_bytes)
+
+
+@needs_qmm
+@needs_batch
+def test_blocked_pack_reads_a_decode_table_whole(monkeypatch):
+    """The blocked axis and the E2M1 table are both 16 long here.
+
+    Whether a value is blocked is decided by the DEMAND coming down from
+    the weight, not by its shape: the gather's indices are blocked and the
+    table it gathers through is read whole, however its first dimension
+    happens to compare to the expert count. A bottom-up rule would slice
+    the table and quietly pack the wrong values.
+    """
+    e, n, k, t = 16, 64, 128, 2
+    rng = np.random.default_rng(13)
+    _codes, blocks, sb, w = _random_mxfp4((e, n, k), rng)
+    x = (rng.standard_normal((e, t, k)) * 0.4).astype("bfloat16")
+    args = (blocks, sb, x)
+
+    def f(*a):
+        return experts_mxfp4(*a, k=k)
+
+    whole, out_w, st_w, _ = _packs_of(monkeypatch, f, args, 1 << 40)
+    small, out_b, st_b, _ = _packs_of(monkeypatch, f, args, 1 << 10)
+    assert st_b["blocked"] == 1 and st_b["fallbacks"] == 0, st_b
+    for a, b in zip(whole[0], small[0]):
+        np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(out_w, out_b)
+    exact = np.einsum("etm,ehm->eth", np.asarray(x, np.float32), w)
+    _no_worse_than(out_b, out_w, exact, "bfloat16")

@@ -85,6 +85,17 @@ byte), so `values * scale` is reproduced bit for bit -- in f32 and, because
 an e2m1 value carries a single mantissa bit, in bf16/f16 as well. Anything
 not exactly on the grid rejects the dot.
 
+What the pack COSTS while it runs is a first-class concern at LLM scale:
+the reconstruction is several times the size of the weight it packs (jax's
+own `take` wrapper carries three int32 copies of the index tensor), and MLX
+returns dead buffers to its own cache rather than to the OS, so the claimed
+memory a watchdog reads is the pack's whole traffic. Both are handled by
+evaluating each operand subtree one BLOCK of the weight's rows at a time
+(`_Source`), packing as it goes, with MLX's cache off for the duration:
+gpt-oss-20b's gate_up projection went from a 15.9 GB claimed spike per pack
+to 1.5 GB. A subtree that is not provably row-local falls back to being
+evaluated whole. METALJAX_QMM_BLOCK sets the block size in weight elements.
+
 Packing needs CONCRETE buffers and must never run inside an `mx.compile`
 trace, so it happens in an eager prologue (`prologue()`, called by
 engine.execute) and the packed arrays are threaded into traced code as
@@ -152,7 +163,7 @@ _MXFP4_GROUP = 32
 
 # Diagnostics (tests assert on these; nothing else reads them).
 STATS = {"recognized": 0, "packs": 0, "fallbacks": 0, "perms": 0,
-         "mxfp4": 0, "batched": 0, "shared": 0}
+         "mxfp4": 0, "batched": 0, "shared": 0, "blocked": 0}
 
 
 def stats() -> dict:
@@ -232,10 +243,21 @@ def pack_exact(codes: mx.array, scales: mx.array, zeros, bits: int,
     """
     off = (1 << (bits - 1)) if offset is None else int(offset)
     packed = pack_codes(mx.contiguous(codes).astype(mx.int32) + off, bits)
+    s, b = _scale_bias(scales, zeros, off, scale_dtype)
+    return packed, s, b
+
+
+def _scale_bias(scales, zeros, offset, scale_dtype):
+    """The `(scales, biases)` half of `pack_exact`.
+
+    Split out because a blocked pack packs the codes a row block at a time
+    but derives these two once, from per-group tables that are orders of
+    magnitude smaller than the weight.
+    """
     s32 = mx.contiguous(scales).astype(mx.float32)
     z32 = (mx.contiguous(zeros).astype(mx.float32)
            if zeros is not None else mx.array(0.0, mx.float32))
-    b32 = -(s32 * (z32 + off))
+    b32 = -(s32 * (z32 + offset))
     if (scale_dtype is not None and scale_dtype != mx.float32
             and _SCALE_WIDTH != "f32"):
         # Keep the source (bf16/f16) width when nothing is lost by it: it
@@ -244,8 +266,8 @@ def pack_exact(codes: mx.array, scales: mx.array, zeros, bits: int,
         # the scale); a general zero point usually does not.
         if _SCALE_WIDTH == "source" or (_lossless(s32, scale_dtype)
                                         and _lossless(b32, scale_dtype)):
-            return packed, s32.astype(scale_dtype), b32.astype(scale_dtype)
-    return packed, s32, b32
+            return s32.astype(scale_dtype), b32.astype(scale_dtype)
+    return s32, b32
 
 
 def _lossless(x: mx.array, dtype) -> bool:
@@ -1055,30 +1077,81 @@ def analyze(interp) -> State:
 # --------------------------------------------------------------------------
 
 
-def _eval(interp, value, env):
-    """Evaluate an operand subtree eagerly on concrete arguments."""
+def _use_counts(value):
+    """How many consumers each value in `value`'s subtree has.
+
+    Counted per OP, not per value: a multi-result op would otherwise charge
+    its operands once per result and no count would ever reach zero.
+    """
+    counts, seen, stack = {}, set(), [value]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, ir.BlockArgument):
+            outer = _hoist(v)
+            if outer is not v:
+                # The carry and the value the loop was handed alias one
+                # array; charging the outer one keeps it pinned, which is
+                # what aliasing needs.
+                counts[outer] = counts.get(outer, 0) + 1
+                stack.append(outer)
+            continue
+        o = _owner(v)
+        if o is None:
+            continue
+        key = _okey(o)
+        if key in seen:
+            continue
+        seen.add(key)
+        for x in o.operands:
+            counts[x] = counts.get(x, 0) + 1
+            stack.append(x)
+    return counts
+
+
+def _eval(interp, value, env, live=None):
+    """Evaluate an operand subtree eagerly on concrete arguments.
+
+    Settled op by op, and every intermediate dropped as its last consumer
+    reads it: these subtrees are full weight size, and `env` would otherwise
+    hold every one of them until the root is reached. This is the fallback
+    path -- `_Source` blocks the evaluation when it can, which is worth an
+    order of magnitude more -- and its remaining peak sits INSIDE single
+    ops, so the staging is worth ~6% on gpt-oss-20b's gate_up projection
+    (7.68 -> 7.20 GB live) and more on chains that are wide rather than
+    deep.
+    """
     from metaljax.interpreter import REGISTRY
 
     cached = env.get(value)
     if cached is not None:
         return cached
+    if live is None:
+        live = _use_counts(value)
     if isinstance(value, ir.BlockArgument):
         # A loop-invariant carry: evaluate what the loop was handed.
         outer = _hoist(value)
         if outer is value:
             raise _Reject("unbound value in operand subtree")
-        env[value] = _eval(interp, outer, env)
+        env[value] = _eval(interp, outer, env, live)
         return env[value]
     o = _owner(value)
     if o is None:
         raise _Reject("unbound value in operand subtree")
-    ins = [_eval(interp, x, env) for x in o.operands]
+    ins = [_eval(interp, x, env, live) for x in o.operands]
     handler = REGISTRY.get(o.name)
     if handler is None:
         raise _Reject(f"no handler for {o.name}")
     out = handler(interp, o, ins, env)
     if isinstance(out, mx.array):
         out = [out]
+    out = list(out)
+    mx.eval(*out)
+    for x in o.operands:
+        n = live.get(x)
+        if n is not None:
+            live[x] = n = n - 1
+            if n <= 0:
+                env.pop(x, None)
     for r, v in zip(o.results, out):
         env[r] = v
     return env[value]
@@ -1125,13 +1198,423 @@ def _group_heads(x, gs):
 
 def _pick_group(k, scale_map, zero_map):
     """The largest legal group size these maps are constant within."""
+    g0 = _GROUP_SIZES[-1]
+    if k % g0 or not _group_const(scale_map, g0):
+        return None
+    if zero_map is not None and not _group_const(zero_map, g0):
+        return None
+    return _pick_group_heads(
+        k, _group_heads(scale_map, g0),
+        None if zero_map is None else _group_heads(zero_map, g0))
+
+
+def _pick_group_heads(k, scale_heads, zero_heads):
+    """The same answer, read off the per-`_GROUP_SIZES[-1]` heads.
+
+    Constancy within a group of 128 is constancy within each of its four
+    32-groups (already checked) plus agreement between their heads, so a
+    blocked pack -- which only ever sees one row block of the map -- can
+    still pick the group size the whole weight allows, from a table 32x
+    smaller than the map.
+    """
+    g0 = _GROUP_SIZES[-1]
     for g in _GROUP_SIZES:
-        if k % g:
+        if g < g0 or k % g:
             continue
-        if _group_const(scale_map, g) and (
-                zero_map is None or _group_const(zero_map, g)):
+        r = g // g0
+        if r == 1 or (_group_const(scale_heads, r) and (
+                zero_heads is None or _group_const(zero_heads, r))):
             return g
     return None
+
+
+# --------------------------------------------------------------------------
+# row-blocked evaluation of the operand subtrees
+# --------------------------------------------------------------------------
+
+# Weight elements evaluated per block. The reconstruction chain is much
+# wider than its result -- jax's `take` wrapper alone carries three int32
+# copies of the index tensor -- so a block costs ~16 bytes per element while
+# it runs; 16M elements keeps that under a few hundred MB and still gives
+# every kernel millions of lanes of work.
+_BLOCK_ELEMS = int(os.environ.get("METALJAX_QMM_BLOCK", str(1 << 24)))
+# Ceiling on a value the blocking decides is block-INDEPENDENT (a decode
+# table, a splat constant): those are re-evaluated for every block, so a big
+# one means the blocking misread the graph and evaluating whole is honest.
+_WHOLE_MAX = 1 << 22
+# Result size (in elements) from which a blocked op is settled as it is
+# produced rather than left on the tape.
+_SETTLE_ELEMS = 1 << 20
+
+# Ops whose handler is a pure function of the arrays it is handed -- never
+# of the shape the IR declares for its result -- so that feeding it a slice
+# of the leading axis produces exactly that slice of its result. reshape and
+# broadcast_in_dim are NOT here (they read the result type; the blocked
+# evaluator rewrites their leading dimension itself), nor are gather/reduce/
+# slice/concatenate/transpose, which are row-local only under a rule about
+# their dimension attributes and are checked separately.
+_ROW_LOCAL = frozenset("""
+    stablehlo.abs stablehlo.add stablehlo.and stablehlo.cbrt stablehlo.ceil
+    stablehlo.clamp stablehlo.compare stablehlo.convert stablehlo.cosine
+    stablehlo.count_leading_zeros stablehlo.divide stablehlo.exponential
+    stablehlo.exponential_minus_one stablehlo.floor stablehlo.is_finite
+    stablehlo.log stablehlo.log_plus_one stablehlo.logistic
+    stablehlo.maximum stablehlo.minimum stablehlo.multiply stablehlo.negate
+    stablehlo.not stablehlo.or stablehlo.popcnt stablehlo.power
+    stablehlo.reduce_precision stablehlo.remainder stablehlo.round_nearest_afz
+    stablehlo.round_nearest_even stablehlo.rsqrt stablehlo.select
+    stablehlo.shift_left stablehlo.shift_right_arithmetic
+    stablehlo.shift_right_logical stablehlo.sign stablehlo.sine
+    stablehlo.sqrt stablehlo.subtract stablehlo.tanh stablehlo.xor
+""".split())
+
+
+class _NotBlockable(Exception):
+    """This subtree cannot be evaluated one row block at a time.
+
+    NOT a `_Reject`: the weight still packs, just from a whole evaluation.
+    """
+
+
+class _NoCache:
+    """MLX's buffer cache, off for the duration of a pack.
+
+    MLX frees an intermediate into its own cache, which is bounded by BYTES
+    against the memory limit -- so a pack's dead buffers stay CLAIMED until
+    some other allocation wants them, and the figure a memory watchdog reads
+    (and jetsam acts on) is the pack's whole traffic rather than its live
+    set. Measured on gpt-oss-20b's gate_up projection: 7.7 GB live, 15.9 GB
+    claimed. Packing is a once-per-weight event, so paying the allocator for
+    every buffer is free in wall-clock terms.
+    """
+
+    __slots__ = ("_prev",)
+
+    def __enter__(self):
+        self._prev = mx.set_cache_limit(0)
+        return self
+
+    def __exit__(self, *_):
+        mx.clear_cache()
+        mx.set_cache_limit(self._prev)
+        return False
+
+
+def _blocking(m):
+    """(leading extent, rows per block) for this match's operand subtrees.
+
+    Blocks are slices of the weight's LEADING axis. That axis is the row
+    axis of the `[(B,) N, K]` matrix `quantized_matmul` wants only when the
+    dot needs no transpose to get there, and when it is not part of the
+    contraction (`per % K`: whole rows have to live inside one block, since
+    the group scales and the packed nibble stream both run along K) --
+    otherwise a block of the source is not a block of the packed weight and
+    `rows per block` comes back None, i.e. evaluate the subtree whole.
+    """
+    lead = m.rshape[0] if m.rshape else 0
+    if m.rperm != list(range(len(m.rshape))) or lead < 2:
+        return lead, None
+    per = _prod(m.rshape[1:])
+    if per <= 0 or per % m.K:
+        return lead, None
+    step = max(1, _BLOCK_ELEMS // per)
+    return lead, (None if step >= lead else step)
+
+
+def _replay_rows(x, post, lead, c):
+    """`_replay` on one block: the shape ops must leave the blocked axis be."""
+    for o in post:
+        if o.name == "stablehlo.reshape":
+            src, out = _shape(o.operands[0]), _shape(o.results[0])
+            if (not src or not out or src[0] != lead or out[0] != lead
+                    or _prod(src[1:]) != _prod(out[1:])):
+                raise _NotBlockable("a reshape below the weight mixes rows")
+            x = mx.reshape(x, [c] + out[1:])
+        else:
+            perm = _ir.i64_list(o, "permutation")
+            if perm[0] != 0:
+                raise _NotBlockable("a transpose below the weight moves rows")
+            x = mx.transpose(x, perm)
+    return x
+
+
+class _Source:
+    """A match's operand subtrees, evaluated in blocks of the weight's rows.
+
+    Packing has to see every element of the reconstructed weight -- the
+    exactness checks are what the whole rewrite rests on -- but it never has
+    to see them all at once, because what it derives from them (a 4-bit
+    code, one scale per group) is far smaller than they are. Evaluating a
+    subtree whole costs several times the weight itself: on gpt-oss-20b's
+    gate_up projection (32 x 5760 x 2880 MXFP4 values) the chain peaks at
+    7.7 GB of live buffers for a 0.26 GB pack, and the claimed-memory spike
+    is 15.9 GB.
+
+    So the subtree is evaluated one slice of its leading axis at a time and
+    packed as it goes. Every op on the way has to be row-local -- the slice
+    of the result must BE the result of the slice -- which is free for an
+    elementwise op and a rule about dimension attributes for the rest
+    (`_op`). Anything not provably row-local raises `_NotBlockable` and the
+    caller retries with `unblock()`, where `blocks()` yields one block
+    covering the whole weight and the pack code above is unchanged. Small
+    weights take that path too: blocking a 4 MB reconstruction would only
+    add syncs.
+    """
+
+    __slots__ = ("interp", "m", "args", "main", "lead", "step", "memo",
+                 "binds", "frames")
+
+    def __init__(self, interp, m, args):
+        self.interp, self.m, self.args = interp, m, args
+        self.main = {a: i for i, a in
+                     enumerate(interp._main_block().arguments)}
+        self.memo = {}
+        self.binds = {}
+        self.frames = 0
+        self.lead, self.step = _blocking(m)
+
+    def blocked(self) -> bool:
+        return self.step is not None
+
+    def unblock(self):
+        self.step = None
+        self.memo.clear()
+
+    def blocks(self):
+        if self.step is None:
+            return [(0, self.lead)]
+        return [(lo, min(lo + self.step, self.lead))
+                for lo in range(0, self.lead, self.step)]
+
+    def drop(self, value):
+        """Forget a whole-evaluated subtree (it is full weight size)."""
+        self.memo.pop(value, None)
+
+    def rows(self, value, lo, hi):
+        """`value`'s rows for this block, as a `[rows, K]` matrix.
+
+        Always two-dimensional, batching dimensions included in the row
+        count: every check and every packer below reads groups along the
+        last axis and nothing else, and the packed arrays are folded back
+        into `[(B,) N, ...]` once, at the end (`_join`).
+        """
+        if value is None:
+            return None
+        m = self.m
+        if self.step is None:
+            got = self.memo.get(value)
+            if got is None:
+                env = dict(zip(self.interp._main_block().arguments, self.args))
+                got = mx.contiguous(mx.reshape(
+                    _to_nk(_eval(self.interp, value, env), m), (-1, m.K)))
+                mx.eval(got)
+                self.memo[value] = got
+            return got
+        self.binds.clear()
+        x = self._ev(value, True, lo, hi, {}, 0)
+        x = _replay_rows(x, m.post, self.lead, hi - lo)
+        if list(x.shape) != [hi - lo] + list(m.rshape[1:]):
+            raise _NotBlockable(f"a block evaluated to {list(x.shape)}")
+        out = mx.contiguous(mx.reshape(x, (-1, m.K)))
+        mx.eval(out)
+        return out
+
+    # -- the blocked evaluator ---------------------------------------------
+
+    def _ev(self, value, row, lo, hi, env, frame):
+        """`value` for one block: its rows [lo, hi) when `row`, else whole.
+
+        `row` is a DEMAND, passed down from the weight: a chain read
+        elementwise wants a block of each operand, a table gathered through
+        wants all of it. Reading a value both ways is legal (and keyed
+        separately), which is what keeps a 16-entry decode table from being
+        mistaken for a blocked value because a model happens to have 16
+        experts.
+        """
+        key = (frame, value, row)
+        got = env.get(key)
+        if got is not None:
+            return got
+        if isinstance(value, ir.BlockArgument):
+            bind = self.binds.get(frame)
+            if bind is not None and value in bind[1]:
+                # A callee parameter: resolve the demand in the caller.
+                out = self._ev(bind[1][value], row, lo, hi, env, bind[0])
+            else:
+                idx = self.main.get(value)
+                if idx is None:
+                    outer = _hoist(value)
+                    if outer is value:
+                        raise _Reject("unbound value in operand subtree")
+                    out = self._ev(outer, row, lo, hi, env, frame)
+                else:
+                    out = self.args[idx]
+                    if row:
+                        if not out.ndim or out.shape[0] != self.lead:
+                            raise _NotBlockable(
+                                f"argument {idx} does not carry the "
+                                f"blocked axis")
+                        out = mx.contiguous(out[lo:hi])
+            env[key] = out
+            return out
+        o = _owner(value)
+        if o is None:
+            raise _Reject("unbound value in operand subtree")
+        outs = self._op(o, row, lo, hi, env, frame)
+        if any(a.size >= _SETTLE_ELEMS for a in outs):
+            # Settle the wide ones as they are produced: `env` holds every
+            # value of the block, so an unsettled tape would keep all of
+            # them at once when the block is finally read. A sync costs
+            # ~200us, which is why the narrow ops (index constants, the
+            # per-group scale table) are left to ride along with the next.
+            mx.eval(*outs)
+        for r, v in zip(o.results, outs):
+            env[(frame, r, row)] = v
+        return env[key]
+
+    def _op(self, o, row, lo, hi, env, frame):
+        from metaljax.interpreter import REGISTRY
+
+        name = o.name
+        c = hi - lo
+
+        def ev(v, r):
+            return self._ev(v, r, lo, hi, env, frame)
+
+        def handle(ins):
+            handler = REGISTRY.get(name)
+            if handler is None:
+                raise _Reject(f"no handler for {name}")
+            out = handler(self.interp, o, ins, {})
+            return [out] if isinstance(out, mx.array) else list(out)
+
+        if not row:
+            # Block-independent: the declared shapes are the real ones, so
+            # the interpreter's own handler applies unchanged.
+            outs = handle([ev(v, False) for v in o.operands])
+            for a in outs:
+                if a.size > _WHOLE_MAX:
+                    raise _NotBlockable(f"{name} is block-independent but "
+                                        f"produces {a.size} elements")
+            return outs
+
+        for r in o.results:
+            if not _shape(r) or _shape(r)[0] != self.lead:
+                raise _NotBlockable(f"{name} does not keep the blocked axis")
+
+        if name == "stablehlo.reshape":
+            src, out_t = _shape(o.operands[0]), _shape(o.results[0])
+            if (not src or src[0] != self.lead
+                    or _prod(src[1:]) != _prod(out_t[1:])):
+                raise _NotBlockable("reshape mixes the blocked axis")
+            outs = [mx.reshape(ev(o.operands[0], True), [c] + out_t[1:])]
+        elif name == "stablehlo.broadcast_in_dim":
+            out_t = _shape(o.results[0])
+            src = o.operands[0]
+            sshape = _shape(src)
+            dims = _ir.i64_list(o, "broadcast_dimensions")
+            # The operand is blocked only when its own leading axis IS the
+            # result's; a size-1 leading axis expanded to the full extent is
+            # one row repeated, which every block can read whole.
+            x = ev(src, bool(dims and sshape and dims[0] == 0
+                             and sshape[0] == self.lead))
+            if dims != sorted(dims):
+                perm = sorted(range(len(dims)), key=lambda i: dims[i])
+                x = mx.transpose(x, perm)
+                dims = sorted(dims)
+            interim = [1] * len(out_t)
+            for i, d in enumerate(dims):
+                interim[d] = x.shape[i]
+            if interim[0] not in (1, c):
+                raise _NotBlockable("broadcast expands the blocked axis")
+            outs = [mx.broadcast_to(mx.reshape(x, interim), [c] + out_t[1:])]
+        elif name == "stablehlo.slice":
+            starts = _ir.i64_list(o, "start_indices")
+            limits = _ir.i64_list(o, "limit_indices")
+            strides = _ir.i64_list(o, "strides")
+            if starts[0] or limits[0] != self.lead or strides[0] != 1:
+                raise _NotBlockable("slice cuts the blocked axis")
+            idx = (slice(None),) + tuple(
+                slice(b, e, s) for b, e, s in
+                zip(starts[1:], limits[1:], strides[1:]))
+            outs = [ev(o.operands[0], True)[idx]]
+        elif name == "stablehlo.gather":
+            from metaljax.ops.gather import _gather_dims
+            d = _gather_dims(o)
+            idx_shape = _shape(o.operands[1])
+            # Only the INDICES may carry the block (which is the shape of a
+            # table lookup, jax's `take`): the handler reads `slice_sizes`
+            # off the op, so a blocked OPERAND -- a per-group scale gathered
+            # by a group ramp, say -- would have it reassemble the result
+            # with the full leading extent. Those weights pack from a whole
+            # evaluation.
+            if (0 in d["offset_dims"] or d["index_vector_dim"] == 0
+                    or d["operand_batching_dims"]
+                    or not idx_shape or idx_shape[0] != self.lead):
+                raise _NotBlockable("gather does not batch over the blocked "
+                                    "axis")
+            outs = handle([ev(o.operands[0], False), ev(o.operands[1], True)])
+        elif name == "stablehlo.reduce":
+            if 0 in _ir.i64_list(o, "dimensions"):
+                raise _NotBlockable("reduce folds the blocked axis")
+            n = len(o.operands) // 2
+            outs = handle([ev(v, True) for v in o.operands[:n]]
+                          + [ev(v, False) for v in o.operands[n:]])
+        elif name == "func.call":
+            outs = self._call(o, lo, hi, env, frame)
+        elif name in _ROW_LOCAL or (
+                name == "stablehlo.transpose"
+                and _ir.i64_list(o, "permutation")[0] == 0) or (
+                name == "stablehlo.concatenate"
+                and _ir.int_attr(o, "dimension") != 0):
+            # An operand is blocked exactly when it carries the blocked axis;
+            # StableHLO's elementwise ops take operands of the result's own
+            # shape, with rank-0 scalars (select's predicate, clamp's bounds)
+            # the only exception.
+            outs = handle([ev(v, bool(_shape(v))
+                              and _shape(v)[0] == self.lead)
+                           for v in o.operands])
+        else:
+            raise _NotBlockable(f"{name} is not known to be row-local")
+        for a in outs:
+            if not a.ndim or a.shape[0] != c:
+                raise _NotBlockable(f"{name} produced {list(a.shape)} for a "
+                                    f"block of {c}")
+        return outs
+
+    def _call(self, o, lo, hi, env, frame):
+        """A call, evaluated INSIDE the callee.
+
+        `interp.run_func` would evaluate the callee's body against the
+        shapes it declares -- and jax's `take` wrapper is full of splat
+        constants of the full leading extent, which MLX would happily
+        broadcast against a block instead of failing.
+        """
+        callee = ir.FlatSymbolRefAttr(o.attributes["callee"]).value
+        fn = self.interp.funcs.get(callee)
+        if fn is None or len(fn.regions[0].blocks) != 1:
+            raise _NotBlockable(f"callee {callee} is not a single block")
+        body = fn.regions[0].blocks[0]
+        term = list(body.operations)[-1].operation
+        if term.name != "func.return":
+            raise _NotBlockable(f"callee terminator {term.name}")
+        self.frames += 1
+        sub = self.frames
+        self.binds[sub] = (frame, dict(zip(body.arguments, o.operands)))
+        return [self._ev(v, True, lo, hi, env, sub) for v in term.operands]
+
+
+def _cat(parts):
+    return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
+
+
+def _join(parts, m):
+    """Packed row blocks back into the shape `emit` reads them in."""
+    out = _cat(parts)
+    if m.bshape:
+        out = mx.reshape(out, m.bshape + [m.N, out.shape[-1]])
+    mx.eval(out)
+    return out
 
 
 # Packs that are still alive, grouped by a digest of their contents. jax
@@ -1210,56 +1693,69 @@ def _record_pack(m, pk):
     return pk
 
 
-def _build_mxfp4_pack(m, values, scale_map, leaves):
-    """Verify and repack an MXFP4 weight from its two evaluated factors.
+def _build_mxfp4_pack(m, src, leaves):
+    """Verify and repack an MXFP4 weight, one row block at a time.
 
-    Both arrive full weight size, so each is dropped the moment the small
-    per-group form has been derived from it.
+    Each block's two factors are derived and dropped before the next block
+    is evaluated: the reconstruction is full weight size, what is kept from
+    it (a nibble per value, a byte per 32) is an eighth of that, and the
+    verification -- every value read back off the E2M1 grid by exact
+    integer equality, every group scale an exact power of two -- covers
+    every element either way.
     """
     gs = _MXFP4_GROUP
     if m.K % gs:
         raise _Reject(f"K={m.K} is not a multiple of {gs}")
     perm = None
-    if not _group_const(scale_map, gs):
-        # The same interleaving story as the affine path: permuting the
-        # contraction axis on BOTH operands leaves the dot unchanged.
-        perm = _regroup(m.K, (scale_map,))
-        if perm is not None:
-            perm = mx.array(perm)
-            scale_map = _take_k(scale_map, perm)
-            values = _take_k(values, perm)
+    ws, sbs = [], []
+    for lo, hi in src.blocks():
+        scale_map = src.rows(m.scale, lo, hi)
         if not _group_const(scale_map, gs):
-            raise _Reject("MXFP4 scales are not constant within a group "
-                          f"of {gs}")
-    sbytes = mxfp4_scale_bytes(_group_heads(scale_map, gs))
-    scale_map = None
-    codes = mxfp4_codes(values)
-    values = None
-    # The E2M1 nibble order is MLX's: element i of a row occupies bits
-    # [4i, 4i+4) of the little-endian uint32 stream, the same layout the
-    # affine 4-bit packer emits.
-    w = pack_codes(codes, 4)
-    codes = None
-    mx.eval(w, sbytes)
-    return _Pack(leaves, w, sbytes, None, perm, gs, 4, mode="mxfp4")
+            if src.blocked():
+                # The permutation that un-interleaves the groups is a
+                # property of the whole contraction axis: hand this weight
+                # back to the unblocked path, which can see all of it.
+                raise _NotBlockable("MXFP4 scales are not constant within a "
+                                    f"group of {gs}")
+            # The same interleaving story as the affine path: permuting the
+            # contraction axis on BOTH operands leaves the dot unchanged.
+            perm = _regroup(m.K, (scale_map,))
+            if perm is not None:
+                perm = mx.array(perm)
+                scale_map = _take_k(scale_map, perm)
+            if not _group_const(scale_map, gs):
+                raise _Reject("MXFP4 scales are not constant within a group "
+                              f"of {gs}")
+        sbs.append(mxfp4_scale_bytes(_group_heads(scale_map, gs)))
+        scale_map = None
+        src.drop(m.scale)
+        values = src.rows(m.codes, lo, hi)
+        if perm is not None:
+            values = _take_k(values, perm)
+        # The E2M1 nibble order is MLX's: element i of a row occupies bits
+        # [4i, 4i+4) of the little-endian uint32 stream, the same layout the
+        # affine 4-bit packer emits.
+        ws.append(pack_codes(mxfp4_codes(values), 4))
+        values = None
+        src.drop(m.codes)
+        mx.eval(ws[-1], sbs[-1])
+    return _Pack(leaves, _join(ws, m), _join(sbs, m), None, perm, gs, 4,
+                 mode="mxfp4")
 
 
-def _build_pack(interp, m, args, leaves):
-    # One environment per operand subtree: they share only cheap prefixes
-    # (the group-index cast), while each one's intermediates are full weight
-    # size -- keeping all three alive at once would triple the peak.
-    def evaluate(value):
-        env = dict(zip(interp._main_block().arguments, args))
-        return _to_nk(_eval(interp, value, env), m)
-
-    if m.mode == "mxfp4":
-        return _record_pack(
-            m, _build_mxfp4_pack(m, evaluate(m.codes), evaluate(m.scale),
-                                 leaves))
-
-    codes = evaluate(m.codes)
-    lo = int(mx.min(codes).item())
-    hi = int(mx.max(codes).item())
+def _build_affine_pack(interp, m, src, args, leaves):
+    """Verify and repack a `scale * (code - zero)` weight, block at a time."""
+    # The code range first: the offset that makes the codes unsigned has to
+    # be one number for the whole weight, so the codes are walked twice --
+    # free unblocked (`_Source` memoizes the one evaluation), a second pass
+    # over the subtree when blocked, which is the price of not holding it.
+    lo = hi = None
+    for b in src.blocks():
+        codes = src.rows(m.codes, *b)
+        clo, chi = int(mx.min(codes).item()), int(mx.max(codes).item())
+        lo = clo if lo is None else min(lo, clo)
+        hi = chi if hi is None else max(hi, chi)
+        codes = None
     # The codes only have to FIT: any integer shift that makes them
     # non-negative is undone in the bias, so the code range decides the
     # width (a symmetric [-8, 7] weight lands on 4 bits either way).
@@ -1303,40 +1799,63 @@ def _build_pack(interp, m, args, leaves):
         scales = mx.broadcast_to(scales, (m.N, m.K // gs))
         zeros = None
     else:
-        scale_map = evaluate(m.scale)
-        zero_map = evaluate(m.zero) if m.zero is not None else None
-        gs = _pick_group(m.K, scale_map, zero_map)
-        note = ""
-        if gs is None:
-            # The groups may still be there, interleaved: recover the
-            # permutation that makes them contiguous and re-verify EXACTLY
-            # (the clustering is only a proposal -- `_pick_group` on the
-            # permuted maps is what the pack's exactness rests on).
-            perm = _regroup(m.K, (scale_map, zero_map))
-            if perm is not None:
-                perm = mx.array(perm)
-                # Rebind as each permuted copy lands: these are full weight
-                # size, and holding the originals as well would raise the
-                # peak by one whole map each. Nothing below reads the
-                # unpermuted ones -- a failed verification rejects the dot.
-                scale_map = _take_k(scale_map, perm)
-                if zero_map is not None:
-                    zero_map = _take_k(zero_map, perm)
-                codes = _take_k(codes, perm)
-                gs = _pick_group(m.K, scale_map, zero_map)
-                if gs is None:
-                    perm = None
+        # Heads at the SMALLEST legal group size, per block; the group size
+        # the whole weight allows is then read off the heads, which are 32x
+        # smaller than the maps and can be held for every block at once.
+        g0 = _GROUP_SIZES[-1]
+        sheads, zheads = [], []
+        for b in src.blocks():
+            scale_map = src.rows(m.scale, *b)
+            zero_map = src.rows(m.zero, *b)
+            if not _group_const(scale_map, g0) or (
+                    zero_map is not None and not _group_const(zero_map, g0)):
+                if src.blocked():
+                    raise _NotBlockable("scales/zeros are not constant "
+                                        f"within a group of {g0}")
+                # The groups may still be there, interleaved: recover the
+                # permutation that makes them contiguous and re-verify
+                # EXACTLY (the clustering is only a proposal -- the
+                # constancy check on the permuted maps is what the pack's
+                # exactness rests on).
+                perm = _regroup(m.K, (scale_map, zero_map))
+                note = ""
+                if perm is not None:
+                    perm = mx.array(perm)
+                    # Rebind as each permuted copy lands: these are full
+                    # weight size, and holding the originals as well would
+                    # raise the peak by one whole map each. Nothing below
+                    # reads the unpermuted ones -- a failed verification
+                    # rejects the dot.
+                    scale_map = _take_k(scale_map, perm)
+                    if zero_map is not None:
+                        zero_map = _take_k(zero_map, perm)
                     note = " (even regrouped)"
+                if not _group_const(scale_map, g0) or (
+                        zero_map is not None
+                        and not _group_const(zero_map, g0)):
+                    raise _Reject("scales/zeros are not constant within any "
+                                  f"group{note}")
+            scale_dtype = scale_map.dtype
+            sheads.append(_group_heads(scale_map, g0))
+            if zero_map is not None:
+                zheads.append(_group_heads(zero_map, g0))
+            scale_map = zero_map = None
+            src.drop(m.scale)
+            src.drop(m.zero)
+            mx.eval(*(sheads[-1:] + zheads[-1:]))
+        scales = _cat(sheads)
+        zeros = _cat(zheads) if zheads else None
+        gs = _pick_group_heads(m.K, scales, zeros)
         if gs is None:
-            raise _Reject(
-                f"scales/zeros are not constant within any group{note}")
-        scale_dtype = scale_map.dtype
-        scales = _group_heads(scale_map, gs)
-        zeros = None
-        if zero_map is not None:
+            raise _Reject("scales/zeros are not constant within any group")
+        if gs != g0:
+            scales = _group_heads(scales, gs // g0)
+            if zeros is not None:
+                zeros = _group_heads(zeros, gs // g0)
+        if zeros is not None:
             # In f32 throughout: the zero map may be an integer tensor, and
             # MLX refuses to compare one against out-of-range literals.
-            zeros = _group_heads(zero_map, gs).astype(mx.float32)
+            zeros = zeros.astype(mx.float32)
             if not bool(mx.all(zeros == mx.round(zeros)).item()):
                 raise _Reject("zero points are not integers")
             if bool(mx.any(mx.abs(zeros) > 32768).item()):
@@ -1349,17 +1868,44 @@ def _build_pack(interp, m, args, leaves):
                 zhi = int(mx.max(zeros).item())
                 if (lo - zhi) < m.sub_range[0] or (hi - zlo) > m.sub_range[1]:
                     raise _Reject("integer zero-point subtraction can wrap")
-        # Free the full-size maps before packing: only the per-group values
-        # are needed from here on.
         mx.eval(*[a for a in (scales, zeros) if a is not None])
-        scale_map = zero_map = None
 
-    w, scales, biases = pack_exact(codes, scales, zeros, bits,
-                                   scale_dtype=scale_dtype, offset=offset)
+    ws = []
+    for b in src.blocks():
+        codes = src.rows(m.codes, *b)
+        if perm is not None:
+            codes = _take_k(codes, perm)
+        ws.append(pack_codes(mx.contiguous(codes).astype(mx.int32) + offset,
+                             bits))
+        codes = None
+        src.drop(m.codes)
+        mx.eval(ws[-1])
+    scales, biases = _scale_bias(scales, zeros, offset, scale_dtype)
     # Materialize: a lazy packed weight would pin the whole reconstruction
     # graph (and its full-size intermediates) for the life of the cache.
-    mx.eval(w, scales, biases)
-    return _record_pack(m, _Pack(leaves, w, scales, biases, perm, gs, bits))
+    mx.eval(scales, biases)
+    return _Pack(leaves, _join(ws, m), _join([scales], m),
+                 _join([biases], m), perm, gs, bits)
+
+
+def _build_pack(interp, m, args, leaves):
+    """Verify and repack one match's weight, on concrete argument buffers."""
+    src = _Source(interp, m, args)
+    while True:
+        try:
+            with _NoCache():
+                pk = (_build_mxfp4_pack(m, src, leaves) if m.mode == "mxfp4"
+                      else _build_affine_pack(interp, m, src, args, leaves))
+            if src.blocked():
+                STATS["blocked"] += 1
+            return _record_pack(m, pk)
+        except _NotBlockable as e:
+            if not src.blocked():
+                raise
+            if _DEBUG:
+                print(f"[metaljax] qmm: {m.name} packs from a whole "
+                      f"evaluation ({e})", flush=True)
+            src.unblock()
 
 
 def _resolve(interp, m, args):
@@ -1402,12 +1948,13 @@ def prologue(interp, args) -> bool:
                 pk, fresh = _resolve(interp, m, args)
                 packed_any = packed_any or fresh
                 if fresh:
-                    # Packing one weight peaks ~10 GB active and leaves ~8 GB
-                    # in MLX's cache at gpt-oss scale; clearing only at the
-                    # END of the prologue let 24 layers of that accumulate
-                    # (the +14 GB/sample ramp that guard-killed the row-7
-                    # re-measure). Reclaim per pack: gc first, dead refcycles
-                    # pin buffers clear_cache cannot free (CLAUDE.md item 19).
+                    # `_build_pack` bounds what ONE pack costs (blocked
+                    # evaluation, MLX's cache off); this bounds what a
+                    # prologue full of them leaves behind. Clearing only at
+                    # the END let 24 layers of gpt-oss accumulate (the
+                    # +14 GB/sample ramp that guard-killed the row-7
+                    # re-measure). gc first: dead refcycles pin buffers
+                    # clear_cache cannot free (CLAUDE.md item 19).
                     gc.collect()
                     mx.clear_cache()
             except Exception as e:
