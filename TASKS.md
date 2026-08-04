@@ -80,6 +80,47 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   decode-specialized GEMV via custom Metal kernels — msl_scan
   machinery generalizes; only after the layers above land.
 
+## PAUSED — machine-wedge class (kernel panic #7, 2026-08-04)
+
+Per Oleg after panic #7: stop the runs implicated in reboots; for each,
+build an equivalent SMALLER-model repro, verify it runs at its
+predicted peak memory, and only then retry the big model.
+
+- **Panic #7 record**: watchdogd starvation (no checkins 91 s), memory
+  explicitly HEALTHY at panic (compressor 7%, swap OK) — a hard
+  machine wedge, NOT a memory ramp; mem_guard is structurally blind to
+  this class (row 8's flight log: footprint 53 GB, sys 58.8 GB, all
+  samples "ok", log stops mid-line). Happened ~46 s into row 8's
+  STREAMED LOAD (Qwen3.6-35B-A3B, arch Qwen3_5MoeCausalLM, 53 of
+  71.9 GB assigned). Same class as panic #4 (load-time wedge with
+  memory fine); distinct from #5/#6 (memory ramps). Distinguishing
+  feature vs R1-32B — which streamed 61 GB clean TWICE the same day:
+  assign rate ~1.2 GB/s over ~1500+ mostly-small MoE expert tensors
+  (vs R1's 0.6 GB/s over 771) → working hypothesis: GPU command-queue
+  pileup during rapid small assigns starves userspace. Residual
+  uncertainty: two worktree agents were live at the time (both under
+  lock discipline, so row 8 should have been the only GPU user).
+- **PAUSED rows**: 8 (Qwen3.6-35B — the wedge), 12 (Mixtral 93.4 GB,
+  same streamed-keras class, never attempted), 15/10 (maxtext 8B
+  class, already embargoed after panics #4/#5).
+- **Ladder protocol** (per row, before any big retry):
+  1. Same-arch repro at SMALL size — smallest same-arch HF checkpoint,
+     or a synthetic one: build the backbone from a shrunken config,
+     save HF-safetensors, stream-load through the identical path
+     (arbitrary size dial on the exact code path).
+  2. Predict peak (weights + shim overhead) BEFORE the run; guarded
+     run must match the prediction; soak ×3 (the wedge class is
+     plausibly nondeterministic).
+  3. Step up (~4-8 GB → ~20-30 GB → full), one supervised run at full
+     size only after the ladder is green.
+  4. Instrument the load: per-N-tensors phase markers (a wedge must
+     leave a fingerprint), and test whether tighter sync bounds the
+     queue (BENCH_STREAM_CLEAR_GB smaller / explicit mx.synchronize
+     cadence) at small scale first.
+- **Still allowed** (never implicated, repeatedly clean same-day):
+  gpt-oss class ≤25 GB (10+ clean runs), gemma4-26b 51.6 GB (3 clean),
+  SD3.5 34 GB, texmo gates, pytest, agents' synthetic validations.
+
 ## Deferred / blocked (with measured reasons)
 
 - DeepSeek-V2-Lite metal: guard-killed at 122 GB (maxtext MoE prefill
