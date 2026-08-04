@@ -62,30 +62,29 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   path. The texmo topconfs geomean (anchor:
   notes/data/texmo-topconfs-final.jsonl) and the STATUS mlx-lm band
   are the tracked metrics.
-- **Quantized storage + matmul** (25–33× on gpt-oss; North-star row 20):
-  map dequant+matmul patterns onto mx.quantized_matmul / gather_qmm;
-  packed sub-byte storage. Unblocks rows 15/20; fixes the int4
-  unpack re-materialization (11.7×) and the int8 int64 cliff.
-- **MoE gather path** (16.7×, row 3): lower expert dispatch onto
-  mx.gather_mm instead of dense-all-experts.
-- **Fused attention** (fast.scaled_dot_product_attention mapping):
-  unblocks SD3.5/diffusion (row 17: ~90 GB unfused live set) and
-  should compress the ~6× prefill gap.
-- **keras load path**: streaming weight load (skip random-init) —
-  unblocks the ≥60 GB keras metal cells (rows 8, 9, 12) and the
-  122 GB LoRA load transient.
+- ~~Quantized storage + matmul~~ LANDED pre-migration (qmm recognizer,
+  affine + MXFP4 + per-channel: rows 7/13 measured; row 20 still wants
+  3-bit packed storage, deferred per Oleg).
+- ~~MoE gather path~~ LANDED pre-migration (2310aa2, gather_mm/
+  gather_qmm: row 7 measured 39.6→22.2; row 3 re-measure queued).
+- ~~Fused attention~~ LANDED pre-migration (sdpa recognizer, e4d9f5b:
+  SD3.5 512² 1389 + 1024² 5141 both measured; prefill-gap compression
+  not yet re-measured on the LLM rows).
+- ~~keras load path~~ LANDED pre-migration (streaming shim in
+  adapter_keras_extra; rows 8/9/12 first runs queued).
 - **Persistent compile cache**: cold-process warmup (31B pays ~9 s per
-  process; serialized executables would amortize it).
+  process; serialized executables would amortize it). Related landed
+  piece: in-process cross-executable pack-build cache (in progress —
+  see "qmm per-executable pack REBUILD" below).
 - **Kernel-specialization tier** (mlx→llama.cpp residual, ~1.25×):
   decode-specialized GEMV via custom Metal kernels — msl_scan
   machinery generalizes; only after the layers above land.
 
 ## Deferred / blocked (with measured reasons)
 
-- SD3.5 at 1024² on metaljax: unfused-attention live set ~90 GB
-  (STATUS footnote 9) — needs fused attention.
 - DeepSeek-V2-Lite metal: guard-killed at 122 GB (maxtext MoE prefill
-  memory model).
+  memory model; retry with the memory stack queued behind the row-15
+  supervised run, needs Oleg's sign-off — maxtext 8B class).
 - 26B-A4B CPU: guard-killed at 34 GB en route to ~150 GB.
 - gpt-oss CPU: dequantized working set ~126 GB — infeasible.
 - eager-path scan flush cadence: values pinned by tests; revisit only
@@ -110,11 +109,10 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
 - **bytes estimator returns 0 for gpt-oss programs** → compile gate never
   fires → trace wave guard-kills row 7 re-measure. Debug shows
   bytes=0.0MB on its mains. Estimator bug for this graph class.
-- **SD3.5 1024² retry**: 512² banked (1389 ms/step, fn 9); 1024² guard-
-  killed clean at the 55 GB budget with the ramp still climbing —
-  legit working set ~50–60 GB (4× pixels). Retry at budget ~70,
-  ceiling ~85, single non-chained run; same caps (COMPILE_BYTES_MB
-  16384). Next-session queue, with rows 3/9/8.
+- **SD3.5 1024² — DONE (2026-08-04)**: 5141 ms/step, real image, peak
+  34.0 GB under the 70 GB guard (STATUS fn 9). The old 50–60 GB
+  working-set estimate predated plan-aware pruning; deferred-list
+  entry removed.
 - **qmm pack transient — RESOLVED (e04c7fc)**: row-blocked pack
   evaluation + MLX cache off during packs; 15.9 → 1.5 GB per pack
   (notes/qmm-pack-transient-2026-08.md). Row 7 re-measured **22.2**

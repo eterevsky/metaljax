@@ -30,7 +30,7 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ MLX command-buffer bug ⁸ | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | — | 29.8 (b32: 591) | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512² ⁹ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512², 5141 @1024² ⁹ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
 | 18 | LoRA E2B train (ms/step) | 2048 | **407** | — | 135.6 ¹⁰ | — |
 | 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **28.0** (102.9 GB, load 12 s) | — | — |
@@ -103,7 +103,12 @@ the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
    same black image. Fixed: per-step-count samplers + fail-closed
    image check + diffusion-appropriate prompt; backend exonerated
    (OOB-NaN propagation verified bit-matching CPU). Image verified
-   against the torch-MPS reference. 1024² measurement pending.
+   against the torch-MPS reference. 1024² measured 2026-08-04 on the
+   0.11.3 tree: 5141 ms/step (marginal 5100), 20 steps, real image
+   (pixel_std 62.6), peak footprint 34.0 GB under a 70 GB guard —
+   the earlier 55-GB-budget kill predated plan-aware pruning + the
+   16 GB compile-bytes cap this run used (METALJAX_COMPILE_BYTES_MB=
+   16384). 1.7× behind torch-MPS at 1024² (vs 2.1× at 512²).
 10. torch MPS SDPA has no backward kernel — substantiated by autograd
     node inspection (math fallback), disclosed in the record. Loss
     series not comparable across stacks (different preprocessing);
