@@ -268,7 +268,17 @@ def main():
         os.environ.setdefault(
             "JAX_PLATFORMS", "metal" if ns.backend == "metaljax" else "cpu")
         os.environ.setdefault("KERAS_BACKEND", "jax")
-        fn = ADAPTERS[bench["path"]]
+        if bench["path"] in ("maxtext", "maxtext_train"):
+            # Lazy: the maxtext rows run in their own venv
+            # (~/.cache/metaljax-bench/maxtext/venv, see README_maxtext.md
+            # and setup_maxtext.sh) whose deps the bench venv does not
+            # carry -- importing at module scope would break every other
+            # row there.
+            from adapter_maxtext import run_maxtext, run_maxtext_train
+            fn = (run_maxtext_train if bench["path"] == "maxtext_train"
+                  else run_maxtext)
+        else:
+            fn = ADAPTERS[bench["path"]]
 
     t0 = time.monotonic()
     rec = {"id": ns.bench_id, "backend": ns.backend,

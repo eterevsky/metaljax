@@ -61,6 +61,7 @@ echo "# guard budget_gb=$BUDGET_GB sys_gb=$SYS_GB rss_gb=$RSS_CAP_GB period=$PER
 KILLED=0
 PREV=0
 PREV_T=$(date +%s)
+TRAJ_PENDING=0
 
 fire() {  # reason
   KILLED=1
@@ -117,7 +118,20 @@ while kill -0 $CHILD 2>/dev/null; do
         if (d > 0 && f + 2*d > b)
           printf "projected %.2f GB (+%.2f GB/sample) crosses budget %s GB", f+2*d, d, b;
       }')
-    [ -n "$VERDICT" ] && fire "$VERDICT"
+    # The trajectory rule needs TWO consecutive projected crossings: a
+    # single big allocation landing between samples (an Orbax restore
+    # placing a whole parameter set, a 1 GB expert-bank assign) reads as
+    # an infinite ramp for exactly one sample, then d collapses to zero.
+    # A real runaway (panic #5: +2-4 GB/sample SUSTAINED for seconds)
+    # keeps projecting over and still dies within one extra period.
+    # Absolute-threshold verdicts (footprint/system/rss) fire at once.
+    case "$VERDICT" in
+      projected*)
+        if [ "$TRAJ_PENDING" = 1 ]; then fire "$VERDICT (2nd consecutive)"
+        else TRAJ_PENDING=1; fi ;;
+      "") TRAJ_PENDING=0 ;;
+      *) fire "$VERDICT" ;;
+    esac
   fi
   PREV=$FOOT_GB
   PREV_T=$NOW
