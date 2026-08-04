@@ -129,13 +129,19 @@ predicted peak memory, and only then retry the big model.
   (4.45 GB): predicted peak 6.13, measured 5.88, 7/7 guarded runs
   clean, assign rate meets row 8's. Peak model (calibrated on R1:
   predicted 65.3 vs 65.0 measured): weights + 1.2 GB + 2× largest
-  tensor. NEXT: two ~17 GB mid rungs A/B-ing assign SIZE vs count —
-  `mid` (div=2, largest 0.47 GB, budget 24) and `wide` (div=1 ×9
-  layers, real 1.0 GB expert banks, budget 26), soak ×3 each with
-  GUARD_RSS_GB; then row 8 retry ONLY on green (predicted peak 68.6,
-  upper 76.6 — its old 95 budget was correctly sized; the wedge was
-  never a budget event) with a page-cache lever if the mid rungs
-  implicate file-backed pressure.
+  tensor. MID TIER GREEN 2026-08-04: `mid` (div=2, small assigns)
+  3/3 clean, footprint 19.0 vs 18.98 predicted, RSS 35.9; `wide`
+  (div=1 ×9 layers, real 1.0 GB expert banks) 3/3 clean, footprint
+  23.0 (point prediction 20.0, upper 28.0), RSS 40.4 — one guard
+  kill in the first wide soak was the TRAJECTORY rule tripping on
+  1 GB-granular assigns at a tight budget (26), not an anomaly;
+  reran at the upper bound (28). A/B verdict: big assigns cost
+  ~+3 GB transient and run SLOWER per byte (0.77 vs 1.24 GB/s) —
+  consistent with page-cache pressure, not queue pileup. Row 8 retry
+  awaits Oleg's go: budget 95, GUARD_RSS_GB≈95 (the panic profile
+  crossed RSS 95 ~10 s before the wedge), supervised, single run;
+  optional stronger lever first = per-shard page-cache release in
+  the loader (madvise/F_NOCACHE class, not built).
 - **Still allowed** (never implicated, repeatedly clean same-day):
   gpt-oss class ≤25 GB (10+ clean runs), gemma4-26b 51.6 GB (3 clean),
   SD3.5 34 GB, texmo gates, pytest, agents' synthetic validations.
