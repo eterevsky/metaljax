@@ -22,7 +22,7 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
 | 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | **13.7** | — | — |
-| 9 | R1-Distill-32B | ✗ 131 GB | ✗ warmup transients ¹⁷ | 131.8 | — | — |
+| 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | **10.6** | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **52.8** (93.4 GB) | — | — |
@@ -149,10 +149,20 @@ the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     swap to 9 GB (R1, guard-killed at 95 GB budget) and a chained
     second load onto that degraded system caused kernel panic #6.
     mlx-lm holds 93.4 GB resident fine — the danger is our stack's
-    allocation ramps, not static residency. Rows 8/9 (and 12) wait
-    for the eager-phase eval-forcing work (TASKS), same as rows
-    10/15; big-run moratorium >50 GB expected claim until it lands,
-    and big runs are never chained without a system-recovered check.
+    allocation ramps, not static residency. RESOLVED for row 9
+    (2026-08-04): the "warmup transient" was a HARNESS double
+    residency — R1 takes the special-token retry path, and
+    from_preset raises AFTER assigning the full 61 GB checkpoint;
+    the retry ran INSIDE the except block, where the live traceback
+    pins the dead first model while a second copy loads (93 GB and
+    climbing at the guard kill; the CLAUDE.md item-17 trap in the
+    harness this time). Retry moved out of the except scope +
+    gc.collect: load runs flat at ~71 GB (phased probe), row 9
+    completes at 65.5 GB peak under the 95 budget — **217.7**
+    ms/tok, 1.65× behind mlx-lm, first metal number for this row.
+    Rows 8/12 queued behind the same protocol (row 8 loads via the
+    normal path — no retry — so its old kill was pure load ceiling,
+    fixed by streaming).
 18. Packed int4 memory saving IS real on metaljax (2.7 vs 10.2 GB —
     the only sub-byte JAX path that keeps it). XLA:CPU fuses the
     in-graph unpack into a small net WIN (67.5 vs 79.2 bf16). The

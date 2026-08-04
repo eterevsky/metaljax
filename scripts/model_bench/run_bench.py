@@ -116,15 +116,29 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
 
     cls = getattr(keras_hub.models, bench["arch"])
     t0 = time.monotonic()
+    retry_tokenizer = False
     try:
         lm = cls.from_preset(bench["model"])
     except ValueError as e:
         # Checkpoints that renamed keras-hub's hardcoded special tokens
         # (DeepSeek R1 distills drop Qwen's <|endoftext|>): rebuild the
         # tokenizer around the checkpoint's own EOS, then load the
-        # backbone separately.
+        # backbone separately. The retry must run OUTSIDE this block:
+        # from_preset raises AFTER assigning the full checkpoint (61 GB
+        # on R1-32B), and the live traceback pins that dead model while
+        # a second copy loads -- the two stacked to a 93 GB guard kill.
+        # Same trap as the engine's execute retries (CLAUDE.md item 17).
         if "Cannot find special token" not in str(e):
             raise
+        retry_tokenizer = True
+    if retry_tokenizer:
+        # keras models are refcycles; without a collect the failed
+        # attempt's buffers survive the except block. The collect drops
+        # them into MLX's cache, which the streaming clears (or the next
+        # allocations) then reuse -- measured: the retry load runs FLAT
+        # at ~70 GB instead of stacking to 130+.
+        import gc
+        gc.collect()
         from adapter_keras_extra import _bpe_tokenizer_with_eos_alias
         pre_cls = cls.preprocessor_cls
         tok, _ = _bpe_tokenizer_with_eos_alias(pre_cls.tokenizer_cls,
