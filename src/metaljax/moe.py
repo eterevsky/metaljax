@@ -80,6 +80,7 @@ METALJAX_MOE=0 disables the recognizer.
 from __future__ import annotations
 
 import os
+from collections import deque
 
 import mlx.core as mx
 import numpy as np
@@ -810,12 +811,16 @@ class Match:
     __slots__ = ("root", "key", "skip_keys", "order", "out", "router",
                  "e_axis", "t_axis", "E", "T", "K", "P", "out_axis",
                  "out_shape", "out_dtype", "sum_dtype", "disabled",
-                 "verified", "packs", "name", "reads")
+                 "verified", "packs", "name", "reads", "bytes")
 
     def __init__(self):
         self.disabled = False
         self.verified = not _VERIFY
         self.packs = []
+        # `emit_bytes` reads nothing that changes after analysis, and the
+        # cost estimator asks every match on every traversal of the block
+        # that holds it (23.5k calls, 2.1 s, on a gpt-oss decode).
+        self.bytes = None
 
 
 def _protect_closure(values):
@@ -849,24 +854,58 @@ def _dead_sweep(block, skip, protect, root_key):
     The dense router scores, the one-hot and their broadcasts are only ever
     read by the sum being replaced; leaving them behind would keep computing
     a [tokens, experts] tensor nobody looks at.
+
+    Driven from a worklist rather than by rescanning the block to a fixpoint.
+    An op's every-use-is-skipped test can only turn true when one of its
+    USERS joins `skip`, so the candidates worth re-testing are exactly the
+    defining ops of a newly-skipped op's operands -- which makes the sweep
+    linear in the region instead of quadratic in the whole program. gpt-oss
+    has one of these per layer over a main block of thousands of ops, and it
+    was 8.8 s of every recognizer pass.
     """
-    changed = True
-    while changed:
-        changed = False
-        for op in block.operations:
-            o = op.operation
-            k = _okey(o)
-            if (k is None or k in skip or k == root_key
-                    or o.name in _NEVER_SWEEP):
+    inblock = set()
+    for op in block.operations:
+        k = _okey(op.operation)
+        if k is not None:
+            inblock.add(k)
+
+    work, queued = deque(), set()
+
+    def enqueue(o):
+        """Re-test the ops that define `o`'s operands."""
+        for v in o.operands:
+            d = _owner(v)
+            if d is None:
                 continue
-            if any(r in protect for r in o.results):
+            k = _okey(d)
+            if (k is None or k in skip or k == root_key or k not in inblock
+                    or k in queued):
                 continue
-            uses = list(_users(o))
-            if not uses:
-                continue
-            if all(_okey(u) in skip or _is_key(u, root_key) for u in uses):
-                skip.add(k)
-                changed = True
+            queued.add(k)
+            work.append(k)
+
+    # Seeds: everything already inside the region, plus the root itself --
+    # a candidate qualifies only if all its users are in one of those, so it
+    # necessarily defines an operand of one of them.
+    for k in list(skip) + [root_key]:
+        o = _owner(k)
+        if o is not None:
+            enqueue(o)
+
+    while work:
+        k = work.popleft()
+        queued.discard(k)
+        o = _owner(k)
+        if o is None or k in skip or o.name in _NEVER_SWEEP:
+            continue
+        if any(r in protect for r in o.results):
+            continue
+        uses = list(_users(o))
+        if not uses:
+            continue
+        if all(_okey(u) in skip or _is_key(u, root_key) for u in uses):
+            skip.add(k)
+            enqueue(o)
 
 
 def _analyze_root(interp, qst, block, root):
@@ -1345,6 +1384,8 @@ def emit_bytes(m) -> int:
 
     Keep in step with `emit`, like `emit_reads`.
     """
+    if m.bytes is not None:
+        return m.bytes
     total = 0
     for node in m.order:
         lead = m.P if node.paired() else 1
@@ -1354,6 +1395,7 @@ def emit_bytes(m) -> int:
     out = m.out
     trail = _prod(_trailing(out.shape, out.ea, out.ta))
     total += m.P * trail * max(m.sum_dtype.size, m.out_dtype.size)
+    m.bytes = total
     return total
 
 

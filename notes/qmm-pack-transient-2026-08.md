@@ -153,3 +153,146 @@ peak sits INSIDE `@_take` and `mxfp4_codes`, not across ops).
   still peak at ~11x and ~8x their output when handed a whole weight. Only
   the fallback path sees that now; staging them would cost 16 more syncs
   per block on the path that matters.
+
+# Pack WAVES: one build per weight per process (2026-08-04)
+
+Follow-up to the same investigation. With the per-pack transient fixed, what
+was left on gpt-oss-20b was the number of TIMES the wave ran. keras-hub
+compiles a separate generate program per sequence-length shape, so a normal
+benchmark run has three executables over one set of weights; each gets its
+own `qmm.State` with its own fresh `Match`es, whose pack cache is empty, so
+`_resolve` missed and `_build_pack` re-evaluated and re-verified all 94
+weights -- ~0.9 s each, ~80 s per executable, three times
+(`~/.cache/metaljax-bench/logs/qmm-transient/profile-defaults2.log`: warmup
+95.7 s, and pack waves bleeding into timed windows). `_share` deduped the
+STORAGE afterwards, which is exactly the evidence that the builds were
+duplicates.
+
+## The build cache
+
+A pack is a deterministic pure function of two things: the argument buffers
+its reconstruction reads, and the reconstruction itself. So a finished pack
+can be reused iff BOTH are provably identical, and `_BUILT` keys on exactly
+that pair:
+
+1. **the buffers**, by identity -- `id()` is only the hash bucket, and every
+   hit re-confirms with `is` against weak references (CPython recycles the
+   addresses of freed objects; this project has shipped that bug twice).
+2. **the reconstruction**, as a canonical serialization (`_Fingerprint`):
+   op name, result types, and every attribute in full text sorted by name;
+   operands in operand order; values named by the order the walk reaches
+   them, never by SSA name; regions (reduce bodies) walked with their own
+   numbering; and `func.call` serialized through the callee's BODY, not its
+   symbol -- jax renumbers private helpers per program (`@_take`,
+   `@_take_0`), and two modules can bind one name to different bodies.
+   Leaves are numbered by the walk too, so two programs that take the model's
+   weights in different argument orders still agree.
+
+What the serialization covers on the match itself is exactly what
+`_build_pack` reads: mode, K, N, bshape, rshape, rperm, nshape, recip,
+sub_range, bcast_dims and the `post` shape ops. NOT `M`/`mshape`/`lperm` --
+those describe the dot's ACTIVATION operand, they are precisely what differs
+between two executables of one model, and no packed byte depends on them.
+
+Anything that cannot be serialized exactly DECLINES (`_NoFingerprint`,
+counted as `stats()["build_declines"]`, silent): a dense attribute over
+`_FP_DENSE_ELEMS` (1024) elements, an attribute whose text runs past 64 KB, a
+`dense_resource` (its blob name is not its contents), an unresolvable or
+recursive callee, an unbound block argument. A decline costs nothing -- the
+weight is built exactly as it was before this cache existed. Verification is
+never weakened either: every miss runs the full build with every element
+checked.
+
+Entries are weak in BOTH directions -- they pin neither the weights nor the
+packed arrays -- so a cached pack lives exactly as long as some `Match` holds
+it, the same lifetime rule `_Pack` and `_SHARED` already follow. Dropping the
+first executable therefore costs a rebuild, correctly.
+
+`_share` stays for what the cache cannot prove: the same bytes arriving in
+two different buffers (`test_identical_weights_from_two_buffers_share_a_pack`).
+Two dots over one buffer set inside one program -- jax's prefill and its
+decode-loop body -- are now answered by the build cache instead, so that pair
+never builds twice at all.
+
+Knobs: `METALJAX_QMM_BUILD_CACHE` (entries, default 512; **0 turns
+cross-executable reuse off**), `stats()["build_hits"]` /
+`["build_declines"]`, `METALJAX_DEBUG=1` names each reuse and each decline.
+
+## Prologue cost trims that came with it
+
+* **`gc.collect()` per fresh pack** (added when whole-eval packs left ~8 GB
+  in the cache each) is ~100 ms on an LLM-sized heap -- 9.3 s of the 95 s
+  wave, for 94 packs that with row-blocking leave ~1.5 GB rather than
+  9-15 GB. Blocked builds now collect every `_GC_EVERY` (8,
+  `METALJAX_QMM_GC_EVERY`); UNBLOCKED builds, the ones that actually spike,
+  still collect per pack; and the end-of-prologue sweep now collects as well
+  as clears, so the tail is caught either way.
+* **`_hoist` memoized per `_Source`** (12.9 s of the same wave): it walks a
+  while body to its terminator, and `list(body.operations)[-1]` costs the
+  whole body -- a decode loop's body is the entire model. Every row block
+  re-asked the same question about the same loop carries.
+* **`moe._dead_sweep` on a worklist** (8.8 s per recognizer pass, i.e. per
+  executable, and NOT something the build cache helps): it rescanned the
+  whole main block to a fixpoint, once per MoE layer. An op's
+  every-use-is-skipped test can only turn true when one of its users joins
+  `skip`, so the only candidates worth re-testing are the defining ops of a
+  newly-skipped op's operands. Seeded from the region and the root, that is
+  linear in the region instead of quadratic in the program.
+  `test_dead_sweep_worklist_agrees_with_the_fixpoint` runs the old fixpoint
+  alongside the new sweep on the real MoE block and asserts the skip sets
+  are equal, op for op.
+* **`moe.emit_bytes` memoized on the match** (23.5k calls, 2.1 s on a
+  gpt-oss decode profile): it reads only `m.order`/`m.P`/`m.out`, none of
+  which change after analysis, and the cost estimator asks on every
+  traversal of the block.
+
+## Numbers (real gpt-oss-20b tensors, `pack_wave.py`)
+
+Layers 0-1, gate_up + down = 4 MXFP4 weights (0.74 GB of codes), three
+executables at token counts 2 / 5 / 3, prologue timed directly:
+
+| wave | before (`METALJAX_QMM_BUILD_CACHE=0`) | after |
+|---|---|---|
+| 1 | 2.450 s, 4 packs | 2.450 s, 4 packs |
+| 2 | 2.464 s, 4 more packs (4 `_share` aliases) | **0.0027 s**, 4 hits |
+| 3 | 2.505 s, 4 more packs (4 more aliases) | **0.0028 s**, 4 hits |
+| total prologue | 7.42 s | **2.46 s** |
+| packs built | 12 | **4** |
+| `_share` aliases | 8 | 0 (nothing duplicate is built) |
+| MLX peak | 2.83 GB | 2.43 GB |
+
+Extrapolated to the shape that motivated this (94 packs x 3 executables at
+~0.9 s), the ~240 s of pack waves in a benchmark run becomes ~80 s, and only
+the first one lands in a timed window.
+
+gc.collect() calls the prologue makes, over 12 stacked blocked packs (the
+synthetic `_affine_grouped` layout, `METALJAX_QMM_BLOCK=64`, two
+executables):
+
+| | wave 1 | wave 2 |
+|---|---|---|
+| `METALJAX_QMM_GC_EVERY=1` (the old per-pack rule) | 13 | 13 |
+| amortized | 2 | 2 |
+| amortized + build cache | 2 | **0** |
+
+The wall-clock saving from the gc change does not show at this heap size --
+a collect over a few hundred MB of arrays is milliseconds. It is the
+LLM-sized heap that makes it ~100 ms a call, which is where the 9.3 s over
+95 packs in the decode profile came from; what is measured here is the call
+COUNT, which is what the rule controls.
+
+## Known gaps (build cache)
+
+* **Weak by design**: if the first executable is released before the second
+  runs, the pack is gone and the second rebuilds. That is right (nothing
+  else holds the arrays) but means the win depends on the caller keeping its
+  shape variants alive -- keras-hub does.
+* **A big baked constant declines.** A weight stored as a
+  `stablehlo.constant` rather than an argument has no leaf buffer to key on
+  and its value attribute is over the element cap, so it is rebuilt per
+  executable. Those weights also do not block (see above), so they are the
+  expensive case twice over.
+* The fingerprint is recomputed per `Match`, i.e. per executable; on
+  gpt-oss it is ~8 KB of text per weight and well under a millisecond, but
+  it is O(subtree) and would not stay free for a subtree with thousands of
+  ops.

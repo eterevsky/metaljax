@@ -37,6 +37,11 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 # still run (the literal chain must be right too), the ones that assert the
 # rewrite happened do not.
 needs_qmm = pytest.mark.skipif(not qmm.QMM_ENABLED, reason="METALJAX_QMM=0")
+# METALJAX_QMM_BUILD_CACHE=0 turns off cross-executable pack reuse; the tests
+# that assert a reuse happened have nothing to say then (the ones that assert
+# a MISS still do, and stay on).
+needs_build_cache = pytest.mark.skipif(
+    not qmm._MAX_BUILT, reason="METALJAX_QMM_BUILD_CACHE=0")
 
 
 def _metal():
@@ -454,7 +459,8 @@ def test_interleaved_groups_in_a_decode_loop():
         # permutation is a property of the entire contraction axis.
         assert qmm.stats() == {"recognized": 1, "packs": 1, "fallbacks": 0,
                                "perms": 1, "mxfp4": 0, "batched": 0,
-                               "shared": 0, "blocked": 0}, \
+                               "shared": 0, "blocked": 0, "build_hits": 0,
+                               "build_declines": 0}, \
             qmm.stats()
         got2 = np.asarray(jf(*moved)).astype(np.float32)
     np.testing.assert_array_equal(got, got2)
@@ -723,7 +729,8 @@ def test_disabled_by_env(monkeypatch):
     got = _run(lambda *a: dense_sub(*a, columns=cols), args, _metal())
     assert qmm.stats() == {"recognized": 0, "packs": 0, "fallbacks": 0,
                            "perms": 0, "mxfp4": 0, "batched": 0,
-                           "shared": 0, "blocked": 0}
+                           "shared": 0, "blocked": 0, "build_hits": 0,
+                           "build_declines": 0}
     want = _run(lambda *a: dense_sub(*a, columns=cols), args, _cpu())
     np.testing.assert_allclose(got, want, rtol=2e-2, atol=1e-1)
 
@@ -957,11 +964,11 @@ def test_cost_model_charges_the_fused_dot():
 def _packs_of(monkeypatch, f, args, block_elems):
     """Run `f` on metal with a given block size; return the packs it built.
 
-    The content-addressed pack table is cleared first: two runs of the same
-    weight produce identical packs, which `_share` would otherwise ALIAS --
-    and comparing an array against itself proves nothing. `args` are host
-    arrays so that each run's `device_put` lands on fresh buffers and really
-    repacks.
+    Both pack tables are cleared first: two runs of the same weight produce
+    identical packs, which `_share` would otherwise ALIAS -- and comparing an
+    array against itself proves nothing. `args` are host arrays so that each
+    run's `device_put` lands on fresh buffers and really repacks (which is
+    also what keeps `_BUILT` from answering the second run).
     """
     built = []
     orig = qmm._build_pack
@@ -972,6 +979,7 @@ def _packs_of(monkeypatch, f, args, block_elems):
         return pk
 
     qmm._SHARED.clear()
+    qmm._BUILT.clear()
     monkeypatch.setattr(qmm, "_BLOCK_ELEMS", block_elems)
     monkeypatch.setattr(qmm, "_build_pack", spy)
     qmm.reset_stats()
@@ -1078,3 +1086,189 @@ def test_blocked_affine_falls_back_when_groups_interleave(monkeypatch):
     np.testing.assert_array_equal(out_w, out_b)
     exact = np.asarray(x, np.float32) @ ref.T
     np.testing.assert_allclose(out_b, exact, rtol=3e-2, atol=3e-2)
+
+
+# --------------------------------------------------------------------------
+# the cross-executable build cache
+# --------------------------------------------------------------------------
+
+
+def _on_device(weights):
+    """`weights` placed ONCE: the cache keys on buffer identity, so a second
+    `device_put` of the same array is a different weight as far as it is
+    concerned (correctly -- it really is a different buffer)."""
+    dev = _metal()
+    with jax.default_device(dev):
+        return [jax.device_put(v, dev) for v in weights]
+
+
+def _two_executables(monkeypatch, moved, shapes, cols, const=None,
+                     cache=True, clear=True):
+    """Run one weight set through several executables; return their packs.
+
+    Each shape is a separate jitted function, i.e. a separate executable with
+    its own `State` and its own fresh `Match`es -- which is what keras-hub
+    produces (one generate program per sequence length) and what the build
+    cache exists for. The functions are HELD: a pack lives as long as some
+    Match holds it, and the cache is weak, so dropping the first executable
+    would legitimately cost a rebuild.
+    """
+    if clear:
+        qmm._SHARED.clear()
+        qmm._BUILT.clear()
+    qmm.reset_stats()
+    if not cache:
+        monkeypatch.setattr(qmm, "_build_key", lambda *_a: (None, ()))
+
+    cold, hits = [], []
+    orig_build, orig_cached = qmm._build_pack, qmm._cached_build
+
+    def build_spy(interp, m, argv, leaves):
+        pk = orig_build(interp, m, argv, leaves)
+        cold.append([np.array(a) for a in pk.arrays()])
+        return pk
+
+    def cached_spy(key, keyleaves, leaves):
+        pk = orig_cached(key, keyleaves, leaves)
+        if pk is not None:
+            hits.append([np.array(a) for a in pk.arrays()])
+        return pk
+
+    monkeypatch.setattr(qmm, "_build_pack", build_spy)
+    monkeypatch.setattr(qmm, "_cached_build", cached_spy)
+
+    dev = _metal()
+    fns, outs = [], []
+    with jax.default_device(dev):
+        for t in shapes:
+            x = (np.random.default_rng(100 + t).standard_normal((t, cols[0]))
+                 * 0.4).astype("float32")
+            if const is None:
+                f = jax.jit(lambda *a: dense_sub(*a, columns=cols[1]))
+            else:
+                f = jax.jit(lambda *a: _scaled_sub(*a, columns=cols[1],
+                                                   const=const))
+            fns.append(f)
+            outs.append((x, np.asarray(f(*moved, jax.device_put(x, dev)))))
+    st = qmm.stats()
+    monkeypatch.undo()
+    return cold, hits, outs, st, fns
+
+
+def _scaled_sub(packed, scale, zero, g_idx, x, columns, const):
+    """`dense_sub` with one extra constant folded into the scale map.
+
+    The two variants differ in NOTHING but that constant's attribute, and
+    they read the very same buffers -- so a fingerprint that skipped op
+    attributes would hand the second graph the first one's weight.
+    """
+    w = _unpack_nibbles(packed, columns)
+    g = g_idx.astype(jnp.int32)
+    s = jnp.take(scale, g, axis=0) * jnp.asarray(const, x.dtype)
+    z = jnp.take(zero, g, axis=0)
+    return x @ ((w.astype(x.dtype) - z.astype(x.dtype)) * s)
+
+
+@needs_qmm
+@needs_build_cache
+def test_second_executable_reuses_the_pack(monkeypatch):
+    """One weight set, three executables: one build and two reuses.
+
+    And the reused arrays are the ones a cold build produces, bit for bit --
+    checked against a run of the same three programs with the cache declined,
+    so the reference really was built rather than looked up.
+    """
+    rows, cols = 128, 64
+    part = _quantize(rows, cols, 64, "float32", seed=41)
+    moved = _on_device(part[1:5])
+    exact_w = part[5]
+    shapes = (2, 5, 3)
+
+    cold, hits, outs, st, _fns = _two_executables(
+        monkeypatch, moved, shapes, (rows, cols), cache=False)
+    assert st["packs"] == len(shapes), st
+    assert st["build_hits"] == 0, st
+    for other in cold[1:]:
+        for a, b in zip(cold[0], other):
+            np.testing.assert_array_equal(a, b)
+
+    got, hits, outs, st, _fns = _two_executables(
+        monkeypatch, moved, shapes, (rows, cols))
+    assert st["packs"] == 1, st
+    assert st["build_hits"] == len(shapes) - 1, st
+    assert len(hits) == len(shapes) - 1
+    for reused in hits:
+        assert len(reused) == len(cold[0])
+        for a, b in zip(cold[0], reused):
+            assert a.dtype == b.dtype and a.shape == b.shape
+            np.testing.assert_array_equal(a, b)
+
+    for x, out in outs:
+        exact = x @ exact_w
+        np.testing.assert_allclose(out, exact, rtol=1e-5,
+                                   atol=1e-5 * np.abs(exact).max())
+
+
+@needs_qmm
+def test_different_weight_content_misses_the_build_cache(monkeypatch):
+    """Same shapes, same dtypes, different bytes: identity has to catch it.
+
+    The fingerprint cannot -- the two graphs ARE the same graph. What
+    separates them is that the second execute hands the recognizer different
+    buffers, and the key names buffers by identity.
+    """
+    rows, cols = 128, 64
+    a = _quantize(rows, cols, 64, "float32", seed=42)
+    b = _quantize(rows, cols, 64, "float32", seed=43)
+    x = (np.random.default_rng(44).standard_normal((2, rows))
+         * 0.4).astype("float32")
+    qmm._SHARED.clear()
+    qmm._BUILT.clear()
+    qmm.reset_stats()
+    dev = _metal()
+    f = jax.jit(lambda *a_: dense_sub(*a_, columns=cols))
+    outs = []
+    with jax.default_device(dev):
+        for part in (a, b):
+            moved = [jax.device_put(v, dev)
+                     for v in (part[1], part[2], part[3], part[4], x)]
+            outs.append(np.asarray(f(*moved)))
+    st = qmm.stats()
+    assert st["build_hits"] == 0, st
+    assert st["packs"] == 2, st
+    for part, got in zip((a, b), outs):
+        exact = x @ part[5]
+        np.testing.assert_allclose(got, exact, rtol=1e-5,
+                                   atol=1e-5 * np.abs(exact).max())
+    assert not np.allclose(outs[0], outs[1])
+
+
+@needs_qmm
+def test_one_different_constant_misses_the_build_cache(monkeypatch):
+    """Same buffers, same shapes, one attribute apart.
+
+    A wrong hit here would be silent: both graphs pack to a legal weight, so
+    only the numbers say which one came back. They are asserted per variant.
+    """
+    rows, cols = 128, 64
+    part = _quantize(rows, cols, 64, "float32", seed=45)
+    moved = _on_device(part[1:5])
+    outs = {}
+    held = []
+    for i, const in enumerate((2.0, 3.0)):
+        # The second variant runs against the FIRST one's cache entry, over
+        # the very same buffers (and against its still-live pack, which
+        # `held` keeps alive) -- clearing in between, or placing the weights
+        # again, would make the miss vacuous.
+        _cold, hits, got, st, fns = _two_executables(
+            monkeypatch, moved, (2,), (rows, cols), const=const,
+            clear=(i == 0))
+        held.append(fns)
+        assert st["build_hits"] == 0, (const, st)
+        assert st["packs"] == 1, (const, st)
+        assert hits == []
+        outs[const] = got[0]
+    for const, (x, out) in outs.items():
+        exact = x @ (part[5] * const)
+        np.testing.assert_allclose(out, exact, rtol=1e-5,
+                                   atol=1e-5 * np.abs(exact).max())

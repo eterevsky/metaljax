@@ -96,6 +96,15 @@ gpt-oss-20b's gate_up projection went from a 15.9 GB claimed spike per pack
 to 1.5 GB. A subtree that is not provably row-local falls back to being
 evaluated whole. METALJAX_QMM_BLOCK sets the block size in weight elements.
 
+A pack is also built at most ONCE per weight per process, however many
+programs ask for it. A model that is compiled per sequence-length shape (what
+keras-hub's sampler does) hands each shape its own executable, its own
+recognizer state and its own empty pack cache, so the same 94 weights were
+verified and repacked from scratch three times over one benchmark run. The
+build cache keys a finished pack on a canonical serialization of its
+reconstruction subtree plus the identity of the buffers that subtree reads --
+both provably identical, or no reuse (see `_build_key`).
+
 Packing needs CONCRETE buffers and must never run inside an `mx.compile`
 trace, so it happens in an eager prologue (`prologue()`, called by
 engine.execute) and the packed arrays are threaded into traced code as
@@ -152,6 +161,8 @@ _MAX_REPACKS = int(os.environ.get("METALJAX_QMM_REPACKS", "8"))
 _SCALE_WIDTH = os.environ.get("METALJAX_QMM_SCALES", "auto")
 # Fuse dots that carry batching dimensions (a stack of per-expert weights).
 _BATCH = os.environ.get("METALJAX_QMM_BATCH", "1") != "0"
+# Blocked packs between reclaims in the packing prologue (see `prologue`).
+_GC_EVERY = int(os.environ.get("METALJAX_QMM_GC_EVERY", "8"))
 
 # OCP MXFP4: one shared power-of-two scale per 32 elements of a row, and a
 # 4-bit E2M1 element (sign | 2-bit exponent, bias 1 | 1-bit mantissa). The
@@ -163,7 +174,8 @@ _MXFP4_GROUP = 32
 
 # Diagnostics (tests assert on these; nothing else reads them).
 STATS = {"recognized": 0, "packs": 0, "fallbacks": 0, "perms": 0,
-         "mxfp4": 0, "batched": 0, "shared": 0, "blocked": 0}
+         "mxfp4": 0, "batched": 0, "shared": 0, "blocked": 0,
+         "build_hits": 0, "build_declines": 0}
 
 
 def stats() -> dict:
@@ -581,10 +593,13 @@ class Match:
                  "lperm", "rperm", "rshape", "bshape", "mshape", "nshape",
                  "B", "M", "K", "N", "out_dtype", "disabled", "slot", "gs",
                  "bits", "packs", "repacks", "name", "sub_range", "has_perm",
-                 "mode", "nvals", "swapped", "absorbed")
+                 "mode", "nvals", "swapped", "absorbed", "fp")
 
     def __init__(self):
         self.recip = False
+        # Lazily computed by `_build_key`: None = not yet, False = this
+        # reconstruction declined to be build-cached.
+        self.fp = None
         # Set by metaljax.moe when an expert-gather rewrite takes over this
         # dot: the weight is still packed here, but the dense
         # quantized_matmul is never emitted (gather_qmm replaces it).
@@ -612,7 +627,8 @@ class Match:
 
 
 class _Pack:
-    __slots__ = ("refs", "w", "scales", "biases", "perm", "gs", "bits", "mode")
+    __slots__ = ("refs", "w", "scales", "biases", "perm", "gs", "bits",
+                 "mode", "blocked")
 
     def __init__(self, leaves, w, scales, biases, perm, gs, bits,
                  mode="affine"):
@@ -624,6 +640,9 @@ class _Pack:
         self.perm = perm
         self.gs, self.bits = gs, bits
         self.mode = mode
+        # Whether the build that produced this pack ran block by block --
+        # what it left behind for the prologue to clean up (see `prologue`).
+        self.blocked = False
 
     def arrays(self):
         """The packed arrays, in the order `emit` reads them back.
@@ -1362,7 +1381,7 @@ class _Source:
     """
 
     __slots__ = ("interp", "m", "args", "main", "lead", "step", "memo",
-                 "binds", "frames")
+                 "binds", "frames", "hoists")
 
     def __init__(self, interp, m, args):
         self.interp, self.m, self.args = interp, m, args
@@ -1371,6 +1390,12 @@ class _Source:
         self.memo = {}
         self.binds = {}
         self.frames = 0
+        # `_hoist` walks a while body to its terminator, and `list(
+        # body.operations)[-1]` costs the whole body -- a decode loop's is
+        # the entire model. Every block re-asks the same question about the
+        # same carries (it was 12.9 s of a 95 s gpt-oss pack wave), and the
+        # answer is a property of the IR, which does not change under us.
+        self.hoists = {}
         self.lead, self.step = _blocking(m)
 
     def blocked(self) -> bool:
@@ -1443,7 +1468,9 @@ class _Source:
             else:
                 idx = self.main.get(value)
                 if idx is None:
-                    outer = _hoist(value)
+                    outer = self.hoists.get(value)
+                    if outer is None:
+                        outer = self.hoists[value] = _hoist(value)
                     if outer is value:
                         raise _Reject("unbound value in operand subtree")
                     out = self._ev(outer, row, lo, hi, env, frame)
@@ -1898,6 +1925,7 @@ def _build_pack(interp, m, args, leaves):
                       else _build_affine_pack(interp, m, src, args, leaves))
             if src.blocked():
                 STATS["blocked"] += 1
+            pk.blocked = src.blocked()
             return _record_pack(m, pk)
         except _NotBlockable as e:
             if not src.blocked():
@@ -1908,6 +1936,338 @@ def _build_pack(interp, m, args, leaves):
             src.unblock()
 
 
+# --------------------------------------------------------------------------
+# the cross-executable build cache
+# --------------------------------------------------------------------------
+
+# A pack is a deterministic pure function of exactly two things: the argument
+# buffers its reconstruction reads, and the reconstruction itself. Two
+# EXECUTABLES over one model share the first and duplicate the second --
+# keras-hub compiles a separate generate program per sequence-length shape,
+# and each gets a fresh `State` whose fresh `Match`es hold no packs, so every
+# weight was re-evaluated and re-verified from nothing (0.9 s x 94 packs on
+# gpt-oss-20b, once per executable shape). `_share` is the proof that those
+# builds were duplicates: it dedupes their STORAGE, content-addressed, after
+# the fact. This cache moves the dedup in FRONT of the build.
+#
+# Reuse is sound only when both halves are PROVABLY the same, so the key is
+# a canonical serialization of the reconstruction plus the identity of the
+# buffers it bottoms out on. Anything the serialization cannot cover exactly
+# declines to be cached and is built exactly as before -- declining is free,
+# and it is the only thing standing between "we can prove it" and a wrong
+# weight. Verification itself is never weakened: a miss runs the full
+# build, every element checked.
+
+
+class _NoFingerprint(Exception):
+    """This reconstruction cannot be serialized exactly: do not cache it."""
+
+
+# Elements of a dense attribute that may go into a fingerprint. A weight
+# subtree's constants are decode tables and thresholds; thousands of elements
+# means the weight itself is baked into the graph, and hashing that costs
+# more than the build it would save.
+_FP_DENSE_ELEMS = 1024
+# ...and a cap on any attribute's printed form, which also catches the
+# encodings whose size cannot be read off a shaped type (complex dense
+# attributes, which the bindings cannot even cast).
+_FP_ATTR_CHARS = 1 << 16
+
+_WALKING = object()
+
+
+def _attr_text(o, name, attr) -> str:
+    """One attribute's COMPLETE text, or a decline.
+
+    Complete is the whole point. A `dense_resource` prints its blob name and
+    two modules can bind one name to different bytes, so it can never stand
+    in for its contents; a big dense attribute could be printed in full, but
+    reading it is the cost the cache exists to avoid.
+    """
+    dense = None
+    try:
+        dense = ir.DenseElementsAttr(attr)
+    except Exception:
+        pass
+    if dense is not None:
+        # A splat carries one element however big its type says it is.
+        if not dense.is_splat:
+            st = ir.ShapedType(dense.type)
+            n = 1
+            if st.has_rank:
+                for i in range(st.rank):
+                    n *= st.get_dim_size(i)
+            if n > _FP_DENSE_ELEMS:
+                raise _NoFingerprint(f"{o.name} carries {n} constant elements")
+    elif o.name == "stablehlo.constant":
+        # Complex dense attributes cannot even be CAST by the bindings, so
+        # their size has to come off the result type -- before anything asks
+        # for their text.
+        try:
+            n = _prod(_shape(o.results[0]))
+        except Exception:
+            raise _NoFingerprint(f"{o.name} has no ranked result")
+        if n > _FP_DENSE_ELEMS:
+            raise _NoFingerprint(f"{o.name} carries {n} constant elements the "
+                                 f"bindings cannot size")
+    s = str(attr)
+    if len(s) > _FP_ATTR_CHARS:
+        raise _NoFingerprint(f"{o.name}'s {name} prints {len(s)} characters")
+    if "dense_resource<" in s:
+        raise _NoFingerprint(f"{o.name}'s {name} is a dense_resource "
+                             f"(its contents are not in the IR)")
+    return s
+
+
+class _Fingerprint:
+    """A canonical serialization of what a pack gets built from.
+
+    Deterministic by construction, and independent of everything that is not
+    the computation: values are named by the order THIS walk reaches them
+    (never by SSA name), operands in operand order, attributes sorted by name
+    and printed in full, callees serialized through their BODY -- jax
+    renumbers private helpers per program, so `@_take` and `@_take_0` have to
+    fingerprint identically when their bodies agree, and two modules that
+    bind one name to different bodies must not.
+    """
+
+    __slots__ = ("interp", "main", "parts", "ids", "leaves", "callees",
+                 "sealed")
+
+    def __init__(self, interp):
+        self.interp = interp
+        self.main = {a: i for i, a in
+                     enumerate(interp._main_block().arguments)}
+        self.parts = []
+        self.ids = {}
+        self.leaves = []        # @main argument positions, in walk order
+        self.callees = {}
+        self.sealed = False
+
+    def text(self) -> str:
+        return "".join(self.parts)
+
+    def value(self, v):
+        """`v` and everything under it (the demand-driven half of the walk)."""
+        if self.sealed:
+            # A callee body is serialized ONCE and reused for every call of
+            # it, so it must not name anything from a caller. Functions are
+            # isolated from above, so this cannot fire -- but a body that
+            # somehow did capture would otherwise be memoized with one
+            # caller's operands baked in.
+            raise _NoFingerprint("a callee body reads a value from its caller")
+        got = self.ids.get(v)
+        if got is not None:
+            self.parts.append(f"#{got};")
+            return
+        self.ids[v] = len(self.ids)
+        if isinstance(v, ir.BlockArgument):
+            idx = self.main.get(v)
+            if idx is None:
+                outer = _hoist(v)
+                if outer is v:
+                    raise _NoFingerprint("an unbound block argument")
+                self.parts.append("carry(")
+                self.value(outer)
+                self.parts.append(");")
+                return
+            # Leaves are numbered by the walk, not by their argument
+            # position: two programs may take one model's weights in
+            # different orders, and the reconstruction is what has to match.
+            self.parts.append(f"leaf{len(self.leaves)}:{v.type};")
+            self.leaves.append(idx)
+            return
+        o = _owner(v)
+        if o is None:
+            raise _NoFingerprint("a value that is neither argument nor result")
+        self.parts.append(f"r{v.result_number}=")
+        self.head(o)
+        self.parts.append("(")
+        for x in o.operands:
+            self.value(x)
+        self.parts.append(")")
+        self.regions(o, {})
+
+    def head(self, o):
+        """`o`'s name, result types and attributes -- everything but operands."""
+        self.parts.append(f"{o.name}[")
+        for r in o.results:
+            self.parts.append(f"{r.type},")
+        self.parts.append(":")
+        named = sorted(((o.attributes[i].name, o.attributes[i].attr)
+                        for i in range(len(o.attributes))),
+                       key=lambda kv: kv[0])
+        call = o.name == "func.call"
+        for name, attr in named:
+            if call and name == "callee":
+                # The callee's BODY stands in for its name (see `callee`);
+                # printing the symbol as well would make two copies of one
+                # helper fingerprint differently for no reason.
+                continue
+            self.parts.append(f"{name}={_attr_text(o, name, attr)},")
+        self.parts.append("]")
+
+    def regions(self, o, ids):
+        """`o`'s regions, walked top to bottom with their own numbering.
+
+        Reduce bodies and sort comparators live here; `_Source` evaluates
+        them through the interpreter's handlers, so what they compute is
+        part of what the pack is.
+        """
+        if o.name == "func.call":
+            self.parts.append(self.callee(o))
+        for region in o.regions:
+            self.parts.append("{")
+            for blk in region.blocks:
+                self.parts.append("|")
+                for a in blk.arguments:
+                    ids[a] = len(ids)
+                    self.parts.append(f"p{ids[a]};")
+                for inner in blk.operations:
+                    self.body_op(inner.operation, ids)
+            self.parts.append("}")
+
+    def body_op(self, o, ids):
+        """One op of a region or callee body, in source order."""
+        self.head(o)
+        self.parts.append("(")
+        for x in o.operands:
+            got = ids.get(x)
+            if got is None:
+                # A value the region captures from outside: name it in the
+                # walk that owns it, so one capture reads the same either way.
+                self.value(x)
+            else:
+                self.parts.append(f"%{got};")
+        self.parts.append(")")
+        self.regions(o, ids)
+        for r in o.results:
+            ids[r] = len(ids)
+        self.parts.append(";")
+
+    def callee(self, o) -> str:
+        try:
+            sym = ir.FlatSymbolRefAttr(o.attributes["callee"]).value
+        except Exception:
+            raise _NoFingerprint("a call with no resolvable callee")
+        got = self.callees.get(sym)
+        if got is _WALKING:
+            raise _NoFingerprint(f"callee @{sym} is recursive")
+        if got is None:
+            fn = self.interp.funcs.get(sym)
+            if fn is None:
+                raise _NoFingerprint(f"callee @{sym} is not in the module")
+            self.callees[sym] = _WALKING
+            outer, sealed = self.parts, self.sealed
+            self.parts, self.sealed = [], True
+            try:
+                self.regions(fn, {})
+                got = "".join(self.parts)
+            finally:
+                self.parts, self.sealed = outer, sealed
+            self.callees[sym] = got
+        return got
+
+
+def _fingerprint(interp, m):
+    """(serialization, leaf argument positions) for `m`'s pack inputs.
+
+    What goes in is exactly what `_build_pack` reads. The activation side of
+    the dot does NOT: `m.M`, `m.mshape` and `m.lperm` describe the other
+    operand, they are precisely what makes two executables of one model
+    differ, and no packed byte depends on them.
+    """
+    fp = _Fingerprint(interp)
+    fp.parts.append("qmm1|")
+    for x in (m.mode, m.K, m.N, m.bshape, m.rshape, m.rperm, m.nshape,
+              m.recip, m.sub_range, m.bcast_dims):
+        fp.parts.append(f"{x}|")
+    for o in m.post:
+        # The shape ops between the reconstruction and the dot: `_replay`
+        # reads their result shapes and permutations off the IR.
+        fp.parts.append(f"{_shape(o.operands[0])}->")
+        fp.head(o)
+        fp.parts.append("|")
+    fp.parts.append("codes:")
+    fp.value(m.codes)
+    fp.parts.append("scale:")
+    fp.value(m.scale)
+    if m.zero is not None:
+        fp.parts.append("zero:")
+        fp.value(m.zero)
+    return fp.text(), tuple(fp.leaves)
+
+
+# Packs already built in this process, keyed by (what the reconstruction is,
+# which buffers it reads). Weak throughout: an entry keeps neither the
+# weights nor the pack alive, so a cached build lives exactly as long as some
+# Match holds it -- the same lifetime rule `_Pack` and `_SHARED` follow.
+# id() is only the hash bucket; every hit re-confirms identity with `is`,
+# because CPython reuses the addresses of freed objects (this project has
+# twice shipped a bug from a set keyed on id alone).
+_BUILT = {}
+# Entries retained; 0 turns the cross-executable reuse off entirely (every
+# executable rebuilds, which is what happened before this cache existed).
+_MAX_BUILT = int(os.environ.get("METALJAX_QMM_BUILD_CACHE", "512"))
+
+
+def _entry_dead(ent) -> bool:
+    lrefs, arefs = ent[0], ent[1]
+    return (any(r() is None for r in lrefs)
+            or any(r is not None and r() is None for r in arefs))
+
+
+def _cached_build(key, keyleaves, leaves):
+    """The pack this key was built for, rewrapped on `leaves`, or None."""
+    ent = _BUILT.get(key)
+    if ent is None:
+        return None
+    lrefs, arefs, gs, bits, mode = ent
+    arrays = [None if r is None else r() for r in arefs]
+    if (len(lrefs) != len(keyleaves)
+            or any(r() is not a for r, a in zip(lrefs, keyleaves))
+            or any(r is not None and a is None
+                   for r, a in zip(arefs, arrays))):
+        # Either an address was recycled by a different buffer, or the pack
+        # died with the last executable that held it.
+        del _BUILT[key]
+        return None
+    return _Pack(leaves, arrays[0], arrays[1], arrays[2], arrays[3],
+                 gs, bits, mode)
+
+
+def _remember_build(key, keyleaves, pk):
+    if len(_BUILT) >= _MAX_BUILT:
+        for k in [k for k, e in _BUILT.items() if _entry_dead(e)]:
+            del _BUILT[k]
+        if len(_BUILT) >= _MAX_BUILT:
+            _BUILT.clear()       # coarse, and only ever costs a rebuild
+    _BUILT[key] = ([weakref.ref(a) for a in keyleaves],
+                   [None if a is None else weakref.ref(a)
+                    for a in (pk.w, pk.scales, pk.biases, pk.perm)],
+                   pk.gs, pk.bits, pk.mode)
+
+
+def _build_key(interp, m, args):
+    """(cache key, the buffers it names) for `m`, or (None, ()) to decline."""
+    if not _MAX_BUILT:
+        return None, ()
+    if m.fp is None:
+        try:
+            m.fp = _fingerprint(interp, m)
+        except _NoFingerprint as e:
+            m.fp = False
+            STATS["build_declines"] += 1
+            if _DEBUG:
+                print(f"[metaljax] qmm: {m.name} is not build-cached ({e})",
+                      flush=True)
+    if m.fp is False:
+        return None, ()
+    text, positions = m.fp
+    keyleaves = [args[i] for i in positions]
+    return (text, tuple(id(a) for a in keyleaves)), keyleaves
+
+
 def _resolve(interp, m, args):
     """(pack, freshly_built) for these argument buffers."""
     leaves = [args[i] for i in m.arg_indices]
@@ -1916,11 +2276,27 @@ def _resolve(interp, m, args):
             if i:
                 m.packs.insert(0, m.packs.pop(i))
             return pk, False
+    key, keyleaves = _build_key(interp, m, args)
+    if key is not None:
+        pk = _cached_build(key, keyleaves, leaves)
+        if pk is not None:
+            # Built by another executable over these very buffers. Not a
+            # repack (nothing was rebuilt) and not `_share`d (this IS the
+            # shared pack), so neither counter moves.
+            STATS["build_hits"] += 1
+            if _DEBUG:
+                print(f"[metaljax] qmm: {m.name} reuses a pack built "
+                      f"earlier in this process", flush=True)
+            m.packs.insert(0, pk)
+            del m.packs[_MAX_PACKS:]
+            return pk, False
     m.repacks += 1
     if m.repacks > _MAX_REPACKS:
         raise _Reject(f"operands changed {m.repacks} times; repacking costs "
                       f"more than the chain it replaces")
     pk = _build_pack(interp, m, args, leaves)
+    if key is not None:
+        _remember_build(key, keyleaves, pk)
     m.packs.insert(0, pk)
     del m.packs[_MAX_PACKS:]
     return pk, True
@@ -1940,14 +2316,15 @@ def prologue(interp, args) -> bool:
     changed = False
     values = []
     packed_any = False
+    since_gc = 0
     with interp.context:
         for m in st.matches:
             if m.disabled:
                 continue
             try:
                 pk, fresh = _resolve(interp, m, args)
-                packed_any = packed_any or fresh
                 if fresh:
+                    packed_any = True
                     # `_build_pack` bounds what ONE pack costs (blocked
                     # evaluation, MLX's cache off); this bounds what a
                     # prologue full of them leaves behind. Clearing only at
@@ -1955,8 +2332,19 @@ def prologue(interp, args) -> bool:
                     # +14 GB/sample ramp that guard-killed the row-7
                     # re-measure). gc first: dead refcycles pin buffers
                     # clear_cache cannot free (CLAUDE.md item 19).
-                    gc.collect()
-                    mx.clear_cache()
+                    #
+                    # gc.collect() over an LLM-sized heap costs ~100 ms,
+                    # though, and a BLOCKED build leaves ~1.5 GB behind
+                    # where a whole evaluation leaves 9-15 GB -- so 94
+                    # blocked packs paid 9 s of a pack wave to reclaim what
+                    # the end-of-prologue sweep takes anyway. Blocked builds
+                    # amortize it over `_GC_EVERY`; the unblocked ones, which
+                    # are the ones that actually spike, still pay per pack.
+                    since_gc += 1
+                    if not pk.blocked or since_gc >= _GC_EVERY:
+                        since_gc = 0
+                        gc.collect()
+                        mx.clear_cache()
             except Exception as e:
                 m.disabled = True
                 changed = True
@@ -1991,7 +2379,10 @@ def prologue(interp, args) -> bool:
     st.values = values
     if packed_any:
         # The reconstruction ran once at full weight size; its intermediates
-        # are dead now and Metal counts live buffers, not bytes.
+        # are dead now and Metal counts live buffers, not bytes. This is also
+        # what catches the tail of the blocked packs that skipped their own
+        # collection above.
+        gc.collect()
         mx.clear_cache()
     return changed
 

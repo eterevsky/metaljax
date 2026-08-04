@@ -439,3 +439,64 @@ def test_offgrid_weights_fall_back_to_dense_and_stay_correct():
     assert moe.stats()["gather_mm"] >= 2
     want = _run(f, _args(w), _cpu())
     np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
+
+
+# --------------------------------------------------------------------------
+# the dead sweep
+# --------------------------------------------------------------------------
+
+
+def _fixpoint_sweep(block, skip, protect, root_key):
+    """The pre-worklist `_dead_sweep`, verbatim, as the reference.
+
+    Kept here rather than in the module: it is what the worklist has to
+    agree with, and agreeing with a rescan-to-fixpoint is the whole
+    correctness argument for not rescanning.
+    """
+    changed = True
+    while changed:
+        changed = False
+        for op in block.operations:
+            o = op.operation
+            k = moe._okey(o)
+            if (k is None or k in skip or k == root_key
+                    or o.name in moe._NEVER_SWEEP):
+                continue
+            if any(r in protect for r in o.results):
+                continue
+            uses = list(moe._users(o))
+            if not uses:
+                continue
+            if all(moe._okey(u) in skip or moe._is_key(u, root_key)
+                   for u in uses):
+                skip.add(k)
+                changed = True
+
+
+@needs_moe
+def test_dead_sweep_worklist_agrees_with_the_fixpoint(monkeypatch):
+    """Same skip set, op for op, on the real MoE block.
+
+    The worklist only re-tests the ops that define a newly-skipped op's
+    operands; that is sound because nothing else can have its
+    every-use-is-skipped test turn true. This asserts it.
+    """
+    seen = []
+    orig = moe._dead_sweep
+
+    def spy(block, skip, protect, root_key):
+        before = set(skip)
+        orig(block, skip, protect, root_key)
+        ref = set(before)
+        _fixpoint_sweep(block, ref, protect, root_key)
+        seen.append((len(before), len(skip)))
+        assert skip == ref, (skip - ref, ref - skip)
+
+    monkeypatch.setattr(moe, "_dead_sweep", spy)
+    w = make_weights(4, 5, 64, 32, seed=55)
+    got = _run(lambda *a: moe_block(*a, k=2), _args(w), _metal())
+    assert seen, "the recognizer never reached the sweep"
+    # ...and the sweep is not vacuous: it really adds the dense router work.
+    assert any(after > before for before, after in seen), seen
+    want = _run(lambda *a: moe_block(*a, k=2), _args(w), _cpu())
+    np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)

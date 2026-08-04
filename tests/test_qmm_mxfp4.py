@@ -53,6 +53,8 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 needs_qmm = pytest.mark.skipif(not qmm.QMM_ENABLED, reason="METALJAX_QMM=0")
 needs_batch = pytest.mark.skipif(not qmm._BATCH, reason="METALJAX_QMM_BATCH=0")
+needs_build_cache = pytest.mark.skipif(
+    not qmm._MAX_BUILT, reason="METALJAX_QMM_BUILD_CACHE=0")
 
 # The E2M1 grid, indexed by the 4-bit code (bit 3 is the sign).
 E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -379,14 +381,17 @@ def test_batched_experts_mxfp4(dtype):
 
 
 @needs_qmm
+@needs_build_cache
 def test_identical_weights_pack_once():
     """Two dots over the SAME weight share one packed copy.
 
     jax lowers a decode loop's prefill and its while body as separate dots
     over one set of weights, so without this a model's whole packed weight
     set is built and held twice (measured on gpt-oss-20b: 2 x 10.2 GB).
-    Sharing is decided by comparing the packed arrays, so it can only ever
-    alias bit-identical packs.
+    Here the two chains are the same chain over the same buffers, so the
+    BUILD cache answers the second one and the second build never runs;
+    `test_identical_weights_from_two_buffers_share_a_pack` covers the case
+    it cannot prove, where content-addressed sharing is still the answer.
     """
     n, k, t = 64, 128, 2
     rng = np.random.default_rng(9)
@@ -399,10 +404,11 @@ def test_identical_weights_pack_once():
         return a + b
 
     qmm.reset_stats()
+    qmm._BUILT.clear()
     got = _run(f, (jnp.asarray(blocks), jnp.asarray(sb), jnp.asarray(x)),
                _metal())
     st = qmm.stats()
-    assert st["packs"] == 2 and st["shared"] == 1, st
+    assert st["packs"] == 1 and st["build_hits"] == 1, st
 
     wf = jnp.asarray(w, "bfloat16")
     ref = _run(lambda x_: (jnp.einsum("th,nh->tn", x_, wf)
@@ -411,6 +417,41 @@ def test_identical_weights_pack_once():
     exact = (x.astype(np.float32) @ w.T
              + np.tanh(x.astype(np.float32)) @ w.T)
     _no_worse_than(got, ref, exact, "bfloat16")
+
+
+@needs_qmm
+def test_identical_weights_from_two_buffers_share_a_pack():
+    """Same bytes, two placements: the build cache cannot prove it, `_share`
+    can.
+
+    Buffer identity is what the build key names, and these really are two
+    buffers -- so both weights get built and the content-addressed dedupe is
+    what stops the model holding two copies. That is the case `_share`
+    exists for once the build cache has taken the provable one.
+    """
+    n, k, t = 64, 128, 2
+    rng = np.random.default_rng(91)
+    _codes, blocks, sb, w = _random_mxfp4((n, k), rng)
+    x = (rng.standard_normal((t, k)) * 0.4).astype("float32")
+
+    def f(b1, s1, b2, s2, x_):
+        return dense_mxfp4(b1, s1, x_, k) + dense_mxfp4(b2, s2, x_, k)
+
+    qmm.reset_stats()
+    qmm._SHARED.clear()
+    qmm._BUILT.clear()
+    dev = _metal()
+    with jax.default_device(dev):
+        # Two separate placements of the SAME bytes.
+        args = [jax.device_put(v, dev) for v in
+                (blocks, sb, blocks.copy(), sb.copy(), x)]
+        got = np.asarray(jax.jit(f)(*args))
+    st = qmm.stats()
+    assert st["packs"] == 2 and st["shared"] == 1, st
+    assert st["build_hits"] == 0, st
+    exact = 2.0 * (x.astype(np.float32) @ w.T)
+    np.testing.assert_allclose(got, exact, rtol=1e-5,
+                               atol=1e-6 * np.abs(exact).max())
 
 
 @needs_qmm
@@ -651,6 +692,7 @@ def _packs_of(monkeypatch, f, args, block_elems):
         return pk
 
     q._SHARED.clear()
+    q._BUILT.clear()
     monkeypatch.setattr(q, "_BLOCK_ELEMS", block_elems)
     monkeypatch.setattr(q, "_build_pack", spy)
     q.reset_stats()
@@ -763,3 +805,124 @@ def test_blocked_pack_reads_a_decode_table_whole(monkeypatch):
     np.testing.assert_array_equal(out_w, out_b)
     exact = np.einsum("etm,ehm->eth", np.asarray(x, np.float32), w)
     _no_worse_than(out_b, out_w, exact, "bfloat16")
+
+
+# --------------------------------------------------------------------------
+# the cross-executable build cache
+# --------------------------------------------------------------------------
+
+
+def _through_executables(shapes, blocks, sb, k, dtype="bfloat16"):
+    """One MXFP4 weight through several executables; return (outs, stats).
+
+    The MXFP4 chain is the one that makes the cache worth having: its E2M1
+    lookup lowers to a private `@_take` function, so the fingerprint has to
+    walk a CALLEE body -- and jax renumbers those per program, which is
+    exactly what a symbol-name key would get wrong.
+    """
+    qmm._SHARED.clear()
+    qmm._BUILT.clear()
+    qmm.reset_stats()
+    dev = _metal()
+    fns, outs = [], []
+    with jax.default_device(dev):
+        moved = [jax.device_put(v, dev) for v in (blocks, sb)]
+        for t in shapes:
+            x = (np.random.default_rng(200 + t).standard_normal(
+                (t, k)) * 0.4).astype(dtype)
+            f = jax.jit(lambda b, s, xx: dense_mxfp4(b, s, xx, k=k))
+            fns.append(f)                    # a dropped executable drops its
+            outs.append((x, np.asarray(     # pack, and the cache is weak
+                f(*moved, jax.device_put(x, dev)))))
+    return outs, qmm.stats(), fns
+
+
+@needs_qmm
+@needs_build_cache
+def test_second_executable_reuses_the_mxfp4_pack():
+    n, k = 64, 128
+    rng = np.random.default_rng(77)
+    _codes, blocks, sb, w = _random_mxfp4((n, k), rng)
+    outs, st, _fns = _through_executables((2, 5, 3), blocks, sb, k)
+    assert st["packs"] == 1, st
+    assert st["build_hits"] == 2, st
+    assert st["build_declines"] == 0, st
+    for x, got in outs:
+        exact = np.asarray(x, np.float32) @ w.T
+        np.testing.assert_allclose(got.astype(np.float32), exact,
+                                   rtol=2e-2, atol=2e-2 * np.abs(exact).max())
+
+
+@needs_qmm
+@needs_build_cache
+def test_a_big_constant_declines_the_build_cache(monkeypatch):
+    """A decode table too big to serialize: no cache, and no wrong reuse.
+
+    The declining is the safety valve -- everything the fingerprint cannot
+    cover exactly falls back to building, which is what happened before this
+    cache existed. Here the E2M1 table itself is put over the limit.
+    """
+    monkeypatch.setattr(qmm, "_FP_DENSE_ELEMS", 8)
+    n, k = 64, 128
+    rng = np.random.default_rng(78)
+    _codes, blocks, sb, w = _random_mxfp4((n, k), rng)
+    outs, st, _fns = _through_executables((2, 5), blocks, sb, k)
+    assert st["build_declines"] == 2, st     # one per match, once each
+    assert st["build_hits"] == 0, st
+    assert st["packs"] == 2, st
+    for x, got in outs:
+        exact = np.asarray(x, np.float32) @ w.T
+        np.testing.assert_allclose(got.astype(np.float32), exact,
+                                   rtol=2e-2, atol=2e-2 * np.abs(exact).max())
+
+
+def _fingerprint_of(text):
+    """The build-cache fingerprint of the one match in a module's text."""
+    from jaxlib.mlir import ir
+    from metaljax import _ir
+    from metaljax.interpreter import Interpreter
+
+    ctx = _ir.make_context()
+    with ctx:
+        module = ir.Module.parse(text)
+    interp = Interpreter(module, context=ctx)
+    st = qmm.analyze(interp)
+    assert len(st.matches) == 1
+    return qmm._fingerprint(interp, st.matches[0])[0]
+
+
+@needs_qmm
+def test_fingerprint_reads_callee_bodies_not_their_names():
+    """A call is what its callee DOES, not what it is called.
+
+    jax emits `jnp.take` as a private helper and numbers those per program
+    (`@_take`, `@_take_0`), so two programs holding the same weight will
+    disagree about the name; the same argument says two modules that bind
+    one name to different bodies must never share a key.
+    """
+    import re
+
+    n, k = 64, 128
+    _codes, blocks, sb, _w = _random_mxfp4((n, k), np.random.default_rng(79))
+    x = np.zeros((2, k), np.float32)
+    text = jax.jit(lambda b, s, xx: dense_mxfp4(b, s, xx, k=k)).lower(
+        blocks, sb, x).as_text()
+    assert "func.func private @_take(" in text
+
+    base = _fingerprint_of(text)
+    # The gather, the reduce and the select live ONLY in the helpers, so
+    # their presence is the proof that the bodies were walked at all.
+    for name in ("stablehlo.gather", "stablehlo.reduce", "stablehlo.select"):
+        assert name in base
+
+    renamed = _fingerprint_of(text.replace("_take", "_pick_9")
+                              .replace("_where", "_pick_8"))
+    assert renamed == base
+
+    start = text.index("func.func private @_take(")
+    end = text.index("\n  }", start)
+    body = text[start:end]
+    mo = re.search(r"stablehlo\.constant dense<(-?\d+)>", body)
+    edited = (text[:start] + body[:mo.start(1)] + "7" + body[mo.end(1):]
+              + text[end:])
+    assert _fingerprint_of(edited) != base
