@@ -263,3 +263,49 @@ work (TASKS: eager-phase memory discipline) bounds the transient waves.
 Rows 8/9 join 10/15 behind that work: their LOADS are fixed (the 35B
 ported all 1026 weights streamed at ~70 GB), warmup transients are what
 remain lethal.
+
+---
+
+## Addendum 2026-08-04 (114b4d4): canaries re-pinned as SWEEPS
+
+The "which budget corrupts" tables above are all stale — not because MLX
+changed, but because our own lowerings did. Full re-sweep on 114b4d4, both
+assets, one fresh process per value (probe = the two detectors in
+tests/test_command_buffer.py; logs in
+`~/.cache/metaljax-bench/logs/canary-repin/`):
+
+**Kernel budget, `qwen3_init_scan.mlir` eager scan, bytes held at 512:**
+
+| `MLX_MAX_OPS_PER_BUFFER` | 50 | 100 | 150 | 200 | 250-350 | 400 | 450-1300 | 1350-10^9 |
+|---|---|---|---|---|---|---|---|---|
+| result | **wrong** | **wrong** | ok | **wrong** | ok | **wrong** | ok | **wrong** |
+
+400 still corrupts (5/5 fresh processes), and so do 200 and 100 (5/5 each) —
+the 2026-08-03 "moved 400 -> 200" reading was a single-value observation of a
+lottery that has several losing tickets. New since then: the ENTIRE high tail
+corrupts. With no kernel cut the 512 MB byte budget cuts by itself and cuts
+badly (ops=10^9: 512 and 1024 MB wrong, 2048 MB and unlimited clean), so
+"raise the kernel budget to be safer" is exactly backwards.
+
+**Byte budget, same scan, kernels held at 800:** <=400 MB wrong (400, 384,
+256, 160, 40 all 5/5), >=416 MB clean. The shipped 512 has ~1.25x of margin
+to the edge, not the 3x the old "160 MB is the first clean value" line
+suggested.
+
+**Byte budget, `qwen3_prefill_shrunk.mlir` compiled decode, kernels at 800:**
+8, 12, 16, 24, 32, 40, 48 wrong; 56 and up clean (80 corrupted in the
+2026-08-03 note; that edge moved). Kernel budget on the same asset: 1, 2, 4
+wrong; >=8 clean, unchanged.
+
+**Shipped (800 kernels / 512 MB): clean 24/24 reps on each asset** (8 fresh
+processes x 3 reps), and it sits mid-band on the kernel axis (450-1300).
+
+Test consequence: `tests/test_command_buffer.py` no longer names one
+corrupting value in a comment. It ships two canaries that re-derive one, each
+sweeping a candidate list in subprocesses (MLX latches both budgets at load)
+and stopping at the first value that corrupts — usual cost one subprocess,
+~3 s. If NONE of them corrupts the canary fails loudly: either MLX fixed the
+bug (re-measure the workaround) or the assets stopped straddling a bad
+boundary (the canary needs a bigger graph). The bounds test now pins the
+shipped values to the measured clean bands (450-1300 kernels, 512-2048 MB)
+instead of the old, far looser >=64 / >=160.

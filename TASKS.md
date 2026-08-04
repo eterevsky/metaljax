@@ -44,12 +44,17 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   notes/data/mlx-cbuf-repro/ (repro_a/b.py + .mlxfn, only mlx+numpy;
   corrupts at MLX's STOCK defaults). Issue draft ready for Oleg:
   notes/mlx-command-buffer-upstream-issue.md.
-- **test_command_buffer canaries are stale** (found 2026-08-03): the
-  corrupting ops alignment MOVED 400 → 200 after fdc7cde's shift
-  peephole changed the threefry lowering — our own commits reshuffle
-  the lottery, and the shipped ops=800 is currently pinned by nothing.
-  Re-pin the canary values (and consider a sweep-style canary) before
-  the 0.11.3 gate.
+- ~~test_command_buffer canaries are stale~~ DONE 2026-08-04 (114b4d4):
+  re-swept both axes on both assets and replaced the pinned comment
+  values with SWEEP canaries — two tests that re-derive a corrupting
+  budget in subprocesses (candidate list, stop at the first hit; ~3 s
+  typical, ~25 s worst case) and fail loudly if none corrupts. Map:
+  kernels 50/100/200/400 wrong, 450-1300 clean, 1350-10^9 wrong (the
+  high tail is the byte budget cutting by itself); bytes <=400 wrong on
+  the scan, <=48 wrong on the compiled decode. Shipped 800/512 clean
+  24/24 reps on each asset. The bounds test now pins the shipped values
+  to those measured bands (was >=64 / >=160). notes/
+  mlx-command-buffer-split.md addendum 2026-08-04 has the tables.
 - **Quantized-decode correctness criterion**: token-stream equality is
   not usable for quantized models (notes/int8-divergence-verdict.md);
   compare_tokens.py encodes the policy — extend the logit-ladder
