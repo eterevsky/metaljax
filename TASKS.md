@@ -115,11 +115,15 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   legit working set ~50–60 GB (4× pixels). Retry at budget ~70,
   ceiling ~85, single non-chained run; same caps (COMPILE_BYTES_MB
   16384). Next-session queue, with rows 3/9/8.
-- **qmm pack transient (row 7 re-measure blocker)**: per-pack prologue
-  reclaim (02808b3) fixed the ACCUMULATION (base now stable ~28-31 GB
-  vs the old ramp-to-death) but individual packs still spike 9-15 GB
-  in a single guard sample — trajectory-killed at budgets 45 and 55.
-  Do NOT budget-creep; shrink the transient itself (chunked/streamed
-  packing over weight slices — the pack is a reinterpretation for
-  mxfp4, its transient should be near-zero; investigate why it is
-  not). Then row 7 re-measures toward the ~24 ms/tok MoE projection.
+- **qmm pack transient — RESOLVED (e04c7fc)**: row-blocked pack
+  evaluation + MLX cache off during packs; 15.9 → 1.5 GB per pack
+  (notes/qmm-pack-transient-2026-08.md). Row 7 re-measured **22.2**
+  ms/tok (STATUS footnote 23) — the ~24 MoE projection held.
+- **qmm per-executable pack REBUILD** (in progress, agent out):
+  keras-hub builds one executable per generate length; each new State's
+  matches re-evaluate + re-verify every weight (~0.9 s × 94/shape,
+  ~200 s build_s on row 7) even though `_share` proves the results
+  content-identical. Cross-executable build cache keyed on (leaf buffer
+  identity, structural subtree fingerprint); on hit skip build+verify
+  (sound: the pack is a pure function of both). Also: per-pack
+  gc.collect cadence (~10 s/wave) and moe._dead_sweep (8.8 s/wave).

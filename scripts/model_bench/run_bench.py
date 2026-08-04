@@ -154,6 +154,18 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
     lm.generate(prompt, max_length=plen + 8)
     warmup_s = time.monotonic() - t0
 
+    # Absorb executable builds for BOTH timed shapes before timing them:
+    # keras-hub compiles a separate generate function per max_length, and a
+    # shape's first call pays jit + engine compile + (on quantized rows) the
+    # whole weight-pack wave inside the timed window -- on gpt-oss-20b that
+    # read as 96 s of "prefill" and +24 ms/tok of "decode" for one-time
+    # work the mlx-lm and torch columns never pay in theirs. The metric is
+    # steady-state latency; the one-time cost stays visible as build_s.
+    t0 = time.monotonic()
+    lm.generate(prompt, max_length=plen + 1)
+    lm.generate(prompt, max_length=plen + n_decode)
+    build_s = time.monotonic() - t0
+
     t0 = time.monotonic()
     lm.generate(prompt, max_length=plen + 1)
     prefill_ms = 1000 * (time.monotonic() - t0)
@@ -164,8 +176,9 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
     ids = [int(t) for t in lm.preprocessor.tokenizer(out)][:64]
     n_new = len(lm.preprocessor.tokenizer(out)) - plen
     decode_ms = (1000 * dt - prefill_ms) / max(n_new - 1, 1)
-    return dict(load_s=load_s, warmup_s=warmup_s, prefill_ms=prefill_ms,
-                decode_ms_tok=decode_ms, out_tokens=n_new, token_ids=ids,
+    return dict(load_s=load_s, warmup_s=warmup_s, build_s=build_s,
+                prefill_ms=prefill_ms, decode_ms_tok=decode_ms,
+                out_tokens=n_new, token_ids=ids,
                 prompt_tokens=plen, stream_load=stream_info)
 
 

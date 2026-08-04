@@ -2,13 +2,15 @@
 
 *(Harness and manifest: [scripts/model_bench/](scripts/model_bench/).)*
 
-*Last updated: 2026-08-03 — FINAL for the 0.11.2 baseline: all cells
-from the sequential release-gate run at shipped defaults (ops=800,
-bytes=512 MB), token agreement audited (4 bf16 rows exact; 2 certified
-tie-flips within 1–2 bf16 ULPs, see footnote 21; quantized rows per the
-int8 certification). Headline metric per cell: LLM rows = warm decode
-ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
-✗ = established impossible (with the measured reason).*
+*Last updated: 2026-08-04 — 0.11.2 baseline cells are FINAL (sequential
+release-gate run at shipped defaults, token agreement audited per
+footnotes 21/22); rows re-measured on the 0.11.3 tree are marked by
+footnote (row 7 so far, footnote 23). As of the 2026-08-04 harness,
+prefill/decode absorb per-shape executable builds first (steady-state
+metric; one-time cost reported as build_s — footnote 23). Headline
+metric per cell: LLM rows = warm decode ms/token; vision = forward ms;
+diffusion = ms/step; training = ms/step. ✗ = established impossible
+(with the measured reason).*
 
 | # | benchmark | jax CPU | metaljax | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|
@@ -18,7 +20,7 @@ ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
 | 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | 10.5 ¹⁵ | — | — |
 | 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
 | 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
-| 7 | gpt-oss-20b | ✗ ⁴ | **39.6** (23.9 GB, native MXFP4) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
+| 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | ✗ warmup transients ¹⁷ | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | **10.6** | — | — |
@@ -39,10 +41,11 @@ ms/token; vision = forward ms; diffusion = ms/step; training = ms/step.
 
 **mlx-lm gap band (same Metal library underneath — the C++-rewrite
 target):** bf16 dense decode 1.7–2.6× (Qwen3-8B 60.4 vs 30.4; Llama
-57.3 vs 29.4; 12B 97.1 vs 58.3; 31B 350 vs 137); gpt-oss 25×
-(native-MXFP4 quantized_matmul + our dispatch compounded); MoE 16.7×
-(284 vs 17.0). llama.cpp leads mlx-lm a further ~1.25× on bf16 — the
-kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
+57.3 vs 29.4; 12B 97.1 vs 58.3; 31B 350 vs 137); gpt-oss 2.5×
+(22.2 vs 8.8 — MXFP4 quantized_matmul + expert gather on both sides,
+footnote 23); MoE-dense 16.7× (284 vs 17.0, row 3 re-measure with the
+gather path pending). llama.cpp leads mlx-lm a further ~1.25× on bf16 —
+the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
 
 ## Footnotes
 
@@ -182,6 +185,29 @@ kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     (3.1× vs bf16 — the int64 cliff). NB token-stream equality is not
     a usable correctness criterion for quantized decode; use the
     logit-delta ladder.
+23. Row 7 arc (2026-08-04): 222 (dense-dequant) → 39.6 (native MXFP4,
+    0.11.2) → **22.2** with the MoE expert-gather engaged (47 dispatches)
+    and TWO fixes that were prerequisites, both on the 0.11.3 tree:
+    (a) qmm row-blocked pack evaluation (e04c7fc,
+    notes/qmm-pack-transient-2026-08.md) — the 9–15 GB per-pack
+    transients that trajectory-killed every earlier re-measure are now
+    ~1.5 GB; run peaks at 25.0 GB under a 45 GB guard. (b) HARNESS
+    metric fix: keras-hub compiles a separate generate executable per
+    max_length, and each shape's first call was paying jit + engine
+    compile + the whole qmm pack wave inside the TIMED window — row 7's
+    "96 s prefill" was ~99% one-time build, and its measured decode
+    varied 37–54 ms/tok with the wave's tail. run_bench.py now absorbs
+    both timed shapes first (reported as build_s; 200 s here — the
+    per-executable pack REBUILD it contains is the next cost to fall,
+    packs are content-identical across executables); steady-state
+    decode profiled flat at ~30 ms/tok under cProfile overhead, 22.2
+    clean. Applies to all keras rows; materially moves only the
+    quantized ones (7, 13). Greedy tokens vs the 39.6 run agree 55/64
+    then flip once — benign reassociation (expert-gather sums 4 experts
+    in a different order than dense-all-experts); footnote 22's ladder
+    policy applies. Eager-discipline A/B (prune/flush/sdpa off) is
+    IDENTICAL at steady state (29.9 vs 30.1 ms/tok) — the disciplines
+    cost nothing where it counts; defaults unchanged.
 
 ## Bug ledger (found by this suite)
 
@@ -200,6 +226,11 @@ kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
 - **SD3.5 black image** (RESOLVED by 28ad2eb, same MLX bug): footnote 9.
 - **sentencepiece SIGABRT** (worked around): footnote 1.
 - **int8 dot_general int64 cliff** (known, measured): footnote 8.
-- **MoE dense-expert lowering** (open, measured 27.8×): footnote 16.
+- **MoE dense-expert lowering** (FIXED for row 7, 2310aa2 expert
+  gather: 39.6→22.2; row 3 re-measure pending): footnote 16.
+- **Per-shape executable builds timed as prefill/decode** (FIXED in the
+  harness, build-absorb + build_s column): footnote 23. Underlying
+  per-executable pack rebuild (~0.9 s × 94/shape) open — build cache in
+  progress.
 - **keras load-path memory** (open, blocks ≥60 GB keras rows): footnote 17.
 - **int4 unpack re-materialization on metal** (open, 11.7×): footnote 18.
