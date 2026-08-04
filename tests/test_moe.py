@@ -189,6 +189,115 @@ def test_router_scores_also_returned():
 
 
 # --------------------------------------------------------------------------
+# keras-hub's Gemma4 block: a per-expert scale, and DECODE (T = 1)
+# --------------------------------------------------------------------------
+#
+# The block below is `Gemma4Router` + `Gemma4MoEBlock` written in plain
+# `jax.numpy`. It differs from the gpt-oss one above in a single structural
+# way that turns out to matter: a per-expert OUTPUT SCALE, `[E]` reshaped to
+# `[E, 1, 1]` and broadcast over the `[E, T, H]` expert outputs.
+#
+# At T = 1 that broadcast's token axis is a UNIT axis, and so is the token
+# axis it is broadcast to -- reading the source axis as "the token axis"
+# instead of as a broadcast demands a token axis from `[E]`, which has none,
+# and rejected every DECODE step of gemma4-26B-A4B while its prefill fused.
+# T is parametrised over 1 and >1 for exactly that reason.
+
+
+def gemma4_scores(x, proj, per_dim, k):
+    """`Gemma4Router.call`: softmax -> top-k -> renormalise -> one-hot."""
+    H = x.shape[-1]
+    normed = x * jax.lax.rsqrt(
+        jnp.mean(jnp.square(x), axis=-1, keepdims=True) + 1e-6)
+    normed = normed * jnp.asarray(H ** -0.5, x.dtype) * per_dim
+    probs = jax.nn.softmax(normed @ proj, axis=-1)
+    _v, idx = jax.lax.top_k(probs, k)
+    w = jnp.take_along_axis(probs, idx, axis=-1)
+    w = w / jnp.maximum(jnp.sum(w, axis=-1, keepdims=True),
+                        jnp.asarray(1e-9, w.dtype))
+    hot = jax.nn.one_hot(idx, proj.shape[-1], dtype=w.dtype)
+    return jnp.sum(hot * w[..., None], axis=1)
+
+
+def gemma4_experts(x, wg, wu, wd, escale):
+    """`down(gelu(gate(x)) * up(x))`, then the per-expert scale -- [E, T, H]."""
+    g = jnp.einsum("th,ehi->eti", x, wg)
+    u = jnp.einsum("th,ehi->eti", x, wu)
+    y = jnp.einsum("eti,eih->eth", jax.nn.gelu(g, approximate=True) * u, wd)
+    return y * jnp.reshape(escale, (escale.shape[0], 1, 1))
+
+
+def gemma4_block(x, proj, per_dim, wg, wu, wd, escale, k):
+    s = gemma4_scores(x, proj, per_dim, k)
+    y = gemma4_experts(x, wg, wu, wd, escale)
+    return jnp.sum(y * s.T[..., None], axis=0)
+
+
+def make_gemma4(E, T, H, I, seed=0, dtype=np.float32):
+    rng = np.random.default_rng(seed)
+
+    def n(*shape):
+        return (rng.standard_normal(shape) / np.sqrt(H)).astype(dtype)
+
+    return [n(T, H), n(H, E), n(H), n(E, H, I), n(E, H, I), n(E, I, H),
+            (1.0 + rng.standard_normal(E) / 8).astype(dtype)]
+
+
+@needs_moe
+@pytest.mark.parametrize("T", [1, 6])
+@pytest.mark.parametrize("E,k", [(4, 2), (8, 4)])
+def test_gemma4_block_gathered(T, E, k):
+    args = make_gemma4(E, T, 64, 32, seed=T * 100 + E)
+    f = lambda *a: gemma4_block(*a, k=k)
+    moe.reset_stats()
+    got = _run(f, args, _metal())
+    st = moe.stats()
+    assert st["recognized"] == 1, st
+    assert st["verified"] == 1, st
+    assert st["gather_mm"] >= 3, st       # gate, up and down projections
+    want = _run(f, args, _cpu())
+    assert got.shape == want.shape == (T, 64)
+    np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
+
+
+@needs_moe
+@pytest.mark.parametrize("dtype", [np.float32, "bfloat16"])
+def test_gemma4_decode_loop_gathered(dtype):
+    """Prefill plus a decode step INSIDE a while body, as generate emits it.
+
+    Both dispatches must be gathered: the `[T, H]` prefill and the `[1, H]`
+    step whose token axis exists only as a unit dimension. The loop is a
+    `while_loop` because that is what a sampler emits (keras' `ops.while_loop`
+    with a python body) -- its body is inlined into the while region, where
+    the recognizer looks. A `fori_loop` body arrives as a private `func.func`
+    reached by a call instead, and is NOT searched (see `moe.analyze`).
+    """
+    import ml_dtypes
+    dt = ml_dtypes.bfloat16 if dtype == "bfloat16" else np.float32
+    args = make_gemma4(8, 5, 64, 32, seed=57, dtype=dt)
+
+    def f(x, *w):
+        pre = gemma4_block(x, *w, k=2)                 # [T, H]  prefill
+
+        def body(c):
+            i, tok = c
+            return i + 1, gemma4_block(tok, *w, k=2)   # [1, H]  decode step
+
+        _i, tok = jax.lax.while_loop(lambda c: c[0] < 3, body, (0, pre[-1:]))
+        return pre, tok
+
+    moe.reset_stats()
+    got = _run(f, args, _metal())
+    st = moe.stats()
+    assert st["recognized"] == 2, st                   # prefill AND decode
+    assert st["verified"] == 2, st
+    want = _run(f, args, _cpu())
+    tol = 4e-2 if dt is not np.float32 else 2e-5
+    for g, wn in zip(got, want):
+        np.testing.assert_allclose(g, wn, rtol=tol, atol=tol)
+
+
+# --------------------------------------------------------------------------
 # fail-closed cases
 # --------------------------------------------------------------------------
 
@@ -240,6 +349,26 @@ def test_capacity_style_mask_does_not_fuse():
         return jnp.sum(y * s.T[..., None], axis=0)
 
     _expect_no_fusion(f, _args(w))
+
+
+@needs_moe
+@pytest.mark.parametrize("T", [1, 6])
+def test_gemma4_dense_router_does_not_fuse(T):
+    """The near miss for the decode form: same block, no top-k.
+
+    T = 1 is the point. The unit token axis now walks the planner all the way
+    to the router instead of stopping at the per-expert scale, so the top-k
+    proof is the only thing left standing between a decode step and a wrong
+    answer -- every expert is really routed here and nothing may be skipped.
+    """
+    args = make_gemma4(8, T, 64, 32, seed=61)
+
+    def f(x, proj, per_dim, wg, wu, wd, escale):
+        s = jax.nn.softmax(x @ proj, axis=-1)
+        y = gemma4_experts(x, wg, wu, wd, escale)
+        return jnp.sum(y * s.T[..., None], axis=0)
+
+    _expect_no_fusion(f, args)
 
 
 @needs_moe
@@ -384,8 +513,11 @@ def moe_block_mxfp4(x, wr, br, gu_c, gu_s, d_c, d_s, bgu, bd, H, I, k):
 
 @needs_moe
 @pytest.mark.parametrize("E,k", [(4, 2), (8, 4)])
-def test_mxfp4_experts_gathered(E, k):
-    T, H, I = 3, 64, 32
+@pytest.mark.parametrize("T", [1, 3])
+def test_mxfp4_experts_gathered(E, k, T):
+    # T = 1 is gpt-oss' decode step: the packed path through the same
+    # unit-token-axis planning the gemma4 tests above cover for gather_mm.
+    H, I = 64, 32
     rng = np.random.default_rng(E)
     gu_c, gu_s, gu_ref = make_mxfp4(2 * I, H, E, seed=E)
     d_c, d_s, d_ref = make_mxfp4(H, I, E, seed=E + 1)

@@ -625,13 +625,21 @@ class _Planner:
             if d not in (ea, ta):
                 continue
             full = self.E if d == ea else self.T
-            if sshape[j] == full:
+            # A UNIT source axis is a BROADCAST, never the axis itself. The
+            # two tests overlap when the axis is degenerate -- T = 1, which
+            # is every decode step -- and reading the unit axis as "the token
+            # axis" is what kept gemma4-26B-A4B's decode dense: it demands a
+            # token axis from everything upstream, and a per-expert scale of
+            # shape [E] has none. Reading it as a broadcast is exact (a
+            # size-1 axis broadcast to size 1 is the identity) and it is what
+            # the T > 1 graph does with the same value.
+            if sshape[j] == 1:
+                drop.add(j)
+            elif sshape[j] == full:
                 if d == ea:
                     bea = j
                 else:
                     bta = j
-            elif sshape[j] == 1:
-                drop.add(j)
             else:
                 raise _Reject("expert/token axis broadcast from a part")
         node = self.plan(src, frame, bea, bta)
@@ -1006,7 +1014,15 @@ def _analyze_root(interp, qst, block, root):
 
 
 def analyze(interp, qst):
-    """Find gatherable MoE dispatches and extend `qst` with them."""
+    """Find gatherable MoE dispatches and extend `qst` with them.
+
+    Every block reachable from `@main` is searched, which includes the bodies
+    of `while` / `if` regions -- a sampler's decode step is a MoE dispatch
+    like any other and must fuse like one. A body that arrives as a separate
+    private `func.func` reached by a `func.call` (a `fori_loop` lowers that
+    way; an `ops.while_loop` with a python body does not) is NOT searched:
+    the rewrite would have to reason about every call site's environment.
+    """
     if not ENABLED:
         return
     found = []
@@ -1021,8 +1037,15 @@ def analyze(interp, qst):
                         found.append(_analyze_root(interp, qst, block, o))
                     except _Reject as e:
                         if _DEBUG and _looks_like_moe(o):
+                            # The shape is half the diagnostic: prefill and
+                            # decode dispatches of the same layer differ only
+                            # in their token axis, and a census that cannot
+                            # tell [E, 58, H] from [E, 1, H] cannot say which
+                            # of the two is falling out.
+                            shp = "x".join(
+                                str(s) for s in _shape(o.operands[0]))
                             print(f"[metaljax] moe: rejected a candidate "
-                                  f"({e})", flush=True)
+                                  f"{shp} ({e})", flush=True)
                     except Exception as e:   # analysis must never break a run
                         if _DEBUG:
                             print(f"[metaljax] moe: analysis error ({e})",
