@@ -22,6 +22,31 @@ from jaxlib.mlir import ir
 from metaljax import _ir, dtypes, qmm
 from metaljax.interpreter import Interpreter
 
+# --- Stage 2: the native replay engine (notes/cpp-migration-plan.md) ---
+# METALJAX_ENGINE=native loads the C++ extension (native/build.sh) and,
+# milestone by milestone, moves the runtime path there. Python remains
+# the reference engine and the fallback for any program the native side
+# does not support; "py" (default) never touches the extension.
+ENGINE = os.environ.get("METALJAX_ENGINE", "py")
+NATIVE = None
+if ENGINE == "native":
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(__file__),
+                                     "..", "..", "native", "build"))
+    import metaljax_native as NATIVE  # noqa: N812
+    # libmlx has no stable ABI: refuse a skewed native engine loudly at
+    # import instead of corrupting at runtime. All three must agree —
+    # the headers the extension compiled against, the libmlx it linked,
+    # and the mlx the Python side imports (version lives on mlx.core;
+    # the bare mlx package does not export it).
+    _vers = (NATIVE.compiled_mlx_version(), NATIVE.linked_mlx_version(),
+             mx.__version__)
+    if len(set(_vers)) != 1:
+        raise ImportError(
+            f"metaljax native engine: mlx version skew {_vers} "
+            f"(compiled/linked/python) — rebuild native/build.sh against "
+            f"the installed mlx wheel")
+
 # PJRT_Buffer_Type enum values (pjrt_c_api.h, PJRT API 0.114).
 _PJRT_TYPES = [
     "INVALID", "PRED", "S8", "S16", "S32", "S64", "U8", "U16", "U32", "U64",
