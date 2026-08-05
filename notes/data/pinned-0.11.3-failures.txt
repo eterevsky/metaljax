@@ -1,0 +1,146 @@
+# Pinned jax-v0.11.0 suite — release 0.11.3 gate artifact
+# Sequential run, 2026-08-05, tree 0012813; 28,067 passed / 132 failed = 99.53% (45.1 min after the gc-duty fix)
+# 130 entries inherited from the 0.11.0 whitelist (all still failing, zero fixed, zero new in their classes).
+#
+# TRACKED-OPEN (per Oleg 2026-08-05: NOT whitelisted-benign — serious
+# class, wrong values — but non-blocking for 0.11.3; scheduled for
+# fix soon after the C++ migration, together with the blocked model
+# rows 8/10/12/15. Pre-existing in released 0.11.0 (approval tree
+# fails the same 283-test-prefix repro identically); position-
+# dependent; lottery-classification experiment is the first step.
+# See TASKS.md 'position-dependent silent wrongness in sparse'.
+jax-v0.11.0/tests/sparse_bcoo_bcsr_test.py::BCOOTest::test_bcoo_spdot_general0  # TRACKED-OPEN
+jax-v0.11.0/tests/sparse_bcoo_bcsr_test.py::BCOOTest::test_bcoo_spdot_general6  # TRACKED-OPEN
+#
+# --- inherited 0.11.0 whitelist below ---
+
+jax-v0.11.0/tests/aot_test.py::JaxAotTest::test_get_topology_from_devices
+jax-v0.11.0/tests/aot_test.py::JaxAotTest::test_topology_jit_serialize
+jax-v0.11.0/tests/api_test.py::APITest::test_dtype_warning0
+jax-v0.11.0/tests/api_test.py::APITest::test_dtype_warning1
+jax-v0.11.0/tests/api_test.py::APITest::test_dtype_warning3
+jax-v0.11.0/tests/api_test.py::APITest::test_inline_optimized_hlo
+jax-v0.11.0/tests/api_test.py::AutodidaxTest::test_autodidax_smoketest
+jax-v0.11.0/tests/api_test.py::JitTest::test_double_donation
+jax-v0.11.0/tests/api_test.py::JitTest::test_print_token_buffer_error
+jax-v0.11.0/tests/async_collectives_test.py::AsyncCollectivesTest::test_async_all_gather
+jax-v0.11.0/tests/async_collectives_test.py::AsyncCollectivesTest::test_async_all_to_all
+jax-v0.11.0/tests/async_collectives_test.py::AsyncCollectivesTest::test_async_ppermute
+jax-v0.11.0/tests/async_collectives_test.py::AsyncCollectivesTest::test_async_psum
+jax-v0.11.0/tests/async_collectives_test.py::AsyncCollectivesTest::test_async_psum_scatter
+jax-v0.11.0/tests/buffer_callback_test.py::BufferCallbackTest::test_side_effect
+jax-v0.11.0/tests/checkify_test.py::AssertPrimitiveTests::test_assert_primitive_lowering
+jax-v0.11.0/tests/checkify_test.py::AssertPrimitiveTests::test_debug_check_noop
+jax-v0.11.0/tests/compilation_cache_test.py::CompilationCacheDisabledTest::test_jit
+jax-v0.11.0/tests/core_test.py::CoreTest::test_reference_cycles
+jax-v0.11.0/tests/core_test.py::CoreTest::test_reference_cycles_jit
+jax-v0.11.0/tests/export_back_compat_test.py::CompatTest::test_custom_call_coverage
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_2x32_shape_shape_100_100_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_2x32_shape_shape_3_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_2x32_shape_shape_5_7_4_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_broadcasting_shape_float32_4_8_1_1_dimension_1
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_broadcasting_shape_float32_4_8_1_1_dimension_2
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_dtypes_shape_bfloat16_2_3_dimension_0
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_dtypes_shape_complex64_2_3_dimension_0
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_dtypes_shape_float16_2_3_dimension_0
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_dtypes_shape_float32_2_3_dimension_0
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_dtypes_shape_int16_2_3_dimension_0
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_dtypes_shape_int32_2_3_dimension_0
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_dtypes_shape_int8_2_3_dimension_0
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_dtypes_shape_uint16_2_3_dimension_0
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_dtypes_shape_uint32_2_3_dimension_0
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_iota_dtypes_shape_uint8_2_3_dimension_0
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_randint_shape_int16_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_randint_shape_int16_32_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_randint_shape_int16_5_4_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_randint_shape_int32_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_randint_shape_int32_32_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_randint_shape_int32_5_4_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_randint_shape_int8_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_randint_shape_int8_32_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_randint_shape_int8_5_4_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_split_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_uniform_shape_bfloat16_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_uniform_shape_bfloat16_32_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_uniform_shape_bfloat16_5_4_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_uniform_shape_float16_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_uniform_shape_float16_32_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_uniform_shape_float16_5_4_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_uniform_shape_float32_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_uniform_shape_float32_32_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_random_uniform_shape_float32_5_4_
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_sign_special_0_dtype_bfloat16
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_sign_special_0_dtype_complex64
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_sign_special_0_dtype_float16
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_sign_special_0_dtype_float32
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_sign_special_0_dtype_int16
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_sign_special_0_dtype_int32
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_sign_special_0_dtype_int8
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_sign_special_0_dtype_uint16
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_sign_special_0_dtype_uint32
+jax-v0.11.0/tests/export_harnesses_multi_platform_test.py::PrimitiveTest::test_prim_sign_special_0_dtype_uint8
+jax-v0.11.0/tests/export_test.py::JaxExportTest::test_memory_space_from_arg
+jax-v0.11.0/tests/export_test.py::JaxExportTest::test_memory_space_from_out_shardings
+jax-v0.11.0/tests/export_test.py::JaxExportTest::test_multi_platform_and_poly
+jax-v0.11.0/tests/export_test.py::JaxExportTest::test_multi_platform_mlir_lower_fun_with_platform_specific_primitives
+jax-v0.11.0/tests/export_test.py::JaxExportTest::test_multi_platform_nested_inside_single_platform_export
+jax-v0.11.0/tests/export_test.py::JaxExportTest::test_ordered_effects_multi_platform_and_poly_v_10
+jax-v0.11.0/tests/export_test.py::JaxExportTest::test_ordered_effects_multi_platform_and_poly_v_9
+jax-v0.11.0/tests/jaxpr_effects_test.py::EffectOrderingTest::test_can_execute_python_callback
+jax-v0.11.0/tests/lax_control_flow_test.py::LaxControlFlowTest::testScanGrad_jit_scan=False_jit_f=False_impl=unroll0
+jax-v0.11.0/tests/lax_numpy_operators_test.py::JaxNumpyOperatorTests::testSpacingSubnormals0
+jax-v0.11.0/tests/lax_test.py::LaxTest::test_dce_sink_prevents_xla_dce
+jax-v0.11.0/tests/layout_test.py::LayoutTest::test_device_put_user_concrete_layout
+jax-v0.11.0/tests/linalg_test.py::NumpyLinalgTest::testQrInvalidDtypeCPU
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testCallableMatricesF64geom_cond_100k
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testCallableMatricesF64geom_cond_1k
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testCallableMatricesF64id
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testCallableMatricesF64linear_cond_100k
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testCallableMatricesF64linear_cond_1k
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testCallableMatricesF64randn
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testCallableMatricesF64ring_laplacian
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testCallableMatricesF64sparse_10_
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testCallableMatricesF64sparse_1_
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgConsistencyF64cluster_k_1__n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgConsistencyF64cluster_k_2__n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgConsistencyF64cluster_k__n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgConsistencyF64geom_cond_100k_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgConsistencyF64geom_cond_1k_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgConsistencyF64id_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgConsistencyF64linear_cond_100k_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgConsistencyF64linear_cond_1k_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgConsistencyF64ring_laplacian_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgMonotonicityF64cluster_k_1__n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgMonotonicityF64cluster_k_2__n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgMonotonicityF64cluster_k__n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgMonotonicityF64geom_cond_100k_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgMonotonicityF64geom_cond_1k_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgMonotonicityF64id_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgMonotonicityF64linear_cond_100k_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgMonotonicityF64linear_cond_1k_n100
+jax-v0.11.0/tests/lobpcg_test.py::F64LobpcgTest::testLobpcgMonotonicityF64ring_laplacian_n100
+jax-v0.11.0/tests/logging_test.py::LoggingTest::test_subprocess_stderr_debug_logging
+jax-v0.11.0/tests/logging_test.py::LoggingTest::test_subprocess_stderr_info_logging
+jax-v0.11.0/tests/memories_test.py::StreamAnnotationTest::test_compute_on2_out_mem_space
+jax-v0.11.0/tests/memories_test.py::StreamAnnotationTest::test_compute_on2_out_mem_space_tuple
+jax-v0.11.0/tests/nn_test.py::NNFunctionsTest::testDotProductAttentionFloat64MaskDebugInfs
+jax-v0.11.0/tests/profiler_session_test.py::ProfilerSessionTest::test_programmatic_profiling_with_custom_session_id
+jax-v0.11.0/tests/profiler_session_test.py::ProfilerSessionTest::test_programmatic_profiling_with_empty_session_id
+jax-v0.11.0/tests/profiler_session_test.py::ProfilerSessionTest::test_programmatic_profiling_without_session_id
+jax-v0.11.0/tests/shape_poly_test.py::ShapePolyHarnessesTest::test_harness_jnp_insert_insert_constant
+jax-v0.11.0/tests/shape_poly_test.py::ShapePolyHarnessesTest::test_harness_jnp_insert_insert_poly
+jax-v0.11.0/tests/shape_poly_test.py::ShapePolyHarnessesTest::test_harness_jnp_nonzero_size_constant
+jax-v0.11.0/tests/shape_poly_test.py::ShapePolyHarnessesTest::test_harness_jnp_nonzero_size_poly
+jax-v0.11.0/tests/shard_alike_test.py::ShardAlikeTest::test_sharding_preserverd_single_device
+jax-v0.11.0/tests/shard_map_test.py::ShardMapTest::test_custom_linear_solve_rep_rules
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_custom_jvp
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_custom_vjp
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_jit_cache
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_mul
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_sin
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_while_loop0
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_while_loop1
+jax-v0.11.0/tests/xla_transform_test.py::XlaTransformE2ETest::test_simple_transform_preserves_donation_and_aliasing
+jax-v0.11.0/tests/xla_transform_test.py::XlaTransformTest::test_clear_transform
+jax-v0.11.0/tests/xla_transform_test.py::XlaTransformTest::test_sin_to_cos0
+jax-v0.11.0/tests/xla_transform_test.py::XlaTransformTest::test_sin_to_cos1

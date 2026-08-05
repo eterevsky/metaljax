@@ -71,9 +71,12 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   command-buffer lottery (process allocation state changes the draw)
   — investigate post-0.11.3; candidate datapoint for the upstream
   report. Repro command in the 2026-08-05 release-gate fixes log dir.
-  WHITELIST PROPOSAL for 0.11.3 (Oleg decides): 2 entries, class
-  "pre-existing in 0.11.0, discovered by the gc fix lengthening the
-  observed file".
+  DECIDED (Oleg, 2026-08-05): NOT whitelisted-benign — tracked-open,
+  non-blocking for 0.11.3 (notes/data/pinned-0.11.3-failures.txt
+  carries them in a separate TRACKED-OPEN section). Fix scheduled
+  soon after the C++ migration, together with the blocked model rows
+  (8/10/12/15). First step: the lottery-classification experiment
+  (283-prefix repro under METALJAX_COMPILE=0 + shifted budgets).
 
 ## Performance — C++ era (measured targets in STATUS.md)
 
