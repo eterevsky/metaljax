@@ -60,6 +60,62 @@ def test_dynamic_while_body_is_compiled():
         "the body of a dynamic while was interpreted op by op"
 
 
+# A compiled body's kernels are GENERATED AT EVAL, not by the call that
+# builds the graph. MLX fuses a wide elementwise body into a single Metal
+# kernel whose argument buffers are (non-constant inputs + outputs + up to
+# three for strides/shape/ndim), and Metal caps those at 31 -- so a body
+# reading ~29 distinct arrays dies with "Too many inputs/outputs fused in
+# the Metal Compiled primitive". Below: a wide carry combined through
+# selects, which is the shape of jax's rejection samplers (random.binomial,
+# random.multinomial) and of the hyp2f1 series -- the real programs this
+# came from. The failure surfaces at the next sync point, by which time the
+# carry has advanced past the iteration a redo could repair, so the body
+# runner probes each freshly compiled body with one synchronous eval and
+# falls back to the uncompiled body. Without that probe this dies at the
+# loop flush and the whole execute fails.
+_NWIDE = 20
+
+
+def _wide_dynamic_while(x):
+    def cond(c):
+        xs, i = c
+        # Not the counted pattern -> the dynamic path, whose body compiles.
+        return jnp.logical_and(i < 3, xs[0][0] < 1e6)
+
+    def body(c):
+        xs, i = c
+        terms = [jnp.where(xs[j] > 0, xs[j] * np.float32(1.0 + j),
+                           xs[j] - np.float32(0.5)) for j in range(_NWIDE)]
+        # Combined as a TREE: MLX stops fusing at depth 11, so a linear
+        # chain of the same width would never reach one kernel.
+        while len(terms) > 1:
+            nxt = [terms[k] + terms[k + 1] for k in range(0, len(terms) - 1, 2)]
+            if len(terms) % 2:
+                nxt.append(terms[-1])
+            terms = nxt
+        acc = terms[0]
+        return (tuple(xs[j] * 0.5 + acc * 0.001 for j in range(_NWIDE)),
+                i + 1)
+
+    xs = tuple(x + np.float32(j) for j in range(_NWIDE))
+    return jax.lax.while_loop(cond, body, (xs, jnp.int32(0)))
+
+
+def test_wide_dynamic_while_body():
+    check(_wide_dynamic_while, rng.standard_normal(8).astype(np.float32),
+          rtol=1e-5, atol=1e-5)
+
+
+def test_binomial_sampler_wide_body():
+    # The reported case: jax's btrs rejection loop is a dynamic while whose
+    # body carries 16 values and captures 12 more.
+    def f(seed):
+        key = jax.random.key(seed)
+        return jax.random.binomial(key, jnp.float32(20.0), jnp.float32(0.3),
+                                   shape=(3,))
+    check(f, np.uint32(0))
+
+
 def test_cond():
     def f(p, x):
         return jax.lax.cond(p, lambda a: a * 2.0, lambda a: a - 1.0, x)

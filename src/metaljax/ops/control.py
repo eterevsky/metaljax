@@ -788,6 +788,15 @@ class _BodyRunner:
     - anything else out of a COMPILED call (e.g. unordered_map::at on
       graphs with unused inputs): fall back to the uncompiled body for the
       rest of this program's life.
+
+    A compiled call only BUILDS the graph; MLX generates and compiles the
+    fused Metal kernels at eval, so a whole class of failures ("Too many
+    inputs/outputs fused ...": a fused elementwise chain over more than
+    Metal's 31 argument buffers) lands at the next sync point instead of
+    at the call — by which time the carry has advanced past the iteration
+    a redo could repair. The first call of each freshly bound compiled
+    body is therefore evaluated synchronously, so those failures surface
+    HERE, with `vals` still the caller's untouched input.
     """
 
     def __init__(self, interp, body_block, env, repeat=1):
@@ -802,6 +811,11 @@ class _BodyRunner:
         self.fn, free, self.compiled = _body_fn(
             self.interp, self.block, compile_body=True, repeat=self.repeat)
         self.captures = _captures(self.interp, self.env, free)
+        # Probe the freshly bound compiled body once (see class docstring).
+        # One sync per loop ENTRY: the shapes are fixed for the life of the
+        # loop, so one buildable call proves every later one. Uncompiled
+        # bodies build no kernels of their own and need no probe.
+        self._probe = self.compiled
 
     def _drop_compiled(self):
         # _body_fn consults _no_body_compile, so rebinding now yields the
@@ -814,6 +828,13 @@ class _BodyRunner:
         """One iteration: the next carry, or None when it must be redone."""
         try:
             out = list(self.fn(*vals, *self.captures))
+            if self._probe:
+                # Inside the try on purpose: this is where a body MLX
+                # cannot generate kernels for reports itself. Synchronous
+                # (not async_eval) — a Metal build error raised on a
+                # worker thread aborts the process.
+                mx.eval(*out)
+                self._probe = False
             self._limit_retries = 0
             return out
         except (RuntimeError, IndexError, ValueError) as e:
