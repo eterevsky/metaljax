@@ -11,6 +11,7 @@ import ctypes
 import gc
 import hashlib
 import os
+import time
 
 import ml_dtypes
 import mlx.core as mx
@@ -62,6 +63,56 @@ _ENUM_TO_NP = {
     _ENUM["U4"]: np.dtype(ml_dtypes.uint4),
 }
 _NP_TO_ENUM = {v: k for k, v in _ENUM_TO_NP.items()}
+
+
+# --------------------------------------------------------------------------
+# heap reclamation
+# --------------------------------------------------------------------------
+
+# Reclamation points (compile boundaries, the execute backstop, buffer-limit
+# recovery) collect Python cycles before clearing MLX's cache: dead managers
+# and executables routinely sit in reference cycles, and clear_cache cannot
+# free a buffer something still references (CLAUDE.md item 19).
+#
+# gc.collect() walks the WHOLE live heap, so it costs what the process holds,
+# not what the boundary it guards left behind: ~20 ms into a fresh jax
+# process, 130 ms once its caches have grown, ~100 ms on an LLM-sized heap.
+# Programs arrive at wildly different rates -- a training worker compiles
+# once per configuration, but eager per-primitive dispatch compiles one
+# program per operation, and then the cost lands on every one of them
+# (jax's sparse_bcoo_bcsr_test: 2,574 compiles in 60 tests, 83% of the
+# file's wall time inside gc.collect, growing with the heap the whole way:
+# the 3600 s release-gate timeout).
+#
+# So amortize by measured cost, not by a period: a collection here may take
+# at most 1/_GC_DUTY of the wall time since the last one, which bounds the
+# overhead at any heap size and still collects often in absolute terms
+# (130 ms collection -> at most one every 6.5 s). Recovery paths force a
+# collection regardless -- those run because memory has actually run out.
+# METALJAX_COMPILE_GC_DUTY=0 restores a collection at every boundary.
+_GC_DUTY = float(os.environ.get("METALJAX_COMPILE_GC_DUTY", "50"))
+_gc_deadline = 0.0
+
+GC_STATS = {"collections": 0, "skipped": 0, "seconds": 0.0}
+
+
+def reclaim(force: bool = False) -> bool:
+    """Collect cycles (duty-limited unless `force`) and clear MLX's cache."""
+    global _gc_deadline
+    now = time.monotonic()
+    if force or not _GC_DUTY or now >= _gc_deadline:
+        gc.collect()
+        done = time.monotonic()
+        GC_STATS["collections"] += 1
+        GC_STATS["seconds"] += done - now
+        _gc_deadline = done + _GC_DUTY * (done - now)
+        collected = True
+    else:
+        GC_STATS["skipped"] += 1
+        collected = False
+    # Cheap and heap-independent: always worth doing at a reclamation point.
+    mx.clear_cache()
+    return collected
 
 
 class MetalBuffer:
@@ -282,13 +333,13 @@ def compile_program(code: bytes, fmt: str,
     from metaljax import compile_options as _copts
     _copts.validate(options)
     # New program = config boundary: cached buffers from prior shapes are
-    # dead weight against the Metal buffer-count limit. gc.collect() first:
-    # dead managers/executables often sit in reference cycles (Python's gc
-    # triggers on allocation counts, which array workloads barely tick),
-    # and each pins its mx.compile traces and plan arrays — clear_cache
-    # cannot free buffers that are still referenced.
-    gc.collect()
-    mx.clear_cache()
+    # dead weight against the Metal buffer-count limit, and the managers and
+    # executables that pinned them often sit in reference cycles (Python's
+    # gc triggers on allocation counts, which array workloads barely tick).
+    # `reclaim` collects those, duty-limited: see its comment — a compile
+    # boundary is where reclamation is CHEAPEST to reach, not where it is
+    # urgent, and one compiled program is not evidence that anything died.
+    reclaim()
     from jaxlib.mlir.dialects import stablehlo
 
     ctx = _ir.make_context()
@@ -335,8 +386,9 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
     global _exec_count
     _exec_count += 1
     if _CLEAR_PERIOD and _exec_count % _CLEAR_PERIOD == 0:
-        gc.collect()  # array workloads rarely trip Python's own gc
-        mx.clear_cache()
+        # 50k executes is evidence of real work, not of a cheap boundary:
+        # collect whatever the duty cycle would have deferred.
+        reclaim(force=True)
     args = [b.data for b in buffers]
     if args and ex.sync_inputs:
         mx.eval(*args)
@@ -410,13 +462,18 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
                       f"kernel(s) for this program and retrying", flush=True)
             ex.disable_msl(suspect)
             retry = "same"
-        gc.collect()  # dead refcycles pin executables clear_cache can't free
-        mx.clear_cache()
+        # A retry only happens after something failed for want of resources:
+        # force the collection the duty cycle may be holding back (dead
+        # refcycles pin executables clear_cache cannot free).
+        reclaim(force=True)
         runner = ex.interpreter if retry == "eager" else ex.runner()
         outs = list(runner(*args))
         if outs:
             mx.eval(*outs)
     if os.environ.get("METALJAX_MEMDBG", "") == "1":
+        print(f"[metaljax-mem] gc: {GC_STATS['collections']} collections "
+              f"({GC_STATS['seconds']:.1f}s), "
+              f"{GC_STATS['skipped']} deferred by the duty cycle", flush=True)
         print(f"[metaljax-mem] execute done: "
               f"active={mx.get_active_memory()}B "
               f"cache={mx.get_cache_memory()}B", flush=True)

@@ -59,6 +59,21 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   not usable for quantized models (notes/int8-divergence-verdict.md);
   compare_tokens.py encodes the policy — extend the logit-ladder
   method if quantized rows multiply.
+- **NEW (discovered 2026-08-05, present in RELEASED 0.11.0):
+  position-dependent silent wrongness in sparse spdot_general** —
+  `BCOOTest::test_bcoo_spdot_general0/6` produce WRONG VALUES (8/90
+  elements, max abs diff 1.97 — not tolerance) only deep into a long
+  process (a 283-test prefix reproduces; standalone passes). Proven
+  NOT a 0.11.3 regression: the 0.11.0 approval tree 725bd84 fails
+  identically; the approval run never saw it because the per-file
+  gc-quadratic (now fixed) masked the tail of the file and the
+  specific prefix. Position dependence smells like the MLX
+  command-buffer lottery (process allocation state changes the draw)
+  — investigate post-0.11.3; candidate datapoint for the upstream
+  report. Repro command in the 2026-08-05 release-gate fixes log dir.
+  WHITELIST PROPOSAL for 0.11.3 (Oleg decides): 2 entries, class
+  "pre-existing in 0.11.0, discovered by the gc fix lengthening the
+  observed file".
 
 ## Performance — C++ era (measured targets in STATUS.md)
 
