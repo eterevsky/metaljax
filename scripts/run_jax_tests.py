@@ -31,6 +31,33 @@ PY = ROOT / ".venv" / "bin" / "python"
 COUNT_RE = re.compile(
     r"(\d+) (passed|failed|skipped|error|errors|xfailed|xpassed)")
 
+# Optional third-party packages the upstream suite imports. Missing ones do
+# not announce themselves: without `flatbuffers`, jax.export's serializer
+# raises ImportError from inside test bodies (5 phantom failures in the
+# 2026-08-05 gate: export_test::test_dict_non_string_key and the four
+# error_check_test AOT tests) and export_serialization_back_compat_test dies
+# at collection, so its 21 tests vanish from the totals instead of failing.
+# Check up front and say so.
+OPTIONAL_DEPS = {
+    "flatbuffers": "jax.export serialization — export_test, error_check_test "
+                   "AOT tests, export_serialization_back_compat_test",
+    "hypothesis": "hypothesis_test_util_test, state_test (also need jax "
+                  "internals newer than 0.11 — expected to stay red)",
+}
+
+
+def missing_optional_deps():
+    """Return {name: what it affects} for optional deps PY cannot import."""
+    probe = ("import importlib.util,sys;"
+             "print(' '.join(n for n in sys.argv[1:]"
+             " if importlib.util.find_spec(n) is None))")
+    try:
+        out = subprocess.run([str(PY), "-c", probe, *OPTIONAL_DEPS],
+                             capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return {n: OPTIONAL_DEPS[n] for n in out.stdout.split()}
+
 
 def run_file(path: Path, outdir: Path, timeout: int):
     env = dict(os.environ)
@@ -97,6 +124,17 @@ def main():
     if args.filter:
         files = [p for p in files if args.filter in p.name]
     print(f"{len(files)} test files, {args.jobs} jobs -> {outdir}", flush=True)
+
+    missing = missing_optional_deps()
+    if missing:
+        lines = ["MISSING OPTIONAL TEST DEPENDENCIES — the tests below cannot "
+                 "run; counts are not comparable to a run that has them:"]
+        lines += [f"  {n}: affects {what}" for n, what in missing.items()]
+        lines.append(f"  install with: VIRTUAL_ENV={PY.parent.parent} "
+                     f"uv pip install {' '.join(missing)}")
+        banner = "\n".join(lines)
+        print(f"\n{banner}\n", flush=True)
+        (outdir / "preflight.txt").write_text(banner + "\n")
 
     rows, all_fails = [], []
     done = 0

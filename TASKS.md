@@ -205,3 +205,11 @@ predicted peak memory, and only then retry the big model.
   identity, structural subtree fingerprint); on hit skip build+verify
   (sound: the pack is a pure function of both). Also: per-pack
   gc.collect cadence (~10 s/wave) and moe._dead_sweep (8.8 s/wave).
+
+- **Suite-only deps are undeclared** (found 2026-08-05: an Aug-1 `uv
+  sync` pruned ad-hoc `flatbuffers` → 5 phantom JAX-suite failures +
+  export_serialization_back_compat's 21 tests silently uncollected;
+  restored + run_jax_tests.py now preflights optional deps). DECISION
+  FOR OLEG: declare a test dependency group in pyproject (or a
+  documented install line in RELEASING.md) so pytest/scipy/optax/
+  torch/flatbuffers survive venv re-syncs.
