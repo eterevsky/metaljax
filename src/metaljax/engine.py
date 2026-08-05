@@ -140,6 +140,16 @@ def reclaim(force: bool = False) -> bool:
     return collected
 
 
+# Device dtype the native to_host expects per PJRT enum (F64/C128 pass
+# through stored narrow). Anything else falls back to the numpy path.
+_EXPECTED_MX = {
+    1: mx.bool_, 2: mx.int8, 3: mx.int16, 4: mx.int32, 5: mx.int64,
+    6: mx.uint8, 7: mx.uint16, 8: mx.uint32, 9: mx.uint64,
+    10: mx.float16, 11: mx.float32, 12: mx.float32, 13: mx.bfloat16,
+    14: mx.complex64, 15: mx.complex64,
+}
+
+
 class MetalBuffer:
     """A device buffer: an mx.array plus PJRT-visible metadata."""
 
@@ -163,6 +173,15 @@ def buffer_from_host(data, type_enum: int, dims, byte_strides,
         raise TypeError(
             f"PJRT buffer type {_PJRT_TYPES[type_enum]} not supported on metal"
         )
+    if NATIVE is not None and NATIVE.native_type(type_enum):
+        # M1: the C++ path — one staging copy straight into the array's own
+        # storage, raw-byte bf16, in-place f64/c128 narrowing. The emulated
+        # dtypes (i4/f8*/f6...) keep the numpy path below.
+        arr = NATIVE.buffer_from_host(
+            data, type_enum, [int(d) for d in dims],
+            None if byte_strides is None else [int(s) for s in byte_strides],
+            int(offset))
+        return MetalBuffer(arr, type_enum, dims)
     if data is None:
         arr = np.zeros(dims, np_dtype)
     elif byte_strides is None:
@@ -177,6 +196,12 @@ def buffer_from_host(data, type_enum: int, dims, byte_strides,
 
 
 def to_host(buf: MetalBuffer) -> bytes:
+    if (NATIVE is not None and NATIVE.native_type(buf.type_enum)
+            and buf.data.dtype == _EXPECTED_MX.get(buf.type_enum)):
+        # The dtype check guards results whose device storage differs from
+        # the enum's expected form (host-op products, dtype quirks); those
+        # keep the numpy path's astype semantics.
+        return bytes(NATIVE.to_host(buf.data, buf.type_enum))
     arr = dtypes.to_np(buf.data)
     want = _ENUM_TO_NP[buf.type_enum]
     if arr.dtype != want:  # e.g. f64 buffers stored as f32 on device
