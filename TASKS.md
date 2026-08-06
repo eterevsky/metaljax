@@ -231,3 +231,17 @@ predicted peak memory, and only then retry the big model.
   FOR OLEG: declare a test dependency group in pyproject (or a
   documented install line in RELEASING.md) so pytest/scipy/optax/
   torch/flatbuffers survive venv re-syncs.
+
+- **Latent order-dependency in the compile cost model** (found during
+  M2, pre-existing): control._block_cost discounts qmm-absorbed ops by
+  reading interp._qmm, and sdpa.analyze POPULATES interp._qmm as a
+  side effect (via _claimed) — so merely querying sdpa earlier flips
+  the Python engine's compile decision for programs nothing rewrites.
+  M2 works around it (native lowering asks sdpa last); fix properly
+  by making qmm analysis explicit rather than a side effect.
+- **M2 native-tape next batches**: func.call inlining (single-block
+  callees — jax 0.11 wraps where/clip/round in private helpers; the
+  single biggest decline family), divide/remainder/power/shifts with
+  their XLA-semantics wrappers, argmax-pair reduce, gather/scatter,
+  integer dot_general (exact-f32 chunk machinery), expm1 (MSL
+  helper). Then M3: native mx::compile + control flow.

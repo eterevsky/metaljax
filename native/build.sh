@@ -30,7 +30,7 @@ clang++ -std=c++17 -O2 -fPIC -shared \
   -I "$(dirname "$NBINC")/ext/robin_map/include" \
   -DNDEBUG -DNB_COMPACT_ASSERTIONS \
   -DNB_DOMAIN=mlx \
-  metaljax_native.cc "$NBSRC/nb_combined.cpp" \
+  metaljax_native.cc tape.cc "$NBSRC/nb_combined.cpp" \
   -L "$MLX/lib" -lmlx -Wl,-rpath,"$MLX/lib" \
   -undefined dynamic_lookup \
   -o "build/metaljax_native$EXT_SUFFIX"

@@ -120,6 +120,16 @@ _gc_deadline = 0.0
 
 GC_STATS = {"collections": 0, "skipped": 0, "seconds": 0.0}
 
+# Stage 2 M2 observability: how many executables the native tape took, how
+# many it declined, and — the number that must stay zero — how many blew up
+# at run time and fell back mid-flight. Tests read it; METALJAX_DEBUG
+# narrates the individual decisions.
+NATIVE_STATS = {"lowered": 0, "declined": 0, "lower_errors": 0,
+                "runs": 0, "run_failures": 0}
+# The tape replaces the eager path only until native compile lands (M3);
+# see MetalExecutable._native. METALJAX_TAPE_ALL=1 lifts the restriction.
+_TAPE_EAGER_ONLY = os.environ.get("METALJAX_TAPE_ALL", "0") != "1"
+
 
 def reclaim(force: bool = False) -> bool:
     """Collect cycles (duty-limited unless `force`) and clear MLX's cache."""
@@ -227,6 +237,9 @@ class MetalExecutable:
         self._can_compile = None  # resolved lazily on first execute
         self._sync_inputs = None  # ditto (a whole-module walk)
         self._msl_build_failed = False  # a generated kernel didn't compile
+        # M2 native tape: None = not tried, False = declined or disabled,
+        # else the C++ Program. Resolved on first execute, never retried.
+        self._native_prog = None
 
     def disable_msl(self, plans=()):
         """Drop msl_scan persistent kernels after Metal's shader compiler
@@ -293,6 +306,84 @@ class MetalExecutable:
         interp._traceable_cache.clear()
         self._compiled = None
         self._can_compile = None
+
+    def native_program(self):
+        """This program as a native tape (Stage 2 M2), or None.
+
+        Resolved once, on the first execute, and cached either way: the
+        answer is a static property of the module and re-asking would mean
+        walking it again on every call. None means the Python engine runs
+        the program, which is always correct — the native op set is a
+        subset and grows monotonically (see metaljax.tape).
+
+        The recognizer gate is here rather than in the lowering because it
+        is about the ANALYSIS, not the ops: a rewritten program's roots
+        execute `emit` instead of themselves and its absorbed ops do not
+        execute at all, so the literal op list the tape would walk is not
+        what the Python engine runs. qmm's prologue has already analyzed by
+        the time execute asks; sdpa analyzes lazily.
+        """
+        if NATIVE is None or self._native_prog is False:
+            return None
+        if self._native_prog is None:
+            self._native_prog = False  # decided now, whatever happens below
+            interp = self.interpreter
+            # Until M3 gives the native engine its own mx::compile, the tape
+            # replaces the EAGER path only: a compile-eligible program keeps
+            # the fused-graph replay, which the M2 benchmark measured 5x
+            # faster than the tape (41.6 vs 208 us on a 200-op chain; the
+            # tape beats eager by 2.4x). The flag must never be a
+            # regression relative to the default engine.
+            # METALJAX_TAPE_ALL=1 (and the differential tests) lifts the
+            # restriction so the tape can be exercised on any program.
+            if _TAPE_EAGER_ONLY and self.can_compile():
+                NATIVE_STATS["declined"] += 1
+                return None
+            try:
+                prog = self._lower_native(interp)
+                if prog is not None:
+                    self._native_prog = prog
+            except Exception as e:  # a lowering bug must not break a program
+                NATIVE_STATS["lower_errors"] += 1
+                if os.environ.get("METALJAX_DEBUG", "") == "1":
+                    print(f"[metaljax] native tape lowering failed: {e!r}",
+                          flush=True)
+            NATIVE_STATS["lowered" if self._native_prog is not False
+                         else "declined"] += 1
+        return None if self._native_prog is False else self._native_prog
+
+    def _lower_native(self, interp):
+        qst = interp._qmm
+        if qst is not None and (qst.matches or qst.moe):
+            return None
+        with interp.context:
+            # Host callbacks, LAPACK on the host, tokens, control flow: the
+            # declined op set covers all of them, but the gate is cheap and
+            # says so explicitly.
+            if not interp.block_is_pure(interp._main_block()):
+                return None
+        from metaljax import sdpa as _sdpa, tape
+        prog = tape.lower(interp)
+        if prog is None:
+            return None
+        # The sdpa question comes LAST, after a program has proved itself
+        # lowerable, because asking it is not free of consequences: sdpa's
+        # analysis consults qmm's candidate list, and control._block_cost
+        # reads `interp._qmm` directly and discounts the ops a candidate
+        # absorbs — so merely ASKING can change the Python engine's compile
+        # decision for a program that was never going to be rewritten
+        # (visible with qmm's packing prologue turned off, where nothing
+        # else would have analyzed). Asking only about programs the tape
+        # can already run keeps the two engines' decisions independent.
+        with interp.context:
+            if _sdpa.analyze(interp).matches:
+                return None
+        return prog
+
+    def can_compile(self) -> bool:
+        """Whether the whole main compiles (resolves the lazy decision)."""
+        self.runner()
+        return bool(self._can_compile)
 
     def runner(self):
         """The callable executing this program, mx.compile'd when possible."""
@@ -455,6 +546,31 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
     retry = None  # "same" | "eager" | "no_msl"
     pending = ex.interpreter._msl_pending
     pending.clear()
+    # Stage 2 M2: the native tape, when this program lowered. It returns
+    # LAZY arrays like every other path — flush policy stays here — and any
+    # failure hands the call back to the Python engine and retires the tape
+    # for this executable (the fallback is what makes the native op set
+    # safe to grow).
+    outs = None
+    prog = ex.native_program()
+    if prog is not None:
+        try:
+            outs = list(prog.run(inputs=args))
+            NATIVE_STATS["runs"] += 1
+            if outs:
+                if _SYNC:
+                    mx.eval(*outs)
+                else:
+                    mx.async_eval(*outs)
+        except Exception as e:
+            NATIVE_STATS["run_failures"] += 1
+            ex._native_prog = False
+            outs = None
+            print(f"[metaljax] native tape failed at run time ({e!r}); "
+                  f"falling back to the Python engine for {ex.name}",
+                  flush=True)
+    if outs is not None:
+        return _finish(ex, args, outs)
     try:
         outs = list(ex.runner()(*args))
         if outs:
@@ -520,6 +636,11 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
         outs = list(runner(*args))
         if outs:
             mx.eval(*outs)
+    return _finish(ex, args, outs)
+
+
+def _finish(ex: MetalExecutable, args, outs) -> list[MetalBuffer]:
+    """Turn a run's arrays into PJRT buffers. Engine-independent."""
     if os.environ.get("METALJAX_MEMDBG", "") == "1":
         print(f"[metaljax-mem] gc: {GC_STATS['collections']} collections "
               f"({GC_STATS['seconds']:.1f}s), "

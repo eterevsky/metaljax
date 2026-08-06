@@ -10,3 +10,4 @@ plugin/build/
 src/metaljax/lib/
 .DS_Store
 jax-v0.11.0/
+native/build/

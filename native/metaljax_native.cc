@@ -220,6 +220,11 @@ nb::bytes to_host(const mx::array& a, int type_enum) {
 
 }  // namespace
 
+// M2: the prepared-program tape (native/tape.cc). Declared rather than
+// header-included — one free function is the whole interface between the
+// two translation units.
+void register_tape(nb::module_& m);
+
 NB_MODULE(metaljax_native, m) {
   m.doc() = "metaljax native replay engine (Stage 2, phase 1)";
   m.def("compiled_mlx_version", &compiled_mlx_version);
@@ -234,4 +239,6 @@ NB_MODULE(metaljax_native, m) {
         nb::arg("data").none(), nb::arg("type_enum"), nb::arg("dims"),
         nb::arg("byte_strides").none(), nb::arg("offset") = 0);
   m.def("to_host", &to_host);
+  // M2: prepared programs and the eager core interpreter.
+  register_tape(m);
 }
