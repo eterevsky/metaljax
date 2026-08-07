@@ -126,9 +126,6 @@ GC_STATS = {"collections": 0, "skipped": 0, "seconds": 0.0}
 # narrates the individual decisions.
 NATIVE_STATS = {"lowered": 0, "declined": 0, "lower_errors": 0,
                 "runs": 0, "run_failures": 0}
-# The tape replaces the eager path only until native compile lands (M3);
-# see MetalExecutable._native. METALJAX_TAPE_ALL=1 lifts the restriction.
-_TAPE_EAGER_ONLY = os.environ.get("METALJAX_TAPE_ALL", "0") != "1"
 
 
 def reclaim(force: bool = False) -> bool:
@@ -328,19 +325,13 @@ class MetalExecutable:
         if self._native_prog is None:
             self._native_prog = False  # decided now, whatever happens below
             interp = self.interpreter
-            # Until M3 gives the native engine its own mx::compile, the tape
-            # replaces the EAGER path only: a compile-eligible program keeps
-            # the fused-graph replay, which the M2 benchmark measured 5x
-            # faster than the tape (41.6 vs 208 us on a 200-op chain; the
-            # tape beats eager by 2.4x). The flag must never be a
-            # regression relative to the default engine.
-            # METALJAX_TAPE_ALL=1 (and the differential tests) lifts the
-            # restriction so the tape can be exercised on any program.
-            if _TAPE_EAGER_ONLY and self.can_compile():
-                NATIVE_STATS["declined"] += 1
-                return None
             try:
-                prog = self._lower_native(interp)
+                # M3: a compile-eligible program is no longer held back —
+                # the native tape traces through mx::compile itself, so
+                # taking it costs nothing the fused-graph replay was
+                # providing. The DECISION stays Python's (same estimators,
+                # one answer for both engines); the tape merely records it.
+                prog = self._lower_native(interp, self.can_compile())
                 if prog is not None:
                     self._native_prog = prog
             except Exception as e:  # a lowering bug must not break a program
@@ -352,18 +343,17 @@ class MetalExecutable:
                          else "declined"] += 1
         return None if self._native_prog is False else self._native_prog
 
-    def _lower_native(self, interp):
+    def _lower_native(self, interp, compile_main):
         qst = interp._qmm
         if qst is not None and (qst.matches or qst.moe):
             return None
-        with interp.context:
-            # Host callbacks, LAPACK on the host, tokens, control flow: the
-            # declined op set covers all of them, but the gate is cheap and
-            # says so explicitly.
-            if not interp.block_is_pure(interp._main_block()):
-                return None
+        # NB no purity gate. Until M3 the tape declined every impure
+        # program wholesale, which was really a decline of control flow;
+        # now while/if/case lower, and everything else impure — host
+        # callbacks, LAPACK on the host, tokens — is still declined where
+        # it belongs, by the op set and the dtype table.
         from metaljax import sdpa as _sdpa, tape
-        prog = tape.lower(interp)
+        prog = tape.lower(interp, compile_main=compile_main)
         if prog is None:
             return None
         # The sdpa question comes LAST, after a program has proved itself

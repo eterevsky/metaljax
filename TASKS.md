@@ -255,3 +255,9 @@ predicted peak memory, and only then retry the big model.
   scatter declined: MLX ships no C++ indexing-semantics layer; next
   frontier by census: bitcast_convert (29), fft (9), gather (6),
   dynamic_slice (kv-cache ops, cheap via mx::slice_update).
+
+- **Pre-existing engine crash flagged in M3**: nested loop with inner
+  counter captured from enclosing scope dies in _run_chunked (eval
+  during function transformations; except RuntimeError misses
+  ValueError) — native engine survives the same module. Fix with the
+  post-C++ batch.

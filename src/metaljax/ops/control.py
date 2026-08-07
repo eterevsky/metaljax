@@ -214,6 +214,21 @@ def _loop_flush(arrays, cost_units):
                   f"cache={mx.get_cache_memory()}B", flush=True)
 
 
+# Iterations of an eagerly replayed loop body per sync point. Deliberately
+# a function, and the ONE place the formula lives: the native engine's
+# lowering (metaljax.tape) reads it too, and a loop's sync points are where
+# MLX's command-buffer split bug bites (notes/mlx-command-buffer-split.md),
+# so the two engines drifting apart here would be a correctness question,
+# not a performance one. tests/test_command_buffer.py patches it to compare
+# cadences -- which is only a detector because both engines take it from
+# here.
+_PERIOD_MAX = 64
+
+
+def _flush_period(cost: int) -> int:
+    return max(1, min(_PERIOD_MAX, 25_000 // max(cost, 1)))
+
+
 def _static_start(op, k):
     """Static initial counter value of a while op, else None."""
     v = op.operands[k]
@@ -934,7 +949,7 @@ def _while(interp, op, ins, env):
             # own compile is gated in _body_fn.
             K = max(1, min(trip, _TRACE_BUDGET // max(cost, 1), _CHUNK_MAX,
                            _bytes_chunks(interp, body_block)))
-        period = max(1, min(64, 25_000 // max(cost, 1)))
+        period = _flush_period(cost)
         if _DEBUG:
             print(f"[metaljax] while: trip={trip} cost={cost} K={K} "
                   f"period={period} pure={interp.block_is_pure(body_block)} "

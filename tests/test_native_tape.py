@@ -61,17 +61,11 @@ def _mod(params, results, body, name="tape_test"):
 @contextlib.contextmanager
 def _native_engine():
     saved = engine.NATIVE
-    saved_eager = engine._TAPE_EAGER_ONLY
     engine.NATIVE = native
-    # The differential programs here are small enough to be compile-
-    # eligible; lift the eager-only production gate so the tape actually
-    # runs them (its own test below covers the gate).
-    engine._TAPE_EAGER_ONLY = False
     try:
         yield
     finally:
         engine.NATIVE = saved
-        engine._TAPE_EAGER_ONLY = saved_eager
 
 
 def _buffers(arrays):
@@ -84,22 +78,26 @@ def _buffers(arrays):
     return bufs
 
 
-def _run(mod, arrays, tape_on):
+def _run(mod, arrays, tape_on, compiled=False):
     ex = engine.compile_program(mod, "mlir")
     if not tape_on:
-        ex._native_prog = False  # the Python engine...
-        ex._can_compile = False  # ...op by op; see the module docstring
+        ex._native_prog = False  # the Python engine
+    if not compiled:
+        # Op by op on WHICHEVER engine runs it; see the module docstring on
+        # why eager is the reference. Set before the first execute, so the
+        # tape is lowered with the same answer the Python engine acts on.
+        ex._can_compile = False
     outs = engine.execute(ex, _buffers(arrays))
     return [engine.to_host(o) for o in outs], ex
 
 
-def check(mod, arrays, lowered=True):
+def check(mod, arrays, lowered=True, compiled=False):
     """Run both engines on `mod`; assert identical bytes and that the tape
     did (or did not) take the program. Returns the native executable."""
     with _native_engine():
         before = dict(engine.NATIVE_STATS)
-        ref, _ = _run(mod, arrays, False)
-        got, ex = _run(mod, arrays, True)
+        ref, _ = _run(mod, arrays, False, compiled)
+        got, ex = _run(mod, arrays, True, compiled)
     assert len(ref) == len(got), f"{len(got)} outputs vs {len(ref)}"
     for i, (r, g) in enumerate(zip(ref, got)):
         assert r == g, f"output {i}: native bytes differ from the Python engine"
@@ -110,6 +108,32 @@ def check(mod, arrays, lowered=True):
     key = "lowered" if lowered else "declined"
     assert engine.NATIVE_STATS[key] == before[key] + 1
     return ex
+
+
+def fresh_outputs(mod, arrays, positions, args_too=()):
+    """Assert the named outputs are buffers of their own.
+
+    Two calls are kept alive at once on purpose: an output that reads a
+    constant the Program holds (or an argument's array) would come back at
+    the SAME address twice, and with both alive the allocator cannot make
+    two distinct copies look equal by reusing a freed buffer.
+    """
+    with _native_engine():
+        ex = engine.compile_program(mod, "mlir")
+        in1 = _buffers(arrays)
+        out1 = engine.execute(ex, in1)
+        in2 = _buffers(arrays)
+        out2 = engine.execute(ex, in2)
+        assert ex._native_prog is not False, "the tape declined this program"
+        for j in positions:
+            assert engine.buffer_pointer(out1[j]) != \
+                engine.buffer_pointer(out2[j]), \
+                f"output {j} is the same buffer on two calls"
+            for i in args_too:
+                assert engine.buffer_pointer(out1[j]) != \
+                    engine.buffer_pointer(in1[i]), \
+                    f"output {j} shares argument {i}'s buffer"
+        return ex
 
 
 def declines(mod):
@@ -596,6 +620,118 @@ def test_slice_rank0_and_full():
     %1 = stablehlo.slice %a [0:6:2] : (tensor<6xf32>) -> tensor<3xf32>
     return %0, %1 : tensor<1xf32>, tensor<3xf32>""")
     check(mod, [_f32((6,))])
+
+
+# --------------------------------------------------------------------------
+# bitcast / dynamic slice — the kv-cache and RNG shapes
+# --------------------------------------------------------------------------
+
+
+_BITCAST_SAME = [("f32", "i32", np.float32), ("i32", "f32", np.int32),
+                 ("ui32", "f32", np.uint32), ("i16", "ui16", np.int16),
+                 ("f16", "ui16", np.float16), ("bf16", "ui16",
+                                               ml_dtypes.bfloat16)]
+
+
+@pytest.mark.parametrize("src,dst,npdt", _BITCAST_SAME)
+def test_bitcast_same_width(src, dst, npdt):
+    t, ot = f"tensor<6x{src}>", f"tensor<6x{dst}>"
+    mod = _mod([("a", t)], [ot], f"""
+    %0 = stablehlo.bitcast_convert %a : ({t}) -> {ot}
+    return %0 : {ot}""")
+    if np.issubdtype(np.dtype(npdt), np.integer):
+        info = np.iinfo(npdt)
+        x = np.array([0, 1, -1 if info.min else 2, info.max, info.min, 7],
+                     npdt)
+    else:
+        x = _specials(npdt)[:6]
+    check(mod, [x])
+
+
+def test_bitcast_narrowing_and_widening():
+    # i32 -> i8 adds a trailing dim of 4 (XLA packs the minor-most axis),
+    # and the reverse collapses it.
+    mod = _mod([("a", "tensor<3xi32>")],
+               ["tensor<3x4xi8>", "tensor<3xi32>"], """
+    %0 = stablehlo.bitcast_convert %a : (tensor<3xi32>) -> tensor<3x4xi8>
+    %1 = stablehlo.bitcast_convert %0 : (tensor<3x4xi8>) -> tensor<3xi32>
+    return %0, %1 : tensor<3x4xi8>, tensor<3xi32>""")
+    check(mod, [np.array([0, -1, 305419896], np.int32)])
+
+
+def test_bitcast_rank0_narrowing():
+    mod = _mod([("a", "tensor<f32>")], ["tensor<4xui8>"], """
+    %0 = stablehlo.bitcast_convert %a : (tensor<f32>) -> tensor<4xui8>
+    return %0 : tensor<4xui8>""")
+    check(mod, [np.float32(-1.5)])
+
+
+def test_bitcast_of_a_constant_is_copied():
+    # mx.view shares storage, so a bitcast reaching an output would hand
+    # out the Program's own constant.
+    mod = _mod([("a", "tensor<4xi32>")], ["tensor<4xf32>", "tensor<4xi32>"], """
+    %c = stablehlo.constant dense<[1, 2, 3, 4]> : tensor<4xi32>
+    %0 = stablehlo.bitcast_convert %c : (tensor<4xi32>) -> tensor<4xf32>
+    %1 = stablehlo.add %a, %c : tensor<4xi32>
+    return %0, %1 : tensor<4xf32>, tensor<4xi32>""")
+    check(mod, [np.array([5, 6, 7, 8], np.int32)])
+    fresh_outputs(mod, [np.array([5, 6, 7, 8], np.int32)], [0])
+
+
+@pytest.mark.parametrize("start", [0, 2, 5, -3])
+def test_dynamic_slice(start):
+    """XLA clamps the start so the window stays inside the operand — the
+    negative and past-the-end cases are the whole point."""
+    t = "tensor<6x4xf32>"
+    ot = "tensor<2x4xf32>"
+    mod = _mod([("a", t), ("i", "tensor<i32>")], [ot], f"""
+    %z = stablehlo.constant dense<0> : tensor<i32>
+    %0 = stablehlo.dynamic_slice %a, %i, %z, sizes = [2, 4] : ({t}, tensor<i32>, tensor<i32>) -> {ot}
+    return %0 : {ot}""")
+    check(mod, [_f32((6, 4)), np.int32(start)])
+
+
+@pytest.mark.parametrize("start", [0, 3, 9, -2])
+def test_dynamic_update_slice(start):
+    t = "tensor<6x4xf32>"
+    ut = "tensor<2x4xf32>"
+    mod = _mod([("a", t), ("u", ut), ("i", "tensor<i32>")], [t], f"""
+    %z = stablehlo.constant dense<0> : tensor<i32>
+    %0 = stablehlo.dynamic_update_slice %a, %u, %i, %z : ({t}, {ut}, tensor<i32>, tensor<i32>) -> {t}
+    return %0 : {t}""")
+    check(mod, [_f32((6, 4)), _f32((2, 4)), np.int32(start)])
+
+
+def test_dynamic_slice_unsigned_and_i64_indices():
+    t = "tensor<8xf32>"
+    ot = "tensor<3xf32>"
+    mod = _mod([("a", t), ("i", "tensor<ui32>"), ("j", "tensor<i64>")],
+               [ot, ot], f"""
+    %0 = stablehlo.dynamic_slice %a, %i, sizes = [3] : ({t}, tensor<ui32>) -> {ot}
+    %1 = stablehlo.dynamic_slice %a, %j, sizes = [3] : ({t}, tensor<i64>) -> {ot}
+    return %0, %1 : {ot}, {ot}""")
+    check(mod, [_f32((8,)), np.uint32(6), np.int64(1)])
+
+
+def test_dynamic_slice_rank0_operand_passes_through():
+    """No index operands: there is nothing to slice, and the handler hands
+    the operand back — so the output is a copy of the argument."""
+    t = "tensor<f32>"
+    mod = _mod([("a", t)], [t], f"""
+    %0 = stablehlo.dynamic_slice %a, sizes = [] : ({t}) -> {t}
+    return %0 : {t}""")
+    check(mod, [np.float32(2.5)])
+    fresh_outputs(mod, [np.float32(2.5)], [0], args_too=[0])
+
+
+def test_dynamic_update_slice_rank0_operand_passes_through():
+    t = "tensor<f32>"
+    mod = _mod([("a", t), ("u", t)], [t], f"""
+    %0 = stablehlo.dynamic_update_slice %a, %u : ({t}, {t}) -> {t}
+    return %0 : {t}""")
+    check(mod, [np.float32(2.5), np.float32(-1.0)])
+    fresh_outputs(mod, [np.float32(2.5), np.float32(-1.0)], [0],
+                  args_too=[1])
 
 
 # --------------------------------------------------------------------------
@@ -1105,13 +1241,13 @@ def test_composite_inlined():
     check(mod, [_f32()])
 
 
-def test_decline_call_forwarding_an_argument():
+def test_call_forwarding_an_argument_is_copied():
     """`call @identity(%a)` hands back main's own argument array.
 
     engine.execute copies statically-forwarded outputs, but its notion of
     "forwarded" is main's terminator naming a block argument — an OpResult
     that happens to hold the same array is invisible to it, and nanobind
-    defeats the dynamic id() pass. So the tape declines instead.
+    defeats the dynamic id() pass. So the tape marks it and C++ copies.
     """
     t = "tensor<3x4xf32>"
     mod = _with_funcs(
@@ -1120,7 +1256,8 @@ def test_decline_call_forwarding_an_argument():
         f"    %1 = stablehlo.tanh %a : {t}\n"
         f"    return %1, %0 : {t}, {t}",
         [_helper("ident", [("x", t)], t, f"    return %x : {t}")])
-    check(mod, [_f32()], lowered=False)
+    check(mod, [_f32()])
+    fresh_outputs(mod, [_f32()], [1], args_too=[0])
 
 
 def test_decline_call_with_an_unsupported_body():
@@ -1182,7 +1319,10 @@ def test_decline_region_op():
     check(mod, [_f32()], lowered=False)
 
 
-def test_decline_control_flow():
+def test_control_flow_lowers_but_a_forwarding_branch_is_copied():
+    # M3 lowers if/case; this one's branches BOTH hand back a value the
+    # Program owns (main's argument, and a constant), so the result is
+    # copied. tests/test_native_control.py covers control flow properly.
     t = "tensor<f32>"
     mod = _mod([("a", t)], [t], f"""
     %c = stablehlo.constant dense<0.0> : tensor<f32>
@@ -1193,7 +1333,8 @@ def test_decline_control_flow():
       stablehlo.return %c : {t}
     }}) : (tensor<i1>) -> {t}
     return %0 : {t}""")
-    check(mod, [np.float32(1.5)], lowered=False)
+    check(mod, [np.float32(1.5)])
+    fresh_outputs(mod, [np.float32(1.5)], [0], args_too=[0])
 
 
 def test_decline_complex():
@@ -1253,18 +1394,20 @@ def test_decline_totalorder_compare():
     check(mod, [x, np.roll(x, 2)], lowered=False)
 
 
-def test_decline_constant_output():
+def test_constant_output_is_copied():
     # A constant returned directly would alias across calls: the Program
-    # holds it for the executable's life. Declining keeps XLA's contract.
+    # holds it for the executable's life. The tape says so statically and
+    # native/tape.cc hands out a copy (XLA's no-alias contract).
     t = "tensor<3xf32>"
     mod = _mod([("a", t)], [t, t], f"""
     %c = stablehlo.constant dense<[1.0, 2.0, 3.0]> : {t}
     %0 = stablehlo.add %a, %c : {t}
     return %0, %c : {t}, {t}""")
-    check(mod, [_f32((3,))], lowered=False)
+    check(mod, [_f32((3,))])
+    fresh_outputs(mod, [_f32((3,))], [1])
 
 
-def test_decline_constant_view_output():
+def test_constant_view_output_is_copied():
     # A splat constant is a ONE-element buffer the tape holds forever;
     # broadcasting it to an output would hand every call a view of that
     # same storage.
@@ -1274,17 +1417,20 @@ def test_decline_constant_view_output():
     %b = stablehlo.broadcast_in_dim %c, dims = [1] : (tensor<3xf32>) -> tensor<2x3xf32>
     %0 = stablehlo.add %a, %c : tensor<3xf32>
     return %0, %b : tensor<3xf32>, tensor<2x3xf32>""")
-    check(mod, [_f32((3,))], lowered=False)
+    check(mod, [_f32((3,))])
+    fresh_outputs(mod, [_f32((3,))], [1])
 
 
-def test_decline_identity_forwarded_argument():
+def test_identity_forwarded_argument_is_copied():
     # A reshape to the SAME shape may hand back the operand object itself;
-    # engine.execute catches that by id() on the Python path only.
+    # engine.execute catches that by id() on the Python path only, and
+    # nanobind's fresh wrappers make it invisible there.
     t = "tensor<3x4xf32>"
     mod = _mod([("a", t)], [t], f"""
     %0 = stablehlo.reshape %a : ({t}) -> {t}
     return %0 : {t}""")
-    check(mod, [_f32()], lowered=False)
+    check(mod, [_f32()])
+    fresh_outputs(mod, [_f32()], [0], args_too=[0])
 
 
 def test_argument_forwarded_directly_still_lowers():
@@ -1332,7 +1478,7 @@ def test_run_time_failure_falls_back(monkeypatch):
     x = _f32()
     with _native_engine():
         ref, _ = _run(mod, [x], False)
-        monkeypatch.setattr(tape, "lower", lambda interp: _Boom())
+        monkeypatch.setattr(tape, "lower", lambda interp, **kw: _Boom())
         before = engine.NATIVE_STATS["run_failures"]
         ex = engine.compile_program(mod, "mlir")
         outs = engine.execute(ex, _buffers([x]))
@@ -1380,7 +1526,7 @@ def test_lowering_error_is_not_fatal(monkeypatch):
     %0 = stablehlo.tanh %a : {t}
     return %0 : {t}""")
 
-    def _explode(interp):
+    def _explode(interp, **kw):
         raise ValueError("lowering bug")
 
     with _native_engine():
@@ -1459,12 +1605,14 @@ def test_opcode_registry_covers_the_lowering_table():
         assert name in ops
 
 
-def test_eager_only_gate_declines_compiled_programs():
-    """The production gate: compile-eligible programs keep mx.compile.
+def test_compile_eligible_programs_take_the_native_path():
+    """M3 retired the eager-only production gate.
 
-    Until M3, the tape only replaces the eager path (it is 5x slower
-    than a fused-graph replay and 2.4x faster than Python eager); the
-    flag must never regress a program the default engine would compile.
+    Until the native engine had its own mx::compile, a compile-eligible
+    program had to keep the Python fused-graph replay (the M2 tape was 5x
+    slower than one). It now compiles natively, so the gate would only cost
+    the dispatch win it exists to deliver — and the compiled tape really is
+    what runs, which `compiled_calls` proves.
     """
     t = "tensor<4xf32>"
     mod = _mod([("a", t), ("b", t)], [t], f"""
@@ -1472,10 +1620,11 @@ def test_eager_only_gate_declines_compiled_programs():
     %1 = stablehlo.multiply %0, %a : {t}
     return %1 : {t}""")
     with _native_engine():
-        engine._TAPE_EAGER_ONLY = True
         before = dict(engine.NATIVE_STATS)
+        calls = native.stats()["compiled_calls"]
         ex = engine.compile_program(mod, "mlir")
         engine.execute(ex, _buffers([np.ones(4, np.float32)] * 2))
-        assert ex._native_prog is False
-        assert engine.NATIVE_STATS["declined"] == before["declined"] + 1
+        assert ex._native_prog is not False
+        assert engine.NATIVE_STATS["lowered"] == before["lowered"] + 1
         assert ex._can_compile is True
+        assert native.stats()["compiled_calls"] > calls

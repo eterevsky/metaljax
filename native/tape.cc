@@ -20,8 +20,11 @@
 // makes it reachable, and there is no second table to forget.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -29,10 +32,12 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include <mlx/mlx.h>
+#include <mlx/compile_impl.h>
 
 namespace nb = nanobind;
 namespace mx = mlx::core;
@@ -60,6 +65,9 @@ enum Op : int {
   kReshape, kTranspose, kBroadcastInDim, kSlice, kConcatenate, kIota,
   // data / structured
   kConstant, kReduce, kArgReduce, kDotGeneral,
+  kBitcastConvert, kDynamicSlice, kDynamicUpdateSlice,
+  // control flow (M3): each carries its regions as sub-Programs
+  kWhile, kIf, kCase,
 };
 
 // StableHLO name -> opcode. Several names may share an opcode (chlo.erf is
@@ -128,6 +136,12 @@ const NamedOp kOpNames[] = {
     // opcode by this pseudo-name; C++ still owns both enum values.
     {"stablehlo.reduce.arg_pair", kArgReduce},
     {"stablehlo.dot_general", kDotGeneral},
+    {"stablehlo.bitcast_convert", kBitcastConvert},
+    {"stablehlo.dynamic_slice", kDynamicSlice},
+    {"stablehlo.dynamic_update_slice", kDynamicUpdateSlice},
+    {"stablehlo.while", kWhile},
+    {"stablehlo.if", kIf},
+    {"stablehlo.case", kCase},
 };
 
 // --------------------------------------------------------------------------
@@ -210,6 +224,174 @@ mx::array fresh_copy(const mx::array& a) {
 }
 
 // --------------------------------------------------------------------------
+// runtime disciplines (M3)
+// --------------------------------------------------------------------------
+//
+// Every cadence below is a MEASURED value with a crash or a corruption story
+// behind it (see src/metaljax/interpreter.py and ops/control.py, which own
+// the comments). None of them is re-derived here: `configure` copies them in
+// from the Python modules that parse the environment, so the two engines can
+// never drift apart on a number the command-buffer lottery is pinned to.
+
+struct Config {
+  int64_t eager_flush_bytes = 1024LL << 20;   // METALJAX_EAGER_FLUSH_MB
+  int64_t flush_sync_every = 1;               // METALJAX_EAGER_FLUSH_SYNC
+  int64_t flush_clear_bytes = 2048LL << 20;   // METALJAX_FLUSH_CLEAR_MB
+  int64_t loop_clear_cost = 500000;           // METALJAX_LOOP_CLEAR_COST
+  bool debug = false;                         // METALJAX_DEBUG
+  bool memdbg = false;                        // METALJAX_MEMDBG
+};
+
+Config g_cfg;
+
+struct Stats {
+  int64_t flushes = 0;         // eager byte-denominated sync points
+  int64_t cache_clears = 0;    // ...that returned cache memory to the OS
+  int64_t loop_flushes = 0;    // loop sync points
+  int64_t loop_clears = 0;     // ...that cleared on the op-unit cadence
+  int64_t limit_retries = 0;   // Metal buffer-limit recoveries
+  int64_t compiled_calls = 0;  // replays of a compiled tape (main or body)
+  int64_t compiles = 0;        // mx::compile traces built
+  int64_t compile_drops = 0;   // compiled paths abandoned after a failure
+  int64_t chunk_drops = 0;     // chunked loop replays abandoned
+  int64_t unrolls = 0;         // counted loops unrolled into a trace
+};
+
+Stats g_stats;
+
+// A distinctive high tag: mx::detail::compile keys its cache by an integer
+// the CALLER owns, and MLX's own Python bindings use the address of a Python
+// function object. Ids from this counter can collide with neither those nor
+// any real pointer (user-space addresses on arm64 macOS live far below).
+std::atomic<std::uintptr_t> g_next_compile_id{0x6D6A5F0000000001ULL};
+
+std::uintptr_t new_compile_id() { return g_next_compile_id.fetch_add(1); }
+
+bool is_resource_limit(const std::exception& e) {
+  return std::string(e.what()).find("Resource limit") != std::string::npos;
+}
+
+// Python's cycle collector barely triggers under array workloads, and dead
+// refcycles pin buffers mx::clear_cache cannot free (CLAUDE.md item 19).
+// Needs the GIL, which the hot path has released.
+void gc_collect() {
+  nb::gil_scoped_acquire gil;
+  try {
+    nb::module_::import_("gc").attr("collect")();
+  } catch (...) {
+    // A collection that cannot run must not take the recovery down with it.
+  }
+}
+
+// Narration. Deliberately not routed through Python: these fire from paths
+// that have released the GIL, some of them while recovering from an
+// allocation failure.
+void debug_line(const std::string& line) {
+  fputs((line + "\n").c_str(), stdout);
+  fflush(stdout);
+}
+
+// METALJAX_DEBUG.
+void debug_print(const std::string& msg) {
+  if (g_cfg.debug) debug_line("[metaljax] " + msg);
+}
+
+// interpreter.flush_eval: settle `arrays`, recovering once from Metal buffer
+// exhaustion. Programs are pure, so clearing and retrying is safe.
+void flush_eval(const std::vector<mx::array>& arrays, bool hard) {
+  try {
+    if (hard) {
+      mx::eval(arrays);
+    } else {
+      mx::async_eval(arrays);
+    }
+    return;
+  } catch (const std::exception& e) {
+    if (!is_resource_limit(e)) throw;
+  }
+  debug_print("Metal buffer limit hit at eager flush; clearing cache and "
+              "retrying");
+  g_stats.limit_retries++;
+  gc_collect();
+  mx::clear_cache();
+  mx::eval(arrays);
+}
+
+// ops.control._loop_flush: a sync point inside a loop. Evaluates pending
+// work, keeps the Metal buffer COUNT bounded (MLX's cache is bounded by
+// bytes only, and long loops over small models accumulate tiny buffers until
+// metal::malloc dies), and recovers once if the limit is hit anyway.
+int64_t g_flushed_cost = 0;
+
+void loop_flush(const std::vector<mx::array>& arrays, int64_t cost_units) {
+  g_stats.loop_flushes++;
+  bool retry = false;
+  try {
+    mx::eval(arrays);
+  } catch (const std::exception& e) {
+    if (!is_resource_limit(e)) throw;
+    retry = true;
+  }
+  if (retry) {
+    debug_print("Metal buffer limit hit at loop flush; clearing cache and "
+                "retrying");
+    g_stats.limit_retries++;
+    gc_collect();  // dead refcycles pin buffers clear_cache cannot free
+    mx::clear_cache();
+    mx::eval(arrays);
+  }
+  g_flushed_cost += cost_units;
+  if (g_cfg.loop_clear_cost > 0 && g_flushed_cost >= g_cfg.loop_clear_cost) {
+    g_flushed_cost = 0;
+    g_stats.loop_clears++;
+    mx::clear_cache();
+    if (g_cfg.memdbg)
+      debug_line("[metaljax-mem] loop clear: active=" +
+                 std::to_string(mx::get_active_memory()) + "B cache=" +
+                 std::to_string(mx::get_cache_memory()) + "B");
+  }
+}
+
+// ops.control._anchor_outputs: give constant outputs a bitwise-exact data
+// dependency on an input. where(x == x, out, out) == out for every bit
+// pattern (both branches are `out`), but the result is a computed node, not
+// a constant MLX's compiler can bake into a table KEYED BY VALUE -- where
+// two equal-valued constant outputs collide and the compiled call dies with
+// unordered_map::at.
+void anchor_outputs(std::vector<mx::array>& outs,
+                    const std::vector<mx::array>& args,
+                    const std::vector<int>& underived) {
+  if (underived.empty() || args.empty()) return;
+  std::optional<mx::array> anchor;
+  for (const mx::array& a : args) {
+    if (a.size() == 0) continue;
+    mx::array head = mx::slice(mx::reshape(a, mx::Shape{-1}), mx::Shape{0},
+                               mx::Shape{1});
+    anchor = mx::reshape(mx::equal(head, head), mx::Shape{});
+    break;
+  }
+  if (!anchor) return;
+  for (int i : underived) {
+    if (i >= 0 && static_cast<size_t>(i) < outs.size())
+      outs[i] = mx::where(*anchor, outs[i], outs[i]);
+  }
+}
+
+// The loop counter / branch index of a control-flow op, on the host. Reading
+// one is a sync point, exactly as the Python handlers' `.item()` is.
+int64_t item_int(const mx::array& a) {
+  mx::array v = mx::astype(a, mx::int64);
+  v.eval();
+  return v.item<int64_t>();
+}
+
+bool item_bool(const mx::array& a) {
+  mx::array v = mx::astype(a, mx::bool_);
+  v.eval();
+  return v.item<bool>();
+}
+
+// --------------------------------------------------------------------------
 // the tape
 // --------------------------------------------------------------------------
 //
@@ -235,6 +417,26 @@ mx::array fresh_copy(const mx::array& a) {
 //                        out_dtype, out_rank, out_shape..., kind, chunk]
 //                       kind: 0 float matmul, 1 exact-f32 K-chunks,
 //                             2 int64 outer product, 3 the same in bool
+//   kBitcastConvert     [dtype, kind]           kind: 0 same width,
+//                                               1 narrowing, 2 widening
+//   kDynamicSlice       [rank, clamp bounds..., sizes...]
+//   kDynamicUpdateSlice [rank, clamp bounds...]  (sizes = update's shape)
+//   kWhile              [ncarry, ncond_caps, nbody_caps, counted, k,
+//                        bound_kind, bound, cost, period, chunkable, kmax,
+//                        body_compile_max]
+//                       regions [cond, body]; ins [carry..., cond caps...,
+//                       body caps...]; bound_kind 0 static N, 1 carry index,
+//                       2 index into the cond's captures
+//   kIf / kCase         [ncaps_0, ncaps_1, ...] one per region
+//                       regions = the branches; ins [pred/index, caps...]
+//
+// A region is a Program of its own, whose arguments are the region block's
+// arguments followed by its CAPTURES -- the values it reads from enclosing
+// scopes, resolved to parent slots at lowering. That is the whole of the
+// nesting: no environment is shared, so a sub-program is compiled, replayed
+// and reasoned about exactly like a top-level one.
+
+class Program;
 
 struct Entry {
   int op;
@@ -243,6 +445,8 @@ struct Entry {
   std::vector<int64_t> attrs;
   std::optional<mx::array> payload;  // kConstant only
   std::vector<int> drops;            // slots whose last use is this op
+  std::vector<std::shared_ptr<Program>> regions;  // control flow only
+  int64_t bytes = 0;  // estimated result bytes, for the eager flush cadence
 };
 
 // Reduce monoids, resolved at lowering time from the body op and the input
@@ -341,38 +545,64 @@ class Program {
       throw std::invalid_argument("tape: bad slot counts");
   }
 
+  ~Program() {
+    // MLX keeps a compiled graph per id for as long as nobody erases it.
+    for (const auto& kv : compiled_) mx::detail::compile_erase(kv.second.id);
+  }
+
+  Program(const Program&) = delete;
+  Program& operator=(const Program&) = delete;
+
   void add(int op, std::vector<int> ins, std::vector<int> outs,
            std::vector<int64_t> attrs, std::optional<mx::array> payload,
-           std::vector<int> drops) {
+           std::vector<int> drops,
+           std::vector<std::shared_ptr<Program>> regions, int64_t bytes) {
     for (int s : ins) check_slot(s);
     for (int s : outs) check_slot(s);
     for (int s : drops) check_slot(s);
     ops_.push_back(Entry{op, std::move(ins), std::move(outs),
                          std::move(attrs), std::move(payload),
-                         std::move(drops)});
+                         std::move(drops), std::move(regions), bytes});
   }
 
-  void set_outputs(std::vector<int> outs) {
+  // `copies` are output POSITIONS whose array may not be handed out as it
+  // is: it could be one of the program's own constants (which the Program
+  // holds for the life of the executable, so two calls would share a
+  // buffer) or an input's array reaching an output through no-ops. Which
+  // ones those are is a static property tape.py works out; making the copy
+  // here is XLA's no-alias contract, the half object identity cannot
+  // express across the language boundary.
+  void set_outputs(std::vector<int> outs, std::vector<int> copies) {
     for (int s : outs) check_slot(s);
     outputs_ = std::move(outs);
+    copies_ = std::move(copies);
+  }
+
+  // Whether this program's tape is traced through mx::compile, and which of
+  // its outputs need anchoring when it is. BOTH decided in Python: the cost
+  // and byte estimators that gate compilation live there (ops/control.py),
+  // and re-deriving them here would be a second opinion nothing keeps in
+  // step with the first.
+  void set_compile(bool on, std::vector<int> anchors, int64_t max_repeat) {
+    compile_ = on;
+    anchors_ = std::move(anchors);
+    max_repeat_ = max_repeat;
   }
 
   std::vector<mx::array> run(std::vector<mx::array> inputs) {
     if (static_cast<int>(inputs.size()) != nargs_)
       throw std::invalid_argument("tape: wrong number of inputs");
-    std::vector<std::optional<mx::array>> env(nslots_);
-    for (size_t i = 0; i < inputs.size(); i++) env[i] = std::move(inputs[i]);
     std::vector<mx::array> outs;
     {
       // Nothing below touches Python: MLX builds a lazy graph and the
       // arrays are already C++ objects. The GIL comes back for the cast
-      // of the results, in nanobind's own code.
+      // of the results, in nanobind's own code (and briefly, deliberately,
+      // in the recovery paths, which call the cycle collector).
       nb::gil_scoped_release nogil;
-      for (const Entry& e : ops_) step(e, env);
-      outs.reserve(outputs_.size());
-      for (int s : outputs_) {
-        if (!env[s]) throw std::runtime_error("tape: output slot is empty");
-        outs.push_back(*env[s]);
+      outs = run_recovering(inputs);
+      for (int i : copies_) {
+        if (i >= 0 && static_cast<size_t>(i) < outs.size())
+          outs[i] = fresh_copy(outs[i]);
       }
       // XLA's no-alias contract, the half object identity cannot express
       // across the language boundary: two outputs reading the SAME slot
@@ -393,8 +623,110 @@ class Program {
     return outs;
   }
 
+  // One call of this program's tape: the compiled graph when it has one,
+  // the op-by-op walk otherwise. `in_trace` says an enclosing mx::compile
+  // is already tracing us, which forbids both a nested compile and any
+  // sync point (there is nothing to evaluate: the values are tracers).
+  std::vector<mx::array> call(const std::vector<mx::array>& inputs,
+                              bool in_trace) {
+    if (in_trace) return interpret(inputs, true);
+    if (compile_ && !compile_disabled_) {
+      g_stats.compiled_calls++;
+      return compiled(1)(inputs);
+    }
+    return interpret(inputs, false);
+  }
+
+  // `repeat` applications of this program's tape as one compiled graph.
+  // Bodies are compiled per repeat count (one chunked replay of K
+  // iterations is a different graph from a single step), and each variant
+  // gets a cache id of its own.
+  const std::function<std::vector<mx::array>(const std::vector<mx::array>&)>&
+  compiled(int repeat) {
+    auto it = compiled_.find(repeat);
+    if (it != compiled_.end()) return it->second.fn;
+    Compiled c;
+    c.id = new_compile_id();
+    Program* self = this;
+    std::vector<int> anchors = anchors_;
+    auto traced = [self, repeat, anchors](const std::vector<mx::array>& flat)
+        -> std::vector<mx::array> {
+      std::vector<mx::array> vals = self->interpret(flat, true);
+      if (repeat > 1) {
+        // A body's outputs are its next carries, and its captures ride
+        // along unchanged: feed the outputs back in, keep the tail.
+        for (int r = 1; r < repeat; r++) {
+          std::vector<mx::array> next(vals);
+          next.insert(next.end(), flat.begin() + vals.size(), flat.end());
+          vals = self->interpret(next, true);
+        }
+      }
+      anchor_outputs(vals, flat, anchors);
+      return vals;
+    };
+    g_stats.compiles++;
+    c.fn = mx::detail::compile(traced, c.id, false, {});
+    auto ins = compiled_.emplace(repeat, std::move(c));
+    return ins.first->second.fn;
+  }
+
+  bool may_compile(int repeat) const {
+    return compile_ && !compile_disabled_ && repeat <= max_repeat_;
+  }
+
+  // A compiled path failed at CALL time. Every such failure is permanent
+  // for this program (MLX will reject the same graph again), so drop the
+  // compiled variants and never build another.
+  void drop_compiled() {
+    compile_disabled_ = true;
+    for (const auto& kv : compiled_) mx::detail::compile_erase(kv.second.id);
+    compiled_.clear();
+    g_stats.compile_drops++;
+  }
+
+  bool compiled_dropped() const { return compile_disabled_; }
+  bool no_chunk() const { return no_chunk_; }
+  void set_no_chunk() { no_chunk_ = true; }
+
   size_t num_ops() const { return ops_.size(); }
   int num_slots() const { return nslots_; }
+  int num_args() const { return nargs_; }
+
+  // The op-by-op walk. `in_trace` is threaded rather than stored: the same
+  // Program is walked both ways (a counted loop unrolls its body into an
+  // enclosing trace and replays it eagerly on the next call), and a stored
+  // flag would make that a race with itself.
+  std::vector<mx::array> interpret(const std::vector<mx::array>& inputs,
+                                   bool in_trace) {
+    if (static_cast<int>(inputs.size()) != nargs_)
+      throw std::invalid_argument("tape: wrong number of inputs");
+    std::vector<std::optional<mx::array>> env(nslots_);
+    for (size_t i = 0; i < inputs.size(); i++) env[i] = inputs[i];
+    // interpreter.run_block's byte-denominated safety net: once this much
+    // estimated result data has been produced with no sync point, settle
+    // what is still live so the pending graph -- and the Metal buffers it
+    // pins -- stay bounded. Never inside a trace: there is nothing to
+    // evaluate there, and MLX manages the traced tape itself.
+    const bool flushing = !in_trace && g_cfg.eager_flush_bytes > 0;
+    int64_t acc = 0;
+    for (const Entry& e : ops_) {
+      step(e, env, in_trace);
+      if (flushing) {
+        acc += e.bytes;
+        if (acc >= g_cfg.eager_flush_bytes) {
+          acc = 0;
+          eager_flush(env);
+        }
+      }
+    }
+    std::vector<mx::array> outs;
+    outs.reserve(outputs_.size());
+    for (int s : outputs_) {
+      if (!env[s]) throw std::runtime_error("tape: output slot is empty");
+      outs.push_back(*env[s]);
+    }
+    return outs;
+  }
 
   // Peak number of slots the environment holds at once, from the drop
   // lists alone. The tests assert on it: it is what says liveness pruning
@@ -422,7 +754,8 @@ class Program {
       throw std::invalid_argument("tape: slot index out of range");
   }
 
-  void step(const Entry& e, std::vector<std::optional<mx::array>>& env) const {
+  void step(const Entry& e, std::vector<std::optional<mx::array>>& env,
+            bool in_trace) const {
     auto in = [&](size_t i) -> const mx::array& {
       const auto& v = env[e.ins[i]];
       if (!v) throw std::runtime_error("tape: read of a dropped slot");
@@ -833,11 +1166,431 @@ class Program {
         break;
       }
 
+      case kBitcastConvert: {
+        // ops/shape.py _bitcast_convert, byte-multiple arm only: MLX's
+        // storage IS the XLA layout there, so the whole op is a view. The
+        // 4-bit forms cannot reach this handler -- i4/ui4 are not in the
+        // dtype table, and every other emulated type is declined for the
+        // same reason (their bit patterns do not exist on the device).
+        mx::Dtype dt = dtype_of(at[0]);
+        if (at[1] == 0) {
+          env[e.outs[0]] = mx::view(in(0), dt);
+        } else if (at[1] == 1) {
+          // Narrowing: the result gains a trailing dim of the size ratio,
+          // and mx::view rescales the LAST axis -- so split a fresh unit
+          // axis (which also makes a rank-0 input legal).
+          env[e.outs[0]] = mx::view(mx::expand_dims(in(0), -1), dt);
+        } else {
+          // Widening: the input's trailing ratio-sized dim collapses.
+          env[e.outs[0]] = mx::squeeze(mx::view(in(0), dt), -1);
+        }
+        break;
+      }
+
+      case kDynamicSlice:
+      case kDynamicUpdateSlice: {
+        // ops/shape.py _dynamic_slice / _dynamic_update_slice. XLA clamps
+        // the start indices so the window stays inside the operand; the
+        // clamp bounds are shape arithmetic, resolved at lowering.
+        const bool update = e.op == kDynamicUpdateSlice;
+        const size_t first = update ? 2 : 1;
+        int64_t rank = at[0];
+        std::vector<mx::array> parts;
+        parts.reserve(static_cast<size_t>(rank));
+        for (int64_t i = 0; i < rank; i++)
+          parts.push_back(
+              mx::reshape(mx::astype(in(first + static_cast<size_t>(i)),
+                                     mx::int32),
+                          mx::Shape{}));
+        mx::Shape bounds = shape(at, 1, rank);
+        std::vector<int> ax(static_cast<size_t>(rank));
+        for (int64_t i = 0; i < rank; i++) ax[i] = static_cast<int>(i);
+        mx::array starts =
+            mx::clip(mx::stack(parts), mx::array(0, mx::int32),
+                     mx::array(bounds.begin(),
+                               mx::Shape{static_cast<int>(rank)}, mx::int32));
+        if (update) {
+          env[e.outs[0]] = mx::slice_update(in(0), in(1), starts, ax);
+        } else {
+          env[e.outs[0]] =
+              mx::slice(in(0), starts, ax, shape(at, 1 + rank, rank));
+        }
+        break;
+      }
+
+      // --- control flow (ops/control.py) -----------------------------
+      case kWhile:
+        run_while(e, env, in_trace);
+        break;
+
+      case kIf:
+      case kCase: {
+        // _if / _case: the branch is chosen on the HOST, so both make a
+        // block impure in the Python analysis and no program containing
+        // one is ever compiled -- which is why reading the predicate here
+        // cannot be a sync point inside a trace.
+        int64_t which;
+        if (e.op == kIf) {
+          which = item_bool(in(0)) ? 0 : 1;
+        } else {
+          which = item_int(in(0));
+          which = std::min<int64_t>(
+              std::max<int64_t>(which, 0),
+              static_cast<int64_t>(e.regions.size()) - 1);
+        }
+        size_t base = 1;  // ins[0] is the predicate/index
+        for (int64_t r = 0; r < which; r++)
+          base += static_cast<size_t>(at[static_cast<size_t>(r)]);
+        std::vector<mx::array> args;
+        int64_t ncaps = at[static_cast<size_t>(which)];
+        args.reserve(static_cast<size_t>(ncaps));
+        for (int64_t i = 0; i < ncaps; i++) args.push_back(in(base + i));
+        std::vector<mx::array> outs =
+            e.regions[static_cast<size_t>(which)]->call(args, in_trace);
+        if (outs.size() != e.outs.size())
+          throw std::runtime_error("tape: branch result count mismatch");
+        for (size_t i = 0; i < outs.size(); i++) env[e.outs[i]] = outs[i];
+        break;
+      }
+
       default:
         throw std::invalid_argument("tape: unknown opcode");
     }
 
     for (int s : e.drops) env[s].reset();
+  }
+
+  // ops/control.py _while, transliterated. Every branch here has a comment
+  // in that file explaining what it is for; the policy numbers (cost,
+  // cadence, chunk size, which bodies may be compiled) are computed by the
+  // same Python estimators and arrive in `attrs`.
+  void run_while(const Entry& e, std::vector<std::optional<mx::array>>& env,
+                 bool in_trace) const {
+    auto in = [&](size_t i) -> const mx::array& {
+      const auto& v = env[e.ins[i]];
+      if (!v) throw std::runtime_error("tape: read of a dropped slot");
+      return *v;
+    };
+    const std::vector<int64_t>& at = e.attrs;
+    const int64_t ncarry = at[0], ncond_caps = at[1], nbody_caps = at[2];
+    const bool counted = at[3] != 0;
+    const int64_t k = at[4], bound_kind = at[5], bound = at[6];
+    const int64_t cost = std::max<int64_t>(at[7], 1);
+    const int64_t period = std::max<int64_t>(at[8], 1);
+    const bool chunkable = at[9] != 0;
+    const int64_t kmax = at[10];
+
+    Program* cond = e.regions[0].get();
+    Program* body = e.regions[1].get();
+
+    std::vector<mx::array> ins, cond_caps, body_caps;
+    ins.reserve(static_cast<size_t>(ncarry));
+    for (int64_t i = 0; i < ncarry; i++) ins.push_back(in(i));
+    for (int64_t i = 0; i < ncond_caps; i++)
+      cond_caps.push_back(in(static_cast<size_t>(ncarry + i)));
+    for (int64_t i = 0; i < nbody_caps; i++)
+      body_caps.push_back(in(static_cast<size_t>(ncarry + ncond_caps + i)));
+
+    std::vector<mx::array> vals;
+    if (counted) {
+      int64_t n;
+      if (bound_kind == 0) {
+        n = bound;
+      } else if (bound_kind == 1) {
+        n = item_int(ins[static_cast<size_t>(bound)]);
+      } else {
+        n = item_int(cond_caps[static_cast<size_t>(bound)]);
+      }
+      const int64_t start = item_int(ins[static_cast<size_t>(k)]);
+      const int64_t trip = std::max<int64_t>(n - start, 0);
+      if (in_trace) {
+        // An enclosing mx::compile is tracing us: inline the iterations
+        // into that graph. Past 64 of them the trace holds more
+        // intermediates than Metal's buffer budget allows, and the answer
+        // is the same as the Python engine's -- abort, and let the caller
+        // fall back to the eager path (run_recovering does that here).
+        if (trip > 64)
+          throw std::runtime_error(
+              "metaljax: refusing to unroll trip=" + std::to_string(trip) +
+              " inside a trace");
+        g_stats.unrolls++;
+        vals = ins;
+        for (int64_t i = 0; i < trip; i++)
+          vals = run_body(body, vals, body_caps, true);
+        write_results(e, env, vals);
+        return;
+      }
+      // Eager loop. Chained replays are expensive (a compiled call
+      // evaluates its inputs), so unroll as many iterations as the trace
+      // budget allows into each compiled chunk and replay trip/K chunks
+      // instead of trip single steps -- while flushing often enough that
+      // the buffers a pending replay pins stay bounded.
+      int64_t K = 1;
+      if (chunkable && !body->no_chunk())
+        K = std::max<int64_t>(1, std::min<int64_t>(trip, kmax));
+      if (K > 1) {
+        bool failed = false;
+        try {
+          vals = run_chunked(body, ins, body_caps, trip, K, cost);
+        } catch (const std::exception& ex) {
+          // MLX's compiler can reject big fused traces ("Too many
+          // inputs/outputs fused..."). Fall back to single-step replays,
+          // from the ORIGINAL carries -- a failed chunk changed nothing.
+          debug_print(std::string("chunked loop failed (") + ex.what() +
+                      "); falling back to single-step");
+          failed = true;
+        }
+        if (!failed) {
+          write_results(e, env, vals);
+          return;
+        }
+        body->set_no_chunk();
+        g_stats.chunk_drops++;
+      }
+      BodyRunner runner(body, body_caps, 1);
+      vals = ins;
+      for (int64_t i = 1; i <= trip; i++) {
+        vals = runner.run_one(vals);
+        if (i % period == 0) loop_flush(vals, period * cost);
+      }
+      write_results(e, env, vals);
+      return;
+    }
+
+    // Dynamic (non-counted) loop: evaluate the condition each iteration.
+    // The BODY still gets compiled -- a data-dependent trip count says
+    // nothing about the body, and interpreting it op by op is what made
+    // LLM decode Python-dispatch-bound. The cond stays eager: it ends in
+    // a host read.
+    if (in_trace)
+      throw std::runtime_error(
+          "metaljax: a dynamic while cannot run inside a trace");
+    BodyRunner runner(body, body_caps, 1);
+    vals = ins;
+    for (;;) {
+      std::vector<mx::array> cargs(vals);
+      cargs.insert(cargs.end(), cond_caps.begin(), cond_caps.end());
+      std::vector<mx::array> pred = cond->interpret(cargs, false);
+      if (pred.size() != 1)
+        throw std::runtime_error("tape: while cond must return one value");
+      if (!item_bool(pred[0])) break;
+      vals = runner.run_one(vals);
+      // Flush the carry, not nothing: the cond only forces the values it
+      // reads, so anything else in the carry (a KV cache) would pile up as
+      // unevaluated graph across iterations.
+      loop_flush(vals, cost);
+    }
+    write_results(e, env, vals);
+  }
+
+  static void write_results(const Entry& e,
+                            std::vector<std::optional<mx::array>>& env,
+                            const std::vector<mx::array>& vals) {
+    if (vals.size() != e.outs.size())
+      throw std::runtime_error("tape: loop result count mismatch");
+    for (size_t i = 0; i < vals.size(); i++) env[e.outs[i]] = vals[i];
+  }
+
+  // One uncompiled application of a loop body.
+  static std::vector<mx::array> run_body(Program* body,
+                                         const std::vector<mx::array>& vals,
+                                         const std::vector<mx::array>& caps,
+                                         bool in_trace) {
+    std::vector<mx::array> flat(vals);
+    flat.insert(flat.end(), caps.begin(), caps.end());
+    return body->interpret(flat, in_trace);
+  }
+
+  // ops/control.py _run_chunked.
+  static std::vector<mx::array> run_chunked(
+      Program* body, const std::vector<mx::array>& ins,
+      const std::vector<mx::array>& caps, int64_t trip, int64_t K,
+      int64_t cost) {
+    std::vector<mx::array> vals = ins;
+    const int64_t sync_every =
+        std::max<int64_t>(1, 75000 / std::max<int64_t>(K * cost, 1));
+    auto chunk = [&](int64_t repeat, const std::vector<mx::array>& v) {
+      std::vector<mx::array> flat(v);
+      flat.insert(flat.end(), caps.begin(), caps.end());
+      if (body->may_compile(static_cast<int>(repeat))) {
+        g_stats.compiled_calls++;
+        return body->compiled(static_cast<int>(repeat))(flat);
+      }
+      std::vector<mx::array> out = v;
+      for (int64_t r = 0; r < repeat; r++) out = run_body(body, out, caps, false);
+      return out;
+    };
+    for (int64_t i = 0; i < trip / K; i++) {
+      vals = chunk(K, vals);
+      // Async-flush each chunk (a blocking sync per chunk serializes CPU
+      // and GPU); block only often enough to bound pending buffers.
+      if ((i + 1) % sync_every == 0) {
+        loop_flush(vals, sync_every * K * cost);
+      } else {
+        mx::async_eval(vals);
+      }
+    }
+    const int64_t rem = trip % K;
+    for (int64_t i = 0; i < rem; i++) vals = chunk(1, vals);
+    loop_flush(vals, (trip % std::max<int64_t>(sync_every * K, 1)) * cost);
+    return vals;
+  }
+
+  // ops/control.py _BodyRunner: runs a while body, recovering from the ways
+  // MLX's compiled path can fail at CALL time. Every recovery simply redoes
+  // the iteration -- bodies are pure, and a failed call leaves the caller's
+  // carry untouched.
+  class BodyRunner {
+   public:
+    BodyRunner(Program* body, const std::vector<mx::array>& caps, int repeat)
+        : body_(body), caps_(caps), repeat_(repeat) {
+      bind();
+    }
+
+    std::vector<mx::array> run_one(const std::vector<mx::array>& vals) {
+      for (;;) {
+        std::optional<std::vector<mx::array>> out = step(vals);
+        if (out) return std::move(*out);
+      }
+    }
+
+   private:
+    void bind() {
+      compiled_ = body_->may_compile(repeat_);
+      // Probe the freshly bound compiled body once: a compiled call only
+      // BUILDS the graph, and MLX generates the fused Metal kernels at
+      // eval, so failures like "Too many inputs/outputs fused" land at the
+      // next sync point -- by which time the carry has advanced past the
+      // iteration a redo could repair. One sync per loop ENTRY: the shapes
+      // are fixed for the life of the loop, so one buildable call proves
+      // every later one.
+      probe_ = compiled_;
+    }
+
+    std::optional<std::vector<mx::array>> step(
+        const std::vector<mx::array>& vals) {
+      bool resource_limit = false;
+      std::exception_ptr err;
+      try {
+        std::vector<mx::array> flat(vals);
+        flat.insert(flat.end(), caps_.begin(), caps_.end());
+        std::vector<mx::array> out;
+        if (compiled_) {
+          g_stats.compiled_calls++;
+          out = body_->compiled(repeat_)(flat);
+        } else {
+          out = body_->interpret(flat, false);
+        }
+        if (probe_) {
+          // Inside the try on purpose: this is where a body MLX cannot
+          // generate kernels for reports itself. Synchronous (not
+          // async_eval) — a Metal build error raised on a worker thread
+          // aborts the process.
+          mx::eval(out);
+          probe_ = false;
+        }
+        limit_retries_ = 0;
+        return out;
+      } catch (const std::exception& ex) {
+        resource_limit = is_resource_limit(ex);
+        err = std::current_exception();
+      }
+      // Recovery OUTSIDE the handler: the failed attempt's arrays must be
+      // gone before anything tries to allocate again (the C++ analogue of
+      // the traceback that pins a failed trace's buffers in Python).
+      if (resource_limit) {
+        debug_print("Metal buffer limit hit in while body; clearing cache "
+                    "and retrying");
+        g_stats.limit_retries++;
+        gc_collect();
+        mx::clear_cache();
+        limit_retries_++;
+        // BOUNDED: retrying an oversized compiled trace forever once
+        // livelocked a worker for hours.
+        if (limit_retries_ == 2 && compiled_) {
+          body_->drop_compiled();
+          bind();
+        } else if (limit_retries_ > 3) {
+          std::rethrow_exception(err);
+        }
+        return std::nullopt;
+      }
+      if (!compiled_) std::rethrow_exception(err);
+      debug_print("compiled while body failed; retrying eagerly");
+      body_->drop_compiled();
+      bind();
+      return std::nullopt;
+    }
+
+    Program* body_;
+    const std::vector<mx::array>& caps_;
+    int repeat_;
+    bool compiled_ = false;
+    bool probe_ = false;
+    int limit_retries_ = 0;
+  };
+
+  // engine.execute's recovery policy, on the native side of the boundary:
+  // a compiled path that fails hands the program to the eager one (which
+  // is always correct), and buffer exhaustion clears and retries once.
+  // Programs are pure, so a rerun is safe.
+  std::vector<mx::array> run_recovering(const std::vector<mx::array>& inputs) {
+    for (int attempt = 0;; attempt++) {
+      bool used_compiled = compile_ && !compile_disabled_;
+      bool resource_limit = false;
+      std::exception_ptr err;
+      try {
+        return call(inputs, false);
+      } catch (const std::exception& ex) {
+        resource_limit = is_resource_limit(ex);
+        err = std::current_exception();
+      }
+      // Outside the handler, holding none of the failed attempt's arrays.
+      if (used_compiled) {
+        // Whatever went wrong, the compiled graph is what was running:
+        // MLX's compiler rejects some traces outright, and buffer
+        // exhaustion during a trace means the trace is too big to hold.
+        debug_print("compiled native tape failed; running eagerly");
+        drop_compiled();
+        if (resource_limit) {
+          gc_collect();
+          mx::clear_cache();
+        }
+        continue;
+      }
+      if (resource_limit && attempt < 2) {
+        debug_print("Metal buffer limit hit in the native tape; clearing "
+                    "cache and retrying");
+        g_stats.limit_retries++;
+        gc_collect();
+        mx::clear_cache();
+        continue;
+      }
+      std::rethrow_exception(err);
+    }
+  }
+
+  // interpreter._eager_flush: settle everything the environment still
+  // holds. Only that needs to survive -- pruned intermediates are already
+  // unreferenced, so MLX frees them as the evaluation walks the graph
+  // instead of materializing the whole chain at once.
+  static void eager_flush(const std::vector<std::optional<mx::array>>& env) {
+    std::vector<mx::array> live;
+    for (const auto& v : env)
+      if (v) live.push_back(*v);
+    if (live.empty()) return;
+    g_stats.flushes++;
+    const bool hard = g_cfg.flush_sync_every > 0 &&
+                      g_stats.flushes % g_cfg.flush_sync_every == 0;
+    flush_eval(live, hard);
+    // "Frees" into MLX's CACHE, whose byte bound is the memory limit -- so
+    // an eager phase whose traffic is many times its live set claims the
+    // traffic. Return it to the OS past the configured watermark.
+    if (hard && g_cfg.flush_clear_bytes >= 0 &&
+        static_cast<int64_t>(mx::get_cache_memory()) > g_cfg.flush_clear_bytes) {
+      g_stats.cache_clears++;
+      mx::clear_cache();
+    }
   }
 
   static mx::Shape shape(const std::vector<int64_t>& at, size_t off,
@@ -856,10 +1609,25 @@ class Program {
     return a;
   }
 
+  struct Compiled {
+    std::uintptr_t id = 0;
+    std::function<std::vector<mx::array>(const std::vector<mx::array>&)> fn;
+  };
+
   int nslots_;
   int nargs_;
   std::vector<Entry> ops_;
   std::vector<int> outputs_;
+  std::vector<int> copies_;
+  // M3: the compiled path. `compile_` and `anchors_` are Python's decision
+  // (see set_compile); everything else is run-time state that only ever
+  // moves one way -- toward the eager path, which is always correct.
+  bool compile_ = false;
+  bool compile_disabled_ = false;
+  bool no_chunk_ = false;
+  int64_t max_repeat_ = 1;
+  std::vector<int> anchors_;
+  std::map<int, Compiled> compiled_;
 };
 
 nb::dict opcodes() {
@@ -874,6 +1642,36 @@ nb::dict dtype_codes() {
   return d;
 }
 
+// The runtime cadences, copied in from the Python modules that parse the
+// environment (metaljax.interpreter and metaljax.ops.control). One source of
+// truth per number: a second env-var reader here would be a second opinion,
+// and these are values the command-buffer lottery is pinned to.
+void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
+               int64_t flush_clear_bytes, int64_t loop_clear_cost, bool debug,
+               bool memdbg) {
+  g_cfg.eager_flush_bytes = eager_flush_bytes;
+  g_cfg.flush_sync_every = flush_sync_every;
+  g_cfg.flush_clear_bytes = flush_clear_bytes;
+  g_cfg.loop_clear_cost = loop_clear_cost;
+  g_cfg.debug = debug;
+  g_cfg.memdbg = memdbg;
+}
+
+nb::dict stats() {
+  nb::dict d;
+  d["flushes"] = g_stats.flushes;
+  d["cache_clears"] = g_stats.cache_clears;
+  d["loop_flushes"] = g_stats.loop_flushes;
+  d["loop_clears"] = g_stats.loop_clears;
+  d["limit_retries"] = g_stats.limit_retries;
+  d["compiled_calls"] = g_stats.compiled_calls;
+  d["compiles"] = g_stats.compiles;
+  d["compile_drops"] = g_stats.compile_drops;
+  d["chunk_drops"] = g_stats.chunk_drops;
+  d["unrolls"] = g_stats.unrolls;
+  return d;
+}
+
 }  // namespace
 
 void register_tape(nb::module_& m) {
@@ -881,13 +1679,25 @@ void register_tape(nb::module_& m) {
         "StableHLO op name -> opcode; a name absent here declines");
   m.def("dtype_codes", &dtype_codes,
         "MLIR element type -> dtype code; absent means unsupported");
+  m.def("configure", &configure, nb::arg("eager_flush_bytes"),
+        nb::arg("flush_sync_every"), nb::arg("flush_clear_bytes"),
+        nb::arg("loop_clear_cost"), nb::arg("debug"), nb::arg("memdbg"),
+        "Copy the Python-side runtime cadences into the native engine");
+  m.def("stats", &stats, "Native-engine counters (sync points, compiles)");
   nb::class_<Program>(m, "Program")
       .def(nb::init<int, int>(), nb::arg("num_slots"), nb::arg("num_args"))
       .def("add", &Program::add, nb::arg("opcode"), nb::arg("operands"),
            nb::arg("results"), nb::arg("attrs"),
-           nb::arg("payload").none(), nb::arg("drops"))
-      .def("set_outputs", &Program::set_outputs, nb::arg("slots"))
+           nb::arg("payload").none(), nb::arg("drops"),
+           nb::arg("regions") = std::vector<std::shared_ptr<Program>>(),
+           nb::arg("bytes") = 0)
+      .def("set_outputs", &Program::set_outputs, nb::arg("slots"),
+           nb::arg("copies") = std::vector<int>())
+      .def("set_compile", &Program::set_compile, nb::arg("compile"),
+           nb::arg("anchors") = std::vector<int>(),
+           nb::arg("max_repeat") = 1)
       .def("run", &Program::run, nb::arg("inputs"))
+      .def_prop_ro("compiled_dropped", &Program::compiled_dropped)
       .def_prop_ro("num_ops", &Program::num_ops)
       .def_prop_ro("num_slots", &Program::num_slots)
       .def_prop_ro("max_live", &Program::max_live);

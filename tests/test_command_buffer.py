@@ -25,12 +25,20 @@ loads, and the two modules below -- that decode program, and that init scan
 
 Every finite budget is a draw in the same lottery, and OUR OWN COMMITS
 RESHUFFLE IT: any change that moves a lowering moves where the command
-buffers get cut. So the two correctness tests (shipped budgets, must be
-clean) are paired with two CANARIES that sweep known-corrupting budgets in
-subprocesses and fail if none of them corrupts any more -- a passing
-correctness test proves nothing unless the same detector can still see the
-bug. Sweeps, not single pinned values: a single value goes stale the moment
-a lowering shifts (400 -> 200 did, after fdc7cde's shift peephole).
+buffers get cut. So the correctness tests (shipped budgets, must be clean)
+are paired with CANARIES that sweep known-corrupting budgets in subprocesses
+and fail if none of them corrupts any more -- a passing correctness test
+proves nothing unless the same detector can still see the bug. Sweeps, not
+single pinned values: a single value goes stale the moment a lowering shifts
+(400 -> 200 did, after fdc7cde's shift peephole).
+
+And there are two ENGINES to ask, not one: Stage 2 M3 gave the native engine
+its own mx::compile, loop replay and flush discipline, which is a different
+sync-point layout over the same ops -- a different ticket in the same
+lottery. Measured, and the bands barely overlap: 400 and 200 kernels per
+buffer corrupt the Python scan detector while leaving the native one clean;
+100 and 50 do the reverse. Hence the third detector below and its own pair
+of sweeps.
 """
 
 import json
@@ -211,7 +219,93 @@ def _scan_mismatches():
     return bad
 
 
-_DETECTORS = {"compiled": _compiled_mismatches, "scan": _scan_mismatches}
+# --- the native engine: a second sync-point layout over the same asset -----
+
+# Iterations the native detector runs. The asset's own bound (28) is patched
+# down for the same reason the Python detector runs 10 of them by hand: the
+# corruption needs one whole flush window plus most of another, and this
+# body's cadence is 5 (control._flush_period at cost ~4988). The outputs are
+# still the model's real 28-slot parameter buffers, so a run peaks around
+# 10 GB of device memory and takes ~3 s.
+_NATIVE_ITERS = 10
+
+
+def _native_source():
+    text = open(INIT_MODULE).read()
+    old = "stablehlo.constant dense<28> : tensor<i32>"
+    new = f"stablehlo.constant dense<{_NATIVE_ITERS}> : tensor<i32>"
+    assert old in text, "the init scan's loop bound is no longer a constant 28"
+    return text.replace(old, new).encode()
+
+
+def _checksums(buffers):
+    """A bitwise checksum per output: every element's bit pattern summed in
+    64 bits. The comparison has to happen on the DEVICE — these outputs are
+    a whole model's parameters, and pulling ~5 GB to the host per run would
+    make the canary the most expensive test in the suite."""
+    out = []
+    for b in buffers:
+        a = b.data
+        if a.dtype.size != 4:
+            a = mx.astype(a, mx.float32)
+        bits = mx.astype(mx.view(mx.reshape(a, (-1,)), mx.uint32), mx.uint64)
+        out.append(int(mx.sum(bits).item()))
+    return out
+
+
+def _native_mismatches():
+    """Native-engine detector: the same init scan, run by the C++ tape.
+
+    The same question as `_scan_mismatches` — a scan's result must not
+    depend on when the graph is evaluated — asked of the other engine,
+    because the native engine lays its sync points out differently (its
+    constants cross once at lowering, its loop flushes from C++, and a
+    compiled body is one call rather than a Python replay). The cadence
+    both engines use comes from ops.control._flush_period, which is the
+    single place either of them reads it from, so patching it here really
+    does move the native loop's sync points and nothing else.
+
+    Runs op-by-op bodies (METALJAX_BODY_COMPILE=0's path) to match what the
+    Python detector exercises.
+    """
+    from metaljax import engine
+    if engine.NATIVE is None:
+        raise AssertionError(
+            "the native canary must run under METALJAX_ENGINE=native")
+
+    def once():
+        ex = engine.compile_program(_native_source(), "mlir")
+        outs = engine.execute(ex, [])
+        mx.eval(*[o.data for o in outs])
+        # Without this the canary would be measuring the PYTHON engine and
+        # passing for the wrong reason.
+        assert ex._native_prog is not False, (
+            "the native tape declined the init scan; this canary no longer "
+            "measures the native engine at all")
+        got = _checksums(outs)
+        del outs
+        mx.clear_cache()
+        return got
+
+    saved_body, saved_period = control._BODY_COMPILE, control._PERIOD_MAX
+    control._BODY_COMPILE = False
+    try:
+        want = once()
+        control._PERIOD_MAX = 1          # flush every iteration
+        got = once()
+    finally:
+        control._BODY_COMPILE, control._PERIOD_MAX = saved_body, saved_period
+
+    bad = []
+    for j, (a, b) in enumerate(zip(want, got)):
+        if a != b:
+            bad.append(f"native output {j}: checksum {a} at the shipped flush "
+                       f"cadence, {b} when every iteration is evaluated")
+    return bad
+
+
+_DETECTORS = {"compiled": _compiled_mismatches, "scan": _scan_mismatches,
+              "native": _native_mismatches}
 
 
 # --- the shipped budgets must be clean -------------------------------------
@@ -288,6 +382,11 @@ def _probe(mode, **budgets):
     """
     env = dict(os.environ)
     env.update({k: str(v) for k, v in budgets.items()})
+    if mode == "native":
+        # The native engine is a process-wide choice (the extension is
+        # loaded at import), so the canary picks it here rather than
+        # depending on how pytest itself was launched.
+        env["METALJAX_ENGINE"] = "native"
     # Make the child import the metaljax under test, not whatever is
     # installed (worktrees, editable installs, PYTHONPATH runs).
     src = os.path.dirname(os.path.dirname(os.path.abspath(metaljax.__file__)))
@@ -328,6 +427,57 @@ def test_byte_budget_canary_still_corrupts():
     raise AssertionError(
         f"no byte budget in {_CANARY_MB} corrupts the compiled decode "
         f"program any more (tried {tried}). " + _CANARY_HELP)
+
+
+# --- the same three questions, asked of the native engine ------------------
+#
+# Stage 2 M3 gave the native engine its own mx::compile, its own loop replay
+# and its own flush discipline, so it draws its OWN ticket in this lottery --
+# and the numbers say so. Swept on this milestone with the detector above,
+# byte budget at the shipped 512 for the kernel axis and kernels at 800 for
+# the byte axis:
+#   kernels: 800 clean (4/4 reps), 400 clean, 200 clean, 100 WRONG (9 of 66
+#            outputs), 50 WRONG (7)
+#   bytes:   512 clean, 400 clean, 256 WRONG (1), 128 WRONG (7), 64 WRONG (7),
+#            40 WRONG (7)
+# Note how little the two engines' bad bands have in common: 400 and 200
+# kernels corrupt the PYTHON scan detector 5/5 and leave the native one
+# clean, while 100 and 50 do the reverse. That is the whole reason this file
+# now carries both -- a budget proven safe for one engine says nothing about
+# the other.
+_NATIVE_CANARY_OPS = (100, 50, 200, 400, 2000, 1600)
+_NATIVE_CANARY_MB = (128, 64, 40, 256, 20, 8)
+
+
+def test_native_engine_scan_is_correct_at_the_shipped_budgets():
+    corrupt, rec = _probe("native")
+    assert not corrupt, "\n".join(rec["detail"])
+
+
+def test_native_kernel_budget_canary_still_corrupts():
+    """Some kernel budget must still break the native scan detector."""
+    tried = []
+    for ops in _NATIVE_CANARY_OPS:
+        corrupt, _ = _probe("native", MLX_MAX_OPS_PER_BUFFER=ops)
+        tried.append((ops, corrupt))
+        if corrupt:
+            return
+    raise AssertionError(
+        f"no kernel budget in {_NATIVE_CANARY_OPS} corrupts the init scan on "
+        f"the native engine any more (tried {tried}). " + _CANARY_HELP)
+
+
+def test_native_byte_budget_canary_still_corrupts():
+    """Some byte budget must still break the native scan detector."""
+    tried = []
+    for mb in _NATIVE_CANARY_MB:
+        corrupt, _ = _probe("native", MLX_MAX_MB_PER_BUFFER=mb)
+        tried.append((mb, corrupt))
+        if corrupt:
+            return
+    raise AssertionError(
+        f"no byte budget in {_NATIVE_CANARY_MB} corrupts the init scan on the "
+        f"native engine any more (tried {tried}). " + _CANARY_HELP)
 
 
 if __name__ == "__main__":

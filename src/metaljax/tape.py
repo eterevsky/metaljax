@@ -30,6 +30,7 @@ import os
 from jaxlib.mlir import ir
 
 from metaljax import _ir
+from metaljax.interpreter import free_values, value_bytes
 
 _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 
@@ -63,6 +64,30 @@ _FLOAT_ELEMENTS = ("f16", "f32", "bf16")
 # optimization: the same ops run on the same arrays in the same order.
 _CALL_OPS = {"func.call": "callee", "stablehlo.composite": "decomposition"}
 
+# Ops whose handler is `return list(ins)`: the result IS the operand array.
+# Lowered by aliasing slots, so the C++ interpreter never sees them and the
+# aliasing taints (identity, const_view) ride along by construction — which
+# is the whole reason they are here rather than as no-op opcodes.
+_ALIAS_OPS = ("stablehlo.optimization_barrier", "sdy.sharding_constraint",
+              "sdy.reshard")
+
+# Ops carrying regions the tape lowers into sub-Programs (see _control).
+_REGION_OPS = ("stablehlo.while", "stablehlo.if", "stablehlo.case")
+
+
+def _rank0_passthrough(o):
+    """Operand index a rank-0 dynamic slice/update hands straight back.
+
+    With no index operands there is nothing to slice: ops/shape.py returns
+    the operand array ITSELF, so the tape aliases the slot rather than
+    emitting an op — which is also what keeps the aliasing taints right.
+    """
+    if o.name == "stablehlo.dynamic_slice" and len(o.operands) == 1:
+        return 0
+    if o.name == "stablehlo.dynamic_update_slice" and len(o.operands) == 2:
+        return 1  # the update replaces all of the operand
+    return None
+
 
 class _Decline(Exception):
     """This program does not lower. Carries the reason, for METALJAX_DEBUG."""
@@ -76,7 +101,13 @@ def _prod(xs):
 
 
 class _Lowering:
-    """One pass over main's block."""
+    """One block, lowered into one native Program.
+
+    Main is one of these; so is every region a control-flow op carries (see
+    `_control`), whose Program takes the region block's arguments followed
+    by its CAPTURES — the values it reads from the enclosing scope, resolved
+    to parent slots here and passed in as ordinary inputs.
+    """
 
     def __init__(self, interp, native):
         self.interp = interp
@@ -90,15 +121,19 @@ class _Lowering:
         # values once per call site, so the dict's size tracks neither.
         self.nslots = 0
         self.calls: list = []        # callee symbols currently being inlined
-        self.entries: list = []      # (opcode, ins, outs, attrs, payload)
+        self.entries: list = []      # (opcode, ins, outs, attrs, payload, ...)
         # Two aliasing taints, both consumed by the output check in `run`.
-        # `identity`: slots that may hold the very array object an ARGUMENT
-        # holds (see `_is_identity`). `const_view`: slots that may share a
-        # CONSTANT's storage, which the Program keeps for the life of the
-        # executable — a view of one is as good as the constant itself, so
-        # this taint spreads through every shape op, not just the no-ops.
-        self.identity: set = set()
+        # `arg_alias`: slot -> the ARGUMENT slots whose very array object it
+        # may be (see `_is_identity`); a region's outputs carry theirs back
+        # to the parent, mapped through the call's operands, so a carry that
+        # a loop passes through untouched is still recognized as its input.
+        # `const_view`: slots that may share a CONSTANT's storage, which the
+        # Program keeps for the life of the executable — a view of one is as
+        # good as the constant itself, so this taint spreads through every
+        # shape op, not just the no-ops.
+        self.arg_alias: dict = {}
         self.const_view: set = set()
+        self._tcache: dict = {}      # ir.Type -> bytes (see value_bytes)
 
     # --- types --------------------------------------------------------
 
@@ -145,6 +180,11 @@ class _Lowering:
             raise _Decline("value defined outside the block")
         return s
 
+    def _tainted(self, slot) -> tuple:
+        """(argument slots this slot may BE, does it view a constant)."""
+        return (self.arg_alias.get(slot, frozenset()),
+                slot in self.const_view)
+
     def _bind(self, v) -> int:
         s = self.nslots
         self.nslots += 1
@@ -164,22 +204,19 @@ class _Lowering:
 
     # --- the walk -----------------------------------------------------
 
-    def run(self):
-        func = self.interp.main
-        if len(func.regions[0].blocks) != 1:
-            raise _Decline("multi-block function")
-        block = self.interp._main_block()
+    def lower_block(self, block, captures=()):
+        """Walk `block` into this frame; return (Program, output slots).
 
-        args = list(block.arguments)
-        for a in args:
-            self._element(a)          # gates tokens and unsupported dtypes
-            self._shape(a)
-            self.identity.add(self._bind(a))
-        nargs = len(args)
-        arg_slots = set(range(nargs))
-        argset = set(args)
-
+        `captures` are the values the block reads from enclosing scopes,
+        already resolved to parent slots by the caller: they become extra
+        arguments of the Program, after the block's own.
+        """
         returned = None
+        for v in list(block.arguments) + list(captures):
+            self._element(v)          # gates tokens and unsupported dtypes
+            self._shape(v)
+            s = self._bind(v)
+            self.arg_alias[s] = frozenset({s})
         for op in block.operations:
             o = op.operation
             if o.name in _TERMINATORS:
@@ -189,43 +226,96 @@ class _Lowering:
         if returned is None:
             raise _Decline("block without a terminator")
         outputs = [self._slot(v) for v in returned]
+        nargs = len(list(block.arguments)) + len(captures)
+        prog = self._build(nargs, outputs)
+        return prog, outputs
 
-        # An output that IS an argument's array object, or a constant the
-        # Program holds for the life of the executable, would alias across
-        # calls; XLA's contract wants a fresh buffer. engine.execute fixes
-        # the shapes of forwarding it can see statically
-        # (forwarded_outputs) and by object identity, and the latter cannot
-        # survive the language boundary — so decline the rest here rather
-        # than hand back an alias. Returning an argument DIRECTLY is fine:
-        # that is the static case, and engine.execute copies it whatever
-        # engine ran. (Duplicate outputs, which are one array read twice,
-        # native/tape.cc copies; no static analysis needed for those.)
-        #
-        # `forwarded_outputs` recognizes exactly ONE shape of forwarding:
-        # main's terminator naming a block argument. Inlining can produce
-        # the same aliasing without that syntax — `call @identity(%a)`
-        # returns main's argument through an OpResult — so an argument slot
-        # in an output position is only safe when the terminator really
-        # does name the block argument.
-        for v, s in zip(returned, outputs):
-            if s in self.const_view:
-                raise _Decline("an output reads a constant's storage")
-            if s in self.identity and not (s in arg_slots and v in argset):
-                raise _Decline("an argument is forwarded through no-ops")
-
+    def _build(self, nargs, outputs):
         drops = self._liveness(outputs)
         prog = self.native.Program(num_slots=self.nslots, num_args=nargs)
-        for (opcode, ins, outs, attrs, payload), drop in zip(self.entries,
-                                                             drops):
+        for (opcode, ins, outs, attrs, payload, regions, nbytes), drop in zip(
+                self.entries, drops):
             prog.add(opcode=opcode, operands=ins, results=outs, attrs=attrs,
-                     payload=payload, drops=drop)
+                     payload=payload, drops=drop, regions=regions,
+                     bytes=nbytes)
+        # Region programs never need output copies: their results are a
+        # loop's carries or a branch's values, which stay inside this
+        # engine. Only a whole program's outputs cross to a caller, and
+        # `run` sets those.
         prog.set_outputs(slots=outputs)
+        return prog
+
+    def run(self, compile_main=False):
+        func = self.interp.main
+        if len(func.regions[0].blocks) != 1:
+            raise _Decline("multi-block function")
+        block = self.interp._main_block()
+
+        args = list(block.arguments)
+        nargs = len(args)
+        arg_slots = set(range(nargs))
+        argset = set(args)
+
+        prog, outputs = self.lower_block(block)
+
+        # Which outputs may not be handed out as they stand: one that IS an
+        # argument's array object, or one that reads a constant the Program
+        # holds for the life of the executable. Either would alias across
+        # calls, and XLA's contract wants a fresh buffer — jax asserts on it
+        # through unsafe_buffer_pointer, and a consumer that DONATES such an
+        # output would clobber a constant for every later call.
+        #
+        # The Python engine catches its half of this at the end of execute
+        # by comparing `id()`, which cannot survive the language boundary
+        # (nanobind hands out a fresh wrapper per call), and its constants
+        # are rebuilt per call so they never alias at all. So the tape says
+        # statically which outputs to copy, and native/tape.cc copies them.
+        # (Duplicate outputs — one array read twice — it catches by array
+        # identity at run time; no static analysis needed for those.)
+        #
+        # Returning an argument DIRECTLY is left alone: `forwarded_outputs`
+        # sees exactly that syntax and engine.execute copies it whatever
+        # engine ran. Inlining can produce the same aliasing WITHOUT it —
+        # `call @identity(%a)` returns main's argument through an OpResult —
+        # so an argument slot in an output position is only left alone when
+        # the terminator really does name the block argument.
+        returned = list(list(block.operations)[-1].operation.operands)
+        copies = []
+        for j, (v, s) in enumerate(zip(returned, outputs)):
+            if s in self.const_view:
+                copies.append(j)
+            elif s in self.arg_alias and not (s in arg_slots and v in argset):
+                copies.append(j)
+        prog.set_outputs(slots=outputs, copies=copies)
+
+        if compile_main:
+            # The whole tape traces through mx::compile. Python decided that
+            # (engine.MetalExecutable.can_compile, the same cost and byte
+            # gates the Python engine uses); all that is resolved here is
+            # which outputs need anchoring against MLX's constant-baking bug.
+            from metaljax.ops import control
+            prog.set_compile(
+                True, anchors=control._underived_outputs(block, []),
+                max_repeat=1)
         return prog
 
     def _op(self, o):
         name = o.name
         if name in _CALL_OPS:
             self._inline(o, _CALL_OPS[name])
+            return
+        if name in _ALIAS_OPS:
+            if len(o.results) != len(o.operands):
+                raise _Decline(f"op {name} is not an arity-preserving alias")
+            for r, v in zip(o.results, o.operands):
+                self._alias(r, self._slot(v))
+            return
+        passthrough = _rank0_passthrough(o)
+        if passthrough is not None:
+            self._alias(o.results[0], self._slot(o.operands[passthrough]))
+            return
+        if name in _REGION_OPS:
+            self._control(o)
             return
         opcode = self.opcodes.get(name)
         if opcode is None:
@@ -266,10 +356,229 @@ class _Lowering:
         elif nres == 1:
             if any(s in self.const_view for s in ins) and name in _VIEW_OPS:
                 self.const_view.add(outs[0])
-            if any(s in self.identity for s in ins) and self._is_identity(
-                    name, o):
-                self.identity.add(outs[0])
-        self.entries.append((opcode, ins, outs, attrs, payload))
+            if self._is_identity(name, o):
+                src = frozenset().union(
+                    *[self.arg_alias.get(s, frozenset()) for s in ins])
+                if src:
+                    self.arg_alias[outs[0]] = src
+        self._emit(opcode, ins, outs, attrs, payload, o)
+
+    def _emit(self, opcode, ins, outs, attrs, payload, o, regions=()):
+        """Append one tape entry, charged the result bytes the eager flush
+        cadence meters (interpreter.eager_plan's `out_bytes`: the plain
+        value_bytes sum, splat corrections deliberately absent — see the
+        note there on why a cadence over-counts rather than under-counts)."""
+        nbytes = sum(value_bytes(r, self._tcache) for r in o.results)
+        self.entries.append((opcode, ins, outs, attrs, payload, list(regions),
+                             nbytes))
+
+    # --- control flow -------------------------------------------------
+    #
+    # Each region becomes a Program of its own; the parent entry carries the
+    # sub-Programs and, for a while, the loop policy Python's analysis in
+    # ops/control.py resolved. Nothing about the POLICY is re-derived in
+    # C++: the cost model, the trace budgets, the counted-loop recognizer
+    # and the compile decisions all run here, once, and the tape records
+    # their answers.
+
+    def _region(self, block):
+        """Lower one region block into a sub-Program.
+
+        Returns (Program, capture slots in the parent, per-output taints,
+        the child frame). A region's captures are resolved against THIS
+        frame, so a value from further out becomes a capture of this frame
+        too — recursively, which is what lets a nested loop read a value
+        defined in main.
+        """
+        if len(list(block.operations)) == 0:
+            raise _Decline("empty region")
+        free = free_values(block)
+        cap_slots = [self._slot(v) for v in free]
+        child = _Lowering(self.interp, self.native)
+        prog, outputs = child.lower_block(block, free)
+        return prog, free, cap_slots, outputs, child
+
+    def _region_taints(self, child, outputs, parent_slots):
+        """Per-output (arg-alias set, const-view flag) in the PARENT frame.
+
+        A region output that may be one of the region's own arguments may,
+        in the parent, be whatever that argument was: a carry init, a
+        capture, and through those an argument of main or a constant the
+        Program holds forever. Mapping the taints back is what keeps a loop
+        that forwards a carry from smuggling an alias into an output.
+        """
+        out = []
+        for s in outputs:
+            srcs, cv = child._tainted(s)
+            alias: set = set()
+            for i in srcs:
+                # Child arg slots are 0..nargs-1, in the order lower_block
+                # bound them (block arguments, then captures).
+                p = parent_slots[i]
+                alias |= self.arg_alias.get(p, frozenset())
+                cv = cv or p in self.const_view
+            out.append((frozenset(alias), cv))
+        return out
+
+    def _control(self, o):
+        name = o.name
+        opcode = self.opcodes.get(name)
+        if opcode is None:
+            raise _Decline(f"op {name}")
+        for v in list(o.operands) + list(o.results):
+            self._dtype_code(self._element(v))
+            self._shape(v)
+        for region in o.regions:
+            if len(region.blocks) != 1:
+                raise _Decline(f"op {name} has a multi-block region")
+        if name == "stablehlo.while":
+            self._while(o, opcode)
+        else:
+            self._branch(o, opcode)
+
+    def _while(self, o, opcode):
+        from metaljax.interpreter import COMPILE_ENABLED
+        from metaljax.ops import control
+
+        if control._msl_plan_for(self.interp, o) is not None:
+            # A generated persistent kernel beats anything this milestone
+            # can do with the loop; native msl_scan is M5.
+            raise _Decline("while has an msl_scan plan")
+
+        cond_block = o.regions[0].blocks[0]
+        body_block = o.regions[1].blocks[0]
+        ncarry = len(o.operands)
+        if len(list(body_block.arguments)) != ncarry:
+            raise _Decline("while body arity mismatch")
+        if len(list(cond_block.arguments)) != ncarry:
+            raise _Decline("while cond arity mismatch")
+
+        cond_prog, cond_free, cond_caps, cond_outs, _ = self._region(
+            cond_block)
+        if len(cond_outs) != 1:
+            raise _Decline("while cond does not return one value")
+        body_prog, body_free, body_caps, body_outs, body_lo = self._region(
+            body_block)
+        if len(body_outs) != ncarry:
+            raise _Decline("while body result count mismatch")
+
+        counted = control._analyze_counted(self.interp, o)
+        is_counted, k, bound_kind, bound = 0, 0, 0, 0
+        if counted is not None:
+            k, b = counted
+            if isinstance(b, int):
+                is_counted, bound_kind, bound = 1, 0, b
+            elif isinstance(b, tuple):          # ("carry", j): invariant state
+                is_counted, bound_kind, bound = 1, 1, b[1]
+            elif b in cond_free:
+                # Captured from an enclosing scope; the cond compares
+                # against it, so it is one of the cond's captures.
+                is_counted, bound_kind, bound = 1, 2, cond_free.index(b)
+            # else: the bound is out of reach — the Python engine treats
+            # that as a dynamic loop rather than a KeyError, and so do we.
+
+        cost = control._block_cost(self.interp, body_block)
+        pure = self.interp.block_is_pure(body_block)
+        chunks = control._bytes_chunks(self.interp, body_block)
+        by_cost = control._TRACE_BUDGET // max(cost, 1)
+        # `_bytes_chunks` never returns less than 1 — its callers ask "how
+        # many iterations may one trace hold", and the single-step case is
+        # gated separately in _body_fn (`_bytes_ok(..., repeat)`), which
+        # says NO when one iteration alone is over budget. Solving that
+        # gate for `repeat` is this division, and it must not be floored:
+        # rounding it up to 1 compiles a body the Python engine refuses,
+        # and a compiled body holds every intermediate of an iteration
+        # instead of flushing inside it (measured on the byte-gated
+        # random.normal init: 1.19 GB peak eager, 2.38 GB compiled).
+        if control._COMPILE_BYTES <= 0:
+            by_bytes = by_cost
+        else:
+            by_bytes = control._COMPILE_BYTES // max(
+                control._block_bytes(self.interp, body_block), 1)
+        chunkable = int(COMPILE_ENABLED
+                        and cost <= control._CHUNK_MAX_COST
+                        and pure
+                        and body_block not in self.interp._no_chunk)
+        kmax = max(1, min(by_cost, control._CHUNK_MAX, chunks))
+        period = control._flush_period(cost)
+        # How many iterations one compiled body may hold: the _body_fn gates
+        # (purity, the op budget, the byte budget), solved for `repeat`.
+        body_compile_max = 0
+        if (COMPILE_ENABLED and control._BODY_COMPILE and pure
+                and body_block not in self.interp._no_body_compile):
+            body_compile_max = max(0, min(by_cost, by_bytes))
+        if body_compile_max:
+            body_prog.set_compile(
+                True,
+                anchors=control._underived_outputs(body_block, body_free),
+                max_repeat=body_compile_max)
+
+        attrs = [ncarry, len(cond_caps), len(body_caps), is_counted, k,
+                 bound_kind, bound, cost, period, chunkable, kmax,
+                 body_compile_max]
+        ins = [self._slot(v) for v in o.operands] + cond_caps + body_caps
+        outs = [self._bind(v) for v in o.results]
+
+        # A loop's result j is its carry j: the body's output when the loop
+        # ran, the INITIAL value when the trip count was zero — and an
+        # initial value is very often main's own argument, so which of the
+        # two it is decides whether the result may alias one. A statically
+        # counted loop answers that here; anything else is charged both.
+        static_trip = None
+        if is_counted and bound_kind == 0:
+            start = control._static_start(o, k)
+            if start is not None:
+                static_trip = max(bound - start, 0)
+        body_parents = [self._slot(v) for v in o.operands] + body_caps
+        taints = self._region_taints(body_lo, body_outs, body_parents)
+        for j, (alias, cv) in enumerate(taints):
+            init = ins[j]
+            if static_trip == 0:
+                alias, cv = self._tainted(init)   # the body never runs
+            elif static_trip is None:
+                alias = alias | self.arg_alias.get(init, frozenset())
+                cv = cv or init in self.const_view
+            if cv:
+                self.const_view.add(outs[j])
+            if alias:
+                self.arg_alias[outs[j]] = frozenset(alias)
+        self._emit(opcode, ins, outs, attrs, None, o,
+                   regions=[cond_prog, body_prog])
+
+    def _branch(self, o, opcode):
+        """stablehlo.if / stablehlo.case: branch blocks take no arguments
+        (everything they read is a capture) and the predicate is read on the
+        host, exactly as the Python handlers do."""
+        attrs: list = []
+        ins = [self._slot(o.operands[0])]
+        outs = [self._bind(v) for v in o.results]
+        regions = []
+        per_branch = []
+        for region in o.regions:
+            blk = region.blocks[0]
+            if len(list(blk.arguments)):
+                raise _Decline("branch region takes arguments")
+            prog, free, caps, b_outs, child = self._region(blk)
+            if len(b_outs) != len(outs):
+                raise _Decline("branch result count mismatch")
+            attrs.append(len(caps))
+            ins.extend(caps)
+            regions.append(prog)
+            per_branch.append(self._region_taints(child, b_outs, caps))
+        if not regions:
+            raise _Decline("branch op with no regions")
+        for j in range(len(outs)):
+            alias: set = set()
+            cv = False
+            for taints in per_branch:
+                a, c = taints[j]
+                alias |= a
+                cv = cv or c
+            if cv:
+                self.const_view.add(outs[j])
+            if alias:
+                self.arg_alias[outs[j]] = frozenset(alias)
+        self._emit(opcode, ins, outs, attrs, None, o, regions=regions)
 
     def _inline(self, o, attr):
         """Splice a single-block callee's ops into this tape.
@@ -341,11 +650,11 @@ class _Lowering:
         terminator reads them).
         """
         last: dict = {}
-        for i, (_, ins, _, _, _) in enumerate(self.entries):
-            for s in ins:
+        for i, e in enumerate(self.entries):
+            for s in e[1]:
                 last[s] = i
-        for i, (_, _, outs, _, _) in enumerate(self.entries):
-            for s in outs:
+        for i, e in enumerate(self.entries):
+            for s in e[2]:
                 last.setdefault(s, i)
         for s in outputs:
             last.pop(s, None)
@@ -542,8 +851,54 @@ def _lower_shift(lo, o):
     return [0, 0], None
 
 
+def _lower_bitcast_convert(lo, o):
+    """ops/shape.py _bitcast_convert, the byte-multiple arm.
+
+    Which arm runs is a static property of the two element widths, and the
+    other arm cannot be reached at all: it exists for i4/ui4, whose device
+    storage is a wider dtype and which the dtype table therefore declines
+    (with every other emulated type, for the same reason — a bitcast reads
+    BITS, and theirs do not exist on this device).
+    """
+    from metaljax import dtypes as _dt
+    out_el = lo._element(o.results[0])
+    src = _dt.mx_dtype_for(_ir.tensor_type(o.operands[0]).element_type)
+    dst = _dt.mx_dtype_for(ir.RankedTensorType(o.results[0].type).element_type)
+    if dst.size == src.size:
+        kind = 0
+    elif dst.size < src.size:
+        kind = 1
+    else:
+        kind = 2
+    return [lo._dtype_code(out_el), kind], None
+
+
+def _lower_dynamic_slice(lo, o):
+    """ops/shape.py _dynamic_slice: XLA clamps the start indices so the
+    window stays inside the operand, and both the sizes and the clamp
+    bounds are shape arithmetic — resolved here, once."""
+    sizes = _ir.i64_list(o, "slice_sizes")
+    src = lo._shape(o.operands[0])
+    if len(o.operands) - 1 != len(sizes):
+        raise _Decline("dynamic_slice index arity mismatch")
+    bounds = [d - s for d, s in zip(src, sizes)]
+    return [len(sizes), *bounds, *sizes], None
+
+
+def _lower_dynamic_update_slice(lo, o):
+    sizes = lo._shape(o.operands[1])
+    src = lo._shape(o.operands[0])
+    if len(o.operands) - 2 != len(sizes):
+        raise _Decline("dynamic_update_slice index arity mismatch")
+    bounds = [d - s for d, s in zip(src, sizes)]
+    return [len(sizes), *bounds], None
+
+
 _HANDLERS = {
     "stablehlo.compare": _lower_compare,
+    "stablehlo.bitcast_convert": _lower_bitcast_convert,
+    "stablehlo.dynamic_slice": _lower_dynamic_slice,
+    "stablehlo.dynamic_update_slice": _lower_dynamic_update_slice,
     "stablehlo.shift_left": _lower_shift,
     "stablehlo.shift_right_logical": _lower_shift,
     "stablehlo.shift_right_arithmetic": _lower_shift,
@@ -604,12 +959,16 @@ _IDENTITY_CHECKS = {
     "stablehlo.concatenate": _ident_concatenate,
 }
 
+# A bitcast and a dynamic slice read their operand's storage too (mx.view
+# and mx.slice are views), so a constant reaches an output through either.
+_EXTRA_VIEW_OPS = ("stablehlo.bitcast_convert", "stablehlo.dynamic_slice")
+
 # Ops whose result may be a VIEW of an operand rather than new storage.
 # Used only to keep a constant's buffer out of an output position, where
 # the coarse answer costs a decline and the precise one would cost a rule
 # per op per MLX version. (Splat constants are the case that matters: they
 # are one-element buffers a broadcast_in_dim spreads over a whole shape.)
-_VIEW_OPS = frozenset(_IDENTITY_CHECKS)
+_VIEW_OPS = frozenset(_IDENTITY_CHECKS) | frozenset(_EXTRA_VIEW_OPS)
 
 
 # --------------------------------------------------------------------------
@@ -617,11 +976,37 @@ _VIEW_OPS = frozenset(_IDENTITY_CHECKS)
 # --------------------------------------------------------------------------
 
 
-def lower(interp):
+def configure(native):
+    """Hand the native engine the runtime cadences.
+
+    Every one of them is parsed, documented and defended in the Python
+    module that owns it; copying them across (rather than reading the
+    environment again in C++) is what keeps the two engines from drifting
+    on numbers the command-buffer lottery is pinned to. Re-read on every
+    lowering, so a test that moves a cadence moves it for both engines.
+    """
+    from metaljax import interpreter
+    from metaljax.ops import control
+    native.configure(
+        eager_flush_bytes=interpreter.FLUSH_BYTES,
+        flush_sync_every=interpreter._FLUSH_SYNC_EVERY,
+        flush_clear_bytes=interpreter._FLUSH_CLEAR_BYTES,
+        loop_clear_cost=control._LOOP_CLEAR_COST,
+        debug=interpreter._DEBUG,
+        memdbg=control._MEMDBG,
+    )
+
+
+def lower(interp, compile_main=False):
     """The interpreter's main block as a native Program, or None.
 
     None means "run this on the Python engine" and is never an error: the
     caller caches it per executable and stops asking.
+
+    `compile_main` is the Python engine's own compile decision for this
+    program (engine.MetalExecutable.can_compile). The tape does not second-
+    guess it: the estimators behind it — op cost, traced bytes, purity —
+    live in ops/control.py and stay there.
     """
     from metaljax import engine
     native = engine.NATIVE
@@ -629,7 +1014,8 @@ def lower(interp):
         return None
     try:
         with interp.context:
-            return _Lowering(interp, native).run()
+            configure(native)
+            return _Lowering(interp, native).run(compile_main=compile_main)
     except _Decline as e:
         if _DEBUG:
             print(f"[metaljax] native tape declined: {e}", flush=True)

@@ -309,3 +309,36 @@ bug (re-measure the workaround) or the assets stopped straddling a bad
 boundary (the canary needs a bigger graph). The bounds test now pins the
 shipped values to the measured clean bands (450-1300 kernels, 512-2048 MB)
 instead of the old, far looser >=64 / >=160.
+
+## Addendum, 2026-08-07: the native engine draws its own ticket (Stage 2 M3)
+
+The C++ replay engine (`native/tape.cc`) runs the same ops in the same order
+as the Python one, but its sync points fall elsewhere: constants cross once
+at lowering instead of being rebuilt per call, the loop's flush and
+clear-and-retry live in C++, and a compiled body is one call rather than a
+Python replay. That is a different cut of the same graph — a different
+ticket in the same lottery — and the measurements say so plainly.
+
+Detector: `_native_mismatches` in `tests/test_command_buffer.py` — the same
+`qwen3_init_scan.mlir` asset (bound patched to 10 iterations, uncompiled
+bodies), run twice through the native engine at two flush cadences
+(`ops.control._flush_period`'s shipped 5 for this body, versus 1), compared
+by per-output bitwise checksums computed on the device. One fresh process
+per value, ~3 s and ~10 GB of device memory each.
+
+**Kernel budget, bytes held at 512:** 800 clean (4/4 reps), 400 clean, 200
+clean, 100 **wrong** (9 of 66 outputs), 50 **wrong** (7).
+
+**Byte budget, kernels held at 800:** 512 clean, 400 clean, 256 **wrong**
+(1 output), 128 **wrong** (7), 64 **wrong** (7), 40 **wrong** (7).
+
+Note how little those bands share with the Python engine's on the same
+asset: 400 and 200 kernels corrupt the Python scan detector 5/5 and leave
+the native one clean, while 100 and 50 do the reverse; on the byte axis the
+Python detector is wrong at <=400 and the native one only at <=256. A budget
+proven safe for one engine says nothing about the other, which is why
+`tests/test_command_buffer.py` now carries three detectors and three sweeps.
+
+The shipped budgets are clean on both engines, and the native canary asserts
+that the tape really took the program — a canary that silently fell back to
+the Python engine would pass for the wrong reason.

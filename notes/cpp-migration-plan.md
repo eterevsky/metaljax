@@ -67,14 +67,25 @@ milestones also run the topconfs sweep vs the 2026-08-05 anchor)
   native supports the program; outputs must match bit-exact (float
   tolerance only where the Python engine itself is
   nondeterministic).
-- **M3 — control flow + compile**: while/if/case, counted-loop
-  detection reuse (Python analysis annotates the tape; C++ executes),
-  mx::compile of mains/bodies from C++ closures, chunked replay, the
-  body-probe contract (24e93f0), body-failure fallback, loop flush
-  cadence + clear/retry discipline (0.3.2/0.4.x semantics), eager
-  flush cache-clear (METALJAX_FLUSH_CLEAR_MB). The command-buffer
-  sweep canaries MUST be re-pointed at the native engine before it
-  becomes default — sync-point layout changes redraw the lottery.
+- **M3 — control flow + compile** (landed 2026-08-07): while/if/case,
+  counted-loop detection reuse (Python analysis annotates the tape;
+  C++ executes), mx::compile of mains and bodies from C++ closures
+  (`mx::detail::compile` with ids this engine owns and erases),
+  chunked replay, the body-probe contract (24e93f0), body-failure
+  fallback, loop flush cadence + clear/retry discipline (0.3.2/0.4.x
+  semantics), eager flush cache-clear (METALJAX_FLUSH_CLEAR_MB).
+  Every cadence and budget is READ FROM PYTHON (`tape.configure` and
+  the lowering's annotations), never re-parsed in C++, so the two
+  engines cannot drift on a number the command-buffer lottery is
+  pinned to. The eager-only production gate is gone: a program whose
+  tape lowers takes the native path whether or not it compiles.
+  Canaries re-pointed — tests/test_command_buffer.py grew a native
+  detector and two sweeps, and the native engine's corrupting bands
+  are NOT the Python engine's (2026-08-07 addendum in
+  notes/mlx-command-buffer-split.md). The aliasing rule changed with
+  it: an output that reads a constant the Program holds, or an
+  argument's array through no-ops, is COPIED in C++ instead of
+  declining the whole program.
 - **M4 — recognizer emits native**: qmm/sdpa/moe emits become native
   calls (mx::quantized_matmul, mx::gather_qmm/gather_mm,
   mx::fast::scaled_dot_product_attention). Pack BUILDING stays in
