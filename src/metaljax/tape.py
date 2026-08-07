@@ -57,6 +57,12 @@ _BOOL_REDUCE_KINDS = {
 
 _FLOAT_ELEMENTS = ("f16", "f32", "bf16")
 
+# Symbol-carrying call ops and the attribute naming their callee. Both run
+# `interp.run_func(callee, ins)` in ops/control.py, so inlining the callee's
+# block into the tape is a transliteration of the handler, not an
+# optimization: the same ops run on the same arrays in the same order.
+_CALL_OPS = {"func.call": "callee", "stablehlo.composite": "decomposition"}
+
 
 class _Decline(Exception):
     """This program does not lower. Carries the reason, for METALJAX_DEBUG."""
@@ -78,6 +84,12 @@ class _Lowering:
         self.opcodes = native.opcodes()
         self.dtypes = native.dtype_codes()
         self.slots: dict = {}
+        # Slots are handed out by a monotone counter, NOT by len(self.slots):
+        # inlining aliases values onto existing slots (a callee's block
+        # argument IS the caller's operand) and re-binds a callee's own
+        # values once per call site, so the dict's size tracks neither.
+        self.nslots = 0
+        self.calls: list = []        # callee symbols currently being inlined
         self.entries: list = []      # (opcode, ins, outs, attrs, payload)
         # Two aliasing taints, both consumed by the output check in `run`.
         # `identity`: slots that may hold the very array object an ARGUMENT
@@ -134,9 +146,21 @@ class _Lowering:
         return s
 
     def _bind(self, v) -> int:
-        s = len(self.slots)
+        s = self.nslots
+        self.nslots += 1
         self.slots[v] = s
         return s
+
+    def _alias(self, v, slot: int) -> None:
+        """Bind `v` to a slot that already exists, allocating nothing.
+
+        Inlining is all aliasing: a callee's block argument names the
+        caller's operand array and the call's results name whatever the
+        callee returned. No op is emitted for either, so the identity and
+        const_view taints — which live on slot numbers — ride along by
+        construction.
+        """
+        self.slots[v] = slot
 
     # --- the walk -----------------------------------------------------
 
@@ -153,16 +177,18 @@ class _Lowering:
             self.identity.add(self._bind(a))
         nargs = len(args)
         arg_slots = set(range(nargs))
+        argset = set(args)
 
-        outputs = None
+        returned = None
         for op in block.operations:
             o = op.operation
             if o.name in _TERMINATORS:
-                outputs = [self._slot(v) for v in o.operands]
+                returned = list(o.operands)
                 break
             self._op(o)
-        if outputs is None:
+        if returned is None:
             raise _Decline("block without a terminator")
+        outputs = [self._slot(v) for v in returned]
 
         # An output that IS an argument's array object, or a constant the
         # Program holds for the life of the executable, would alias across
@@ -174,14 +200,21 @@ class _Lowering:
         # that is the static case, and engine.execute copies it whatever
         # engine ran. (Duplicate outputs, which are one array read twice,
         # native/tape.cc copies; no static analysis needed for those.)
-        for s in outputs:
+        #
+        # `forwarded_outputs` recognizes exactly ONE shape of forwarding:
+        # main's terminator naming a block argument. Inlining can produce
+        # the same aliasing without that syntax — `call @identity(%a)`
+        # returns main's argument through an OpResult — so an argument slot
+        # in an output position is only safe when the terminator really
+        # does name the block argument.
+        for v, s in zip(returned, outputs):
             if s in self.const_view:
                 raise _Decline("an output reads a constant's storage")
-            if s in self.identity and s not in arg_slots:
+            if s in self.identity and not (s in arg_slots and v in argset):
                 raise _Decline("an argument is forwarded through no-ops")
 
         drops = self._liveness(outputs)
-        prog = self.native.Program(num_slots=len(self.slots), num_args=nargs)
+        prog = self.native.Program(num_slots=self.nslots, num_args=nargs)
         for (opcode, ins, outs, attrs, payload), drop in zip(self.entries,
                                                              drops):
             prog.add(opcode=opcode, operands=ins, results=outs, attrs=attrs,
@@ -191,33 +224,93 @@ class _Lowering:
 
     def _op(self, o):
         name = o.name
+        if name in _CALL_OPS:
+            self._inline(o, _CALL_OPS[name])
+            return
         opcode = self.opcodes.get(name)
         if opcode is None:
             raise _Decline(f"op {name}")
         if o.regions and name != "stablehlo.reduce":
             raise _Decline(f"op {name} carries a region")
-        if len(o.results) != 1:
-            raise _Decline(f"op {name} has {len(o.results)} results")
+        nres = len(o.results)
+        # Multi-result ops exist only where a handler asks for them (the
+        # argmax/argmin (values, indices) reduce); everything else has to
+        # produce exactly one array, since that is all the tape can bind.
+        if nres != 1 and name != "stablehlo.reduce":
+            raise _Decline(f"op {name} has {nres} results")
         for v in o.operands:
             self._dtype_code(self._element(v))
             self._shape(v)
-        self._dtype_code(self._element(o.results[0]))
-        self._shape(o.results[0])
+        for v in o.results:
+            self._dtype_code(self._element(v))
+            self._shape(v)
 
+        # The handler is what decides how many results the op may have when
+        # more than one is possible, and it may name a different opcode than
+        # the op does: one stablehlo.reduce covers both the monoid fold and
+        # the (values, indices) pair, which are separate C++ handlers.
         handler = _HANDLERS.get(name)
-        attrs, payload = handler(self, o) if handler else ([], None)
+        res = handler(self, o) if handler else ([], None)
+        if len(res) == 3:
+            attrs, payload, opname = res
+            opcode = self.opcodes.get(opname)
+            if opcode is None:
+                raise _Decline(f"op {opname}")
+        else:
+            attrs, payload = res
 
         ins = [self._slot(v) for v in o.operands]
-        out = self._bind(o.results[0])
+        outs = [self._bind(v) for v in o.results]
         if name == "stablehlo.constant":
-            self.const_view.add(out)
-        else:
+            self.const_view.add(outs[0])
+        elif nres == 1:
             if any(s in self.const_view for s in ins) and name in _VIEW_OPS:
-                self.const_view.add(out)
+                self.const_view.add(outs[0])
             if any(s in self.identity for s in ins) and self._is_identity(
                     name, o):
-                self.identity.add(out)
-        self.entries.append((opcode, ins, [out], attrs, payload))
+                self.identity.add(outs[0])
+        self.entries.append((opcode, ins, outs, attrs, payload))
+
+    def _inline(self, o, attr):
+        """Splice a single-block callee's ops into this tape.
+
+        Purely Python-side: the C++ interpreter never sees a call. The
+        callee's block arguments alias the call's operand slots and the
+        call's results alias whatever the callee returned, so the inlined
+        ops read and write exactly the arrays `interp.run_func` would have
+        handed them.
+        """
+        name = ir.FlatSymbolRefAttr(o.attributes[attr]).value
+        fn = self.interp.funcs.get(name)
+        if fn is None:
+            raise _Decline(f"call to unknown symbol @{name}")
+        if name in self.calls:
+            # Recursion has no bounded inlining; the Python engine's own
+            # recursive run_func keeps it.
+            raise _Decline(f"recursive call to @{name}")
+        if len(fn.regions[0].blocks) != 1:
+            raise _Decline(f"callee @{name} is not single-block")
+        block = fn.regions[0].blocks[0]
+        args = list(block.arguments)
+        if len(args) != len(o.operands):
+            raise _Decline(f"callee @{name} arity mismatch")
+        for a, v in zip(args, o.operands):
+            self._alias(a, self._slot(v))
+        self.calls.append(name)
+        rets = None
+        for inner in block.operations:
+            io = inner.operation
+            if io.name in _TERMINATORS:
+                rets = [self._slot(v) for v in io.operands]
+                break
+            self._op(io)
+        self.calls.pop()
+        if rets is None:
+            raise _Decline(f"callee @{name} has no terminator")
+        if len(rets) != len(o.results):
+            raise _Decline(f"callee @{name} result count mismatch")
+        for r, s in zip(o.results, rets):
+            self._alias(r, s)
 
     def _is_identity(self, name, o) -> bool:
         """Whether MLX may return this op's operand array ITSELF.
@@ -350,31 +443,45 @@ def _lower_constant(lo, o):
 
 
 def _lower_reduce(lo, o):
+    """The two shapes of stablehlo.reduce ops/reduction.py recognizes.
+
+    The order of the tests is the Python handler's: single-operand monoid
+    first, then the (values, indices) pair jax lowers argmax/argmin to.
+    Anything else — bitwise bodies, variadic min-with-index chains,
+    arbitrary combiners — is _generic_reduce, which walks the body block
+    op by op and is not ported.
+    """
     n = len(o.operands) // 2
-    if n != 1:
-        # The (values, indices) argmax/argmin pair and variadic bodies keep
-        # the Python engine.
-        raise _Decline("variadic reduce")
+    dims = _ir.i64_list(o, "dimensions")
     body = o.regions[0].blocks[0]
     body_ops = [x.operation for x in body.operations]
-    if len(body_ops) != 2:
-        raise _Decline("reduce body is not a single op")
-    table = (_BOOL_REDUCE_KINDS if lo._element(o.operands[0]) == "i1"
-             else _REDUCE_KINDS)
-    kind = table.get(body_ops[0].name)
-    if kind is None:
-        raise _Decline(f"reduce body {body_ops[0].name}")
-    dims = _ir.i64_list(o, "dimensions")
-    return [kind, len(dims), *dims], None
+
+    if n == 1 and len(body_ops) == 2:
+        if len(o.results) != 1:
+            raise _Decline("monoid reduce with several results")
+        table = (_BOOL_REDUCE_KINDS if lo._element(o.operands[0]) == "i1"
+                 else _REDUCE_KINDS)
+        kind = table.get(body_ops[0].name)
+        if kind is not None:
+            return [kind, len(dims), *dims], None
+
+    if n == 2 and len(dims) == 1 and lo._element(o.operands[0]) != "i1":
+        from metaljax.ops.elementwise import _comparison_direction
+        first = next((_comparison_direction(x) for x in body_ops
+                      if x.name == "stablehlo.compare"), None)
+        if first in ("GT", "GE", "LT", "LE"):
+            if len(o.results) != 2:
+                raise _Decline("argmax-pair reduce with wrong result count")
+            return ([1 if first in ("GT", "GE") else 0, dims[0]], None,
+                    "stablehlo.reduce.arg_pair")
+
+    raise _Decline(f"reduce body {[x.name for x in body_ops]}")
 
 
 def _lower_dot_general(lo, o):
-    from metaljax.ops.linalg import _dot_dims
+    from metaljax import dtypes as _dt
+    from metaljax.ops.linalg import _dot_dims, _exact_f32_chunk
     out_el = lo._element(o.results[0])
-    if out_el not in _FLOAT_ELEMENTS:
-        # Integer dots go through ops.linalg's exact-f32 chunking (or the
-        # int64 outer product); neither is ported.
-        raise _Decline(f"dot_general result {out_el}")
     lb, rb, lc, rc = _dot_dims(o)
     lhs = lo._shape(o.operands[0])
     rhs = lo._shape(o.operands[1])
@@ -387,13 +494,59 @@ def _lower_dot_general(lo, o):
     k = [lhs[d] for d in lc]
     n = [rhs[d] for d in rfree]
     out_shape = batch + m + n
+
+    # Which of ops/linalg._dot_general's three arms runs. Every input is
+    # static (the operand dtypes and prod(k)), so the choice is made once
+    # here and the C++ handler just executes it: 0 float matmul, 1 exact-f32
+    # K-chunks, 2 int64 outer product, 3 the same in bool.
+    out_dt = _dt.mx_dtype_for(ir.RankedTensorType(o.results[0].type)
+                              .element_type)
+    l_dt = _dt.mx_dtype_for(ir.RankedTensorType(o.operands[0].type)
+                            .element_type)
+    r_dt = _dt.mx_dtype_for(ir.RankedTensorType(o.operands[1].type)
+                            .element_type)
+    chunk = (_exact_f32_chunk(l_dt, r_dt)
+             if _dt.is_int(out_dt) and _prod(k) != 0 else None)
+    if chunk is not None:
+        kind = 1
+    elif _dt.is_int(out_dt):
+        kind = 2
+    elif _dt.is_bool(out_dt):
+        kind = 3
+    elif out_el in _FLOAT_ELEMENTS:
+        kind = 0
+    else:
+        raise _Decline(f"dot_general result {out_el}")
     return ([len(lperm), *lperm, len(rperm), *rperm,
              _prod(batch), _prod(m), _prod(k), _prod(n),
-             lo._dtype_code(out_el), len(out_shape), *out_shape], None)
+             lo._dtype_code(out_el), len(out_shape), *out_shape,
+             kind, chunk or 0], None)
+
+
+def _lower_shift(lo, o):
+    """ops/elementwise._shift_guard's static-amount peephole, resolved here.
+
+    XLA defines a shift by >= the operand's bit width as 0 (logical/left) or
+    the sign fill (arithmetic); Metal's shifts are mod-width. The guard is a
+    compare and a select — except when the amount is a compile-time splat,
+    which it almost always is, and then only one arm is emitted. That
+    question is pure IR, so it is answered once, at lowering: `[1, amount]`
+    means "the amount is statically `amount`", `[0, 0]` means the runtime
+    select. Which side of the width the amount falls on stays in C++, where
+    the operand's byte width is known.
+    """
+    from metaljax.ops.elementwise import _static_splat_int
+    c = _static_splat_int(o.operands[1])
+    if c is not None and c >= 0:
+        return [1, c], None
+    return [0, 0], None
 
 
 _HANDLERS = {
     "stablehlo.compare": _lower_compare,
+    "stablehlo.shift_left": _lower_shift,
+    "stablehlo.shift_right_logical": _lower_shift,
+    "stablehlo.shift_right_arithmetic": _lower_shift,
     "stablehlo.convert": _lower_convert,
     "stablehlo.reshape": _lower_reshape,
     "stablehlo.transpose": _lower_transpose,

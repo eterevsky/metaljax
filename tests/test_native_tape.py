@@ -112,6 +112,17 @@ def check(mod, arrays, lowered=True):
     return ex
 
 
+def declines(mod):
+    """Assert the tape refuses `mod` without executing it.
+
+    For programs the PYTHON engine cannot run either — a recursive callee
+    diverges — so `check` has no reference to compare against.
+    """
+    with _native_engine():
+        ex = engine.compile_program(mod, "mlir")
+        assert ex.native_program() is None, "the tape lowered this program"
+
+
 RNG = np.random.default_rng(20260806)
 
 
@@ -119,10 +130,18 @@ def _f32(shape=(3, 4)):
     return RNG.standard_normal(shape).astype(np.float32)
 
 
-def _specials():
-    """The values that separate a faithful port from an approximate one."""
-    return np.array([0.0, -0.0, 1.0, -1.0, 0.5, -2.5, 1e-30, 3.4e38,
-                     np.inf, -np.inf, np.nan, -np.nan], np.float32)
+def _specials(npdt=np.float32):
+    """The values that separate a faithful port from an approximate one.
+
+    3.4e38 overflows to inf in the halves, which is the point: both engines
+    see the same input bytes whatever numpy warns about on the way in.
+    """
+    x = np.array([0.0, -0.0, 1.0, -1.0, 0.5, -2.5, 1e-30, 3.4e38,
+                  np.inf, -np.inf, np.nan, -np.nan], np.float32)
+    if npdt is np.float32:
+        return x
+    with np.errstate(over="ignore"):
+        return x.astype(npdt)
 
 
 # --------------------------------------------------------------------------
@@ -311,6 +330,169 @@ def test_clamp_operand_order():
     x = np.array([-9.0, 0.5, 9.0, 1.0, 0.0], np.float32)
     hi = np.array([1.0, 1.0, 3.0, 8.0, 5.0], np.float32)
     check(mod, [lo, x, hi])
+
+
+# --------------------------------------------------------------------------
+# wrapped semantics: the binaries whose StableHLO meaning is not an MLX op
+# --------------------------------------------------------------------------
+
+
+def _binary_mod(op, el, n=12):
+    t = f"tensor<{n}x{el}>"
+    return _mod([("a", t), ("b", t)], [t], f"""
+    %0 = stablehlo.{op} %a, %b : {t}
+    return %0 : {t}""")
+
+
+@pytest.mark.parametrize("el,npdt", [("f32", np.float32), ("f16", np.float16),
+                                     ("bf16", ml_dtypes.bfloat16)])
+def test_divide_and_remainder_floats(el, npdt):
+    # Float remainder is `a - trunc(a/b)*b` (sign of the DIVIDEND), which is
+    # neither mx.remainder nor floor_divide; zero and infinite divisors are
+    # what separate the three.
+    a = _specials(npdt)
+    b = np.roll(_specials(npdt), 5)
+    for op in ("divide", "remainder"):
+        check(_binary_mod(op, el), [a, b])
+    # The specials alone cannot tell trunc from floor: every pair of them
+    # divides to 0, +-inf or NaN. Ordinary mixed-sign values can — 1 % -2.5
+    # is 1.0 truncated and -1.5 floored.
+    ra = np.array([7.5, -7.5, 7.5, -7.5, 1.0, -1.0, 0.3, -0.3, 5.0, -5.0,
+                   2.5, -2.5], np.float32).astype(npdt)
+    rb = np.array([2.0, 2.0, -2.0, -2.0, -2.5, 2.5, 0.1, -0.1, 5.0, -5.0,
+                   -1.25, 1.25], np.float32).astype(npdt)
+    for op in ("divide", "remainder"):
+        check(_binary_mod(op, el), [ra, rb])
+
+
+_INT_DIV = [("i8", np.int8), ("i16", np.int16), ("i32", np.int32),
+            ("i64", np.int64), ("ui8", np.uint8), ("ui32", np.uint32)]
+
+
+@pytest.mark.parametrize("el,npdt", _INT_DIV)
+def test_divide_and_remainder_ints(el, npdt):
+    # StableHLO divides toward ZERO; MLX only has floor_divide, so every
+    # sign combination has to come out right (-7/2 == -3, not -4).
+    signed = np.issubdtype(np.dtype(npdt), np.signedinteger)
+    if signed:
+        # INT_MIN is the one dividend where the handler's abs()/sign dance
+        # is observable: abs(INT_MIN) wraps back to itself, so the two
+        # spellings of truncated division part company there. Whatever the
+        # Python engine answers, the tape has to answer the same.
+        imin = int(np.iinfo(npdt).min)
+        a = np.array([-7, 7, -7, 7, -1, imin, imin, -8, 8, imin, 100, -3],
+                     npdt)
+        b = np.array([2, 2, -2, -2, 3, 2, -2, 8, -8, 1, -7, 1], npdt)
+    else:
+        a = np.array([7, 9, 15, 1, 0, 5, 200, 3, 12, 99, 8, 6], npdt)
+        b = np.array([2, 4, 4, 3, 5, 5, 7, 8, 12, 10, 3, 1], npdt)
+    for op in ("divide", "remainder"):
+        check(_binary_mod(op, el), [a, b])
+
+
+def test_power_and_atan2():
+    a = _specials()
+    b = np.roll(_specials(), 4)
+    check(_binary_mod("power", "f32"), [a, b])
+    check(_binary_mod("atan2", "f32"), [a, b])
+    # integer power: MLX's own integer exponentiation, exponents >= 0
+    ia = np.array([-3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8], np.int32)
+    ib = np.array([0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5], np.int32)
+    check(_binary_mod("power", "i32"), [ia, ib])
+
+
+@pytest.mark.parametrize("el,npdt", [("i1", np.bool_), ("i8", np.int8),
+                                     ("i32", np.int32), ("i64", np.int64),
+                                     ("ui8", np.uint8),
+                                     ("ui32", np.uint32)])
+def test_not(el, npdt):
+    t = f"tensor<6x{el}>"
+    mod = _mod([("a", t)], [t], f"""
+    %0 = stablehlo.not %a : {t}
+    return %0 : {t}""")
+    if npdt is np.bool_:
+        x = np.array([True, False, True, True, False, False])
+    elif np.issubdtype(np.dtype(npdt), np.signedinteger):
+        info = np.iinfo(npdt)
+        x = np.array([0, -1, 1, 7, info.min, info.max], npdt)
+    else:
+        info = np.iinfo(npdt)
+        x = np.array([0, 1, 2, 7, info.max, info.max // 2], npdt)
+    check(mod, [x])
+
+
+_SHIFTS = ["shift_left", "shift_right_logical", "shift_right_arithmetic"]
+
+
+@pytest.mark.parametrize("op", _SHIFTS)
+@pytest.mark.parametrize("el,npdt", [("i8", np.int8), ("i32", np.int32),
+                                     ("i64", np.int64), ("ui8", np.uint8),
+                                     ("ui32", np.uint32)])
+def test_shift_dynamic_amount(op, el, npdt):
+    # XLA saturates a shift by >= the bit width (0, or the sign fill for the
+    # arithmetic one); Metal's shifts are mod-width. With a non-constant
+    # amount the guard is a compare + select, and negative amounts fall
+    # through it deliberately.
+    signed = np.issubdtype(np.dtype(npdt), np.signedinteger)
+    info = np.iinfo(npdt)
+    big = min(200, int(info.max))          # past every width tested here
+    if signed:
+        a = np.array([-1, 1, -128 if npdt is np.int8 else -12345, 0, 7,
+                      info.min, info.max, -3, 42, -42], npdt)
+        # -1 is deliberate: _shift_guard leaves negative amounts to
+        # whatever the underlying shift does, and both engines must agree.
+        amounts = [0, 1, 3, 7, 8, 31, 63, 64, big, -1]
+    else:
+        a = np.array([0, 1, 3, 255 if npdt is np.uint8 else 65535, 7,
+                      info.max, info.max // 3, 9, 42, 128], npdt)
+        amounts = [0, 1, 3, 7, 8, 31, 63, 64, big, 5]
+    b = np.array(amounts, npdt)
+    check(_binary_mod(op, el, n=10), [a, b])
+
+
+@pytest.mark.parametrize("op", _SHIFTS)
+@pytest.mark.parametrize("amount", [0, 1, 7, 31, 32, 100])
+def test_shift_static_amount(op, amount):
+    # A splat constant amount: tape.py resolves the guard at lowering and
+    # emits ONE arm, so both the in-range and the saturated answer have to
+    # come out of a program with no select in it.
+    t = "tensor<8xi32>"
+    mod = _mod([("a", t)], [t], f"""
+    %c = stablehlo.constant dense<{amount}> : {t}
+    %0 = stablehlo.{op} %a, %c : {t}
+    return %0 : {t}""")
+    x = np.array([-1, 1, 0, 7, -2147483648, 2147483647, -9999, 12345],
+                 np.int32)
+    check(mod, [x])
+
+
+def test_shift_static_amount_broadcast():
+    # keras' int4 unpack shifts by broadcast_in_dim(constant): the peephole
+    # has to see through the broadcast, and the answer must not change if it
+    # does not.
+    t = "tensor<2x4xi32>"
+    mod = _mod([("a", t)], [t], f"""
+    %c = stablehlo.constant dense<4> : tensor<i32>
+    %b = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> {t}
+    %0 = stablehlo.shift_right_logical %a, %b : {t}
+    return %0 : {t}""")
+    check(mod, [np.array([[-1, 1, 0, 255], [-256, 4096, 7, -7]], np.int32)])
+
+
+@pytest.mark.parametrize("el,npdt", [("f32", np.float32), ("f16", np.float16),
+                                     ("bf16", ml_dtypes.bfloat16)])
+def test_expm1(el, npdt):
+    # f32 splits at |x| < 0.25 (MLX's Metal expm1 is fast-math outside it);
+    # halves keep mx.expm1 outright. The split point itself is the test.
+    t = f"tensor<16x{el}>"
+    mod = _mod([("a", t)], [t], f"""
+    %0 = stablehlo.exponential_minus_one %a : {t}
+    return %0 : {t}""")
+    x = np.array([0.0, -0.0, 1e-8, -1e-8, 0.1, -0.1, 0.2499, -0.2499,
+                  0.25, -0.25, 0.2501, 1.0, -1.0, 20.0, -20.0, 100.0],
+                 np.float32).astype(npdt)
+    check(mod, [x])
+    check(mod, [_specials(npdt).repeat(2)[:16]])
 
 
 # --------------------------------------------------------------------------
@@ -537,6 +719,114 @@ def test_reduce_nan_and_inf():
 
 
 # --------------------------------------------------------------------------
+# the (values, indices) reduce jax lowers argmax/argmin to
+# --------------------------------------------------------------------------
+
+
+def _argpair_mod(direction, el="f32", shape=(3, 4), dim=1, idx_el="i32"):
+    """The exact body shape jax emits for argmax/argmin."""
+    dims = list(shape)
+    out = [d for i, d in enumerate(dims) if i != dim]
+    t = "tensor<" + "x".join(str(d) for d in dims) + f"x{el}>"
+    it = "tensor<" + "x".join(str(d) for d in dims) + f"x{idx_el}>"
+    ot = "tensor<" + "".join(f"{d}x" for d in out) + f"{el}>"
+    oit = "tensor<" + "".join(f"{d}x" for d in out) + f"{idx_el}>"
+    if el == "f32":
+        init = "0xFF800000" if direction in ("GT", "GE") else "0x7F800000"
+    elif el == "i1":
+        init = "false" if direction in ("GT", "GE") else "true"
+    else:
+        init = "0"
+    return _mod([("a", t), ("idx", it)], [ot, oit], f"""
+    %vi = stablehlo.constant dense<{init}> : tensor<{el}>
+    %ii = stablehlo.constant dense<0> : tensor<{idx_el}>
+    %0:2 = "stablehlo.reduce"(%a, %idx, %vi, %ii) <{{dimensions = array<i64: {dim}>}}> ({{
+    ^bb0(%av: tensor<{el}>, %ai: tensor<{idx_el}>, %bv: tensor<{el}>, %bi: tensor<{idx_el}>):
+      %p = stablehlo.compare {direction}, %av, %bv : (tensor<{el}>, tensor<{el}>) -> tensor<i1>
+      %v = stablehlo.select %p, %av, %bv : tensor<i1>, tensor<{el}>
+      %i = stablehlo.select %p, %ai, %bi : tensor<i1>, tensor<{idx_el}>
+      stablehlo.return %v, %i : tensor<{el}>, tensor<{idx_el}>
+    }}) : ({t}, {it}, tensor<{el}>, tensor<{idx_el}>) -> ({ot}, {oit})
+    return %0#0, %0#1 : {ot}, {oit}"""), t, it
+
+
+def _iota_idx(shape, dim, dtype=np.int32):
+    return np.broadcast_to(
+        np.arange(shape[dim], dtype=dtype).reshape(
+            [shape[dim] if i == dim else 1 for i in range(len(shape))]),
+        shape).astype(dtype)
+
+
+@pytest.mark.parametrize("direction", ["GT", "GE", "LT", "LE"])
+def test_argpair_reduce(direction):
+    mod, _, _ = _argpair_mod(direction)
+    x = _f32((3, 4))
+    check(mod, [x, _iota_idx((3, 4), 1)])
+
+
+def test_argpair_reduce_ties_and_nans():
+    # XLA/numpy: a NaN wins argmax AND argmin and the FIRST NaN's index is
+    # the answer; MLX's own argmax skips NaNs. Ties go to the lowest index.
+    mod, _, _ = _argpair_mod("GT", shape=(4, 5))
+    x = np.array([
+        [1.0, 3.0, 3.0, 2.0, 0.0],          # tie at the max
+        [np.nan, 1.0, np.nan, 5.0, -1.0],   # two NaNs
+        [-np.inf, -np.inf, -np.inf, -np.inf, -np.inf],
+        [0.0, -0.0, 0.0, -0.0, 7.0],
+    ], np.float32)
+    check(mod, [x, _iota_idx((4, 5), 1)])
+    modmin, _, _ = _argpair_mod("LT", shape=(4, 5))
+    check(modmin, [x, _iota_idx((4, 5), 1)])
+
+
+def test_argpair_reduce_dim0_and_ints():
+    mod, _, _ = _argpair_mod("GE", shape=(4, 3), dim=0)
+    check(mod, [_f32((4, 3)), _iota_idx((4, 3), 0)])
+    # An integer values operand skips the NaN machinery entirely.
+    modi, _, _ = _argpair_mod("GT", el="i32", shape=(3, 5))
+    x = RNG.integers(-9, 9, (3, 5)).astype(np.int32)
+    check(modi, [x, _iota_idx((3, 5), 1)])
+
+
+def test_argpair_reduce_zero_size_batch():
+    # jax forbids argmax over an empty reduced axis, so only a batch dim can
+    # be zero — and MLX's reducers crash on empties, so both engines take
+    # the short-circuit.
+    mod, _, _ = _argpair_mod("GT", shape=(0, 4))
+    check(mod, [np.zeros((0, 4), np.float32), np.zeros((0, 4), np.int32)])
+
+
+def test_argpair_reduce_i64_indices():
+    mod, _, _ = _argpair_mod("GT", idx_el="i64")
+    check(mod, [_f32((3, 4)), _iota_idx((3, 4), 1, np.int64)])
+
+
+def test_decline_argpair_on_bools():
+    # dtypes.is_bool(values) sends the Python handler to _generic_reduce,
+    # which walks the body block; the tape must not shortcut past it.
+    mod, _, _ = _argpair_mod("GT", el="i1", shape=(3, 4))
+    x = RNG.integers(0, 2, (3, 4)) > 0
+    check(mod, [x, _iota_idx((3, 4), 1)], lowered=False)
+
+
+def test_decline_pair_reduce_without_a_compare():
+    # A two-operand reduce whose body is arithmetic is a generic variadic
+    # fold, not an argmax.
+    t = "tensor<3x4xf32>"
+    mod = _mod([("a", t), ("b", t)], ["tensor<3xf32>", "tensor<3xf32>"], f"""
+    %i0 = stablehlo.constant dense<0.0> : tensor<f32>
+    %i1 = stablehlo.constant dense<1.0> : tensor<f32>
+    %0:2 = "stablehlo.reduce"(%a, %b, %i0, %i1) <{{dimensions = array<i64: 1>}}> ({{
+    ^bb0(%av: tensor<f32>, %ai: tensor<f32>, %bv: tensor<f32>, %bi: tensor<f32>):
+      %s = stablehlo.add %av, %bv : tensor<f32>
+      %m = stablehlo.multiply %ai, %bi : tensor<f32>
+      stablehlo.return %s, %m : tensor<f32>, tensor<f32>
+    }}) : ({t}, {t}, tensor<f32>, tensor<f32>) -> (tensor<3xf32>, tensor<3xf32>)
+    return %0#0, %0#1 : tensor<3xf32>, tensor<3xf32>""")
+    check(mod, [_f32(), _f32()], lowered=False)
+
+
+# --------------------------------------------------------------------------
 # dot_general
 # --------------------------------------------------------------------------
 
@@ -604,6 +894,75 @@ def test_dot_halves(el, npdt):
     check(mod, [_f32((3, 4)).astype(npdt), _f32((4, 5)).astype(npdt)])
 
 
+def _int_dot_mod(el, out_el, m=3, k=4, n=5, rel=None):
+    rel = rel or el
+    return _mod([("a", f"tensor<{m}x{k}x{el}>"),
+                 ("b", f"tensor<{k}x{n}x{rel}>")],
+                [f"tensor<{m}x{n}x{out_el}>"], f"""
+    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (tensor<{m}x{k}x{el}>, tensor<{k}x{n}x{rel}>) -> tensor<{m}x{n}x{out_el}>
+    return %0 : tensor<{m}x{n}x{out_el}>""")
+
+
+@pytest.mark.parametrize("el,out_el,npdt", [
+    ("i8", "i32", np.int8),      # the exact-f32 chunk path (chunk 1024)
+    ("i8", "i8", np.int8),       # ...wrapping to 8 bits at the end
+    ("ui8", "i32", np.uint8),    # chunk 256
+    ("i32", "i32", np.int32),    # no chunk: the int64 outer product
+    ("i64", "i64", np.int64),
+    ("i16", "i32", np.int16),
+])
+def test_int_dot(el, out_el, npdt):
+    info = np.iinfo(npdt)
+    lo, hi = max(info.min, -50), min(info.max, 50)
+    a = RNG.integers(lo, hi, (3, 4)).astype(npdt)
+    b = RNG.integers(lo, hi, (4, 5)).astype(npdt)
+    check(_int_dot_mod(el, out_el), [a, b])
+
+
+def test_int_dot_mixed_operand_signs():
+    # i8 x ui8 halves the exact chunk (512): _exact_f32_chunk reads BOTH
+    # operand dtypes, not the result's.
+    mod = _int_dot_mod("i8", "i32", rel="ui8")
+    a = RNG.integers(-128, 128, (3, 4)).astype(np.int8)
+    b = RNG.integers(0, 256, (4, 5)).astype(np.uint8)
+    check(mod, [a, b])
+
+
+def test_int_dot_multiple_chunks():
+    """K past the exact chunk size: three f32 matmuls, summed as integers.
+
+    The data is deliberately irregular. Extreme-but-uniform operands make
+    every partial sum a large power of two times something small, which f32
+    happens to hold exactly — so an accumulator that wrongly stayed in f32
+    would still agree. These totals (~3.5e7, odd) do not survive f32.
+    """
+    k = 2600
+    mod = _int_dot_mod("i8", "i32", m=2, k=k, n=3)
+    a = np.full((2, k), 127, np.int8)
+    a[1] = -128
+    a[0, ::13] = -128
+    b = np.full((k, 3), 127, np.int8)
+    b[::7, 0] = 126
+    b[::5, 1] = -128
+    b[3::11, 2] = 1
+    check(mod, [a, b])
+
+
+def test_int_dot_zero_contraction_and_batched():
+    # K == 0 keeps the outer-product arm (chunking needs prod(k) != 0).
+    mod = _mod([("a", "tensor<3x0xi32>"), ("b", "tensor<0x5xi32>")],
+               ["tensor<3x5xi32>"], """
+    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (tensor<3x0xi32>, tensor<0x5xi32>) -> tensor<3x5xi32>
+    return %0 : tensor<3x5xi32>""")
+    check(mod, [np.zeros((3, 0), np.int32), np.zeros((0, 5), np.int32)])
+    batched = _mod([("a", "tensor<2x3x4xi8>"), ("b", "tensor<2x4x5xi8>")],
+                   ["tensor<2x3x5xi32>"], """
+    %0 = stablehlo.dot_general %a, %b, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<2x3x4xi8>, tensor<2x4x5xi8>) -> tensor<2x3x5xi32>
+    return %0 : tensor<2x3x5xi32>""")
+    check(batched, [RNG.integers(-50, 50, (2, 3, 4)).astype(np.int8),
+                    RNG.integers(-50, 50, (2, 4, 5)).astype(np.int8)])
+
+
 def test_dot_mixed_operand_dtype():
     # f16 operands, f32 accumulator: the handler casts both to the RESULT
     # dtype before the matmul.
@@ -616,16 +975,198 @@ def test_dot_mixed_operand_dtype():
 
 
 # --------------------------------------------------------------------------
+# func.call / stablehlo.composite inlining
+# --------------------------------------------------------------------------
+#
+# jax 0.11 wraps jnp.where / jnp.clip / jnp.round in private helper
+# functions, so a call in main is not exotic — it was the single biggest
+# decline family before this batch. The callee's block is spliced into the
+# tape at lowering time: its block arguments alias the call's operand slots
+# and its results alias whatever it returned, so the C++ side never sees a
+# call at all.
+
+
+def _with_funcs(main_params, main_results, main_body, funcs, name="calls"):
+    args = ", ".join(f"%{n}: {t}" for n, t in main_params)
+    outs = ", ".join(main_results)
+    return (f"module @{name} {{\n"
+            f"  func.func public @main({args}) -> ({outs}) {{\n"
+            f"{main_body}\n  }}\n"
+            + "\n".join(funcs) + "\n}\n").encode()
+
+
+def _helper(name, params, result, body):
+    args = ", ".join(f"%{n}: {t}" for n, t in params)
+    return (f"  func.func private @{name}({args}) -> {result} {{\n"
+            f"{body}\n  }}")
+
+
+def test_func_call_inlined():
+    t = "tensor<3x4xf32>"
+    mod = _with_funcs(
+        [("a", t)], [t],
+        f"    %0 = call @helper(%a) : ({t}) -> {t}\n"
+        f"    return %0 : {t}",
+        [_helper("helper", [("a", t)], t,
+                 f"    %0 = stablehlo.tanh %a : {t}\n"
+                 f"    %1 = stablehlo.sine %0 : {t}\n"
+                 f"    return %1 : {t}")])
+    ex = check(mod, [_f32()])
+    # The callee's ops are the tape's ops; the call itself costs nothing.
+    assert ex._native_prog.num_ops == 2
+
+
+def test_func_call_nested_and_shared_operands():
+    t = "tensor<3x4xf32>"
+    mod = _with_funcs(
+        [("a", t), ("b", t)], [t, t],
+        f"    %0 = call @outer(%a, %b) : ({t}, {t}) -> {t}\n"
+        f"    %1 = stablehlo.multiply %0, %a : {t}\n"
+        f"    return %0, %1 : {t}, {t}",
+        [_helper("outer", [("x", t), ("y", t)], t,
+                 f"    %s = stablehlo.add %x, %y : {t}\n"
+                 f"    %0 = call @inner(%s) : ({t}) -> {t}\n"
+                 f"    return %0 : {t}"),
+         _helper("inner", [("z", t)], t,
+                 f"    %0 = stablehlo.tanh %z : {t}\n"
+                 f"    return %0 : {t}")])
+    ex = check(mod, [_f32(), _f32()])
+    assert ex._native_prog.num_ops == 3
+
+
+def test_func_call_same_callee_twice():
+    """A callee inlined twice re-binds its OWN values a second time.
+
+    Slot numbers used to be `len(self.slots)`, which does not grow when a
+    key is overwritten — so the second inline handed the callee's values
+    slots the first one had already used. The helper reads %p again AFTER
+    %q exists, which is the shape that makes such a collision visible
+    (a collision between a value and its immediate consumer is benign).
+    """
+    t = "tensor<4xf32>"
+    mod = _with_funcs(
+        [("a", t), ("b", t)], [t],
+        f"    %0 = call @h(%a) : ({t}) -> {t}\n"
+        f"    %1 = stablehlo.multiply %0, %b : {t}\n"
+        f"    %2 = call @h(%1) : ({t}) -> {t}\n"
+        f"    %3 = stablehlo.subtract %2, %0 : {t}\n"
+        f"    %4 = call @h(%3) : ({t}) -> {t}\n"
+        f"    return %4 : {t}",
+        [_helper("h", [("x", t)], t,
+                 f"    %p = stablehlo.multiply %x, %x : {t}\n"
+                 f"    %q = stablehlo.add %p, %x : {t}\n"
+                 f"    %r = stablehlo.subtract %q, %p : {t}\n"
+                 f"    return %r : {t}")])
+    ex = check(mod, [_f32((4,)), _f32((4,))])
+    assert ex._native_prog.num_ops == 3 * 3 + 2
+
+
+def test_func_call_multiple_results():
+    t = "tensor<4xf32>"
+    mod = _with_funcs(
+        [("a", t), ("b", t)], [t, t],
+        f"    %0:2 = call @two(%a, %b) : ({t}, {t}) -> ({t}, {t})\n"
+        f"    %s = stablehlo.add %0#0, %0#1 : {t}\n"
+        f"    return %s, %0#1 : {t}, {t}",
+        [(f"  func.func private @two(%x: {t}, %y: {t}) -> ({t}, {t}) {{\n"
+          f"    %p = stablehlo.multiply %x, %y : {t}\n"
+          f"    %d = stablehlo.subtract %x, %y : {t}\n"
+          f"    return %p, %d : {t}, {t}\n  }}")])
+    check(mod, [_f32((4,)), _f32((4,))])
+
+
+def test_func_call_constant_inside_callee():
+    # A constant defined in the callee still belongs to the Program for the
+    # executable's life: returning it (even through a broadcast) aliases.
+    t = "tensor<3xf32>"
+    mod = _with_funcs(
+        [("a", t)], [t],
+        f"    %0 = call @h(%a) : ({t}) -> {t}\n"
+        f"    return %0 : {t}",
+        [_helper("h", [("x", t)], t,
+                 f"    %c = stablehlo.constant dense<[1.0, 2.0, 3.0]> : {t}\n"
+                 f"    %0 = stablehlo.add %x, %c : {t}\n"
+                 f"    return %0 : {t}")])
+    check(mod, [_f32((3,))])
+
+
+def test_composite_inlined():
+    # stablehlo.composite runs its `decomposition` symbol, exactly as
+    # func.call runs its callee (ops/control.py), so it inlines the same way.
+    t = "tensor<3x4xf32>"
+    mod = (f"module @comp {{\n"
+           f"  func.func public @main(%a: {t}) -> ({t}) {{\n"
+           f'    %0 = stablehlo.composite "test.gelu" %a '
+           f"{{decomposition = @dec}} : ({t}) -> {t}\n"
+           f"    return %0 : {t}\n  }}\n"
+           f"  func.func private @dec(%x: {t}) -> {t} {{\n"
+           f"    %0 = stablehlo.tanh %x : {t}\n"
+           f"    return %0 : {t}\n  }}\n}}\n").encode()
+    check(mod, [_f32()])
+
+
+def test_decline_call_forwarding_an_argument():
+    """`call @identity(%a)` hands back main's own argument array.
+
+    engine.execute copies statically-forwarded outputs, but its notion of
+    "forwarded" is main's terminator naming a block argument — an OpResult
+    that happens to hold the same array is invisible to it, and nanobind
+    defeats the dynamic id() pass. So the tape declines instead.
+    """
+    t = "tensor<3x4xf32>"
+    mod = _with_funcs(
+        [("a", t)], [t, t],
+        f"    %0 = call @ident(%a) : ({t}) -> {t}\n"
+        f"    %1 = stablehlo.tanh %a : {t}\n"
+        f"    return %1, %0 : {t}, {t}",
+        [_helper("ident", [("x", t)], t, f"    return %x : {t}")])
+    check(mod, [_f32()], lowered=False)
+
+
+def test_decline_call_with_an_unsupported_body():
+    # The decline is WHOLESALE: one unported op anywhere, callee included,
+    # and the whole program keeps the Python engine.
+    t = "tensor<6xi32>"
+    mod = _with_funcs(
+        [("a", t)], [t],
+        f"    %0 = call @h(%a) : ({t}) -> {t}\n"
+        f"    return %0 : {t}",
+        [_helper("h", [("x", t)], t,
+                 f"    %0 = stablehlo.popcnt %x : {t}\n"
+                 f"    return %0 : {t}")])
+    check(mod, [np.array([0, 1, -1, 7, 255, 9], np.int32)], lowered=False)
+
+
+def test_decline_recursive_call():
+    # Inlining has no fixed point here; the Python engine's own recursive
+    # run_func keeps it (and would diverge too, so this checks the LOWERING
+    # only).
+    t = "tensor<4xf32>"
+    mod = _with_funcs(
+        [("a", t)], [t],
+        f"    %0 = call @rec(%a) : ({t}) -> {t}\n"
+        f"    return %0 : {t}",
+        [_helper("rec", [("x", t)], t,
+                 f"    %0 = stablehlo.tanh %x : {t}\n"
+                 f"    %1 = call @rec(%0) : ({t}) -> {t}\n"
+                 f"    return %1 : {t}")])
+    declines(mod)
+
+
+# --------------------------------------------------------------------------
 # declines — one per family. Each must still compute the right answer.
 # --------------------------------------------------------------------------
 
 
 def test_decline_unsupported_op():
-    t = "tensor<3x4xf32>"
-    mod = _mod([("a", t), ("b", t)], [t], f"""
-    %0 = stablehlo.divide %a, %b : {t}
+    # popcnt is a SWAR chain in the Python handler and has no opcode: the
+    # opcode registry is the gate, so the whole program declines.
+    t = "tensor<6xi32>"
+    mod = _mod([("a", t)], [t], f"""
+    %0 = stablehlo.popcnt %a : {t}
     return %0 : {t}""")
-    check(mod, [_f32(), _f32() + 3.0], lowered=False)
+    check(mod, [np.array([0, 1, -1, 7, 255, -2147483648], np.int32)],
+          lowered=False)
 
 
 def test_decline_region_op():
@@ -684,32 +1225,22 @@ def test_decline_emulated_dtype():
           lowered=False)
 
 
-def test_decline_integer_dot():
-    mod = _mod([("a", "tensor<3x4xi32>"), ("b", "tensor<4x5xi32>")],
-               ["tensor<3x5xi32>"], """
-    %0 = stablehlo.dot_general %a, %b, contracting_dims = [1] x [0] : (tensor<3x4xi32>, tensor<4x5xi32>) -> tensor<3x5xi32>
-    return %0 : tensor<3x5xi32>""")
-    check(mod, [RNG.integers(-9, 9, (3, 4)).astype(np.int32),
-                RNG.integers(-9, 9, (4, 5)).astype(np.int32)], lowered=False)
-
-
 def test_decline_variadic_reduce():
-    # The (values, indices) argmax pair: two operands, two results.
+    # Three operands: past the argmax pair, into _generic_reduce's pairwise
+    # halving, which evaluates the body block op by op.
     t = "tensor<3x4xf32>"
-    it = "tensor<3x4xi32>"
-    mod = _mod([("a", t), ("idx", it)], ["tensor<3xf32>", "tensor<3xi32>"], f"""
-    %vi = stablehlo.constant dense<0xFF800000> : tensor<f32>
-    %ii = stablehlo.constant dense<0> : tensor<i32>
-    %0:2 = "stablehlo.reduce"(%a, %idx, %vi, %ii) <{{dimensions = array<i64: 1>}}> ({{
-    ^bb0(%av: tensor<f32>, %ai: tensor<i32>, %bv: tensor<f32>, %bi: tensor<i32>):
-      %p = stablehlo.compare GT, %av, %bv : (tensor<f32>, tensor<f32>) -> tensor<i1>
-      %v = stablehlo.select %p, %av, %bv : tensor<i1>, tensor<f32>
-      %i = stablehlo.select %p, %ai, %bi : tensor<i1>, tensor<i32>
-      stablehlo.return %v, %i : tensor<f32>, tensor<i32>
-    }}) : ({t}, {it}, tensor<f32>, tensor<i32>) -> (tensor<3xf32>, tensor<3xi32>)
-    return %0#0, %0#1 : tensor<3xf32>, tensor<3xi32>""")
-    idx = np.tile(np.arange(4, dtype=np.int32), (3, 1))
-    check(mod, [_f32(), idx], lowered=False)
+    mod = _mod([("a", t), ("b", t), ("c", t)],
+               ["tensor<3xf32>", "tensor<3xf32>", "tensor<3xf32>"], f"""
+    %i = stablehlo.constant dense<0.0> : tensor<f32>
+    %0:3 = "stablehlo.reduce"(%a, %b, %c, %i, %i, %i) <{{dimensions = array<i64: 1>}}> ({{
+    ^bb0(%a0: tensor<f32>, %a1: tensor<f32>, %a2: tensor<f32>, %b0: tensor<f32>, %b1: tensor<f32>, %b2: tensor<f32>):
+      %s0 = stablehlo.add %a0, %b0 : tensor<f32>
+      %s1 = stablehlo.add %a1, %b1 : tensor<f32>
+      %s2 = stablehlo.maximum %a2, %b2 : tensor<f32>
+      stablehlo.return %s0, %s1, %s2 : tensor<f32>, tensor<f32>, tensor<f32>
+    }}) : ({t}, {t}, {t}, tensor<f32>, tensor<f32>, tensor<f32>) -> (tensor<3xf32>, tensor<3xf32>, tensor<3xf32>)
+    return %0#0, %0#1, %0#2 : tensor<3xf32>, tensor<3xf32>, tensor<3xf32>""")
+    check(mod, [_f32(), _f32(), _f32()], lowered=False)
 
 
 def test_decline_totalorder_compare():
@@ -720,24 +1251,6 @@ def test_decline_totalorder_compare():
     return %0 : {ot}""")
     x = np.array([np.nan, -np.nan, 0.0, -0.0, np.inf, -np.inf], np.float32)
     check(mod, [x, np.roll(x, 2)], lowered=False)
-
-
-def test_decline_func_call():
-    # jax wraps jnp.where / jnp.clip / jnp.round in private helpers, so a
-    # call in main is not exotic — it is the biggest single decline family
-    # today (M3 territory).
-    t = "tensor<3x4xf32>"
-    mod = (f"module @calls {{\n"
-           f"  func.func public @main(%a: {t}) -> ({t}) {{\n"
-           f"    %0 = call @helper(%a) : ({t}) -> {t}\n"
-           f"    return %0 : {t}\n"
-           f"  }}\n"
-           f"  func.func private @helper(%a: {t}) -> {t} {{\n"
-           f"    %0 = stablehlo.tanh %a : {t}\n"
-           f"    return %0 : {t}\n"
-           f"  }}\n"
-           f"}}\n").encode()
-    check(mod, [_f32()], lowered=False)
 
 
 def test_decline_constant_output():

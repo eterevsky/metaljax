@@ -245,3 +245,13 @@ predicted peak memory, and only then retry the big model.
   their XLA-semantics wrappers, argmax-pair reduce, gather/scatter,
   integer dot_general (exact-f32 chunk machinery), expm1 (MSL
   helper). Then M3: native mx::compile + control flow.
+
+- **INT_MIN trunc-div latent bug** (found in M2.5, pre-existing):
+  ops/elementwise._int_trunc_div abs/sign dance wraps at INT_MIN on
+  MLX (int8(-128)/2 == 64, XLA says -64). Both engines pinned to it
+  for now; fix is a Python-engine change + tape follows.
+- M2.5 batches 1-4 DONE (call/composite inlining, wrapped elementwise
+  incl. expm1, argmax-pair reduce, int dot_general). Batch 5 gather/
+  scatter declined: MLX ships no C++ indexing-semantics layer; next
+  frontier by census: bitcast_convert (29), fft (9), gather (6),
+  dynamic_slice (kv-cache ops, cheap via mx::slice_update).

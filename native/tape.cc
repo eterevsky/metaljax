@@ -19,7 +19,9 @@
 // name that is not in the dict declines — so adding an op here is what
 // makes it reachable, and there is no second table to forget.
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -43,11 +45,13 @@ namespace {
 
 enum Op : int {
   // unary
-  kAbs = 0, kCbrt, kCeil, kCos, kErf, kErfInv, kExp, kFloor, kIsFinite,
-  kLog, kLog1p, kLogistic, kNegate, kRoundAfz, kRoundEven, kRsqrt, kSign,
-  kSin, kSqrt, kTan, kTanh, kSquare,
+  kAbs = 0, kCbrt, kCeil, kCos, kErf, kErfInv, kExp, kExpm1, kFloor,
+  kIsFinite, kLog, kLog1p, kLogistic, kNegate, kNot, kRoundAfz, kRoundEven,
+  kRsqrt, kSign, kSin, kSqrt, kTan, kTanh, kSquare,
   // binary
   kAdd, kMultiply, kSubtract, kMaximum, kMinimum, kAnd, kOr, kXor,
+  kDivide, kRemainder, kPower, kAtan2,
+  kShiftLeft, kShiftRightLogical, kShiftRightArithmetic,
   // selection
   kCompare, kSelect, kClamp,
   // dtype
@@ -55,7 +59,7 @@ enum Op : int {
   // shape
   kReshape, kTranspose, kBroadcastInDim, kSlice, kConcatenate, kIota,
   // data / structured
-  kConstant, kReduce, kDotGeneral,
+  kConstant, kReduce, kArgReduce, kDotGeneral,
 };
 
 // StableHLO name -> opcode. Several names may share an opcode (chlo.erf is
@@ -74,12 +78,14 @@ const NamedOp kOpNames[] = {
     {"stablehlo.erf_inv", kErfInv},
     {"chlo.erf_inv", kErfInv},
     {"stablehlo.exponential", kExp},
+    {"stablehlo.exponential_minus_one", kExpm1},
     {"stablehlo.floor", kFloor},
     {"stablehlo.is_finite", kIsFinite},
     {"stablehlo.log", kLog},
     {"stablehlo.log_plus_one", kLog1p},
     {"stablehlo.logistic", kLogistic},
     {"stablehlo.negate", kNegate},
+    {"stablehlo.not", kNot},
     {"stablehlo.round_nearest_afz", kRoundAfz},
     {"stablehlo.round_nearest_even", kRoundEven},
     {"stablehlo.rsqrt", kRsqrt},
@@ -97,6 +103,13 @@ const NamedOp kOpNames[] = {
     {"stablehlo.and", kAnd},
     {"stablehlo.or", kOr},
     {"stablehlo.xor", kXor},
+    {"stablehlo.divide", kDivide},
+    {"stablehlo.remainder", kRemainder},
+    {"stablehlo.power", kPower},
+    {"stablehlo.atan2", kAtan2},
+    {"stablehlo.shift_left", kShiftLeft},
+    {"stablehlo.shift_right_logical", kShiftRightLogical},
+    {"stablehlo.shift_right_arithmetic", kShiftRightArithmetic},
     {"stablehlo.compare", kCompare},
     {"stablehlo.select", kSelect},
     {"stablehlo.clamp", kClamp},
@@ -109,6 +122,11 @@ const NamedOp kOpNames[] = {
     {"stablehlo.iota", kIota},
     {"stablehlo.constant", kConstant},
     {"stablehlo.reduce", kReduce},
+    // ops/reduction.py reads ONE stablehlo.reduce two ways depending on the
+    // body — the single-operand monoid and the (values, indices) pair jax
+    // lowers argmax/argmin to. tape.py decides which, then asks for the
+    // opcode by this pseudo-name; C++ still owns both enum values.
+    {"stablehlo.reduce.arg_pair", kArgReduce},
     {"stablehlo.dot_general", kDotGeneral},
 };
 
@@ -143,6 +161,27 @@ bool is_float(const mx::Dtype& d) {
   return d == mx::float32 || d == mx::float16 || d == mx::bfloat16;
 }
 
+// dtypes.is_unsigned / dtypes.is_int: bool is NEITHER, which several
+// handlers below depend on (a bool `divide` takes the float arm).
+bool is_unsigned(const mx::Dtype& d) {
+  return d == mx::uint8 || d == mx::uint16 || d == mx::uint32 ||
+         d == mx::uint64;
+}
+
+bool is_int(const mx::Dtype& d) {
+  return is_unsigned(d) || d == mx::int8 || d == mx::int16 ||
+         d == mx::int32 || d == mx::int64;
+}
+
+// dtypes.unsigned_of: the same-width unsigned type, or the type itself.
+mx::Dtype unsigned_of(const mx::Dtype& d) {
+  if (d == mx::int8) return mx::uint8;
+  if (d == mx::int16) return mx::uint16;
+  if (d == mx::int32) return mx::uint32;
+  if (d == mx::int64) return mx::uint64;
+  return d;
+}
+
 // MLX's Python bindings promote a python scalar to the ARRAY's dtype (a
 // "weak" type): `mx.abs(x) + 0.5` on float16 stays float16, while a bare
 // C++ `array(0.5)` is float32 and would promote the whole expression to
@@ -150,6 +189,13 @@ bool is_float(const mx::Dtype& d) {
 // operand's dtype explicitly. Not cosmetic — it changes the result bits.
 mx::array weak(double v, const mx::array& a) {
   return mx::array(v, is_float(a.dtype()) ? a.dtype() : mx::float32);
+}
+
+// The same rule for a python INT literal, which adopts the array's dtype
+// whatever it is (`int8_array < 0` compares in int8). Only ever called on
+// arrays whose dtype can hold the literal, which is every use below.
+mx::array weak_int(int64_t v, const mx::array& a) {
+  return mx::array(v, a.dtype());
 }
 
 // An array with the same bits in a buffer of its own. MLX has no such op:
@@ -183,8 +229,12 @@ mx::array fresh_copy(const mx::array& a) {
 //   kConstant           (none — the value rides in `payload`)
 //   kReduce             [kind, ndims, dims...]  kind: 0 sum 1 prod 2 max
 //                                               3 min 4 any 5 all
+//   kArgReduce          [is_max, dim]           two results: (value, index)
+//   kShift*             [static?, amount]       see shift_guard
 //   kDotGeneral         [lrank, lperm..., rrank, rperm..., B, M, K, N,
-//                        out_dtype, out_rank, out_shape...]
+//                        out_dtype, out_rank, out_shape..., kind, chunk]
+//                       kind: 0 float matmul, 1 exact-f32 K-chunks,
+//                             2 int64 outer product, 3 the same in bool
 
 struct Entry {
   int op;
@@ -209,6 +259,65 @@ mx::array reduce_apply(int64_t kind, const mx::array& x,
     case 5: return mx::all(x, axes);
     default: throw std::invalid_argument("tape: bad reduce kind");
   }
+}
+
+// ops/elementwise._int_trunc_div: C-style (truncated) integer division.
+// The Python handler takes the sign off the magnitudes and puts it back,
+// on the assumption that floor_divide floors -- which MLX's does NOT for
+// integers (it forwards to `divide`, and integer division truncates
+// toward zero already, measured: mx.floor_divide(-7, 2) == -3). The two
+// spellings therefore agree everywhere except at INT_MIN, where abs()
+// wraps to itself and the sign flip is real: metaljax answers
+// int8(-128)/2 == 64 where XLA says -64. That is a pre-existing property
+// of the Python engine, and this is a transliteration of it -- the
+// differential test pins the two engines to each other, INT_MIN included.
+mx::array int_trunc_div(const mx::array& a, const mx::array& b) {
+  if (is_unsigned(a.dtype())) return mx::floor_divide(a, b);
+  mx::array q = mx::floor_divide(mx::abs(a), mx::abs(b));
+  mx::array neg = mx::not_equal(mx::less(a, weak_int(0, a)),
+                                mx::less(b, weak_int(0, b)));
+  return mx::astype(mx::where(neg, mx::negative(q), q), a.dtype());
+}
+
+// ops/elementwise._shift_right_logical: a signed operand shifts as its
+// unsigned twin so the sign bit does not fill.
+mx::array shift_right_logical(const mx::array& a, const mx::array& b) {
+  if (is_unsigned(a.dtype()) || is_bool(a.dtype()))
+    return mx::right_shift(a, b);
+  mx::Dtype u = unsigned_of(a.dtype());
+  return mx::astype(mx::right_shift(mx::astype(a, u), mx::astype(b, u)),
+                    a.dtype());
+}
+
+// kind: 0 shift_left, 1 shift_right_logical, 2 shift_right_arithmetic.
+mx::array shift_apply(int kind, const mx::array& a, const mx::array& b) {
+  if (kind == 0) return mx::left_shift(a, b);
+  if (kind == 1) return shift_right_logical(a, b);
+  return mx::right_shift(a, b);
+}
+
+// What XLA yields for a shift by at least the operand's bit width: zero,
+// except that an arithmetic shift keeps filling with the sign bit.
+mx::array shift_fill(int kind, const mx::array& a, const mx::array& b) {
+  if (kind == 2) {
+    int w = static_cast<int>(a.itemsize()) * 8;
+    return mx::right_shift(a, mx::array(w - 1, b.dtype()));
+  }
+  return mx::zeros_like(a);
+}
+
+// ops/elementwise._shift_guard. Metal's shifts are mod-width (x86-style),
+// XLA's saturate; `at` says whether tape.py found the amount to be a
+// compile-time splat, in which case only one arm is emitted.
+mx::array shift_guard(int kind, const mx::array& a, const mx::array& b,
+                      const std::vector<int64_t>& at) {
+  int w = static_cast<int>(a.itemsize()) * 8;
+  if (at[0]) {
+    return at[1] >= w ? shift_fill(kind, a, b) : shift_apply(kind, a, b);
+  }
+  mx::array over = mx::greater_equal(mx::astype(b, mx::int32),
+                                     mx::array(w, mx::int32));
+  return mx::where(over, shift_fill(kind, a, b), shift_apply(kind, a, b));
 }
 
 mx::array reduce_combine(int64_t kind, const mx::array& a,
@@ -365,6 +474,27 @@ class Program {
             mx::sign(x), mx::floor(mx::add(mx::abs(x), weak(0.5, x))));
         break;
       }
+      case kExpm1: {
+        // _expm1 / _expm1_f32: MLX's Metal expm1 kernel is fast-math (worst
+        // relative error 2.0e-5), and exp(x)-1 is ~1 ULP except near zero
+        // where it cancels -- so use expm1 only there. Halves keep their
+        // own expm1, which is already accurate.
+        const mx::array& x = in(0);
+        env[e.outs[0]] =
+            x.dtype() == mx::float32
+                ? mx::where(mx::less(mx::abs(x), weak(0.25, x)), mx::expm1(x),
+                            mx::subtract(mx::exp(x), weak(1.0, x)))
+                : mx::expm1(x);
+        break;
+      }
+      case kNot: {
+        // _not: bool -> logical, integer -> bitwise (mlx 0.32 has
+        // bitwise_invert, so the xor-with-minus-one fallback is dead).
+        const mx::array& x = in(0);
+        env[e.outs[0]] = is_bool(x.dtype()) ? mx::logical_not(x)
+                                            : mx::bitwise_invert(x);
+        break;
+      }
       case kRoundEven: {
         // _round_even, verbatim: the tie goes to the even neighbour.
         const mx::array& x = in(0);
@@ -417,6 +547,45 @@ class Program {
                                             : mx::bitwise_xor(a, in(1));
         break;
       }
+
+      case kDivide: {
+        // _divide: integers truncate toward zero, floats divide.
+        const mx::array& a = in(0);
+        env[e.outs[0]] = is_int(a.dtype()) ? int_trunc_div(a, in(1))
+                                           : mx::divide(a, in(1));
+        break;
+      }
+      case kRemainder: {
+        // _remainder: StableHLO's remainder takes the sign of the
+        // DIVIDEND (truncated division). mx.remainder takes the sign of
+        // the divisor, like python's %, so the float arm spells the
+        // truncation out; the integer arm rides on int_trunc_div.
+        const mx::array& a = in(0);
+        const mx::array& b = in(1);
+        if (is_int(a.dtype())) {
+          env[e.outs[0]] = mx::astype(
+              mx::subtract(a, mx::multiply(int_trunc_div(a, b), b)),
+              a.dtype());
+        } else {
+          mx::array q = mx::divide(a, b);
+          // _trunc
+          mx::array t = mx::where(mx::less(q, weak(0.0, q)), mx::ceil(q),
+                                  mx::floor(q));
+          env[e.outs[0]] = mx::subtract(a, mx::multiply(t, b));
+        }
+        break;
+      }
+      case kPower: env[e.outs[0]] = mx::power(in(0), in(1)); break;
+      case kAtan2: env[e.outs[0]] = mx::arctan2(in(0), in(1)); break;
+      case kShiftLeft:
+        env[e.outs[0]] = shift_guard(0, in(0), in(1), at);
+        break;
+      case kShiftRightLogical:
+        env[e.outs[0]] = shift_guard(1, in(0), in(1), at);
+        break;
+      case kShiftRightArithmetic:
+        env[e.outs[0]] = shift_guard(2, in(0), in(1), at);
+        break;
 
       // --- selection ---
       case kCompare: {
@@ -542,9 +711,51 @@ class Program {
         break;
       }
 
+      case kArgReduce: {
+        // ops/reduction.py _reduce, the (values, indices) form jax lowers
+        // argmax/argmin to. Ties resolve to the lowest index, which is
+        // MLX's first-occurrence answer; the NaN rules are XLA's, not
+        // MLX's, and are the reason this is not just an argmax call.
+        const mx::array& x = in(0);
+        const mx::array& ids = in(1);
+        bool is_max = at[0] != 0;
+        int d = static_cast<int>(at[1]);
+        bool empty = false;
+        for (auto s : x.shape()) if (s == 0) empty = true;
+        if (empty) {
+          // Only BATCH dims can be zero here (jax forbids argmax over an
+          // empty reduced axis) and MLX's reducers crash on empties.
+          mx::Shape out;
+          for (size_t i = 0; i < x.shape().size(); i++)
+            if (static_cast<int>(i) != d) out.push_back(x.shape()[i]);
+          env[e.outs[0]] = mx::zeros(out, x.dtype());
+          env[e.outs[1]] = mx::zeros(out, ids.dtype());
+          break;
+        }
+        mx::array val = is_max ? mx::max(x, d) : mx::min(x, d);
+        mx::array arg = is_max ? mx::argmax(x, d) : mx::argmin(x, d);
+        if (is_float(x.dtype())) {
+          // XLA/numpy: a NaN wins argmax AND argmin, and the FIRST one's
+          // index is the answer. MLX skips NaNs entirely.
+          mx::array nans = mx::isnan(x);
+          mx::array has_nan = mx::any(nans, std::vector<int>{d});
+          mx::array first_nan = mx::argmax(nans, d);
+          arg = mx::where(has_nan, first_nan, arg);
+          val = mx::where(
+              has_nan,
+              mx::array(std::numeric_limits<double>::quiet_NaN(), val.dtype()),
+              val);
+        }
+        mx::array idx = mx::take_along_axis(ids, mx::expand_dims(arg, d), d);
+        env[e.outs[0]] = val;
+        env[e.outs[1]] = mx::squeeze(idx, d);
+        break;
+      }
+
       case kDotGeneral: {
-        // ops/linalg.py _dot_general, float path (integer dots route
-        // through the exact-f32 chunk machinery there and decline here).
+        // ops/linalg.py _dot_general. Which of the three arms runs is a
+        // static property of the operand dtypes, so tape.py resolved it;
+        // all three are here because MLX has no integer matmul.
         size_t p = 0;
         int64_t lrank = at[p++];
         std::vector<int> lperm = axes(at, p, lrank);
@@ -556,6 +767,9 @@ class Program {
         mx::Dtype out_dt = dtype_of(at[p++]);
         int64_t out_rank = at[p++];
         mx::Shape out_shape = shape(at, p, out_rank);
+        p += static_cast<size_t>(out_rank);
+        int64_t kind = at[p++];
+        int64_t chunk = at[p++];
 
         mx::array l = mx::transpose(in(0), lperm);
         mx::array r = mx::transpose(in(1), rperm);
@@ -571,9 +785,51 @@ class Program {
           env[e.outs[0]] = mx::zeros(out_shape, out_dt);
           break;
         }
-        if (l3.dtype() != out_dt) l3 = mx::astype(l3, out_dt);
-        if (r3.dtype() != out_dt) r3 = mx::astype(r3, out_dt);
-        env[e.outs[0]] = mx::reshape(mx::matmul(l3, r3), out_shape);
+        mx::array o3 = l3;
+        if (kind == 1) {
+          // _int_dot_via_f32: f32 holds every integer up to 2**24 exactly,
+          // so an 8-bit integer dot over short enough K-slices is exact in
+          // a real matmul; the per-chunk results accumulate in integer
+          // arithmetic, which wraps exactly like XLA's integer dot.
+          if (chunk <= 0)
+            throw std::invalid_argument("tape: bad dot chunk");
+          mx::Dtype acc_dt = out_dt.size() == 8 ? mx::int64 : mx::int32;
+          std::optional<mx::array> acc;
+          for (int64_t s = 0; s < k; s += chunk) {
+            mx::array lp = l3, rp = r3;
+            if (k > chunk) {
+              int64_t hi = std::min(s + chunk, k);
+              lp = mx::slice(l3, mx::Shape{0, 0, static_cast<int>(s)},
+                             mx::Shape{static_cast<int>(b),
+                                       static_cast<int>(m),
+                                       static_cast<int>(hi)});
+              rp = mx::slice(r3, mx::Shape{0, static_cast<int>(s), 0},
+                             mx::Shape{static_cast<int>(b),
+                                       static_cast<int>(hi),
+                                       static_cast<int>(n)});
+            }
+            mx::array part = mx::astype(
+                mx::matmul(mx::astype(lp, mx::float32),
+                           mx::astype(rp, mx::float32)),
+                acc_dt);
+            acc = acc ? mx::add(*acc, part) : part;
+          }
+          o3 = mx::astype(*acc, out_dt);
+        } else if (kind == 2 || kind == 3) {
+          // MLX matmul is float-only: an explicit multiply-accumulate over
+          // a materialized [B, M, K, N] product. kind 3 is the bool arm,
+          // whose accumulator stays bool until mx.sum promotes it.
+          mx::array acc = kind == 3 ? l3 : mx::astype(l3, mx::int64);
+          mx::array prod = mx::multiply(mx::expand_dims(acc, 3),
+                                        mx::expand_dims(
+                                            mx::astype(r3, acc.dtype()), 1));
+          o3 = mx::astype(mx::sum(prod, std::vector<int>{2}), out_dt);
+        } else {
+          if (l3.dtype() != out_dt) l3 = mx::astype(l3, out_dt);
+          if (r3.dtype() != out_dt) r3 = mx::astype(r3, out_dt);
+          o3 = mx::matmul(l3, r3);
+        }
+        env[e.outs[0]] = mx::reshape(o3, out_shape);
         break;
       }
 
