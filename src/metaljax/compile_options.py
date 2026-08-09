@@ -129,13 +129,23 @@ def _types() -> dict[str, type]:
         try:
             from jaxlib import xla_client as xc
 
-            do = xc.CompileOptions().executable_build_options.debug_options
+            # `opts` MUST stay referenced for the whole walk. jaxlib hands
+            # out executable_build_options and debug_options by REFERENCE
+            # into the CompileOptions that owns them, so binding only the
+            # leaf lets the owner die, and every read below is then a read
+            # of freed memory. Single-threaded it got away with it; under
+            # concurrent compiles (jax's pjit_test.test_concurrent_pjit,
+            # ~25% of runs) another thread claimed the block first and the
+            # string getters segfaulted.
+            opts = xc.CompileOptions()
+            do = opts.executable_build_options.debug_options
             for name in dir(do):
                 if not name.startswith("xla_"):
                     continue
                 v = getattr(do, name)
                 if isinstance(v, (bool, int, float, str)):
                     table[name] = type(v)
+            del do, opts
         except Exception:
             pass
         table.update(_EXTRA_OPTION_TYPES)

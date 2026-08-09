@@ -11,6 +11,7 @@ import ctypes
 import gc
 import hashlib
 import os
+import threading
 import time
 
 import ml_dtypes
@@ -21,6 +22,74 @@ from jaxlib.mlir import ir
 
 from metaljax import _ir, dtypes, qmm
 from metaljax.interpreter import Interpreter
+
+# --------------------------------------------------------------------------
+# streams (threads)
+# --------------------------------------------------------------------------
+#
+# MLX streams are THREAD-LOCAL, and the default one is thread-BOUND: the
+# first MLX call on a thread gives that thread a private stream, and a graph
+# whose primitives carry it can only be evaluated there. Evaluate it
+# anywhere else and MLX raises "There is no Stream(gpu, 0) in current
+# thread" -- or, if the owning thread has already exited, throws where
+# nothing catches and std::terminate takes the process down (an abort with
+# no Python traceback, which is what jax's pjit_test.test_concurrent_pjit
+# was hitting).
+#
+# Producer and consumer threads routinely differ here, because arrays leave
+# execute LAZY -- async_eval is what keeps eager dispatch affordable -- so
+# the thread that built a value is often not the thread that needs it. jax
+# dispatches jit calls from whatever thread the caller is on and reads the
+# results back from another.
+#
+# MLX's answer is new_thread_unsafe_stream: a stream that "can be passed to
+# and evaluated anywhere". So each thread that enters the engine gets one of
+# those as its default, in place of the thread-bound stream MLX would have
+# made anyway (same cost -- MLX creates a stream per thread either way).
+# Values may then cross threads freely, including from threads that have
+# since died.
+#
+# One stream PER THREAD, emphatically not one shared: "thread unsafe" means
+# concurrent use is the caller's problem, and it is not a soft failure --
+# two threads encoding into one stream's command buffer trips a Metal
+# assertion ("A command encoder is already encoding to this command
+# buffer") and aborts. Separate streams keep concurrent executes on separate
+# command buffers, and MLX's own events order the handoffs between them.
+#
+# The other half of the contract is that nothing leaves the engine LAZY. An
+# unscheduled value has to be ENQUEUED by whoever evaluates it, on the
+# stream it was built on -- the concurrent-encoding crash again, and it does
+# fire in practice: consumers walking into a producer's graph abort within a
+# hundred handoffs. Everything crossing the PJRT boundary is therefore
+# enqueued first (execute's own async_eval, `schedule` on the transfer path,
+# and _dealias's copies folded into the run's eval rather than made after
+# it), so a consumer on another thread only ever waits on an event.
+_HAVE_TU_STREAM = hasattr(mx, "new_thread_unsafe_stream")
+_bound = threading.local()
+_streams = []  # engine streams: one per thread that has entered the engine
+
+
+def bind_thread() -> None:
+    """Give this thread a cross-thread-evaluable default stream (once)."""
+    if not _HAVE_TU_STREAM or getattr(_bound, "done", False):
+        return
+    _bound.done = True  # first, so a failure below is not retried per call
+    stream = mx.new_thread_unsafe_stream(mx.default_device())
+    _streams.append(stream)  # GIL-atomic; the list is the thread count
+    mx.set_default_stream(stream)
+
+
+def schedule(*arrays) -> None:
+    """Enqueue `arrays` so another thread can await them without encoding.
+
+    For values crossing the PJRT boundary that some path left lazy;
+    execute's outputs are settled where the flush policy lives.
+    """
+    if arrays:
+        mx.async_eval(*arrays)
+
+
+bind_thread()
 
 # --- Stage 2: the native replay engine (notes/cpp-migration-plan.md) ---
 # METALJAX_ENGINE=native loads the C++ extension (native/build.sh) and,
@@ -174,6 +243,7 @@ class MetalBuffer:
 
 def buffer_from_host(data, type_enum: int, dims, byte_strides,
                      offset: int = 0) -> MetalBuffer:
+    bind_thread()
     dims = list(dims)
     np_dtype = _ENUM_TO_NP.get(type_enum)
     if np_dtype is None:
@@ -188,6 +258,11 @@ def buffer_from_host(data, type_enum: int, dims, byte_strides,
             data, type_enum, [int(d) for d in dims],
             None if byte_strides is None else [int(s) for s in byte_strides],
             int(offset))
+        # Mostly eager (the staging block becomes the array's storage), but
+        # an uninitialized or 0-size request is an mx::zeros — lazy, and so
+        # a graph node another thread would have to encode. Costs 0.12us on
+        # an array that is already there.
+        schedule(arr)
         return MetalBuffer(arr, type_enum, dims)
     if data is None:
         arr = np.zeros(dims, np_dtype)
@@ -199,10 +274,15 @@ def buffer_from_host(data, type_enum: int, dims, byte_strides,
         arr = np.ndarray(shape=dims, dtype=np_dtype, buffer=data,
                          offset=offset, strides=list(byte_strides))
         arr = np.ascontiguousarray(arr).reshape(dims)
-    return MetalBuffer(dtypes.to_mx(arr), type_enum, dims)
+    dev = dtypes.to_mx(arr)
+    # to_mx is a plain upload for most dtypes but a bitcast (bf16) or a grid
+    # conversion (i4/f8*/...) for others, and those leave a graph node.
+    schedule(dev)
+    return MetalBuffer(dev, type_enum, dims)
 
 
 def to_host(buf: MetalBuffer) -> bytes:
+    bind_thread()
     if (NATIVE is not None and NATIVE.native_type(buf.type_enum)
             and buf.data.dtype == _EXPECTED_MX.get(buf.type_enum)):
         # The dtype check guards results whose device storage differs from
@@ -455,6 +535,7 @@ class MetalExecutable:
 
 def compile_program(code: bytes, fmt: str,
                     options: bytes | None = None) -> MetalExecutable:
+    bind_thread()
     if fmt not in ("mlir",):
         raise ValueError(f"unsupported program format {fmt!r}")
     # `options` is the serialized CompileOptionsProto. metaljax applies none
@@ -515,6 +596,7 @@ _exec_count = 0
 
 def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
     global _exec_count
+    bind_thread()
     _exec_count += 1
     if _CLEAR_PERIOD and _exec_count % _CLEAR_PERIOD == 0:
         # 50k executes is evidence of real work, not of a cheap boundary:
@@ -545,7 +627,7 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
     prog = ex.native_program()
     if prog is not None:
         try:
-            outs = list(prog.run(inputs=args))
+            outs = _dealias(ex, args, list(prog.run(inputs=args)))
             NATIVE_STATS["runs"] += 1
             if outs:
                 if _SYNC:
@@ -560,9 +642,9 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
                   f"falling back to the Python engine for {ex.name}",
                   flush=True)
     if outs is not None:
-        return _finish(ex, args, outs)
+        return _buffers(ex, outs)
     try:
-        outs = list(ex.runner()(*args))
+        outs = _dealias(ex, args, list(ex.runner()(*args)))
         if outs:
             # An msl_scan kernel that was traced into a compiled graph has
             # never been built: settle synchronously so a Metal build error
@@ -623,21 +705,34 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
         # refcycles pin executables clear_cache cannot free).
         reclaim(force=True)
         runner = ex.interpreter if retry == "eager" else ex.runner()
-        outs = list(runner(*args))
+        outs = _dealias(ex, args, list(runner(*args)))
         if outs:
             mx.eval(*outs)
-    return _finish(ex, args, outs)
+    return _buffers(ex, outs)
 
 
-def _finish(ex: MetalExecutable, args, outs) -> list[MetalBuffer]:
-    """Turn a run's arrays into PJRT buffers. Engine-independent."""
-    if os.environ.get("METALJAX_MEMDBG", "") == "1":
-        print(f"[metaljax-mem] gc: {GC_STATS['collections']} collections "
-              f"({GC_STATS['seconds']:.1f}s), "
-              f"{GC_STATS['skipped']} deferred by the duty cycle", flush=True)
-        print(f"[metaljax-mem] execute done: "
-              f"active={mx.get_active_memory()}B "
-              f"cache={mx.get_cache_memory()}B", flush=True)
+def _dealias(ex: MetalExecutable, args, outs):
+    """Give every output a buffer of its own. Engine-independent.
+
+    Runs BEFORE the caller settles the results, not after, because the
+    copies it makes are graph nodes like any other: made afterwards they
+    would be the one thing leaving execute unscheduled, and a consumer on
+    another thread would then have to encode them on this thread's stream —
+    which several consumers doing it at once turn into a Metal abort (see
+    bind_thread). Folding them into the run's own eval is also the cheapest
+    place to put them: one submission per execute, never two.
+
+    It is not free even so, for the one program shape whose outputs would
+    otherwise submit NOTHING — every output forwarded, which is what a
+    device_put's staging program and a jitted identity are. Those pay one
+    command-buffer round trip they used to defer until somebody read the
+    value: 11 -> 30us for a device_put, 4 -> 18us for a jit identity,
+    +23us per tensor across a load-shaped burst (measured, py engine,
+    2026-08-09). Programs that compute anything are unaffected — a training
+    step measures the same either side of the change — and a value that
+    feeds another program comes out slightly AHEAD, the submission having
+    overlapped with the Python dispatch that follows it.
+    """
     # XLA's no-alias contract: outputs may not share a buffer with a
     # non-donated input or with another output (jit identity must return
     # a FRESH buffer; jax asserts this via unsafe_buffer_pointer). The
@@ -661,7 +756,18 @@ def _finish(ex: MetalExecutable, args, outs) -> list[MetalBuffer]:
             arr = mx.array(arr)
         seen_out.add(id(arr))
         fixed.append(arr)
-    outs = fixed
+    return fixed
+
+
+def _buffers(ex: MetalExecutable, outs) -> list[MetalBuffer]:
+    """Wrap settled output arrays as PJRT buffers."""
+    if os.environ.get("METALJAX_MEMDBG", "") == "1":
+        print(f"[metaljax-mem] gc: {GC_STATS['collections']} collections "
+              f"({GC_STATS['seconds']:.1f}s), "
+              f"{GC_STATS['skipped']} deferred by the duty cycle", flush=True)
+        print(f"[metaljax-mem] execute done: "
+              f"active={mx.get_active_memory()}B "
+              f"cache={mx.get_cache_memory()}B", flush=True)
     res = []
     for arr, type_enum, dims in zip(outs, ex.out_types, ex.out_dims):
         res.append(MetalBuffer(arr, type_enum, dims))
@@ -731,6 +837,7 @@ def buffer_pointer(buf: MetalBuffer) -> int:
     does memoryview indexing, which cannot take a sub-view of a >1-D buffer
     at all. Read Py_buffer.buf, which is that address by definition.
     """
+    bind_thread()
     mx.eval(buf.data)
     mv = memoryview(buf.data)
     if mv.nbytes == 0:

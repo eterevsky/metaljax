@@ -25,6 +25,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -599,6 +600,13 @@ class Program {
       // of the results, in nanobind's own code (and briefly, deliberately,
       // in the recovery paths, which call the cycle collector).
       nb::gil_scoped_release nogil;
+      // Everything below builds on the CALLING thread's default MLX
+      // stream, which engine.execute has already pointed at a
+      // cross-thread-evaluable stream of this thread's own
+      // (engine.bind_thread) — it is the one entry point a native run can
+      // be reached through, so a threadbare caller is bound before it gets
+      // here.
+      std::lock_guard<std::mutex> guard(lock_);
       outs = run_recovering(inputs);
       for (int i : copies_) {
         if (i >= 0 && static_cast<size_t>(i) < outs.size())
@@ -1628,6 +1636,15 @@ class Program {
   int64_t max_repeat_ = 1;
   std::vector<int> anchors_;
   std::map<int, Compiled> compiled_;
+  // `run` mutates all of the run-time state above -- the compiled-graph
+  // cache above all -- with the GIL released, so two threads calling the
+  // SAME executable would race on it (jax lets one jitted function be
+  // called from any number of threads). One lock per program serializes
+  // those and nothing else; distinct executables still run concurrently.
+  // Taken INSIDE the GIL release, never outside: a waiter must not hold the
+  // GIL, or the holder's recovery paths (which reacquire it to collect
+  // cycles) would deadlock against it.
+  std::mutex lock_;
 };
 
 nb::dict opcodes() {
