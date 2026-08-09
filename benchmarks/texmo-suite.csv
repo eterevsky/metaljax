@@ -103,5 +103,5 @@ mid13-b16l256,bytes.emb.512|attn.512.8.64,fp32,16,256,scan
 mid13-b64l128,bytes.emb.512|attn.512.8.64,fp32,64,128,scan
 mid14-b16l256,bytes.emb.512|lrnn.512.2,fp32,16,256,scan
 mid14-b64l128,bytes.emb.512|lrnn.512.2,fp32,64,128,scan
-synth-matlstm-a,bits.1+bp|matlstm.2,fp32,8,128,scan
-synth-matlstm-b,bits.1+bp|dense.1.tanh-suffix.4-dense.2.tanh-matlstm.2,fp32,4,256,scan
+synth-matlstm-a,tokens.32.shift.emb.8|lrnn.8.4-matlstm.8,fp32,64,32,scan
+synth-matlstm-b,bits.4.oh+bp|matlstm.32-dense.32.gelu,fp32,32,128,scan

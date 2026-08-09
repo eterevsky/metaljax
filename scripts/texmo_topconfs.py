@@ -189,14 +189,31 @@ def bench_config(row):
     text = manager._train_chunk.lower(*args).as_text()
     flat_in = [np.asarray(x) for x in jax.tree_util.tree_leaves(args)]
 
-    # --- metaljax
-    interp = Interpreter(text)
-    mx_args = [mdt.to_mx(x) for x in flat_in]
+    # --- metaljax (through engine.execute when the native engine is on:
+    # the Stage-2 tape hooks there, and a bench that calls Interpreter
+    # directly measures the Python path whatever METALJAX_ENGINE says)
+    from metaljax import engine as mengine
+    if mengine.NATIVE is None:
+        interp = Interpreter(text)
+        mx_args = [mdt.to_mx(x) for x in flat_in]
 
-    def run_metal(*_):
-        outs = interp(*mx_args)
-        mx.eval(*outs)
-        return ()
+        def run_metal(*_):
+            outs = interp(*mx_args)
+            mx.eval(*outs)
+            return ()
+    else:
+        ex = mengine.compile_program(text.encode(), "mlir")
+        bufs = []
+        for x in flat_in:
+            a = np.ascontiguousarray(x)
+            bufs.append(mengine.buffer_from_host(
+                a.tobytes(), mengine._NP_TO_ENUM[a.dtype], list(a.shape),
+                None, 0))
+
+        def run_metal(*_):
+            outs = mengine.execute(ex, bufs)
+            mx.eval(*[o.data for o in outs])
+            return ()
 
     m_warm, m_step = bench_platform(row, run_metal, (), nsteps)
 

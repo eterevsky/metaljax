@@ -43,7 +43,34 @@ from texmo.manager_jax import ManagerJax
 
 import mlx.core as mx
 from metaljax import dtypes as mdt
+from metaljax import engine as mengine
 from metaljax.interpreter import Interpreter
+
+
+def run_module(text, flat_in):
+    """Execute the module on metal, honoring METALJAX_ENGINE.
+
+    The direct Interpreter(text) call bypasses engine.execute — which is
+    where the Stage-2 native tape hooks — so a native-engine gate must go
+    through the engine layer or it silently measures the Python path.
+    """
+    if mengine.NATIVE is None:
+        interp = Interpreter(text)
+        outs = interp(*[mdt.to_mx(np.asarray(x)) for x in flat_in])
+        mx.eval(*outs)
+        return [np.array(o, copy=False) for o in outs]
+    ex = mengine.compile_program(
+        text.encode() if isinstance(text, str) else text, "mlir")
+    bufs = []
+    for x in flat_in:
+        a = np.ascontiguousarray(np.asarray(x))
+        bufs.append(mengine.buffer_from_host(
+            a.tobytes(), mengine._NP_TO_ENUM[a.dtype], list(a.shape),
+            None, 0))
+    outs = mengine.execute(ex, bufs)
+    return [np.frombuffer(mengine.to_host(o),
+                          mengine._ENUM_TO_NP[o.type_enum]).reshape(o.dims)
+            for o in outs]
 
 set_tokens_dir(str(TEXMO / "tokens"))
 train_set = DataSet(path=str(TEXMO / "data" / "pride.txt"))
@@ -111,15 +138,13 @@ def check_one(name, spec, batch, length, nsteps, rng):
                 if np.asarray(x).dtype.kind == "f" else np.asarray(x)
                 for x in jax.tree_util.tree_leaves(ref)]
 
-    interp = Interpreter(text)
-    outs = interp(*[mdt.to_mx(np.asarray(x)) for x in flat_in])
-    mx.eval(*outs)
+    outs = run_module(text, flat_in)
 
     worst = 0.0
     worst_i = -1
     n_bad = 0
     for i, (o, r) in enumerate(zip(outs, flat_ref)):
-        h = np.array(o, copy=False)
+        h = np.asarray(o)
         if h.dtype != r.dtype:
             h = h.astype(r.dtype)
         if h.shape != r.shape:
