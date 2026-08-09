@@ -1,0 +1,107 @@
+name,spec,precision,batch,length,mode
+big00-b32l128,bytes.emb.512|mgru.512,fp32,32,128,scan
+big00-b8l256,bytes.emb.512|mgru.512,fp32,8,256,scan
+big01-b32l128,bytes.emb.256|gru.256-gru.256-gru.256,fp32,32,128,scan
+big01-b8l256,bytes.emb.256|gru.256-gru.256-gru.256,fp32,8,256,scan
+big02-b32l128,bytes|gru.512,fp32,32,128,scan
+big02-b8l256,bytes|gru.512,fp32,8,256,scan
+big03-b32l128,bytes.emb.512|gru.512,fp32,32,128,scan
+big03-b8l256,bytes.emb.512|gru.512,fp32,8,256,scan
+big04-b32l128,"bytes.emb.512|split.add(gru.512, pass)",fp32,32,128,scan
+big04-b8l256,"bytes.emb.512|split.add(gru.512, pass)",fp32,8,256,scan
+big05-b32l128,bytes.emb.512|gru.512-rmsnorm,fp32,32,128,scan
+big05-b8l256,bytes.emb.512|gru.512-rmsnorm,fp32,8,256,scan
+big06-b32l128,bytes.emb.512|conv.4-gru.512,fp32,32,128,scan
+big06-b8l256,bytes.emb.512|conv.4-gru.512,fp32,8,256,scan
+big07-b32l128,bytes.emb.512|dense.512.gelu-gru.512,fp32,32,128,scan
+big07-b8l256,bytes.emb.512|dense.512.gelu-gru.512,fp32,8,256,scan
+big08-b32l128,bytes.emb.512|lstm.512,fp32,32,128,scan
+big08-b8l256,bytes.emb.512|lstm.512,fp32,8,256,scan
+big09-b32l128,bytes.emb.1024|rnn.1024.tanh,fp32,32,128,scan
+big09-b8l256,bytes.emb.1024|rnn.1024.tanh,fp32,8,256,scan
+big10-b32l128,bits.4.oh+bp|gru.1024,fp32,32,128,scan
+big10-b8l256,bits.4.oh+bp|gru.1024,fp32,8,256,scan
+big11-b32l128,bytes.emb.512|gru.512-gru.512,fp32,32,128,scan
+big11-b8l256,bytes.emb.512|gru.512-gru.512,fp32,8,256,scan
+big12-b32l128,bytes.emb.1024|msr.256.4,fp32,32,128,scan
+big12-b8l256,bytes.emb.1024|msr.256.4,fp32,8,256,scan
+big13-b32l128,bytes|lstm.1024,fp32,32,128,scan
+big13-b8l256,bytes|lstm.1024,fp32,8,256,scan
+big14-b32l128,"bytes.emb.512|split.add(rmsnorm-attn.512.8.64, pass)-split.add(rmsnorm-dense.2048.gelu-dense.512, pass)-split.add(rmsnorm-attn.512.8.64, pass)-split.add(rmsnorm-dense.2048.gelu-dense.512, pass)",fp32,32,128,scan
+big14-b8l256,"bytes.emb.512|split.add(rmsnorm-attn.512.8.64, pass)-split.add(rmsnorm-dense.2048.gelu-dense.512, pass)-split.add(rmsnorm-attn.512.8.64, pass)-split.add(rmsnorm-dense.2048.gelu-dense.512, pass)",fp32,8,256,scan
+big15-b32l128,bytes.emb.1024|gru.1024,fp32,32,128,scan
+big15-b8l256,bytes.emb.1024|gru.1024,fp32,8,256,scan
+big16-b32l128,bytes.emb.1024|lstm.1024,fp32,32,128,scan
+big16-b8l256,bytes.emb.1024|lstm.1024,fp32,8,256,scan
+db00-b16l128,bits.1+bp|,fp32,16,128,scan
+db00-b64l256,bits.1+bp|,fp32,64,256,scan
+db01-b256l512,bits.1+bp|dense.1.tanh-suffix.4,fp32,256,512,scan
+db01-b64l256,bits.1+bp|dense.1.tanh-suffix.4,fp32,64,256,scan
+db02-b256l512,"bits.1+bp|split.cat(rnn.1.tanh, pass)-norm-dense.1.tanh-suffix.2",fp32,256,512,scan
+db02-b4l1024,"bits.1+bp|split.cat(rnn.1.tanh, pass)-norm-dense.1.tanh-suffix.2",fp32,4,1024,scan
+db03-b128l128,"bits.1+bp|split.cat(mingru.1, pass)-norm-latent.2.2-suffix.2-dense.1.tanh",fp32,128,128,scan
+db03-b4l1024,"bits.1+bp|split.cat(mingru.1, pass)-norm-latent.2.2-suffix.2-dense.1.tanh",fp32,4,1024,scan
+db04-b128l128,"tokens.32.raw_fold.emb.1|split.add(dense.1.tanh, pass)",fp32,128,128,scan
+db04-b16l128,"tokens.32.raw_fold.emb.1|split.add(dense.1.tanh, pass)",fp32,16,128,scan
+db05-b16l128,bits.1+bp|mgru.4-dense.4.gelu-norm,fp32,16,128,scan
+db05-b64l256,bits.1+bp|mgru.4-dense.4.gelu-norm,fp32,64,256,scan
+db06-b256l512,"bits.4.emb.4|rglru.2-norm-conv.4-split.mul(pass, dense.4)",fp32,256,512,scan
+db06-b64l256,"bits.4.emb.4|rglru.2-norm-conv.4-split.mul(pass, dense.4)",fp32,64,256,scan
+db07-b256l512,"tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)",fp32,256,512,scan
+db07-b4l1024,"tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)",fp32,4,1024,scan
+db08-b128l128,tokens.32.raw_fold.oh|lrnn.4.4,fp32,128,128,scan
+db08-b4l1024,tokens.32.raw_fold.oh|lrnn.4.4,fp32,4,1024,scan
+db09-b128l128,tokens.32.raw_fold.emb.8|mingru.4-latent.8.2,fp32,128,128,scan
+db09-b16l128,tokens.32.raw_fold.emb.8|mingru.4-latent.8.2,fp32,16,128,scan
+db10-b16l128,bits.4.oh+bp|lrnn.8.2-suffix.2-dense.8.gelu,fp32,16,128,scan
+db10-b64l256,bits.4.oh+bp|lrnn.8.2-suffix.2-dense.8.gelu,fp32,64,256,scan
+db11-b256l512,bits.4.oh+bp|rnn.16.gelu-dense.8.gelu-rmsnorm,fp32,256,512,scan
+db11-b64l256,bits.4.oh+bp|rnn.16.gelu-dense.8.gelu-rmsnorm,fp32,64,256,scan
+db12-b256l512,"bits.4.oh+bp|rnn.16.gelu-split.add(lrnn.16.4, pass)",fp32,256,512,scan
+db12-b4l1024,"bits.4.oh+bp|rnn.16.gelu-split.add(lrnn.16.4, pass)",fp32,4,1024,scan
+db13-b128l128,"bits.4.oh+bp|split.mul(dense.4.tanh, dense.4)-rnn.32.gelu-dense.16.gelu-norm",fp32,128,128,scan
+db13-b4l1024,"bits.4.oh+bp|split.mul(dense.4.tanh, dense.4)-rnn.32.gelu-dense.16.gelu-norm",fp32,4,1024,scan
+db14-b128l128,bits.4.oh+bp|rnn.32.gelu-rnn.16.gelu-rmsnorm,fp32,128,128,scan
+db14-b16l128,bits.4.oh+bp|rnn.32.gelu-rnn.16.gelu-rmsnorm,fp32,16,128,scan
+db15-b16l128,"bits.4.oh+bp|suffix.2-rnn.32.gelu-rnn.16.gelu-split.add(suffix.2-dense.16.gelu, pass)-dense.32.gelu",fp32,16,128,scan
+db15-b64l256,"bits.4.oh+bp|suffix.2-rnn.32.gelu-rnn.16.gelu-split.add(suffix.2-dense.16.gelu, pass)-dense.32.gelu",fp32,64,256,scan
+db16-b256l512,bits.4.oh+bp|mgru.32-dense.64.gelu,fp32,256,512,scan
+db16-b64l256,bits.4.oh+bp|mgru.32-dense.64.gelu,fp32,64,256,scan
+db17-b256l512,"bits.4.oh+bp|gru.16-mgru.32-split.cat(dense.64.gelu, pass)",fp32,256,512,scan
+db17-b4l1024,"bits.4.oh+bp|gru.16-mgru.32-split.cat(dense.64.gelu, pass)",fp32,4,1024,scan
+db18-b128l128,bits.4.oh+bp|mullstm.32-dense.128.gelu,fp32,128,128,scan
+db18-b4l1024,bits.4.oh+bp|mullstm.32-dense.128.gelu,fp32,4,1024,scan
+db19-b128l128,bits.4.oh+bp|gru.64-dense.64.gelu-dense.16.gelu-norm,fp32,128,128,scan
+db19-b16l128,bits.4.oh+bp|gru.64-dense.64.gelu-dense.16.gelu-norm,fp32,16,128,scan
+mid00-b16l256,bits.4.oh+bp|gru.128,fp32,16,256,scan
+mid00-b64l128,bits.4.oh+bp|gru.128,fp32,64,128,scan
+mid01-b16l256,"bytes.emb.64|split.add(rmsnorm-attn.64.4.16, pass)-split.add(rmsnorm-dense.256.gelu-dense.64, pass)",fp32,16,256,scan
+mid01-b64l128,"bytes.emb.64|split.add(rmsnorm-attn.64.4.16, pass)-split.add(rmsnorm-dense.256.gelu-dense.64, pass)",fp32,64,128,scan
+mid02-b16l256,bytes.emb.128|rnn.128.tanh,fp32,16,256,scan
+mid02-b64l128,bytes.emb.128|rnn.128.tanh,fp32,64,128,scan
+mid03-b16l256,bits.4.oh+bp|lstm.128,fp32,16,256,scan
+mid03-b64l128,bits.4.oh+bp|lstm.128,fp32,64,128,scan
+mid04-b16l256,bytes.emb.128|gru.128,fp32,16,256,scan
+mid04-b64l128,bytes.emb.128|gru.128,fp32,64,128,scan
+mid05-b16l256,bytes.emb.256|attn.256.4.64,fp32,16,256,scan
+mid05-b64l128,bytes.emb.256|attn.256.4.64,fp32,64,128,scan
+mid06-b16l256,bytes.emb.128|gru.128-gru.128,fp32,16,256,scan
+mid06-b64l128,bytes.emb.128|gru.128-gru.128,fp32,64,128,scan
+mid07-b16l256,bytes.emb.256|msr.64.4,fp32,16,256,scan
+mid07-b64l128,bytes.emb.256|msr.64.4,fp32,64,128,scan
+mid08-b16l256,bytes.emb.256|mgru.256,fp32,16,256,scan
+mid08-b64l128,bytes.emb.256|mgru.256,fp32,64,128,scan
+mid09-b16l256,bytes.emb.256|gru.256,fp32,16,256,scan
+mid09-b64l128,bytes.emb.256|gru.256,fp32,64,128,scan
+mid10-b16l256,"bytes.emb.256|split.add(gru.256, pass)",fp32,16,256,scan
+mid10-b64l128,"bytes.emb.256|split.add(gru.256, pass)",fp32,64,128,scan
+mid11-b16l256,bytes.emb.256|conv.4-gru.256,fp32,16,256,scan
+mid11-b64l128,bytes.emb.256|conv.4-gru.256,fp32,64,128,scan
+mid12-b16l256,bytes.emb.256|lstm.256,fp32,16,256,scan
+mid12-b64l128,bytes.emb.256|lstm.256,fp32,64,128,scan
+mid13-b16l256,bytes.emb.512|attn.512.8.64,fp32,16,256,scan
+mid13-b64l128,bytes.emb.512|attn.512.8.64,fp32,64,128,scan
+mid14-b16l256,bytes.emb.512|lrnn.512.2,fp32,16,256,scan
+mid14-b64l128,bytes.emb.512|lrnn.512.2,fp32,64,128,scan
+synth-matlstm-a,bits.1+bp|matlstm.2,fp32,8,128,scan
+synth-matlstm-b,bits.1+bp|dense.1.tanh-suffix.4-dense.2.tanh-matlstm.2,fp32,4,256,scan

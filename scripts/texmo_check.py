@@ -147,23 +147,18 @@ def check_one(name, spec, batch, length, nsteps, rng):
 
 
 def main():
-    suite_csv = sys.argv[1]
+    # The suite's configuration list is REPO-CANONICAL now (per Oleg,
+    # 2026-08-08): benchmarks/texmo-suite.csv carries the 104 distilled
+    # synthetic configs plus repo-local additions (matlstm first). An
+    # explicit CSV argument still overrides, e.g. to gate against a
+    # freshly regenerated texmo artifact before re-distilling.
+    default_csv = os.path.join(os.path.dirname(__file__), "..",
+                               "benchmarks", "texmo-suite.csv")
+    suite_csv = sys.argv[1] if len(sys.argv) > 1 else default_csv
     nsteps = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     tol = float(os.environ.get("CHECK_TOL", "2e-3"))
     rng = np.random.default_rng(0)
-    configs = configs_from_csv(suite_csv)
-    # Repo-local synthetic additions (benchmarks/gate-extra.csv by
-    # default): configs the generated texmo suite CSV does not carry but
-    # that keep finding bugs — matlstm first among them (matrix state;
-    # notes/matlstm-2026-07.md). Same schema, only spec/batch/length/
-    # name/mode read. ~/texmo stays read-only.
-    extra = os.environ.get(
-        "METALJAX_GATE_EXTRA",
-        os.path.join(os.path.dirname(__file__), "..", "benchmarks",
-                     "gate-extra.csv"))
-    if extra and os.path.exists(extra):
-        configs += configs_from_csv(extra)
-    configs = sorted(configs)
+    configs = sorted(configs_from_csv(suite_csv))
     n_pass = n_fail = n_err = 0
     for spec, batch, length, name in [(s, b, l, n)
                                       for (n, s, b, l) in configs]:

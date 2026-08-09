@@ -4,7 +4,7 @@
 #   scripts/release/texmo_gate.sh [--smoke]
 #
 # Chains, strictly sequentially, holding the machine lock throughout:
-#   (a) scripts/texmo_check.py ~/texmo/benchmarks/m5-metal.csv
+#   (a) scripts/texmo_check.py benchmarks/texmo-suite.csv
 #       whole-model vs jax-CPU on all 104 suite configurations.
 #       Baseline today: 96 ok + 8 ERROR on the tokens.32.raw_fold.* specs
 #       (missing tokenset in ~/texmo/tokens — environmental).  The wrapper
@@ -34,7 +34,7 @@ SMOKE=0
 [ "${1:-}" = "--smoke" ] && SMOKE=1
 
 gate_init
-SUITE_CSV=${TEXMO_SUITE_CSV:-$HOME/texmo/benchmarks/m5-metal.csv}
+SUITE_CSV=${TEXMO_SUITE_CSV:-$MJ_ROOT/benchmarks/texmo-suite.csv}
 TOPCONFS=${TEXMO_TOPCONFS:-$MJ_ROOT/top_confs.jsonl}
 ANCHOR=${TEXMO_ANCHOR:-$MJ_ROOT/notes/data/texmo-topconfs-final.jsonl}
 NEW_JSONL=${TEXMO_OUT:-$MJ_ROOT/notes/data/texmo-topconfs-$GATE_DATE.jsonl}
