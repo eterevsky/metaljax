@@ -41,18 +41,18 @@ db02-b256l512,"bits.1+bp|split.cat(rnn.1.tanh, pass)-norm-dense.1.tanh-suffix.2"
 db02-b4l1024,"bits.1+bp|split.cat(rnn.1.tanh, pass)-norm-dense.1.tanh-suffix.2",fp32,4,1024,scan
 db03-b128l128,"bits.1+bp|split.cat(mingru.1, pass)-norm-latent.2.2-suffix.2-dense.1.tanh",fp32,128,128,scan
 db03-b4l1024,"bits.1+bp|split.cat(mingru.1, pass)-norm-latent.2.2-suffix.2-dense.1.tanh",fp32,4,1024,scan
-db04-b128l128,"tokens.32.raw_fold.emb.1|split.add(dense.1.tanh, pass)",fp32,128,128,scan
-db04-b16l128,"tokens.32.raw_fold.emb.1|split.add(dense.1.tanh, pass)",fp32,16,128,scan
+db04-b128l128,"tokens.32.fold.emb.1|split.add(dense.1.tanh, pass)",fp32,128,128,scan
+db04-b16l128,"tokens.32.fold.emb.1|split.add(dense.1.tanh, pass)",fp32,16,128,scan
 db05-b16l128,bits.1+bp|mgru.4-dense.4.gelu-norm,fp32,16,128,scan
 db05-b64l256,bits.1+bp|mgru.4-dense.4.gelu-norm,fp32,64,256,scan
 db06-b256l512,"bits.4.emb.4|rglru.2-norm-conv.4-split.mul(pass, dense.4)",fp32,256,512,scan
 db06-b64l256,"bits.4.emb.4|rglru.2-norm-conv.4-split.mul(pass, dense.4)",fp32,64,256,scan
-db07-b256l512,"tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)",fp32,256,512,scan
-db07-b4l1024,"tokens.32.raw_fold.emb.4|split.add(lrnn.4.4, pass)",fp32,4,1024,scan
-db08-b128l128,tokens.32.raw_fold.oh|lrnn.4.4,fp32,128,128,scan
-db08-b4l1024,tokens.32.raw_fold.oh|lrnn.4.4,fp32,4,1024,scan
-db09-b128l128,tokens.32.raw_fold.emb.8|mingru.4-latent.8.2,fp32,128,128,scan
-db09-b16l128,tokens.32.raw_fold.emb.8|mingru.4-latent.8.2,fp32,16,128,scan
+db07-b256l512,"tokens.32.fold.emb.4|split.add(lrnn.4.4, pass)",fp32,256,512,scan
+db07-b4l1024,"tokens.32.fold.emb.4|split.add(lrnn.4.4, pass)",fp32,4,1024,scan
+db08-b128l128,tokens.32.fold.oh|lrnn.4.4,fp32,128,128,scan
+db08-b4l1024,tokens.32.fold.oh|lrnn.4.4,fp32,4,1024,scan
+db09-b128l128,tokens.32.fold.emb.8|mingru.4-latent.8.2,fp32,128,128,scan
+db09-b16l128,tokens.32.fold.emb.8|mingru.4-latent.8.2,fp32,16,128,scan
 db10-b16l128,bits.4.oh+bp|lrnn.8.2-suffix.2-dense.8.gelu,fp32,16,128,scan
 db10-b64l256,bits.4.oh+bp|lrnn.8.2-suffix.2-dense.8.gelu,fp32,64,256,scan
 db11-b256l512,bits.4.oh+bp|rnn.16.gelu-dense.8.gelu-rmsnorm,fp32,256,512,scan
