@@ -69,8 +69,9 @@ BENCH_CHUNK = 256       # production texmo chunking: one jitted scan of
 def build(row, nsteps, length):
     conf = Configuration(
         parse_model2(row["spec"], precision=Precision(row["precision"])),
-        lr=row["lr"], length=length, batch=row["batch"], steps=nsteps,
-        decay=row["decay"], cosine=row["cosine"],
+        lr=row.get("lr", 0.01), length=length, batch=row["batch"],
+        steps=nsteps,
+        decay=row.get("decay", 1.0), cosine=row.get("cosine", False),
     )
     manager = ManagerJax(conf=conf, system="metaljax-topconfs",
                          dataset=train_set, test_sample_len=64, test_batch=8)
@@ -249,7 +250,7 @@ def main():
     n_ok = n_fail = n_err = 0
     with open(out_path, "w") as out_f:
         for i, row in enumerate(rows):
-            name = f"tc{i:03d}-w{row['weights']}"
+            name = f"tc{i:03d}-w{row.get('weights', 0)}"
             if ns.filter and ns.filter not in row["spec"]:
                 continue
             rec = {"name": name, **{k: row[k] for k in
