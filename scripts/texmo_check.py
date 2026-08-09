@@ -151,7 +151,19 @@ def main():
     nsteps = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     tol = float(os.environ.get("CHECK_TOL", "2e-3"))
     rng = np.random.default_rng(0)
-    configs = sorted(configs_from_csv(suite_csv))
+    configs = configs_from_csv(suite_csv)
+    # Repo-local synthetic additions (benchmarks/gate-extra.csv by
+    # default): configs the generated texmo suite CSV does not carry but
+    # that keep finding bugs — matlstm first among them (matrix state;
+    # notes/matlstm-2026-07.md). Same schema, only spec/batch/length/
+    # name/mode read. ~/texmo stays read-only.
+    extra = os.environ.get(
+        "METALJAX_GATE_EXTRA",
+        os.path.join(os.path.dirname(__file__), "..", "benchmarks",
+                     "gate-extra.csv"))
+    if extra and os.path.exists(extra):
+        configs += configs_from_csv(extra)
+    configs = sorted(configs)
     n_pass = n_fail = n_err = 0
     for spec, batch, length, name in [(s, b, l, n)
                                       for (n, s, b, l) in configs]:

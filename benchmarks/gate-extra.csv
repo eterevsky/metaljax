@@ -1,0 +1,3 @@
+system,platform,device_kind,name,source,spec,precision,weights,num_layers,batch,length,mode,steps,first_s,step_s,ms_step,ktok_s,error
+synthetic,metal,Apple M5 Max,synth-matlstm-a,synth,bits.1+bp|matlstm.2,fp32,0,0,8,128,scan,8,0,0,0,0,
+synthetic,metal,Apple M5 Max,synth-matlstm-b,synth,bits.1+bp|dense.1.tanh-suffix.4-dense.2.tanh-matlstm.2,fp32,0,0,4,256,scan,8,0,0,0,0,
