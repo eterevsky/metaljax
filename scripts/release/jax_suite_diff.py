@@ -50,8 +50,10 @@ def norm_id(tid):
 def load_whitelist(path):
     ids = []
     for line in Path(path).read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+        # Trailing annotations are legal ("<id>  # TRACKED-OPEN"): strip
+        # them, or an annotated entry reads as fixed AND its failure as new.
+        line = line.split("#", 1)[0].strip()
+        if not line:
             continue
         ids.append(norm_id(line))
     return set(ids)
