@@ -18,6 +18,7 @@ Licensed under the Apache License, Version 2.0.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "metal/metal_names.h"
 #include "xla/layout.h"
 #include "xla/xla_data.pb.h"
 #include "xla/pjrt/maybe_owning_mlir_module.h"
@@ -30,15 +31,6 @@ Licensed under the Apache License, Version 2.0.
 #include "xla/runtime/device_id.h"
 
 namespace metaljax {
-
-// The strings jaxlib and user code see.  They must match the hand-rolled C-API
-// plugin in metaljax/plugin/metal_pjrt.cc, except for the platform version,
-// which is deliberately distinguishable so a test can tell which plugin
-// answered.
-inline constexpr absl::string_view kPlatformName = "metal";
-inline constexpr absl::string_view kDeviceKind = "Apple GPU";
-inline constexpr absl::string_view kMemoryKind = "device";
-inline constexpr absl::string_view kPlatformVersion = "metaljax-native-p0";
 
 class MetalDeviceDescription final : public xla::PjRtDeviceDescription {
  public:

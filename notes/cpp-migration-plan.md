@@ -556,6 +556,19 @@ TWO COMPLETE PLUGINS side by side, not migration-under-the-trampoline:
   freeze + trampoline retirement, XLA optimization layer last.
 - tape.cc split into modules (in flight) — its report is the
   executor's structural doc for the plugin-native author.
+- **P0 landed** (notes/pjrt-native-p0.md): the xla::PjRtClient route,
+  plus the wheel PoC. **P1 landed** (notes/cpp-p1-runtime.md): the
+  executor runtime is Python-free and links into the plugin.
+  **P2 landed** (notes/cpp-p2-lowering.md, 2026-08-11): a C++ tape
+  builder + MetalLoadedExecutable — `2 * jnp.array([1,2,3])` computes on
+  the GPU through the native plugin with no interpreter under jax.
+  Elementwise / shape / reduce / dot_general / constant lower (calls
+  inlined; bf16 constants read straight out of DenseElementsAttr, which
+  the Python bindings cannot do); everything else declines naming its
+  op. 77-case differential suite vs jax-CPU
+  (plugin-native/execute_test.py), and a tape dump byte-identical to
+  tape.py's over six programs. Next: the compile decisions, control
+  flow, gather/scatter, async execute.
 ## The native engine's file layout (2026-08-11)
 
 `native/tape.cc` had grown to 4,128 lines holding everything from the

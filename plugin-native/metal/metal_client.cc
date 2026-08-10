@@ -7,6 +7,8 @@ Licensed under the Apache License, Version 2.0.
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -19,14 +21,15 @@ Licensed under the Apache License, Version 2.0.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
-#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "metal/metal_buffer.h"
+#include "metal/metal_dtypes.h"
+#include "metal/metal_executable.h"
+#include "metal/metal_lowering.h"
+#include "metal/metal_stream.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Operation.h"
-#include "mlir/IR/Visitors.h"
-#include "mlx/array.h"
+#include "mlx/mlx.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
 #include "xla/pjrt/maybe_owning_mlir_module.h"
@@ -34,12 +37,23 @@ Licensed under the Apache License, Version 2.0.
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/runtime/device_id.h"
 #include "xla/shape_util.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/fingerprint.h"
 
 namespace metaljax {
 
 namespace mx = mlx::core;
+
+// METALJAX_DEBUG=1, the one env var this plugin reads: the runtime cadences
+// stay at their compiled-in defaults for now (the Stage 1 engine parses them
+// in Python and copies them in through `metaljax::configure`, and a second
+// reader here would be a second opinion on numbers the command-buffer lottery
+// is pinned to -- see notes/cpp-p2-lowering.md).
+const bool kDebug = [] {
+  const char* v = std::getenv("METALJAX_DEBUG");
+  return v != nullptr && std::string(v) == "1";
+}();
 
 // ------------------------------------------------------------- description
 
@@ -145,6 +159,32 @@ absl::StatusOr<xla::PjRtDevice*> MetalClient::LookupAddressableDevice(
       local_device_id.value()));
 }
 
+namespace {
+
+// Gather a strided host view into contiguous wire-format storage
+// (native/metaljax_native.cc's `strided_gather`).  Element at a time with an
+// odometer: a transfer happens once per buffer, the runs are usually
+// contiguous anyway, and `data` may sit in the MIDDLE of the host allocation
+// -- a flipped numpy view has negative strides and its logical [0,...,0] is
+// not its lowest address.
+void StridedGather(const char* base, char* dst, absl::Span<int64_t const> dims,
+                   absl::Span<int64_t const> strides, size_t item) {
+  int64_t total = 1;
+  for (int64_t d : dims) total *= d;
+  std::vector<int64_t> idx(dims.size(), 0);
+  for (int64_t n = 0; n < total; n++) {
+    int64_t off = 0;
+    for (size_t i = 0; i < dims.size(); i++) off += idx[i] * strides[i];
+    std::memcpy(dst + n * item, base + off, item);
+    for (size_t i = dims.size(); i-- > 0;) {
+      if (++idx[i] < dims[i]) break;
+      idx[i] = 0;
+    }
+  }
+}
+
+}  // namespace
+
 absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>>
 MetalClient::BufferFromHostBuffer(
     const void* data, xla::PrimitiveType type, absl::Span<int64_t const> dims,
@@ -152,80 +192,118 @@ MetalClient::BufferFromHostBuffer(
     HostBufferSemantics host_buffer_semantics,
     absl::AnyInvocable<void() &&> on_done_with_host_buffer,
     xla::PjRtMemorySpace* memory_space, const xla::Layout* device_layout) {
-  if (type != xla::F32) {
+  std::optional<WireType> wire = WireTypeOf(type);
+  if (!wire.has_value()) {
     return absl::UnimplementedError(
-        absl::StrCat("metaljax-native P0 handles f32 only, got ",
+        absl::StrCat("metaljax-native: no host transfer for ",
                      xla::PrimitiveType_Name(type)));
   }
   if (device_layout != nullptr &&
       !xla::LayoutUtil::IsMonotonicWithDim0Major(*device_layout)) {
     return absl::UnimplementedError(
-        "metaljax-native P0 handles row-major layouts only.");
+        "metaljax-native handles row-major layouts only.");
   }
-  // Reject any host buffer that is not densely packed row-major: MLX would
-  // otherwise read the wrong elements.
-  if (byte_strides.has_value()) {
-    if (byte_strides->size() != dims.size()) {
-      return absl::InvalidArgumentError(
-          "metaljax: byte_strides rank does not match dims.");
-    }
-    int64_t expected = sizeof(float);
-    for (int64_t i = dims.size() - 1; i >= 0; --i) {
-      if ((*byte_strides)[i] != expected) {
-        return absl::UnimplementedError(
-            "metaljax-native P0 handles densely packed host buffers only.");
-      }
-      expected *= dims[i];
-    }
+  if (byte_strides.has_value() && byte_strides->size() != dims.size()) {
+    return absl::InvalidArgumentError(
+        "metaljax: byte_strides rank does not match dims.");
   }
 
+  BindThread();
   mx::Shape shape;
   shape.reserve(dims.size());
+  int64_t total = 1;
   for (int64_t d : dims) {
     if (d < 0 || d > std::numeric_limits<mx::ShapeElem>::max()) {
       return absl::InvalidArgumentError(
           absl::StrCat("metaljax: dimension out of range: ", d));
     }
     shape.push_back(static_cast<mx::ShapeElem>(d));
-  }
-
-  // The iterator constructor copies, so the host buffer is ours to release as
-  // soon as this returns; eval() materialises the array, which is what makes
-  // the buffer honestly "ready".
-  mx::array array(static_cast<const float*>(data), shape, mx::float32);
-  array.eval();
-  if (on_done_with_host_buffer) {
-    std::move(on_done_with_host_buffer)();
+    total *= d;
   }
 
   xla::PjRtMemorySpace* space =
       memory_space != nullptr ? memory_space : memory_spaces_.front();
-  return std::make_unique<MetalBuffer>(
-      this, space, devices_.front(), xla::ShapeUtil::MakeShape(type, dims),
-      std::move(array));
+  auto wrap = [&](mx::array array) {
+    array.eval();  // honestly ready before the buffer is handed out
+    if (on_done_with_host_buffer) std::move(on_done_with_host_buffer)();
+    return std::make_unique<MetalBuffer>(this, space, devices_.front(),
+                                         xla::ShapeUtil::MakeShape(type, dims),
+                                         std::move(array));
+  };
+
+  if (data == nullptr || total == 0) {
+    // Never touch a data pointer for an empty transfer: MLX 0.32 can hand out
+    // null-backed zero-size buffers whose access segfaults.
+    return wrap(mx::zeros(shape, wire->device));
+  }
+
+  // Stage into wire-format contiguous memory (gathering strides if any), then
+  // narrow in place if the wire is wider than the device dtype.  The staging
+  // block becomes the array's own storage -- one allocation, one copy, freed
+  // by MLX when the array dies.  Ingest COPIES: PJRT only guarantees the host
+  // memory for the duration of this call.
+  const size_t item = wire->host_item;
+  const size_t nbytes = static_cast<size_t>(total) * item;
+  char* stage = static_cast<char*>(std::malloc(nbytes));
+  if (stage == nullptr) {
+    // The callback still runs: the caller's host buffer is no longer ours to
+    // read whether or not we managed to copy it.
+    if (on_done_with_host_buffer) std::move(on_done_with_host_buffer)();
+    return absl::ResourceExhaustedError(
+        absl::StrCat("metaljax: could not stage ", nbytes, " host bytes"));
+  }
+  const char* src = static_cast<const char*>(data);
+  if (!byte_strides.has_value()) {
+    std::memcpy(stage, src, nbytes);
+  } else {
+    StridedGather(src, stage, dims, *byte_strides, item);
+  }
+  if (wire->widen) {
+    // f64 wire -> f32 device (or c128 -> c64): narrow in place.  Same
+    // rounding as numpy's astype (C double->float, round-to-nearest-even).
+    const double* from = reinterpret_cast<const double*>(stage);
+    float* to = reinterpret_cast<float*>(stage);
+    const int64_t scalars = total * wire->lanes;
+    for (int64_t i = 0; i < scalars; i++) to[i] = static_cast<float>(from[i]);
+  }
+  return wrap(mx::array(static_cast<void*>(stage), shape, wire->device,
+                        [](void* p) { std::free(p); }));
 }
 
 absl::StatusOr<std::unique_ptr<xla::PjRtLoadedExecutable>>
 MetalClient::CompileAndLoad(xla::MaybeOwningMlirModule module,
                             xla::CompileOptions options) {
-  // P0 checkpoint 4: report what the C-API wrapper actually handed us.  If the
-  // op names below are `stablehlo.*` (and not `vhlo.*`), the wrapper has
-  // already parsed the portable artifact and run the VHLO->StableHLO upgrade
-  // for us -- i.e. a native engine never has to touch serialization.
+  // The C-API wrapper hands us a PARSED module: `stablehlo.*`, already
+  // upgraded from the VHLO portable artifact, so nothing here touches
+  // serialization (the whole of what src/metaljax/engine.py does by hand).
   mlir::ModuleOp mlir_module = module.mlir_module();
-  std::vector<std::string> ops;
-  if (mlir_module) {
-    mlir_module->walk([&](mlir::Operation* op) {
-      ops.push_back(op->getName().getStringRef().str());
-    });
+  if (!mlir_module) {
+    return absl::InvalidArgumentError(
+        "metaljax-native: CompileAndLoad received no module.");
   }
-  std::fprintf(stderr,
-               "[metaljax-native] CompileAndLoad(mlir): %zu ops: %s\n",
-               ops.size(), absl::StrJoin(ops, " ").c_str());
-  std::fflush(stderr);
-  return absl::UnimplementedError(absl::StrCat(
-      "metaljax-native P0: received a parsed MLIR module with ", ops.size(),
-      " ops; no executor yet."));
+  const xla::ExecutableBuildOptions& build = options.executable_build_options;
+  if (build.num_replicas() != 1 || build.num_partitions() != 1) {
+    return absl::UnimplementedError(absl::StrCat(
+        "metaljax-native: one device only, asked for ", build.num_replicas(),
+        " replicas x ", build.num_partitions(), " partitions"));
+  }
+
+  ASSIGN_OR_RETURN(LoweredProgram lowered, LowerModule(mlir_module));
+  std::string name = "main";
+  if (auto sym = mlir_module.getSymName(); sym.has_value())
+    name = sym->str();
+  if (kDebug) {
+    std::fprintf(stderr,
+                 "[metaljax-native] lowered %s: %lld entries, %zu args, "
+                 "%zu results, %lld output copies\n",
+                 name.c_str(), static_cast<long long>(lowered.num_entries),
+                 lowered.parameters.size(), lowered.results.size(),
+                 static_cast<long long>(lowered.num_copies));
+    std::fflush(stderr);
+  }
+  return std::make_unique<MetalLoadedExecutable>(
+      this, devices_.front(), memory_spaces_.front(), std::move(lowered),
+      std::move(options), std::move(name));
 }
 
 std::unique_ptr<xla::PjRtClient> CreateMetalClient() {

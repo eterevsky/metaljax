@@ -2,8 +2,10 @@
 
 A PjRtBuffer backed by an mlx::core::array living in Apple unified memory.
 
-P0 scope: dense, contiguous, row-major f32 only.  Anything else is rejected
-with Unimplemented rather than silently mis-transferred.
+The element types are M1's table (native/metaljax_native.cc), rule for rule:
+bf16 is its own bits in both directions, and f64/c128 pass through STORED as
+f32/c64 and are widened back on egress.  Anything else is rejected with
+Unimplemented rather than silently mis-transferred.
 
 Licensed under the Apache License, Version 2.0.
 ==============================================================================*/
@@ -74,13 +76,24 @@ class MetalBuffer final : public xla::PjRtBuffer {
   // out, so it is genuinely ready at construction time.
   xla::Future<> GetReadyFuture() override;
 
+  // The device array, for an executable assembling a replay's inputs.  Empty
+  // once the buffer has been deleted.
+  const std::optional<mlx::core::array>& array() const { return array_; }
+
   // Unified memory is host-visible, but the buffer is device-resident from
   // PJRT's point of view: reporting true would let jax bypass transfers and
   // read MLX's storage directly.
   bool IsOnCpu() const override { return false; }
 
  private:
-  // Bytes of the (contiguous) payload; fails if the buffer was deleted.
+  // The array settled and, if its layout needs it, gathered into contiguous
+  // storage.  Reading `row_contiguous` and `data_size` only AFTER the eval is
+  // deliberate: that is when MLX sets them, and the short-buffer read the
+  // size check guards is a real class of bug (CLAUDE.md item 20).
+  absl::StatusOr<mlx::core::array> Settled() const;
+
+  // Bytes of the (contiguous) payload; fails if the buffer was deleted.  Wire
+  // format, so a widened dtype (f64/c128) is not readable this way.
   absl::StatusOr<size_t> CopyOut(void* dst, size_t dst_size,
                                  size_t src_offset) const;
 

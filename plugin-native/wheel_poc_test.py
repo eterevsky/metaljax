@@ -17,11 +17,10 @@ Checkpoints, in order:
   b. metaljax.engine never entered sys.modules -- no Python trampoline
   c. f32 device_put / np.asarray round-trips bit-exactly (host transfer
      through MetalClient -> mlx::core::array -> back)
-  d. jax.jit fails *from the right layer*: the plugin's Unimplemented,
-     raised by CompileAndLoad after it parsed and logged the StableHLO
+  d. jax.jit COMPUTES: CompileAndLoad lowers the parsed StableHLO into the
+     executor's tape and Execute replays it on the GPU
 
-(d) failing is the expected P0 outcome -- the native plugin has no executor
-yet. Exit status is nonzero if any checkpoint does not behave as described.
+Exit status is nonzero if any checkpoint does not behave as described.
 """
 
 import importlib.util
@@ -101,17 +100,30 @@ def _roundtrip():
     print("  round-trip exact")
 
 
-@step("d: jit reaches CompileAndLoad with parsed StableHLO")
+@step("d: jit compiles and executes")
 def _compile():
+    # The whole stack, from an installed wheel: StableHLO parsed by the C-API
+    # wrapper, lowered to the executor's tape by CompileAndLoad, replayed on
+    # the GPU by Execute, read back through the transfer path.
+    import jax.numpy as jnp
+
     x = jax.device_put(np.ones((2, 3), dtype=np.float32))
+    out = np.asarray(jax.jit(lambda a: a * 2)(x))
+    print("  jit(a * 2) ->", out.tolist())
+    assert np.array_equal(out, np.full((2, 3), 2.0, np.float32)), out
+    # Milestone zero, in the words CLAUDE.md uses for it.
+    zero = np.asarray(2 * jnp.array([1, 2, 3]))
+    print("  2 * jnp.array([1, 2, 3]) ->", zero.tolist())
+    assert np.array_equal(zero, np.array([2, 4, 6], np.int32)), zero
+    # An op outside the native set still declines, and says which one.
     try:
-        jax.jit(lambda a: a * 2)(x)
-    except Exception as e:  # noqa: BLE001 - the expected P0 outcome
+        jax.jit(jnp.sort)(jax.device_put(np.array([3.0, 1.0, 2.0], np.float32)))
+    except Exception as e:  # noqa: BLE001 - the expected decline
         msg = str(e)
-        print("  compile raised:", msg.splitlines()[0][:200])
-        assert "metaljax-native P0" in msg, "unexpected failure, see above"
+        print("  sort declined:", msg.splitlines()[0][:160])
+        assert "stablehlo.sort" in msg, "the decline did not name the op"
         return
-    raise AssertionError("compile unexpectedly succeeded")
+    raise AssertionError("jnp.sort unexpectedly compiled")
 
 
 if FAILED:

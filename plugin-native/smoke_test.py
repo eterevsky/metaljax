@@ -11,8 +11,9 @@ walks the three checkpoints in order, reporting how far the plugin gets:
   2. jax.devices() lists a device served by *this* dylib
      (platform_version == "metaljax-native-p0")
   3. jax.device_put / np.asarray round-trips an f32 array bit-exactly
-  4. jax.jit reaches CompileAndLoad and the plugin logs the parsed
-     StableHLO op names before returning Unimplemented
+  4. jax.jit compiles and executes: the parsed StableHLO becomes the
+     executor's tape and runs on the GPU (execute_test.py is the
+     differential suite; this is only the "it works at all" checkpoint)
 """
 
 import os
@@ -83,17 +84,27 @@ def _roundtrip():
     print("  round-trip exact")
 
 
-@step("checkpoint 4: compile reaches CompileAndLoad with parsed StableHLO")
+@step("checkpoint 4: compile and execute")
 def _compile():
+    import jax.numpy as jnp
+
     x = jax.device_put(np.ones((2, 3), dtype=np.float32))
+    out = np.asarray(jax.jit(lambda a: a * 2)(x))
+    print("  jit(a * 2) ->", out.tolist())
+    assert np.array_equal(out, np.full((2, 3), 2.0, np.float32)), out
+    # Milestone zero, in the words CLAUDE.md uses for it.
+    zero = np.asarray(2 * jnp.array([1, 2, 3]))
+    print("  2 * jnp.array([1, 2, 3]) ->", zero.tolist())
+    assert np.array_equal(zero, np.array([2, 4, 6], np.int32)), zero
+    # An op outside the native set declines, naming itself.
     try:
-        jax.jit(lambda a: a * 2)(x)
-    except Exception as e:  # noqa: BLE001
+        jax.jit(jnp.sort)(jax.device_put(np.array([3.0, 1.0, 2.0], np.float32)))
+    except Exception as e:  # noqa: BLE001 - the expected decline
         msg = str(e)
-        print("  compile raised:", msg.splitlines()[0][:200])
-        assert "metaljax-native P0" in msg, "unexpected failure, see above"
+        print("  sort declined:", msg.splitlines()[0][:160])
+        assert "stablehlo.sort" in msg, "the decline did not name the op"
         return
-    raise AssertionError("compile unexpectedly succeeded")
+    raise AssertionError("jnp.sort unexpectedly compiled")
 
 
 if FAILED:

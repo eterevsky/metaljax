@@ -233,3 +233,11 @@ native runtime executed GIL-free: ok
 * `new_local_repository` hardcodes `/Users/oleg/metaljax/native`, exactly as the
   XLA `local_repository` hardcodes its path. Same fix when it matters
   (`--override_repository`).
+
+---
+
+**Followed by P2** ([`cpp-p2-lowering.md`](cpp-p2-lowering.md)): the plugin now
+*calls* this runtime. `CompileAndLoad` lowers the parsed StableHLO into a
+`Program` and `MetalLoadedExecutable::Execute` replays it, so the "not done,
+and deliberately" item above is closed. Nothing under `native/` had to change
+for it — `program.h` was the whole interface, as intended.

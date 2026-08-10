@@ -1,10 +1,10 @@
 # The metaljax native PJRT plugin: an xla::PjRtClient subclass wrapped into a
 # full PJRT C API by XLA's pjrt_c_api_wrapper_impl.
 #
-# This package holds only the *plugin shell* (client / device / memory space /
-# buffer plumbing).  The execution engine will land in a sibling package so it
-# can be built and tested on its own; the bazel helpers both need live in
-# //build_defs.
+# This package holds the plugin shell (client / device / memory space / buffer
+# plumbing) and the StableHLO -> tape lowering that stands between it and the
+# shared executor runtime (@metaljax_runtime//:runtime).  The bazel helpers
+# live in //build_defs.
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
@@ -15,13 +15,43 @@ package(default_visibility = ["//visibility:public"])
 licenses(["notice"])
 
 cc_library(
+    name = "metal_names",
+    hdrs = ["metal_names.h"],
+    deps = ["@com_google_absl//absl/strings:string_view"],
+)
+
+cc_library(
+    name = "metal_stream",
+    srcs = ["metal_stream.cc"],
+    hdrs = ["metal_stream.h"],
+    deps = ["@mlx"],
+)
+
+cc_library(
+    name = "metal_dtypes",
+    srcs = ["metal_dtypes.cc"],
+    hdrs = ["metal_dtypes.h"],
+    deps = [
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//mlir:IR",
+        "@metaljax_runtime//:runtime",
+        "@mlx",
+        "@xla//xla:xla_data_proto_cc",
+    ],
+)
+
+cc_library(
     name = "metal_buffer",
     srcs = ["metal_buffer.cc"],
     hdrs = ["metal_buffer.h"],
     deps = [
+        ":metal_dtypes",
+        ":metal_stream",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:span",
         "@mlx",
@@ -29,6 +59,62 @@ cc_library(
         "@xla//xla:shape_util",
         "@xla//xla:xla_data_proto_cc",
         "@xla//xla/pjrt:pjrt_client",
+        "@xla//xla/tsl/platform:statusor",
+    ],
+)
+
+# StableHLO -> the executor's tape.  Depends on the runtime (for the opcode
+# and dtype registries and the Program itself) and on the StableHLO dialect,
+# and on no part of the plugin shell: a lowering is a pure function of the
+# module.
+cc_library(
+    name = "metal_lowering",
+    srcs = ["metal_lowering.cc"],
+    hdrs = ["metal_lowering.h"],
+    deps = [
+        ":metal_dtypes",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@metaljax_runtime//:runtime",
+        "@mlx",
+        "@stablehlo//:stablehlo_ops",
+        "@xla//xla:shape_util",
+        "@xla//xla:xla_data_proto_cc",
+    ],
+)
+
+cc_library(
+    name = "metal_executable",
+    srcs = ["metal_executable.cc"],
+    hdrs = ["metal_executable.h"],
+    deps = [
+        ":metal_buffer",
+        ":metal_lowering",
+        ":metal_names",
+        ":metal_stream",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@metaljax_runtime//:runtime",
+        "@mlx",
+        "@xla//xla:shape_util",
+        "@xla//xla:util",
+        "@xla//xla:xla_data_proto_cc",
+        "@xla//xla/hlo/ir:hlo",
+        "@xla//xla/pjrt:pjrt_client",
+        "@xla//xla/pjrt:pjrt_executable",
+        "@xla//xla/service:computation_placer_hdr",
+        "@xla//xla/tsl/platform:statusor",
     ],
 )
 
@@ -38,6 +124,11 @@ cc_library(
     hdrs = ["metal_client.h"],
     deps = [
         ":metal_buffer",
+        ":metal_dtypes",
+        ":metal_executable",
+        ":metal_lowering",
+        ":metal_names",
+        ":metal_stream",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
@@ -55,6 +146,7 @@ cc_library(
         "@xla//xla/pjrt:pjrt_compiler",
         "@xla//xla/pjrt:pjrt_device_description",
         "@xla//xla/pjrt:pjrt_executable",
+        "@xla//xla/tsl/platform:statusor",
     ],
 )
 
