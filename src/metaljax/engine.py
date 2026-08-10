@@ -96,13 +96,24 @@ bind_thread()
 # milestone by milestone, moves the runtime path there. Python remains
 # the reference engine and the fallback for any program the native side
 # does not support; "py" (default) never touches the extension.
-ENGINE = os.environ.get("METALJAX_ENGINE", "py")
+# M6 (per Oleg, 2026-08-11, without the full acceptance sweep — no
+# release until the migration completes): the native engine is the
+# DEFAULT. "py" forces the reference engine; a missing/unbuilt
+# extension falls back to py loudly rather than failing import, since
+# wheel installs do not carry native/build until packaging lands.
+ENGINE = os.environ.get("METALJAX_ENGINE", "native")
 NATIVE = None
 if ENGINE == "native":
     import sys as _sys
     _sys.path.insert(0, os.path.join(os.path.dirname(__file__),
                                      "..", "..", "native", "build"))
-    import metaljax_native as NATIVE  # noqa: N812
+    try:
+        import metaljax_native as NATIVE  # noqa: N812
+    except ImportError:
+        NATIVE = None
+        print("[metaljax] native engine not built (native/build.sh); "
+              "running on the Python engine", flush=True)
+if NATIVE is not None:
     # libmlx has no stable ABI: refuse a skewed native engine loudly at
     # import instead of corrupting at runtime. All three must agree —
     # the headers the extension compiled against, the libmlx it linked,

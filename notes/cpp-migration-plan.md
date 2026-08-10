@@ -527,3 +527,9 @@ enables an honest PJRT OptimizedProgram); (b) our recognizers
 graduate to StableHLO->StableHLO MLIR rewrite passes in the phase-2
 compile path, producing an inspectable optimized graph. Not before
 the migration completes.
+
+## M6 flipped (2026-08-11, per Oleg — no full sweep, no release until
+## migration completes). Default engine = native, graceful py fallback
+## when unbuilt. Phase 2 begins: StableHLO/MLIR C++ compile path,
+## recognizers as passes, exotic-decline ports (conv first), fallback
+## retirement, goldens freeze, then the XLA optimization layer.
