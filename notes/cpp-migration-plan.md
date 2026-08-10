@@ -412,6 +412,61 @@ flips the default — it is the first row where native is behind.
 
 Canaries: 10/10 on both engines, no band moved.
 
+## The 2-10% chunk deficit, attributed (2026-08-10)
+
+Not the tape. Measured on db02 by splitting one chunk into the parts
+that can differ — `execute`'s CPU time (the graph is submitted inside it,
+by `async_eval`), the wait for the first output to land, and the host
+transfer of the other 22 — best of 5, ms per 16-step chunk:
+
+| part | python | native | delta |
+|---|---:|---:|---:|
+| submit + GPU completion (execute CPU + wait) | 14.725 | 14.705 | -0.020 |
+| host transfer of the other 22 outputs | 0.159 | 0.770 | **+0.611** |
+| total | 14.884 | 15.474 | +0.590 |
+
+The parts sum, and only one of them moves. Inside the first: native's CPU
+half is 4.665 vs 5.170 ms — the tape IS cheaper to dispatch, the GPU is
+simply the binding constraint, so the saving shows up as a longer wait
+and nothing else. The suspected culprit is innocent twice over: these
+chunks lower with **zero** static output copies (db02 23 outputs / 0,
+db09 23 / 0, db11 26 / 0 — an optimizer carry is written by the update,
+so no taint reaches it), and the boundary crossing is inside the part
+that came out ahead. Across the tape test corpus, which is deliberately
+full of aliasing edge cases, 24 of 272 programs carry any copy at all.
+
+The cost was M1's `to_host`: it wrapped every result in a fresh
+`mx::contiguous` node and evaluated THAT. The copy short-circuits to a
+shared buffer, but the eval is a full round trip through the stream —
+**20us per output whatever its size** (measured; `eval` on the array
+itself, already available, is 0.11us). Per OUTPUT, so a program handing
+back 23 small tensors paid 0.5ms. It now settles the array itself and
+builds a `contiguous` only for a layout that needs gathering
+(`row_contiguous` and `data_size`, both read after the eval that sets
+them — the short-buffer read this guards is the conv-overread bug of
+CLAUDE.md item 20, in a place with no test to catch it).
+
+`to_host` on a settled f32: 21us -> 0.07us at 16 elements (numpy path
+0.43), 24.9us -> 3.4us at 256x256 (numpy 13.7). Interleaved chunks,
+ms/step, 5 rounds each:
+
+| config | native before | native after | python |
+|---|---:|---:|---:|
+| db02-b4l1024 | 1.004 | 0.923 | 0.919 |
+| db09-b128l128 | 1.617 | 1.565 | 1.578 |
+| db11-b64l256 | 0.840 | 0.776 | 0.791 |
+
+Suites 1255/1255 on both engines, canaries 10/10 on both, and the floor
+is pinned by a test comparing the two paths' per-call cost as a ratio
+(43x before the fix, 0.2x after).
+
+Left alone, deliberately: `buffer_from_host` is 2.2us vs the numpy
+path's 1.0 (one staging malloc+memcpy the numpy path gets for free from
+`frombuffer`), and a non-row-contiguous output still costs its
+gather-and-sync (~190us) where a host-side odometer gather like the
+ingest path's would not need the GPU at all. Neither is on a measured
+hot path today.
+
 ## Grand plan (Oleg, 2026-08-10)
 
 1) Migrate ALL non-test code to C++ (phase 2 included);

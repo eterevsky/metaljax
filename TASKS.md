@@ -262,10 +262,14 @@ predicted peak memory, and only then retry the big model.
   ValueError) — native engine survives the same module. Fix with the
   post-C++ batch.
 
-- PRE-M6 BLOCKERS (tail sweep, 2026-08-10): (a) native 2-10% behind
-  python on fully-lowered texmo chunks (db02 0.985 vs 0.914) —
-  suspect the static output-copy taint copying carries the id() pass
-  would not; measure + fix before the default flip. (b) census blind
+- PRE-M6 BLOCKERS (tail sweep, 2026-08-10): (a) ✅ FIXED — native was
+  2-10% behind python on fully-lowered texmo chunks. NOT the output
+  taint (those chunks lower with ZERO static copies): every
+  millisecond was M1's `to_host`, which wrapped each result in a
+  fresh `contiguous` node and evaluated THAT — a 20us stream round
+  trip per output whatever its size, 0.5ms on a 23-output chunk. Now
+  settles the array itself and copies only a non-row-contiguous
+  layout; all three configs at parity or ahead. (b) census blind
   spot: Interpreter-direct tests (test_conv 13) never hit
   engine.execute — stablehlo.reverse was missing with no test
   noticing; audit op-set vs the full registry, port convolution.

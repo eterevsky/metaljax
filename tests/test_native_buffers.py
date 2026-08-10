@@ -7,6 +7,7 @@ with base offset, rank-0, 0-size, bool, and the data=None zeros path.
 """
 import os
 import sys
+import time
 
 import ml_dtypes
 import numpy as np
@@ -119,6 +120,102 @@ def test_rank0_and_empty():
 def test_none_data_is_zeros():
     py, nat = _roundtrip(None, 11, [2, 2])
     assert py == nat == b"\x00" * 16
+
+
+def _to_host_both(arr, enum):
+    """(python bytes, native bytes) for a DEVICE array of any layout."""
+    dims = list(arr.shape)
+    saved = engine.NATIVE
+    try:
+        engine.NATIVE = None
+        py = engine.to_host(engine.MetalBuffer(arr, enum, dims))
+        engine.NATIVE = native
+        nat = engine.to_host(engine.MetalBuffer(arr, enum, dims))
+    finally:
+        engine.NATIVE = saved
+    return py, nat
+
+
+# One device array per layout an output can reach the wire in: the ones
+# read straight out of their own buffer, and the ones that still have to
+# be gathered first.
+LAYOUTS = {
+    "contiguous": lambda b: b,
+    "transposed": lambda b: mx.transpose(b),
+    "sliced_rows": lambda b: b[1:3],
+    "strided": lambda b: b[:, ::2],
+    "reversed": lambda b: b[::-1],
+    "broadcast": lambda b: mx.broadcast_to(b[0:1], b.shape),
+    "reshaped": lambda b: mx.reshape(b, (b.size,)),
+    "unit_dims": lambda b: b[0:1, 0:1],
+    "rank0": lambda b: b[0, 0],
+    "unevaluated": lambda b: b * 2,
+}
+
+
+@pytest.mark.parametrize("layout", sorted(LAYOUTS))
+def test_to_host_layouts_match_python(layout):
+    """to_host reads the array's own buffer when the layout allows it.
+
+    The fast path (skip `contiguous`, settle the array itself) is what
+    keeps a per-output stream round trip out of every execute; a strided
+    or broadcast result must still be gathered, and BIT-EXACTLY as the
+    numpy path gathers it.
+    """
+    base = mx.arange(24, dtype=mx.float32).reshape(4, 6)
+    mx.eval(base)
+    py, nat = _to_host_both(LAYOUTS[layout](base), 11)
+    assert py == nat
+
+
+@pytest.mark.parametrize("name,enum", [("bf16", 13), ("f64", 12),
+                                       ("c64", 14)])
+def test_to_host_transposed_dtypes(name, enum):
+    """Same, for the dtypes with a rule of their own (bitcast / widen)."""
+    base = mx.arange(12, dtype=mx.float32).reshape(3, 4)
+    if name == "bf16":
+        base = base.astype(mx.bfloat16)
+    elif name == "c64":
+        base = base.astype(mx.complex64)
+    mx.eval(base)
+    for arr in (base, mx.transpose(base)):
+        py, nat = _to_host_both(arr, enum)
+        assert py == nat
+
+
+def test_to_host_settled_output_costs_no_round_trip():
+    """A settled, contiguous output must not cost a stream round trip.
+
+    The floor this pins: reading such an output is a memcpy, so it can
+    only be as expensive as the numpy path's own memcpy. Wrapping it in
+    a fresh `contiguous` node and evaluating that instead used to cost
+    ~20us per output whatever its size — 0.5ms on a program handing back
+    23 small tensors, which was the whole of the native engine's deficit
+    against the Python one on texmo train chunks. Compared as a RATIO so
+    machine load cancels; the real gap either side of the fix is ~300x,
+    so 10x is a floor and not a stopwatch.
+    """
+    arr = mx.arange(16, dtype=mx.float32)
+    mx.eval(arr)
+    buf = engine.MetalBuffer(arr, 11, [16])
+    saved = engine.NATIVE
+    try:
+        for warm in (True, False):
+            engine.NATIVE = native
+            t0 = time.perf_counter()
+            for _ in range(400):
+                engine.to_host(buf)
+            t1 = time.perf_counter()
+            engine.NATIVE = None
+            for _ in range(400):
+                engine.to_host(buf)
+            t2 = time.perf_counter()
+            if warm:
+                continue
+            nat, py = t1 - t0, t2 - t1
+    finally:
+        engine.NATIVE = saved
+    assert nat < 10 * py, f"native to_host {nat:.4f}s vs numpy {py:.4f}s"
 
 
 def test_native_declines_emulated_types():

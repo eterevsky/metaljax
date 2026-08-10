@@ -197,12 +197,32 @@ nb::bytes to_host(const mx::array& a, int type_enum) {
   const size_t item = info->host_item;
   if (total == 0) return nb::bytes("", 0);
 
-  // Settle a contiguous copy; raw device bytes ARE the wire format for
-  // every non-widened dtype (including bf16 — the whole point).
-  mx::array c = mx::contiguous(a);
+  // Settle the array, then read its raw device bytes: those ARE the wire
+  // format for every non-widened dtype (including bf16 — the whole point).
+  //
+  // The settling is done on the array ITSELF and the `contiguous` copy is
+  // made only when the layout needs one. Wrapping every result in a fresh
+  // `contiguous` node and evaluating THAT costs a full round trip through
+  // the stream — 20us, measured, even though the copy short-circuits to a
+  // shared buffer — where `eval` on a value that is already available
+  // returns in 0.1us. It is a per-OUTPUT cost, so a program handing back
+  // 23 small tensors paid 0.5ms of it (the whole of the native engine's
+  // deficit against the Python one on texmo's train chunks).
+  //
+  // `row_contiguous` is read after the eval because that is when MLX sets
+  // it, and `data_size` is checked with it: the flag says the elements
+  // start at `data` and run without gaps, the size says the buffer really
+  // holds all of them (a short buffer read here is the conv-overread bug
+  // of CLAUDE.md item 20, in a place with no test to catch it).
+  mx::array c = a;
   {
     nb::gil_scoped_release nogil;
     c.eval();
+    if (!c.flags().row_contiguous ||
+        c.data_size() != static_cast<size_t>(total)) {
+      c = mx::contiguous(c);
+      c.eval();
+    }
   }
   if (!info->widen) {
     return nb::bytes(c.data<char>(), total * item);
