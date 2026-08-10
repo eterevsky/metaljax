@@ -10,6 +10,7 @@ Licensed under the Apache License, Version 2.0.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -22,7 +23,10 @@ Licensed under the Apache License, Version 2.0.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "metal/metal_dtypes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -31,6 +35,7 @@ Licensed under the Apache License, Version 2.0.
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Region.h"
 #include "mlir/IR/Value.h"
 #include "mlx/mlx.h"
 #include "program.h"
@@ -99,7 +104,14 @@ bool IsViewOp(absl::string_view name) {
   return name == "stablehlo.reshape" || name == "stablehlo.transpose" ||
          name == "stablehlo.convert" || name == "stablehlo.slice" ||
          name == "stablehlo.broadcast_in_dim" ||
-         name == "stablehlo.concatenate";
+         name == "stablehlo.concatenate" || name == "stablehlo.dynamic_slice";
+}
+
+// The three ops that carry regions and become sub-Programs (tape.py
+// `_REGION_OPS`).
+bool IsControlOp(absl::string_view name) {
+  return name == "stablehlo.while" || name == "stablehlo.if" ||
+         name == "stablehlo.case";
 }
 
 // Reduce monoids: body op -> kind, mirroring tape.py's _REDUCE_KINDS and
@@ -186,12 +198,335 @@ mx::array OwnedArray(const char* src, size_t nbytes, const mx::Shape& shape,
 }
 
 // --------------------------------------------------------------------------
+// the analyses a control-flow entry carries (src/metaljax/ops/control.py)
+// --------------------------------------------------------------------------
+//
+// A while entry records the answers to three questions the executor is not
+// allowed to ask for itself: is this the counted loop jax emits for
+// scan/fori_loop, what does one iteration cost, and how often must the loop
+// settle its carries.  Each is transliterated from the Python function named
+// beside it, cache and all -- the caches are on the Interpreter there and on
+// the `LowerContext` here, because the same block is walked once per enclosing
+// analysis and the whole-model bodies are large.
+
+// `_analyze_counted`'s answer: the carry index of the counter, and where the
+// bound comes from.
+struct Counted {
+  enum Kind { kStatic, kCarry, kValue };
+  int64_t k = 0;
+  Kind kind = kStatic;
+  int64_t n = 0;        // kStatic: the bound N; kCarry: the carry index
+  mlir::Value value;    // kValue: the captured value holding N
+};
+
+// Everything shared by the frames of ONE lowering: the module (symbol lookup
+// for inlined callees) and the two analysis caches.
+struct LowerContext {
+  mlir::ModuleOp module;
+  absl::flat_hash_map<mlir::Block*, int64_t> cost;   // interp._cost_cache
+  // interp._counted_cache, keyed by the COND block exactly as the Python one
+  // is (no two while ops can share one).
+  absl::flat_hash_map<mlir::Block*, std::optional<Counted>> counted;
+};
+
+// interpreter.free_values: the SSA values used inside `block` but defined
+// outside it, in FIRST-USE order.  The order is part of the encoding, not an
+// implementation detail: captures become the region Program's trailing
+// arguments in exactly this order, and a counted loop whose bound is captured
+// records the bound's index into this list.
+std::vector<mlir::Value> FreeValues(mlir::Block& block) {
+  llvm::DenseSet<mlir::Value> defined;
+  llvm::DenseSet<mlir::Value> seen;
+  std::vector<mlir::Value> free;
+  std::function<void(mlir::Block&)> walk = [&](mlir::Block& blk) {
+    for (mlir::BlockArgument a : blk.getArguments()) defined.insert(a);
+    for (mlir::Operation& op : blk) {
+      for (mlir::Value v : op.getOperands()) {
+        if (!defined.contains(v) && seen.insert(v).second) free.push_back(v);
+      }
+      for (mlir::Region& r : op.getRegions())
+        for (mlir::Block& b : r.getBlocks()) walk(b);
+      for (mlir::Value v : op.getResults()) defined.insert(v);
+    }
+  };
+  walk(block);
+  return free;
+}
+
+// ops/control.py `_splat_int`: the value of a rank-0 constant as an integer,
+// or nothing.  Python reaches it through `int(...)` on the decoded numpy
+// scalar, so a float constant truncates rather than declining -- and a NaN or
+// an infinity raises there, which is this function's `nullopt`.
+std::optional<int64_t> SplatInt(mlir::Operation* op) {
+  if (op == nullptr) return std::nullopt;
+  auto cst = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(op);
+  if (!cst) return std::nullopt;
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+  if (!t || t.getRank() != 0) return std::nullopt;
+  auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+  if (!dense || dense.getNumElements() != 1) return std::nullopt;
+  mlir::Type el = t.getElementType();
+  if (auto it = mlir::dyn_cast<mlir::IntegerType>(el)) {
+    if (it.getWidth() > 64) return std::nullopt;
+    const llvm::APInt v = *dense.getValues<llvm::APInt>().begin();
+    if (it.isUnsigned() || it.getWidth() == 1)
+      return static_cast<int64_t>(v.getZExtValue());
+    return v.getSExtValue();
+  }
+  if (mlir::isa<mlir::FloatType>(el)) {
+    llvm::APFloat v = *dense.getValues<llvm::APFloat>().begin();
+    if (!v.isFinite()) return std::nullopt;
+    bool lost = false;
+    v.convert(llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven,
+              &lost);
+    return static_cast<int64_t>(v.convertToDouble());
+  }
+  return std::nullopt;
+}
+
+// ops/control.py `_static_start`: the static initial value of carry `k`.
+std::optional<int64_t> StaticStart(mlir::Operation* op, int64_t k) {
+  if (k < 0 || k >= static_cast<int64_t>(op->getNumOperands()))
+    return std::nullopt;
+  return SplatInt(op->getOperand(static_cast<unsigned>(k)).getDefiningOp());
+}
+
+// ops/control.py `_cond_has_effects`: a cond region with host-visible side
+// effects must take the DYNAMIC path, because the counted fast path never
+// executes the cond at all.
+bool CondHasEffects(LowerContext& ctx, mlir::Block& block) {
+  for (mlir::Operation& o : block) {
+    const llvm::StringRef n = o.getName().getStringRef();
+    if (n == "stablehlo.custom_call") {
+      auto attr = o.getAttrOfType<mlir::BoolAttr>("has_side_effect");
+      if (attr && attr.getValue()) return true;
+    }
+    if (n == "func.call" || n == "stablehlo.composite") {
+      auto sym = o.getAttrOfType<mlir::FlatSymbolRefAttr>(
+          n == "func.call" ? "callee" : "decomposition");
+      if (sym) {
+        auto fn = ctx.module.lookupSymbol<mlir::func::FuncOp>(sym.getValue());
+        if (fn && !fn.getBody().empty() &&
+            CondHasEffects(ctx, fn.getBody().front()))
+          return true;
+      }
+    }
+    for (mlir::Region& r : o.getRegions())
+      for (mlir::Block& b : r.getBlocks())
+        if (CondHasEffects(ctx, b)) return true;
+  }
+  return false;
+}
+
+// ops/control.py `_analyze_counted`, structure for structure.  The shape jax
+// emits for scan/fori_loop:
+//
+//   cond:  %n = constant N            (or N captured from an enclosing scope,
+//                                      or carried unchanged in the state)
+//          %p = compare LT, %arg_k, %n
+//          return %p
+//   body:  ... return ..., add(%arg_k, 1), ...
+//
+// Getting this WRONG in the permissive direction is not a cadence question:
+// the counted path never evaluates the condition, so a loop wrongly called
+// counted runs the wrong number of iterations.  Every test below is therefore
+// the Python one, including the ones that look redundant.
+std::optional<Counted> AnalyzeCounted(LowerContext& ctx, mlir::Operation* op) {
+  if (op->getNumRegions() != 2) return std::nullopt;
+  if (op->getRegion(0).getBlocks().size() != 1 ||
+      op->getRegion(1).getBlocks().size() != 1)
+    return std::nullopt;
+  mlir::Block& cond = op->getRegion(0).front();
+  auto cached = ctx.counted.find(&cond);
+  if (cached != ctx.counted.end()) return cached->second;
+
+  std::optional<Counted> result;
+  do {
+    if (CondHasEffects(ctx, cond)) break;
+    mlir::Operation* ret = cond.getTerminator();
+    if (ret == nullptr || ret->getNumOperands() < 1) break;
+    auto cmp = mlir::dyn_cast_or_null<mlir::stablehlo::CompareOp>(
+        ret->getOperand(0).getDefiningOp());
+    if (!cmp ||
+        cmp.getComparisonDirection() != mlir::stablehlo::ComparisonDirection::LT)
+      break;
+    auto lhs = mlir::dyn_cast<mlir::BlockArgument>(cmp->getOperand(0));
+    if (!lhs || lhs.getOwner() != &cond) break;
+    const int64_t k = lhs.getArgNumber();
+    mlir::Value rhs = cmp->getOperand(1);
+    mlir::Block& body = op->getRegion(1).front();
+    mlir::Operation* body_ret = body.getTerminator();
+    if (body_ret == nullptr) break;
+
+    Counted found;
+    found.k = k;
+    bool have_bound = false;
+    if (mlir::Operation* def = rhs.getDefiningOp()) {
+      // Defined by an op: only a rank-0 integer constant is a bound.
+      std::optional<int64_t> n = SplatInt(def);
+      if (n.has_value()) {
+        found.kind = Counted::kStatic;
+        found.n = *n;
+        have_bound = true;
+      }
+    } else if (auto ra = mlir::dyn_cast<mlir::BlockArgument>(rhs)) {
+      if (ra.getOwner() == &cond) {
+        // Carried in the loop state (lbfgs carries maxiter): counted only if
+        // the body forwards it unchanged.
+        const unsigned j = ra.getArgNumber();
+        if (j < body_ret->getNumOperands() && j < body.getNumArguments() &&
+            body_ret->getOperand(j) == body.getArgument(j)) {
+          found.kind = Counted::kCarry;
+          found.n = j;
+          have_bound = true;
+        }
+      } else {
+        // A block argument of an enclosing scope: a capture of the cond.
+        found.kind = Counted::kValue;
+        found.value = rhs;
+        have_bound = true;
+      }
+    }
+    if (!have_bound) break;
+
+    // ...and the body must return arg_k + 1 at position k.
+    if (k >= static_cast<int64_t>(body.getNumArguments()) ||
+        k >= static_cast<int64_t>(body_ret->getNumOperands()))
+      break;
+    mlir::Operation* add =
+        body_ret->getOperand(static_cast<unsigned>(k)).getDefiningOp();
+    if (add == nullptr || add->getName().getStringRef() != "stablehlo.add" ||
+        add->getNumOperands() != 2)
+      break;
+    const mlir::Value barg = body.getArgument(static_cast<unsigned>(k));
+    bool ok = false;
+    for (int swap = 0; swap < 2; swap++) {
+      const mlir::Value x = add->getOperand(swap);
+      const mlir::Value y = add->getOperand(1 - swap);
+      if (x == barg && SplatInt(y.getDefiningOp()) == std::optional<int64_t>(1))
+        ok = true;
+    }
+    if (ok) result = found;
+  } while (false);
+
+  ctx.counted[&cond] = result;
+  return result;
+}
+
+// ops/control.py `_block_cost`: the approximate op count of this block when
+// it is TRACED, loops unrolled.  It sizes the loop's flush period, so it is
+// a cadence number and a wrong one is a memory-pressure question rather than
+// a wrong answer -- but an UNDER-count is what once compiled a whole 256-step
+// chunk into one trace and exhausted the buffer pool, so callees are recursed
+// into and an unknown trip count is charged pessimistically.
+//
+// One deliberate omission from the Python: `_scatter_cost`'s apply-body
+// expansion.  Nothing containing a scatter lowers in this plugin yet, so the
+// generic region walk below is reached instead; when scatter lands, so does
+// that arm.
+int64_t BlockCost(LowerContext& ctx, mlir::Block& block) {
+  auto cached = ctx.cost.find(&block);
+  if (cached != ctx.cost.end()) return cached->second;
+  ctx.cost[&block] = 1;   // break cycles defensively, as the Python does
+  int64_t cost = 0;
+  for (mlir::Operation& o : block) {
+    cost += 1;
+    const llvm::StringRef n = o.getName().getStringRef();
+    if (n == "stablehlo.while") {
+      std::optional<Counted> c = AnalyzeCounted(ctx, &o);
+      // Unknown trip counts must be PESSIMISTIC: a dynamic-bound 2048-step
+      // loop once cost-counted as one body, so the enclosing block passed the
+      // trace budget and the whole thing was traced.
+      int64_t trip = 1024;
+      if (c.has_value() && c->kind == Counted::kStatic) {
+        std::optional<int64_t> start = StaticStart(&o, c->k);
+        if (start.has_value()) trip = std::max<int64_t>(c->n - *start, 1);
+      }
+      if (o.getNumRegions() >= 2 && !o.getRegion(1).empty())
+        cost += trip * BlockCost(ctx, o.getRegion(1).front());
+    } else if (n == "func.call" || n == "stablehlo.composite") {
+      auto sym = o.getAttrOfType<mlir::FlatSymbolRefAttr>(
+          n == "func.call" ? "callee" : "decomposition");
+      if (sym) {
+        auto fn = ctx.module.lookupSymbol<mlir::func::FuncOp>(sym.getValue());
+        if (fn && !fn.getBody().empty())
+          cost += BlockCost(ctx, fn.getBody().front());
+      }
+    } else {
+      for (mlir::Region& r : o.getRegions())
+        for (mlir::Block& b : r.getBlocks()) cost += BlockCost(ctx, b);
+    }
+  }
+  ctx.cost[&block] = cost;
+  return cost;
+}
+
+// ops/control.py `_flush_period`: how many iterations of a body this cheap
+// may run between the loop's sync points.
+int64_t FlushPeriod(int64_t cost) {
+  return std::max<int64_t>(
+      1, std::min<int64_t>(64, 25000 / std::max<int64_t>(cost, 1)));
+}
+
+// --------------------------------------------------------------------------
 // the lowering
 // --------------------------------------------------------------------------
 
+// The two aliasing taints of one slot, in the frame that owns it: which of
+// the frame's ARGUMENTS its array may be, and whether it may view a constant
+// the Program holds for the life of the executable.  tape.py keeps the first
+// as a set rather than a flag because a region maps its outputs' taints back
+// through the parent's operands -- a loop that forwards a carry untouched has
+// to be recognized as its own input on the other side of the frame.
+struct Taint {
+  absl::flat_hash_set<int> args;
+  bool cv = false;
+};
+
+// One program's tape, as text, for METALJAX_DUMP_TAPE.  Built as a tree
+// rather than printed on the fly because a region's entries are lowered
+// before the entry that carries them, and the dump is meant to be diffed
+// against the Stage 1 lowering's, which is recorded the same way.
+struct DumpNode {
+  struct Entry {
+    int op = 0;
+    std::vector<int> ins;
+    std::vector<int> outs;
+    std::vector<int64_t> attrs;
+    bool payload = false;
+    std::vector<DumpNode> regions;
+  };
+  std::vector<Entry> entries;
+  std::vector<int> outputs;
+  std::vector<int> copies;
+  int slots = 0;
+};
+
+void RenderDump(const DumpNode& node, const std::string& indent,
+                std::string* out) {
+  auto join = [](const auto& xs) {
+    std::string s;
+    for (size_t i = 0; i < xs.size(); i++)
+      absl::StrAppend(&s, i ? "," : "", xs[i]);
+    return s;
+  };
+  for (const DumpNode::Entry& e : node.entries) {
+    absl::StrAppend(out, indent, "[tape] ", OpcodeName(e.op), " ", join(e.ins),
+                    " -> ", join(e.outs), " [", join(e.attrs), "]",
+                    e.payload ? " const" : "", "\n");
+    for (size_t r = 0; r < e.regions.size(); r++) {
+      absl::StrAppend(out, indent, "[tape] region ", r, " {\n");
+      RenderDump(e.regions[r], indent + "  ", out);
+      absl::StrAppend(out, indent, "[tape] }\n");
+    }
+  }
+  absl::StrAppend(out, indent, "[tape] outputs ", join(node.outputs),
+                  " copies ", join(node.copies), " slots ", node.slots, "\n");
+}
+
 class Lowering {
  public:
-  explicit Lowering(mlir::ModuleOp module) : module_(module) {}
+  explicit Lowering(LowerContext* ctx) : ctx_(ctx) {}
   absl::StatusOr<LoweredProgram> Run(mlir::func::FuncOp fn);
 
  private:
@@ -202,9 +537,41 @@ class Lowering {
     std::vector<int64_t> attrs;
     std::optional<mx::array> payload;
     int64_t bytes = 0;
+    std::vector<std::shared_ptr<Program>> regions;
+    std::vector<DumpNode> region_dumps;
   };
 
+  // One block lowered into THIS frame: the block's own arguments first, then
+  // `captures` (already resolved to parent slots by the caller), then the
+  // walk and the finished Program.  tape.py's `lower_block`.
+  struct Built {
+    std::shared_ptr<Program> program;
+    std::vector<int> outputs;
+    std::vector<mlir::Value> returned;
+    DumpNode dump;
+  };
+  absl::StatusOr<Built> LowerBlock(mlir::Block& block,
+                                   const std::vector<mlir::Value>& captures);
+  absl::StatusOr<Built> Finish(int nargs, const std::vector<int>& outputs);
+
+  // One region block as a sub-Program, lowered in a CHILD frame (tape.py's
+  // `_region`).  `caps` are the capture slots in THIS frame, in the order
+  // `free` names them; `taints` are the child's per-output taints, still in
+  // the CHILD's argument numbering (the caller maps them: `MapTaint`).
+  struct Region {
+    std::shared_ptr<Program> program;
+    std::vector<mlir::Value> free;
+    std::vector<int> caps;
+    std::vector<int> outputs;
+    std::vector<Taint> taints;
+    DumpNode dump;
+  };
+  absl::StatusOr<Region> LowerRegion(mlir::Block& block);
+
   absl::Status LowerOp(mlir::Operation* op);
+  absl::Status LowerControl(mlir::Operation* op);
+  absl::Status LowerWhile(mlir::Operation* op);
+  absl::Status LowerBranch(mlir::Operation* op);
 
   // Splice a single-block callee's ops into this tape (tape.py `_inline`).
   absl::Status Inline(mlir::Operation* op, llvm::StringRef callee_attr);
@@ -222,6 +589,9 @@ class Lowering {
   absl::StatusOr<std::vector<int64_t>> LowerIota(mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerPad(mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerDotGeneral(mlir::Operation* op);
+  absl::StatusOr<std::vector<int64_t>> LowerDynamicSlice(mlir::Operation* op);
+  absl::StatusOr<std::vector<int64_t>> LowerDynamicUpdateSlice(
+      mlir::Operation* op);
   absl::Status LowerConstant(mlir::Operation* op);
   absl::Status LowerReduce(mlir::Operation* op);
 
@@ -243,9 +613,12 @@ class Lowering {
 
   void Emit(int op, std::vector<int> ins, std::vector<int> outs,
             std::vector<int64_t> attrs, std::optional<mx::array> payload,
-            int64_t bytes) {
+            int64_t bytes,
+            std::vector<std::shared_ptr<Program>> regions = {},
+            std::vector<DumpNode> region_dumps = {}) {
     entries_.push_back(Pending{op, std::move(ins), std::move(outs),
-                               std::move(attrs), std::move(payload), bytes});
+                               std::move(attrs), std::move(payload), bytes,
+                               std::move(regions), std::move(region_dumps)});
   }
 
   int64_t ResultBytes(mlir::Operation* op) {
@@ -255,19 +628,51 @@ class Lowering {
   }
 
   // Slots this op's results inherit taints from, given its operands.
-  void Taint(mlir::Operation* op, absl::string_view name,
-             const std::vector<int>& ins, const std::vector<int>& outs);
+  void TaintResults(mlir::Operation* op, absl::string_view name,
+                    const std::vector<int>& ins, const std::vector<int>& outs);
 
-  mlir::ModuleOp module_;
+  // tape.py `_tainted`: what this frame knows about one of its own slots.
+  Taint TaintOf(int slot) const {
+    Taint t;
+    auto it = arg_alias_.find(slot);
+    if (it != arg_alias_.end()) t.args = it->second;
+    t.cv = const_view_.count(slot) > 0;
+    return t;
+  }
+
+  // tape.py `_region_taints`: a child's taint, restated in THIS frame.  A
+  // region output that may be one of the region's own arguments may, here, be
+  // whatever that argument was -- a carry init, a capture, and through those
+  // an argument of main or a constant the Program holds forever.
+  Taint MapTaint(const Taint& child,
+                 const std::vector<int>& parent_slots) const {
+    Taint out;
+    out.cv = child.cv;
+    for (int i : child.args) {
+      if (i < 0 || i >= static_cast<int>(parent_slots.size())) continue;
+      const int p = parent_slots[i];
+      auto it = arg_alias_.find(p);
+      if (it != arg_alias_.end())
+        out.args.insert(it->second.begin(), it->second.end());
+      out.cv = out.cv || const_view_.count(p) > 0;
+    }
+    return out;
+  }
+
+  void ApplyTaint(int slot, const Taint& t) {
+    if (t.cv) const_view_.insert(slot);
+    if (!t.args.empty()) arg_alias_[slot] = t.args;
+  }
+
+  LowerContext* ctx_;
   llvm::DenseMap<mlir::Value, int> slots_;
   int nslots_ = 0;
   std::vector<Pending> entries_;
   std::vector<std::string> calls_;   // callees currently being inlined
-  // The two aliasing taints, consumed by the output-copy rule in `Run`.
-  // Which argument a slot may be does not matter here (this phase lowers no
-  // regions, so nothing maps taints across a frame): what an output position
-  // asks is only whether it may be an argument's array at all.
-  absl::flat_hash_set<int> arg_alias_;
+  // The two aliasing taints, consumed by the output-copy rule in `Run` and
+  // carried across frames by `MapTaint`.  `arg_alias_` maps a slot to the
+  // ARGUMENT slots of this frame whose very array object it may be.
+  absl::flat_hash_map<int, absl::flat_hash_set<int>> arg_alias_;
   absl::flat_hash_set<int> const_view_;
 };
 
@@ -669,6 +1074,45 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDotGeneral(
   return attrs;
 }
 
+// tape.py `_lower_dynamic_slice`.  XLA CLAMPS the start indices so the window
+// stays inside the operand; MLX's own slice clamps nothing, so the bounds are
+// shape arithmetic resolved here and the handler builds the clip from them.
+// Getting this wrong is silent wrongness rather than a crash, which is why
+// the differential suite tests out-of-range indices in both directions.
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerDynamicSlice(
+    mlir::Operation* op) {
+  auto ds = mlir::dyn_cast<mlir::stablehlo::DynamicSliceOp>(op);
+  if (!ds) return Decline("stablehlo.dynamic_slice in an unexpected form");
+  if (op->getNumOperands() < 1)
+    return Decline("stablehlo.dynamic_slice without an operand");
+  std::vector<int64_t> sizes(ds.getSliceSizes().begin(),
+                             ds.getSliceSizes().end());
+  ASSIGN_OR_RETURN(std::vector<int64_t> src, Dims(op->getOperand(0)));
+  if (op->getNumOperands() - 1 != sizes.size())
+    return Decline("dynamic_slice index arity mismatch");
+  if (src.size() != sizes.size())
+    return Decline("dynamic_slice slice_sizes rank");
+  std::vector<int64_t> attrs{static_cast<int64_t>(sizes.size())};
+  for (size_t i = 0; i < sizes.size(); i++) attrs.push_back(src[i] - sizes[i]);
+  attrs.insert(attrs.end(), sizes.begin(), sizes.end());
+  return attrs;
+}
+
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerDynamicUpdateSlice(
+    mlir::Operation* op) {
+  if (op->getNumOperands() < 2)
+    return Decline("stablehlo.dynamic_update_slice without an update");
+  ASSIGN_OR_RETURN(std::vector<int64_t> sizes, Dims(op->getOperand(1)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> src, Dims(op->getOperand(0)));
+  if (op->getNumOperands() - 2 != sizes.size())
+    return Decline("dynamic_update_slice index arity mismatch");
+  if (src.size() != sizes.size())
+    return Decline("dynamic_update_slice operand ranks disagree");
+  std::vector<int64_t> attrs{static_cast<int64_t>(sizes.size())};
+  for (size_t i = 0; i < sizes.size(); i++) attrs.push_back(src[i] - sizes[i]);
+  return attrs;
+}
+
 absl::Status Lowering::LowerConstant(mlir::Operation* op) {
   auto cst = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(op);
   if (!cst) return Decline("stablehlo.constant in an unexpected form");
@@ -841,21 +1285,226 @@ bool Lowering::IsIdentity(absl::string_view name, mlir::Operation* op) {
   return false;
 }
 
-void Lowering::Taint(mlir::Operation* op, absl::string_view name,
-                     const std::vector<int>& ins,
-                     const std::vector<int>& outs) {
+void Lowering::TaintResults(mlir::Operation* op, absl::string_view name,
+                            const std::vector<int>& ins,
+                            const std::vector<int>& outs) {
   if (outs.size() != 1) return;
   bool from_const = false;
   for (int s : ins) from_const = from_const || const_view_.count(s) > 0;
   if (from_const && IsViewOp(name)) const_view_.insert(outs[0]);
   if (IsIdentity(name, op)) {
+    absl::flat_hash_set<int> src;
     for (int s : ins) {
-      if (arg_alias_.count(s)) {
-        arg_alias_.insert(outs[0]);
-        break;
+      auto it = arg_alias_.find(s);
+      if (it != arg_alias_.end()) src.insert(it->second.begin(),
+                                             it->second.end());
+    }
+    if (!src.empty()) arg_alias_[outs[0]] = std::move(src);
+  }
+}
+
+// --------------------------------------------------------------------------
+// control flow (src/metaljax/tape.py `_control` / `_while` / `_branch`)
+// --------------------------------------------------------------------------
+//
+// Each region becomes a Program of its own, whose arguments are the region
+// block's own followed by its CAPTURES -- the values it reads from enclosing
+// scopes, resolved to slots in THIS frame and passed in as ordinary inputs.
+// That is the whole of the nesting: no environment is shared, so the executor
+// enters a loop body exactly as it enters a top-level program.
+
+absl::StatusOr<Lowering::Region> Lowering::LowerRegion(mlir::Block& block) {
+  if (block.empty()) return Decline("an empty region");
+  Region out;
+  out.free = FreeValues(block);
+  for (mlir::Value v : out.free) {
+    auto it = slots_.find(v);
+    if (it == slots_.end())
+      return Decline("a region capture defined outside the block");
+    out.caps.push_back(it->second);
+  }
+  Lowering child(ctx_);
+  ASSIGN_OR_RETURN(Built built, child.LowerBlock(block, out.free));
+  out.program = std::move(built.program);
+  out.outputs = built.outputs;
+  out.dump = std::move(built.dump);
+  for (int s : out.outputs) out.taints.push_back(child.TaintOf(s));
+  return out;
+}
+
+absl::Status Lowering::LowerControl(mlir::Operation* op) {
+  const absl::string_view name = View(op->getName().getStringRef());
+  for (mlir::Value v : op->getOperands()) RETURN_IF_ERROR(CheckValue(v));
+  for (mlir::Value v : op->getResults()) RETURN_IF_ERROR(CheckValue(v));
+  for (mlir::Region& r : op->getRegions()) {
+    if (r.getBlocks().size() != 1)
+      return Decline(absl::StrCat("op ", name, " has a multi-block region"));
+  }
+  if (name == "stablehlo.while") return LowerWhile(op);
+  return LowerBranch(op);
+}
+
+absl::Status Lowering::LowerWhile(mlir::Operation* op) {
+  if (op->getNumRegions() != 2)
+    return Decline("stablehlo.while without a cond and a body");
+  mlir::Block& cond_block = op->getRegion(0).front();
+  mlir::Block& body_block = op->getRegion(1).front();
+  const int64_t ncarry = static_cast<int64_t>(op->getNumOperands());
+  if (static_cast<int64_t>(body_block.getNumArguments()) != ncarry)
+    return Decline("while body arity mismatch");
+  if (static_cast<int64_t>(cond_block.getNumArguments()) != ncarry)
+    return Decline("while cond arity mismatch");
+  if (static_cast<int64_t>(op->getNumResults()) != ncarry)
+    return Decline("while result count mismatch");
+
+  ASSIGN_OR_RETURN(Region cond, LowerRegion(cond_block));
+  if (cond.outputs.size() != 1)
+    return Decline("while cond does not return one value");
+  ASSIGN_OR_RETURN(Region body, LowerRegion(body_block));
+  if (static_cast<int64_t>(body.outputs.size()) != ncarry)
+    return Decline("while body result count mismatch");
+
+  // Where the trip count comes from, if this is the counted loop jax emits:
+  // 0 a static N, 1 the carry at index `bound`, 2 the cond capture at index
+  // `bound`.  A bound that is out of reach is not an error -- the Python
+  // engine treats it as a dynamic loop, and so does this.
+  int64_t is_counted = 0, k = 0, bound_kind = 0, bound = 0;
+  std::optional<Counted> counted = AnalyzeCounted(*ctx_, op);
+  if (counted.has_value()) {
+    k = counted->k;
+    if (counted->kind == Counted::kStatic) {
+      is_counted = 1;
+      bound_kind = 0;
+      bound = counted->n;
+    } else if (counted->kind == Counted::kCarry) {
+      is_counted = 1;
+      bound_kind = 1;
+      bound = counted->n;
+    } else {
+      for (size_t i = 0; i < cond.free.size(); i++) {
+        if (cond.free[i] == counted->value) {
+          is_counted = 1;
+          bound_kind = 2;
+          bound = static_cast<int64_t>(i);
+          break;
+        }
       }
     }
   }
+
+  const int64_t cost = BlockCost(*ctx_, body_block);
+  const int64_t period = FlushPeriod(cost);
+  // P3 runs everything interpreted: `chunkable` and `body_compile_max` are
+  // the compile decisions, which are Stage 1's analysis (purity, the trace
+  // budget, the byte budget) and move with the recognizers rather than being
+  // re-derived here.  Zero is what the Python lowering itself writes with
+  // METALJAX_COMPILE=0, and it is the reason `kmax` -- read only when
+  // `chunkable` -- is a dead 1 rather than a computed chunk size.
+  const int64_t chunkable = 0, kmax = 1, body_compile_max = 0;
+
+  std::vector<int64_t> attrs{ncarry,
+                             static_cast<int64_t>(cond.caps.size()),
+                             static_cast<int64_t>(body.caps.size()),
+                             is_counted,
+                             k,
+                             bound_kind,
+                             bound,
+                             cost,
+                             period,
+                             chunkable,
+                             kmax,
+                             body_compile_max};
+
+  std::vector<int> ins;
+  for (mlir::Value v : op->getOperands()) {
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    ins.push_back(s);
+  }
+  std::vector<int> body_parents = ins;
+  body_parents.insert(body_parents.end(), body.caps.begin(), body.caps.end());
+  ins.insert(ins.end(), cond.caps.begin(), cond.caps.end());
+  ins.insert(ins.end(), body.caps.begin(), body.caps.end());
+  std::vector<int> outs;
+  for (mlir::Value r : op->getResults()) outs.push_back(Bind(r));
+
+  // A loop's result j is its carry j: the body's output when the loop ran,
+  // the INITIAL value when the trip count was zero -- and an initial value is
+  // very often main's own argument, so which of the two it is decides whether
+  // the result may alias one.  A statically counted loop answers that here;
+  // anything else is charged both.
+  std::optional<int64_t> static_trip;
+  if (is_counted && bound_kind == 0) {
+    std::optional<int64_t> start = StaticStart(op, k);
+    if (start.has_value()) static_trip = std::max<int64_t>(bound - *start, 0);
+  }
+  for (int64_t j = 0; j < ncarry; j++) {
+    Taint t = MapTaint(body.taints[static_cast<size_t>(j)], body_parents);
+    const int init = body_parents[static_cast<size_t>(j)];
+    if (static_trip.has_value() && *static_trip == 0) {
+      t = TaintOf(init);            // the body never runs
+    } else if (!static_trip.has_value()) {
+      const Taint from_init = TaintOf(init);
+      t.args.insert(from_init.args.begin(), from_init.args.end());
+      t.cv = t.cv || from_init.cv;
+    }
+    ApplyTaint(outs[static_cast<size_t>(j)], t);
+  }
+
+  ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.while"));
+  std::vector<std::shared_ptr<Program>> regions{cond.program, body.program};
+  std::vector<DumpNode> dumps;
+  if (kDumpTape) dumps = {cond.dump, body.dump};
+  Emit(opcode, std::move(ins), std::move(outs), std::move(attrs), std::nullopt,
+       ResultBytes(op), std::move(regions), std::move(dumps));
+  return absl::OkStatus();
+}
+
+// stablehlo.if / stablehlo.case.  The branch blocks take no arguments (every
+// value they read is a capture) and the branch is chosen on the HOST, which
+// is what makes a block holding one impure -- so no program containing one is
+// compiled, on either engine.
+absl::Status Lowering::LowerBranch(mlir::Operation* op) {
+  if (op->getNumOperands() != 1)
+    return Decline("a branch op with more than a predicate");
+  ASSIGN_OR_RETURN(int pred, Slot(op->getOperand(0)));
+  std::vector<int64_t> attrs;
+  std::vector<int> ins{pred};
+  std::vector<int> outs;
+  for (mlir::Value r : op->getResults()) outs.push_back(Bind(r));
+
+  std::vector<std::shared_ptr<Program>> regions;
+  std::vector<DumpNode> dumps;
+  std::vector<std::vector<Taint>> per_branch;
+  for (mlir::Region& region : op->getRegions()) {
+    mlir::Block& blk = region.front();
+    if (blk.getNumArguments() != 0)
+      return Decline("a branch region that takes arguments");
+    ASSIGN_OR_RETURN(Region br, LowerRegion(blk));
+    if (br.outputs.size() != outs.size())
+      return Decline("branch result count mismatch");
+    attrs.push_back(static_cast<int64_t>(br.caps.size()));
+    ins.insert(ins.end(), br.caps.begin(), br.caps.end());
+    std::vector<Taint> mapped;
+    for (const Taint& t : br.taints) mapped.push_back(MapTaint(t, br.caps));
+    per_branch.push_back(std::move(mapped));
+    regions.push_back(std::move(br.program));
+    if (kDumpTape) dumps.push_back(std::move(br.dump));
+  }
+  if (regions.empty()) return Decline("a branch op with no regions");
+
+  for (size_t j = 0; j < outs.size(); j++) {
+    Taint t;
+    for (const std::vector<Taint>& branch : per_branch) {
+      t.args.insert(branch[j].args.begin(), branch[j].args.end());
+      t.cv = t.cv || branch[j].cv;
+    }
+    ApplyTaint(outs[j], t);
+  }
+
+  ASSIGN_OR_RETURN(int opcode, Opcode(View(op->getName().getStringRef())));
+  Emit(opcode, std::move(ins), std::move(outs), std::move(attrs), std::nullopt,
+       ResultBytes(op), std::move(regions), std::move(dumps));
+  return absl::OkStatus();
 }
 
 absl::Status Lowering::Inline(mlir::Operation* op, llvm::StringRef attr) {
@@ -871,7 +1520,7 @@ absl::Status Lowering::Inline(mlir::Operation* op, llvm::StringRef attr) {
     if (active == name)
       return Decline(absl::StrCat("a recursive call to @", name));
   }
-  auto fn = module_.lookupSymbol<mlir::func::FuncOp>(sym.getValue());
+  auto fn = ctx_->module.lookupSymbol<mlir::func::FuncOp>(sym.getValue());
   if (!fn) return Decline(absl::StrCat("a call to unknown symbol @", name));
   if (fn.getBody().getBlocks().size() != 1)
     return Decline(absl::StrCat("callee @", name, " is not single-block"));
@@ -932,6 +1581,22 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
     return absl::OkStatus();
   }
 
+  // A rank-0 dynamic slice or update has no index operands and nothing to
+  // slice: ops/shape.py hands the operand array straight back, so this is an
+  // alias like the ones above (tape.py `_rank0_passthrough`).
+  if (name == "stablehlo.dynamic_slice" && op->getNumOperands() == 1) {
+    ASSIGN_OR_RETURN(int s, Slot(op->getOperand(0)));
+    Alias(op->getResult(0), s);
+    return absl::OkStatus();
+  }
+  if (name == "stablehlo.dynamic_update_slice" && op->getNumOperands() == 2) {
+    ASSIGN_OR_RETURN(int s, Slot(op->getOperand(1)));
+    Alias(op->getResult(0), s);   // the update replaces all of the operand
+    return absl::OkStatus();
+  }
+
+  if (IsControlOp(name)) return LowerControl(op);
+
   if (!op->getRegions().empty() && name != "stablehlo.reduce")
     return Decline(absl::StrCat("op ", name, " (it carries a region)"));
 
@@ -966,6 +1631,10 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
     ASSIGN_OR_RETURN(attrs, LowerPad(op));
   } else if (name == "stablehlo.dot_general") {
     ASSIGN_OR_RETURN(attrs, LowerDotGeneral(op));
+  } else if (name == "stablehlo.dynamic_slice") {
+    ASSIGN_OR_RETURN(attrs, LowerDynamicSlice(op));
+  } else if (name == "stablehlo.dynamic_update_slice") {
+    ASSIGN_OR_RETURN(attrs, LowerDynamicUpdateSlice(op));
   } else if (SimpleOps().contains(name)) {
     // no attributes
   } else {
@@ -979,27 +1648,64 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
     ins.push_back(s);
   }
   std::vector<int> outs{Bind(op->getResult(0))};
-  Taint(op, name, ins, outs);
+  TaintResults(op, name, ins, outs);
   Emit(opcode, std::move(ins), outs, std::move(attrs), std::nullopt,
        ResultBytes(op));
   return absl::OkStatus();
 }
 
-absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
-  if (fn.getBody().getBlocks().size() != 1)
-    return Decline("a main function with several blocks");
-  mlir::Block& block = fn.getBody().front();
+// tape.py `_build`: the entries, their drop lists, and the Program.
+absl::StatusOr<Lowering::Built> Lowering::Finish(
+    int nargs, const std::vector<int>& outputs) {
+  // Per-op drop lists: the slots whose last use is that op (tape.py
+  // `_liveness`).  Straight-line, so this is "highest index that reads it";
+  // a result nothing reads is let go at the op that produced it, and an
+  // output is never dropped.
+  absl::flat_hash_map<int, size_t> last;
+  for (size_t i = 0; i < entries_.size(); i++)
+    for (int s : entries_[i].ins) last[s] = i;
+  for (size_t i = 0; i < entries_.size(); i++)
+    for (int s : entries_[i].outs) last.emplace(s, i);
+  for (int s : outputs) last.erase(s);
+  std::vector<std::vector<int>> drops(entries_.size());
+  for (const auto& kv : last) drops[kv.second].push_back(kv.first);
 
-  LoweredProgram lowered;
+  Built built;
+  built.program = std::make_shared<Program>(nslots_, nargs);
+  for (size_t i = 0; i < entries_.size(); i++) {
+    Pending& e = entries_[i];
+    if (kDumpTape) {
+      built.dump.entries.push_back(DumpNode::Entry{
+          e.op, e.ins, e.outs, e.attrs, e.payload.has_value(),
+          e.region_dumps});
+    }
+    built.program->add(e.op, e.ins, e.outs, e.attrs, e.payload, drops[i],
+                       e.regions, e.bytes, {}, nullptr, {});
+  }
+  // A region Program never needs output copies: its results are a loop's
+  // carries or a branch's values, which stay inside this engine.  Only a
+  // whole program's outputs cross to a caller, and `Run` sets those.
+  built.program->set_outputs(outputs, {});
+  built.outputs = outputs;
+  built.dump.outputs = outputs;
+  built.dump.slots = nslots_;
+  return built;
+}
+
+absl::StatusOr<Lowering::Built> Lowering::LowerBlock(
+    mlir::Block& block, const std::vector<mlir::Value>& captures) {
+  // The block's own arguments first, then the captures: that order is what
+  // the executor feeds a region (native/control.cc builds `carry... caps...`),
+  // so it is part of the encoding.
   for (mlir::BlockArgument arg : block.getArguments()) {
     RETURN_IF_ERROR(CheckValue(arg));
-    ASSIGN_OR_RETURN(std::vector<int64_t> dims, Dims(arg));
-    auto t = mlir::cast<mlir::RankedTensorType>(arg.getType());
-    lowered.parameters.push_back(
-        ValueSpec{*PrimitiveTypeOf(t.getElementType()), std::move(dims),
-                  *MxDtypeOf(t.getElementType())});
     const int s = Bind(arg);
-    arg_alias_.insert(s);
+    arg_alias_[s] = {s};
+  }
+  for (mlir::Value cap : captures) {
+    RETURN_IF_ERROR(CheckValue(cap));
+    const int s = Bind(cap);
+    arg_alias_[s] = {s};
   }
 
   std::vector<mlir::Value> returned;
@@ -1020,45 +1726,37 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
     RETURN_IF_ERROR(CheckValue(v));
     ASSIGN_OR_RETURN(int s, Slot(v));
     outputs.push_back(s);
+  }
+  ASSIGN_OR_RETURN(Built built,
+                   Finish(static_cast<int>(block.getNumArguments() +
+                                           captures.size()),
+                          outputs));
+  built.returned = std::move(returned);
+  return built;
+}
+
+absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
+  if (fn.getBody().getBlocks().size() != 1)
+    return Decline("a main function with several blocks");
+  mlir::Block& block = fn.getBody().front();
+
+  LoweredProgram lowered;
+  for (mlir::BlockArgument arg : block.getArguments()) {
+    RETURN_IF_ERROR(CheckValue(arg));
+    ASSIGN_OR_RETURN(std::vector<int64_t> dims, Dims(arg));
+    auto t = mlir::cast<mlir::RankedTensorType>(arg.getType());
+    lowered.parameters.push_back(
+        ValueSpec{*PrimitiveTypeOf(t.getElementType()), std::move(dims),
+                  *MxDtypeOf(t.getElementType())});
+  }
+
+  ASSIGN_OR_RETURN(Built built, LowerBlock(block, {}));
+  for (mlir::Value v : built.returned) {
     ASSIGN_OR_RETURN(std::vector<int64_t> dims, Dims(v));
     auto t = mlir::cast<mlir::RankedTensorType>(v.getType());
     lowered.results.push_back(
         ValueSpec{*PrimitiveTypeOf(t.getElementType()), std::move(dims),
                   *MxDtypeOf(t.getElementType())});
-  }
-
-  // Per-op drop lists: the slots whose last use is that op (tape.py
-  // `_liveness`).  Straight-line, so this is "highest index that reads it";
-  // a result nothing reads is let go at the op that produced it, and an
-  // output is never dropped.
-  absl::flat_hash_map<int, size_t> last;
-  for (size_t i = 0; i < entries_.size(); i++)
-    for (int s : entries_[i].ins) last[s] = i;
-  for (size_t i = 0; i < entries_.size(); i++)
-    for (int s : entries_[i].outs) last.emplace(s, i);
-  for (int s : outputs) last.erase(s);
-  std::vector<std::vector<int>> drops(entries_.size());
-  for (const auto& kv : last) drops[kv.second].push_back(kv.first);
-
-  auto program = std::make_shared<Program>(
-      nslots_, static_cast<int>(lowered.parameters.size()));
-  for (size_t i = 0; i < entries_.size(); i++) {
-    Pending& e = entries_[i];
-    if (kDumpTape) {
-      std::string line = absl::StrCat("[tape] ", OpcodeName(e.op), " ");
-      for (size_t k = 0; k < e.ins.size(); k++)
-        absl::StrAppend(&line, k ? "," : "", e.ins[k]);
-      absl::StrAppend(&line, " -> ");
-      for (size_t k = 0; k < e.outs.size(); k++)
-        absl::StrAppend(&line, k ? "," : "", e.outs[k]);
-      absl::StrAppend(&line, " [");
-      for (size_t k = 0; k < e.attrs.size(); k++)
-        absl::StrAppend(&line, k ? "," : "", e.attrs[k]);
-      absl::StrAppend(&line, "]", e.payload.has_value() ? " const" : "");
-      std::fprintf(stderr, "%s\n", line.c_str());
-    }
-    program->add(e.op, e.ins, e.outs, e.attrs, e.payload, drops[i], {},
-                 e.bytes, {}, nullptr, {});
   }
 
   // Which outputs may not be handed out as they stand: one that may BE an
@@ -1073,25 +1771,22 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
   // engine.execute copies those on the way out whatever engine ran.  There is
   // no engine.execute here, so this plugin copies them itself.
   std::vector<int> copies;
-  for (size_t j = 0; j < outputs.size(); j++) {
-    if (const_view_.count(outputs[j]) || arg_alias_.count(outputs[j]))
+  for (size_t j = 0; j < built.outputs.size(); j++) {
+    if (const_view_.count(built.outputs[j]) ||
+        arg_alias_.count(built.outputs[j]))
       copies.push_back(static_cast<int>(j));
   }
   lowered.num_copies = static_cast<int64_t>(copies.size());
+  built.program->set_outputs(built.outputs, copies);
   if (kDumpTape) {
-    std::string line = "[tape] outputs ";
-    for (size_t j = 0; j < outputs.size(); j++)
-      absl::StrAppend(&line, j ? "," : "", outputs[j]);
-    absl::StrAppend(&line, " copies ");
-    for (size_t j = 0; j < copies.size(); j++)
-      absl::StrAppend(&line, j ? "," : "", copies[j]);
-    absl::StrAppend(&line, " slots ", nslots_);
-    std::fprintf(stderr, "%s\n", line.c_str());
+    built.dump.copies = copies;
+    std::string text;
+    RenderDump(built.dump, "", &text);
+    std::fputs(text.c_str(), stderr);
     std::fflush(stderr);
   }
-  program->set_outputs(outputs, copies);
   lowered.num_entries = static_cast<int64_t>(entries_.size());
-  lowered.program = std::move(program);
+  lowered.program = std::move(built.program);
   return lowered;
 }
 
@@ -1115,7 +1810,8 @@ absl::StatusOr<LoweredProgram> LowerModule(mlir::ModuleOp module) {
     // plugin has never seen, so say so rather than guessing which to run.
     return Decline("a module with no @main function");
   }
-  Lowering lowering(module);
+  LowerContext ctx{module, {}, {}};
+  Lowering lowering(&ctx);
   try {
     return lowering.Run(main);
   } catch (const std::exception& e) {

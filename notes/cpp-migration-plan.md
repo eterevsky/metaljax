@@ -757,10 +757,23 @@ fork authorized but not needed.
   Supersedes two lines of the file-layout section above: register_tape
   now lives in bindings.cc (not config.cc), and the nanobind stl casters
   ride in bindings.cc (program.h includes no nanobind at all).
-* **P2 in flight**: native lowering (tape.py's attr encodings are the
-  spec), MetalLoadedExecutable::Execute, M1 dtype table on the buffers,
-  differential execute_test vs CPU. Then P3 control flow + regions,
-  then coverage families (gather/scatter, rng), suite-vs-suite as the
-  standing gate. Recognizers/msl/compile decisions come after
-  correctness coverage (north star per Oleg: everything through the new
-  stack, correctness first, performance second).
+* **P2 landed** (4efd2ee, notes/cpp-p2-lowering.md): native lowering
+  (tape.py's attr encodings are the spec), MetalLoadedExecutable::Execute,
+  M1 dtype table on the buffers, a 77-case differential execute_test vs CPU.
+* **P3 landed** (notes/cpp-p3-control.md): control flow. Regions are a
+  recursive use of the same `Lowering`, so while/if/case, ds/dus (with
+  XLA's index clamps) and the counted-loop encoding reach the executor —
+  `lax.scan`/`fori_loop`/`while_loop`/`cond`/`switch` all run. The runtime
+  cadences are read from the environment at client creation (this plugin
+  is the only engine in its process, so the "two readers would drift"
+  argument that held in P2 does not apply, and the loop clear cadence is
+  correctness for long loops). Compile decisions stay OFF: the three
+  compile fields of a while entry are written as zeros, which is what
+  tape.py writes under METALJAX_COMPILE=0. execute_test 102 checks;
+  cross-check vs the Stage 1 tape over 9 probes / 170 lines is identical
+  but the dead `kmax` field. Census: **gather and scatter are the only two
+  ops between this plugin and a texmo training step**.
+* Next: gather/scatter, then sort/top_k and rng, then the compile
+  decisions, then async execute + donation. Suite-vs-suite as the standing
+  gate. (North star per Oleg: everything through the new stack,
+  correctness first, performance second.)

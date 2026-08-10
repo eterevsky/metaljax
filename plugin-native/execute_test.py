@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Differential test for the native PJRT plugin's executor (phase 2, P2).
+"""Differential test for the native PJRT plugin's executor (phase 2).
 
 Every expression below is evaluated twice: once through the bazel-built
 native plugin (`JAX_PLATFORMS=metal`, `METALJAX_PLUGIN_PATH` pointing at the
@@ -7,6 +7,12 @@ dylib) and once through jax on the CPU backend, in a subprocess of its own.
 The CPU answer is the bar -- this is the same doctrine the Stage 1 suite runs
 under -- so a case that disagrees is a failure here whatever the two engines
 have in common.
+
+Four kinds of check, in this order: the jitted CASES below; hand-written
+StableHLO MODULES, compiled through both clients, for encodings jax's own
+lowerings never produce; the DECLINES, which must name the op that stopped
+the program; and the CONTRACTS (no-alias, host round-trips, threading, the
+f64 policy).
 
 Run it from the repo venv:
 
@@ -40,6 +46,21 @@ _DEFAULT_DYLIB = _HERE / "bazel-bin" / "metal" / "libmetal_pjrt_native.dylib"
 def _rand(shape, seed, dtype=np.float32):
     return np.asarray(np.random.RandomState(seed).standard_normal(shape),
                       dtype=dtype)
+
+
+def _switch_case(i, x):
+    """`lax.switch` over three branches, including two out-of-range indices.
+
+    XLA clamps a case index into range; the executor does the same
+    (native/control.cc), so 7 must run the last branch and -3 the first.
+    A named function rather than a lambda only because the branch list would
+    otherwise be spelled out once per index.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    branches = [lambda a: a + 1, lambda a: a * 2, lambda a: -a]
+    return tuple(jax.lax.switch(i[k], branches, x) for k in range(5))
 
 
 def _cases():
@@ -214,6 +235,103 @@ def _cases():
         ("no argument", lambda: jnp.arange(5, dtype=jnp.float32) * 2,
          [], *EXACT),
 
+        # control flow (P3).  Every region below becomes a sub-Program of the
+        # tape and the executor enters it exactly as it enters a top-level
+        # one; what is being checked here is the LOWERING -- the carry/capture
+        # ordering, the counted-loop encoding, and the clamps.
+        ("scan (cumulative)",
+         lambda xs: jax.lax.scan(lambda c, x: (c + x, c * 2), np.float32(0),
+                                 xs),
+         [_rand((8,), 40)], *F32),
+        ("scan (carry only)",
+         lambda c0, xs: jax.lax.scan(lambda c, x: (c * 0.9 + x, None),
+                                     c0, xs)[0],
+         [_rand((4,), 41), _rand((6, 4), 42)], *F32),
+        ("fori_loop",
+         lambda x: jax.lax.fori_loop(
+             0, 7, lambda i, c: c * 1.1 + i.astype(jnp.float32), x),
+         [np.float32(1.0)], *F32),
+        # A data-dependent trip count: the cond is evaluated on the host every
+        # iteration (the dynamic arm of native/control.cc's run_while).
+        ("while_loop (dynamic trip)",
+         lambda x: jax.lax.while_loop(
+             lambda s: s[0] < 100.0,
+             lambda s: (s[0] * 2.0, s[1] + 1), (x, jnp.int32(0))),
+         [np.float32(1.5)], *F32),
+        # A loop whose bound is CAPTURED rather than constant: the counted
+        # encoding's bound_kind 2, indexing the cond's capture list.
+        ("fori_loop (captured bound)",
+         lambda x, n: jax.lax.fori_loop(0, n, lambda i, c: c + 1.0, x),
+         [np.float32(0.0), np.int32(9)], *EXACT),
+        ("cond (both branches)",
+         lambda p, x: (
+             jax.lax.cond(p[0] > 0, lambda a: jnp.sin(a) * 2,
+                          lambda a: jnp.cos(a) - 1, x),
+             jax.lax.cond(p[1] > 0, lambda a: jnp.sin(a) * 2,
+                          lambda a: jnp.cos(a) - 1, x)),
+         [np.array([1.0, -1.0], f), _rand((4,), 43)], *F32),
+        ("switch (every branch)", _switch_case,
+         [np.array([0, 1, 2, 7, -3], np.int32), _rand((3,), 44)], *F32),
+        # The GRU shape: a matmul inside the body, and a capture (the weights)
+        # the region reads from the enclosing scope.
+        ("scan over matmul",
+         lambda h0, w, xs: jax.lax.scan(
+             lambda h, x: (jnp.tanh(h @ w + x), None), h0, xs)[0],
+         [_rand((4, 8), 45), _rand((8, 8), 46), _rand((5, 4, 8), 47)], *DOT),
+        ("nested scan",
+         lambda xs: jax.lax.scan(
+             lambda c, row: (
+                 jax.lax.scan(lambda d, v: (d + v * 0.5, None), c, row)[0],
+                 None),
+             np.float32(0), xs)[0],
+         [_rand((4, 3), 48)], *F32),
+        ("scan with a stacked output",
+         lambda w, xs: jax.lax.scan(
+             lambda c, x: (c + x @ w, c), jnp.zeros((3,), jnp.float32), xs)[1],
+         [_rand((4, 3), 49), _rand((5, 4), 50)], *DOT),
+
+        # dynamic_slice / dynamic_update_slice, including the CLAMPS.  XLA
+        # clamps a start index so the window stays inside the operand; MLX
+        # clamps nothing, so the tape carries the bounds and the handler
+        # builds the clip.  An out-of-range index is silent wrongness if that
+        # encoding is wrong, which is why it is tested in both directions.
+        ("dynamic_slice", lambda x, i: jax.lax.dynamic_slice(x, (i,), (3,)),
+         [np.arange(10, dtype=f), np.int32(4)], *EXACT),
+        ("dynamic_slice (index past the end)",
+         lambda x, i: jax.lax.dynamic_slice(x, (i,), (3,)),
+         [np.arange(10, dtype=f), np.int32(100)], *EXACT),
+        ("dynamic_slice (negative index)",
+         lambda x, i: jax.lax.dynamic_slice(x, (i,), (3,)),
+         [np.arange(10, dtype=f), np.int32(-5)], *EXACT),
+        ("dynamic_slice 2d (both clamps)",
+         lambda x, i, j: jax.lax.dynamic_slice(x, (i, j), (2, 2)),
+         [np.arange(12, dtype=f).reshape(3, 4), np.int32(5), np.int32(-3)],
+         *EXACT),
+        ("dynamic_update_slice",
+         lambda x, u, i: jax.lax.dynamic_update_slice(x, u, (i,)),
+         [np.arange(8, dtype=f), np.array([-1, -2, -3], f), np.int32(2)],
+         *EXACT),
+        ("dynamic_update_slice (index past the end)",
+         lambda x, u, i: jax.lax.dynamic_update_slice(x, u, (i,)),
+         [np.arange(8, dtype=f), np.array([-1, -2, -3], f), np.int32(9)],
+         *EXACT),
+        ("dynamic_update_slice 2d (negative index)",
+         lambda x, u, i, j: jax.lax.dynamic_update_slice(x, u, (i, j)),
+         [np.arange(12, dtype=f).reshape(3, 4), np.full((2, 2), -1.0, f),
+          np.int32(-4), np.int32(2)], *EXACT),
+        # The carry-stacking shape scan lowers to: a dus into a buffer at a
+        # loop-carried index, inside a counted loop.
+        ("scan stacking through dus",
+         lambda xs: jax.lax.scan(lambda c, x: (c + x, c), np.float32(0), xs)[1],
+         [_rand((6,), 51)], *F32),
+        # 10k iterations of a tiny body: the loop's flush cadence is what
+        # keeps Metal's live-buffer count bounded, and a loop this long is
+        # where its absence shows up (CLAUDE.md items 11/14).  Exact in f32:
+        # every partial sum is an integer below 2**24.
+        ("long counted loop (10k iterations)",
+         lambda x: jax.lax.fori_loop(0, 10000, lambda i, c: c + 1.0, x),
+         [np.float32(0.0)], *EXACT),
+
         # a realistic little block: the shapes a model's forward pass has
         ("dense + norm + gelu",
          lambda x, w, b: jax.nn.gelu(
@@ -223,6 +341,87 @@ def _cases():
          [_rand((4, 9), 30)], *F32),
     ]
     return cases
+
+
+# --------------------------------------------------------------------------
+# hand-written StableHLO
+# --------------------------------------------------------------------------
+#
+# The same module text through both clients' `compile_and_load`, for encodings
+# jax's own lowerings do not produce.  jax threads every value a while-cond
+# closes over into the CARRY, so the counted encoding's third `bound_kind` --
+# the bound as a CAPTURE of the cond region -- is unreachable from
+# `lax.fori_loop`; getting it wrong would be a wrong trip count, which is the
+# quietest way a loop can be wrong, so it is written out by hand here.
+
+_WHILE_CAPTURED_BOUND = """
+module @captured_bound {
+  func.func public @main(%acc: tensor<f32>, %n: tensor<i32>) -> tensor<f32> {
+    %zero = stablehlo.constant dense<0> : tensor<i32>
+    %one_i = stablehlo.constant dense<1> : tensor<i32>
+    %one_f = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+    %r:2 = stablehlo.while(%i = %zero, %a = %acc) : tensor<i32>, tensor<f32>
+     cond {
+      %p = stablehlo.compare LT, %i, %n : (tensor<i32>, tensor<i32>)
+          -> tensor<i1>
+      stablehlo.return %p : tensor<i1>
+    } do {
+      %i2 = stablehlo.add %i, %one_i : tensor<i32>
+      %a2 = stablehlo.add %a, %one_f : tensor<f32>
+      stablehlo.return %i2, %a2 : tensor<i32>, tensor<f32>
+    }
+    return %r#1 : tensor<f32>
+  }
+}
+"""
+
+
+# jax lowers `lax.cond` to stablehlo.CASE even for a two-way branch, so the
+# IF encoding -- whose predicate is a bool read on the host, and whose FIRST
+# region is the true branch -- has no other coverage.
+_IF_BRANCHES = """
+module @if_branches {
+  func.func public @main(%p: tensor<i1>, %x: tensor<4xf32>) -> tensor<4xf32> {
+    %c = stablehlo.constant dense<2.000000e+00> : tensor<f32>
+    %cb = stablehlo.broadcast_in_dim %c, dims = []
+        : (tensor<f32>) -> tensor<4xf32>
+    %r = "stablehlo.if"(%p) ({
+      %t = stablehlo.multiply %x, %cb : tensor<4xf32>
+      stablehlo.return %t : tensor<4xf32>
+    }, {
+      %f = stablehlo.subtract %x, %cb : tensor<4xf32>
+      stablehlo.return %f : tensor<4xf32>
+    }) : (tensor<i1>) -> tensor<4xf32>
+    return %r : tensor<4xf32>
+  }
+}
+"""
+
+
+def _module_cases():
+    return [
+        ("while with a captured bound", _WHILE_CAPTURED_BOUND,
+         [np.float32(1.5), np.int32(6)]),
+        ("stablehlo.if (true)", _IF_BRANCHES,
+         [np.bool_(True), np.arange(4, dtype=np.float32)]),
+        ("stablehlo.if (false)", _IF_BRANCHES,
+         [np.bool_(False), np.arange(4, dtype=np.float32)]),
+        ("while with a captured bound (zero trip)", _WHILE_CAPTURED_BOUND,
+         [np.float32(1.5), np.int32(0)]),
+        ("while with a captured bound (negative)", _WHILE_CAPTURED_BOUND,
+         [np.float32(1.5), np.int32(-3)]),
+    ]
+
+
+def _run_module(text, args):
+    """Compile and run one module on the default client of this process."""
+    import jax
+    from jax._src.lib import xla_client as xc
+
+    dev = jax.devices()[0]
+    exe = dev.client.compile_and_load(text, [dev], xc.CompileOptions())
+    outs = exe.execute([jax.device_put(a, dev) for a in args])
+    return [np.asarray(o) for o in outs]
 
 
 # Programs that must DECLINE, with the op the message has to name.  A decline
@@ -238,8 +437,13 @@ def _declines():
         ("gather", lambda x, i: x[i],
          [np.arange(6, dtype=np.float32), np.array([0, 2], np.int32)],
          "stablehlo.gather"),
-        ("while loop", lambda x: jax.lax.fori_loop(0, 4, lambda i, c: c + i, x),
-         [np.float32(0.0)], "stablehlo.while"),
+        # A loop whose BODY holds an op outside the set declines the whole
+        # program, naming that op -- the region is lowered by the same
+        # `Lowering` as main, so its declines are main's.
+        ("while loop over an unlowered op",
+         lambda x: jax.lax.fori_loop(
+             0, 4, lambda i, c: jnp.sort(c) + 1.0, x),
+         [np.arange(4, dtype=np.float32)], "stablehlo.sort"),
     ]
 
 
@@ -323,7 +527,21 @@ def write_reference(path):
             kind, arr = _canonical(out)
             saved[f"k{i}_{j}"] = np.asarray(kind)
             saved[f"v{i}_{j}"] = arr
+    for i, (name, text, args) in enumerate(_module_cases()):
+        outs = _run_module(text, args)
+        saved[f"mn{i}"] = np.asarray(len(outs))
+        for j, out in enumerate(outs):
+            kind, arr = _canonical(out)
+            saved[f"mk{i}_{j}"] = np.asarray(kind)
+            saved[f"mv{i}_{j}"] = arr
     np.savez(path, **saved)
+
+
+def read_module_reference(path, index):
+    data = np.load(path)
+    n = int(data[f"mn{index}"])
+    return [(str(data[f"mk{index}_{j}"]), data[f"mv{index}_{j}"])
+            for j in range(n)]
 
 
 def read_reference(path, index):
@@ -389,6 +607,22 @@ def main():
             print(f"{name:<32} {'-':>12}  FAIL: {detail}")
             failures.append(name)
 
+    print("\nhand-written StableHLO (the same text through both clients)")
+    print("-" * 62)
+    for i, (name, text, margs) in enumerate(_module_cases()):
+        try:
+            got = _run_module(text, margs)
+            want = read_module_reference(ref_path, i)
+            ok, detail = _compare(name, got, want, 1e-6, 1e-6)
+        except BaseException as exc:  # noqa: BLE001
+            ok, detail = False, f"{type(exc).__name__}: " \
+                                f"{str(exc).splitlines()[0][:110]}"
+        if ok:
+            print(f"{name:<32} {detail:>12.3e}  ok")
+        else:
+            print(f"{name:<32} {'-':>12}  FAIL: {detail}")
+            failures.append(name)
+
     print("\ndeclines (the message must name the op)")
     print("-" * 62)
     for name, fn, args, op in _declines():
@@ -422,6 +656,27 @@ def main():
         print(f"{'identity returns a fresh buffer':<32} {'':>12}  "
               f"FAIL: {exc}")
         failures.append("no-alias contract")
+
+    # The same contract THROUGH a region: a carry the body forwards untouched
+    # is still the caller's array on the way out, and the tape has to see that
+    # across the frame boundary (metal_lowering.cc's MapTaint).  A loop whose
+    # trip count is not statically zero is charged the taint of its init too,
+    # which is what this exercises.
+    label = "a forwarded carry is copied"
+    try:
+        src = jax.device_put(np.arange(4, dtype=np.float32))
+        out = jax.jit(lambda x, w: jax.lax.fori_loop(
+            0, 3, lambda i, s: (s[0] + w, s[1]), (x, w)))(
+                jax.device_put(np.zeros(4, np.float32)), src)
+        same = src.unsafe_buffer_pointer() == out[1].unsafe_buffer_pointer()
+        ok = not same and np.array_equal(np.asarray(out[1]),
+                                         np.arange(4, dtype=np.float32))
+        detail = "ok" if ok else ("FAIL: aliased" if same else "FAIL: wrong")
+    except BaseException as exc:  # noqa: BLE001
+        ok, detail = False, f"FAIL: {str(exc).splitlines()[0][:90]}"
+    print(f"{label:<32} {'':>12}  {detail}")
+    if not ok:
+        failures.append(label)
 
     # Every dtype the transfer path claims, host -> device -> host, bit exact,
     # plus a negative-stride view (whose logical first element is not its

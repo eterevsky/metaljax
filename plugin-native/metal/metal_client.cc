@@ -5,6 +5,7 @@ Licensed under the Apache License, Version 2.0.
 
 #include "metal/metal_client.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -45,15 +46,68 @@ namespace metaljax {
 
 namespace mx = mlx::core;
 
-// METALJAX_DEBUG=1, the one env var this plugin reads: the runtime cadences
-// stay at their compiled-in defaults for now (the Stage 1 engine parses them
-// in Python and copies them in through `metaljax::configure`, and a second
-// reader here would be a second opinion on numbers the command-buffer lottery
-// is pinned to -- see notes/cpp-p2-lowering.md).
+// METALJAX_DEBUG=1: narrate compiles.  Read here rather than through
+// `g_cfg.debug` because it gates messages from `ConfigureFromEnv` itself.
 const bool kDebug = [] {
   const char* v = std::getenv("METALJAX_DEBUG");
   return v != nullptr && std::string(v) == "1";
 }();
+
+namespace {
+
+// The runtime cadences, from the environment (`ConfigureFromEnv` below).
+//
+// Stage 1 parses these in Python and copies them across through
+// `metaljax::configure` -- so that two engines in ONE process cannot hold two
+// opinions about a number the MLX command-buffer lottery is pinned to
+// (notes/mlx-command-buffer-split.md).  This plugin is the only engine in its
+// process: nothing Python-side is even imported, so there is no second reader
+// to drift from, and leaving the cadences at their compiled-in defaults is
+// what would drift -- from every documented default in
+// src/metaljax/{interpreter,ops/control}.py, and from what a user setting the
+// variable gets on the Stage 1 plugin.
+//
+// The defaults and the arithmetic below are copied from the module that owns
+// each one, and the comment there is the explanation.  They are not
+// preferences: the loop clear cadence is what keeps Metal's ~499k live-buffer
+// limit at bay in a multi-hour loop (CLAUDE.md items 11/14), which is a
+// correctness property of exactly the workloads Stage 2 exists for.
+int64_t EnvInt(const char* name, int64_t fallback) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || *v == '\0') return fallback;
+  char* end = nullptr;
+  const long long parsed = std::strtoll(v, &end, 10);
+  // Python's `int(os.environ[...])` raises on anything else; a plugin cannot
+  // usefully raise from a static initializer, so garbage keeps the default and
+  // says so under METALJAX_DEBUG.
+  if (end == v || *end != '\0') {
+    if (kDebug)
+      std::fprintf(stderr, "[metaljax-native] ignoring %s=%s (not an integer)\n",
+                   name, v);
+    return fallback;
+  }
+  return static_cast<int64_t>(parsed);
+}
+
+bool EnvFlag(const char* name) {
+  const char* v = std::getenv(name);
+  return v != nullptr && std::string(v) == "1";
+}
+
+void ConfigureFromEnv() {
+  const int64_t flush_mb = EnvInt("METALJAX_EAGER_FLUSH_MB", 1024);
+  configure(
+      /*eager_flush_bytes=*/std::max<int64_t>(flush_mb, 0) * (int64_t{1} << 20),
+      /*flush_sync_every=*/EnvInt("METALJAX_EAGER_FLUSH_SYNC", 1),
+      /*flush_clear_bytes=*/EnvInt("METALJAX_FLUSH_CLEAR_MB", 2048) *
+          (int64_t{1} << 20),
+      /*loop_clear_cost=*/EnvInt("METALJAX_LOOP_CLEAR_COST", 500000),
+      /*while_pipeline=*/EnvInt("METALJAX_WHILE_PIPELINE", 1),
+      /*debug=*/EnvFlag("METALJAX_DEBUG"),
+      /*memdbg=*/EnvFlag("METALJAX_MEMDBG"));
+}
+
+}  // namespace
 
 // ------------------------------------------------------------- description
 
@@ -117,6 +171,9 @@ absl::StatusOr<xla::PjRtMemorySpace*> MetalDevice::memory_space_by_kind(
 // ------------------------------------------------------------------ client
 
 MetalClient::MetalClient() {
+  // Once, here: the client is built when jax first asks for the platform, and
+  // every execute in the process runs under these cadences.
+  ConfigureFromEnv();
   // One GPU, one unified memory space.  Apple silicon exposes a single
   // integrated GPU per process; multi-device is out of scope.
   owned_memory_spaces_.push_back(

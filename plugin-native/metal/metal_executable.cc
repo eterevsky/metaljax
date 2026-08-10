@@ -6,6 +6,8 @@ Licensed under the Apache License, Version 2.0.
 #include "metal/metal_executable.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,6 +47,32 @@ std::string ShapeString(const mx::array& a) {
   for (size_t i = 0; i < a.shape().size(); i++)
     absl::StrAppend(&s, i ? "," : "", a.shape()[i]);
   return absl::StrCat(s, "]");
+}
+
+// METALJAX_DEBUG=1 reports what one execute spent of the runtime's cadences.
+// The counters are the executor's own (native/program.h `g_stats`), so this
+// is the only window a process with no interpreter in it has on them -- and
+// the loop counters are what say the flush discipline a long loop depends on
+// really engaged.  Process-wide and unsynchronized, like the counters
+// themselves: with two executes in flight the delta below attributes some of
+// the other one's work, which is a diagnostic's business and not a run's.
+const bool kDebug = [] {
+  const char* v = std::getenv("METALJAX_DEBUG");
+  return v != nullptr && std::string(v) == "1";
+}();
+
+std::string StatsDelta(const Stats& before, const Stats& after) {
+  return absl::StrFormat(
+      "flushes=%d(+clear %d) loop_flushes=%d(+clear %d) limit_retries=%d "
+      "serial_loops=%d pipelined_loops=%d pipelined_steps=%d",
+      after.flushes - before.flushes,
+      after.cache_clears - before.cache_clears,
+      after.loop_flushes - before.loop_flushes,
+      after.loop_clears - before.loop_clears,
+      after.limit_retries - before.limit_retries,
+      after.serial_loops - before.serial_loops,
+      after.pipelined_loops - before.pipelined_loops,
+      after.pipelined_steps - before.pipelined_steps);
 }
 
 }  // namespace
@@ -106,6 +134,7 @@ MetalLoadedExecutable::RunOnce(
   }
 
   std::vector<mx::array> outs;
+  const Stats before = g_stats;
   try {
     outs = lowered_->program->run(std::move(inputs));
     // P2 executes SYNCHRONOUSLY: correctness before pipelining.  Settling
@@ -116,6 +145,11 @@ MetalLoadedExecutable::RunOnce(
   } catch (const std::exception& e) {
     return absl::InternalError(
         absl::StrCat("metaljax-native: ", name_, " failed: ", e.what()));
+  }
+  if (kDebug) {
+    std::fprintf(stderr, "[metaljax-native] %s: %s\n", name_.c_str(),
+                 StatsDelta(before, g_stats).c_str());
+    std::fflush(stderr);
   }
 
   if (outs.size() != lowered_->results.size()) {
