@@ -23,15 +23,20 @@
 //
 // This header is the line a phase-2 native plugin builds against: the opcode
 // enum, the entry format, the `Program` that replays it, and the runtime
-// disciplines a replay runs under. Everything else is one translation unit
-// per concern, and the op families mirror src/metaljax/ops/ one for one --
+// disciplines a replay runs under. It names no Python, and neither does any
+// translation unit below it except `bindings.cc` and `metaljax_native.cc` --
+// the tape is a plain C++ library that a process without an interpreter links
+// and runs. Everything else is one translation unit per concern, and the op
+// families mirror src/metaljax/ops/ one for one --
 // the handlers ARE transliterations of those modules, so keeping the split
 // identical is what lets a reader put the two engines side by side:
 //
 //   program.cc          Program itself: slots, the environment, the walk
 //                       over the tape, and the recovery that wraps a run
-//   config.cc           the Python-facing surface: the op-name registry,
-//                       `configure`, `stats`, the nanobind registration
+//   config.cc           the registries and the cadences: the op-name table,
+//                       `configure`, the counters, the recovery hook
+//   bindings.cc         the nanobind adapter: the ONLY file besides
+//                       metaljax_native.cc that knows Python exists
 //   dtypes.cc           dtypes.py: the element-type table, the predicates
 //                       handlers branch on, weak literals, complex64
 //   runtime.cc          the cadences of interpreter.py + ops/control.py:
@@ -47,7 +52,7 @@
 //   emits.cc            the M4 recognizer emits: qmm, sdpa, moe
 //   control.cc          ops/control.py: while/if/case and the body runners
 //   msl.cc, msl.h       msl_scan.py's generated kernels (M5b)
-//   host.cc             ops/callbacks.py: the entries that take the GIL
+//   host.cc             ops/callbacks.py: the entries that leave the tape
 //
 // `Program::step` owns no handler of its own: it offers the entry to one
 // `step_*` per family until one claims it, so the partition of the opcode
@@ -66,20 +71,11 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
-
-#include <nanobind/nanobind.h>
-// The stl casters ride in the header: every translation unit that hands a
-// vector or a string across the boundary needs them visible, and nanobind
-// silently falls back to an opaque type when they are not.
-#include <nanobind/stl/optional.h>
-#include <nanobind/stl/shared_ptr.h>
-#include <nanobind/stl/string.h>
-#include <nanobind/stl/vector.h>
 
 #include <mlx/mlx.h>
 
-namespace nb = nanobind;
 namespace mx = mlx::core;
 
 namespace metaljax {
@@ -181,6 +177,10 @@ struct Config {
 // spend them are runtime.cc's.
 extern Config g_cfg;
 
+void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
+               int64_t flush_clear_bytes, int64_t loop_clear_cost,
+               int64_t while_pipeline, bool debug, bool memdbg);
+
 struct Stats {
   int64_t flushes = 0;         // eager byte-denominated sync points
   int64_t cache_clears = 0;    // ...that returned cache memory to the OS
@@ -207,7 +207,16 @@ extern Stats g_stats;
 // --------------------------------------------------------------------------
 
 bool is_resource_limit(const std::exception& e);
-void gc_collect();                              // host.cc: needs the GIL
+
+// Breaking reference cycles before a buffer-limit retry is an embedder's
+// business, not the tape's: what pins the buffers mx::clear_cache cannot free
+// is dead Python objects in refcycles (CLAUDE.md item 19), and Python's cycle
+// collector barely triggers under array workloads. The nanobind adapter sets
+// this to gc.collect; in a process with no interpreter it stays empty and
+// `gc_collect` is a no-op, which is the correct behaviour there — there are no
+// cycles to break.
+extern std::function<void()> g_gc_hook;
+void gc_collect();                              // host.cc: runs the hook
 void debug_line(const std::string& line);
 void debug_print(const std::string& msg);
 void flush_eval(const std::vector<mx::array>& arrays, bool hard);
@@ -296,6 +305,14 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 class Program;
 class MslPlan;
 
+// The handler of an op that computes off the device (LAPACK, jax's callbacks:
+// ops/callbacks.py). The tape holds it as an opaque callable and knows nothing
+// about what is on the other side -- today the nanobind adapter wraps a Python
+// handler into one of these and takes the GIL INSIDE the wrapper, which is the
+// whole of what a host call costs the interpreter-free core.
+using HostFn =
+    std::function<std::vector<mx::array>(const std::vector<mx::array>&)>;
+
 struct Entry {
   int op;
   std::vector<int> ins;
@@ -311,10 +328,10 @@ struct Entry {
   int64_t bytes = 0;  // estimated result bytes, for the eager flush cadence
   // M5b. `msl`: a generated persistent kernel for this loop (the entry
   // still carries the interpreted loop in `regions`, as the fallback).
-  // `host`: the Python handler of an op that computes on the host, the one
-  // place a native run reacquires the GIL.
+  // `host`: the handler of an op that computes on the host, the one place a
+  // native run leaves the tape (empty for every other opcode).
   std::shared_ptr<MslPlan> msl;
-  nb::object host;
+  HostFn host;
 };
 
 // Sequential reader for the attribute vectors the M4 emits carry: they are
@@ -375,7 +392,7 @@ class Program {
            std::vector<int> drops,
            std::vector<std::shared_ptr<Program>> regions, int64_t bytes,
            std::vector<double> fattrs, std::shared_ptr<MslPlan> msl,
-           nb::object host);
+           HostFn host);
 
   // `copies` are output POSITIONS whose array may not be handed out as it
   // is: it could be one of the program's own constants (which the Program
@@ -429,7 +446,6 @@ class Program {
   // fused op on the tape rather than the literal chain it replaces —
   // including inside a decode loop's body, which is its own Program.
   void tally(std::map<int, int64_t>& counts) const;
-  nb::dict op_histogram() const;
 
   // Does running this program read anything back to the HOST? Every
   // control-flow op does: a while reads its trip count or its condition, an
@@ -561,25 +577,23 @@ class Program {
   std::vector<int> anchors_;
   std::map<int, Compiled> compiled_;
   // `run` mutates all of the run-time state above -- the compiled-graph
-  // cache above all -- with the GIL released, so two threads calling the
-  // SAME executable would race on it (jax lets one jitted function be
-  // called from any number of threads). One lock per program serializes
-  // those and nothing else; distinct executables still run concurrently.
-  // Taken INSIDE the GIL release, never outside: a waiter must not hold the
-  // GIL, or the holder's recovery paths (which reacquire it to collect
-  // cycles) would deadlock against it.
+  // cache above all -- so two threads calling the SAME executable would race
+  // on it (jax lets one jitted function be called from any number of
+  // threads). One lock per program serializes those and nothing else;
+  // distinct executables still run concurrently. An embedder that holds an
+  // interpreter lock must drop it before calling `run`, never after: a
+  // waiter here holding the GIL would deadlock against the holder's recovery
+  // paths, which reacquire it through `g_gc_hook`. bindings.cc does exactly
+  // that.
   std::mutex lock_;
 };
 
-// The registries Python reads (config.cc, dtypes.cc): a name absent from
-// either declines the program rather than guessing.
-nb::dict opcodes();
-nb::dict dtype_codes();
+// The registries a tape builder reads (config.cc, dtypes.cc): a name absent
+// from either declines the program rather than guessing. Plain pairs, in
+// table order; bindings.cc is what turns them into the dicts Python sees.
+std::vector<std::pair<std::string, int>> opcodes();
+std::vector<std::pair<std::string, int>> dtype_codes();
 
 }  // namespace metaljax
-
-// The whole interface between this extension's two halves: metaljax_native.cc
-// (the module, the buffer path) declares exactly this and nothing else.
-void register_tape(nb::module_& m);
 
 #endif  // METALJAX_PROGRAM_H_

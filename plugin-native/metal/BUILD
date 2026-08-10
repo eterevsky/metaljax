@@ -7,6 +7,7 @@
 # //build_defs.
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//build_defs:xla.bzl", "metaljax_cc_binary")
 
 package(default_visibility = ["//visibility:public"])
@@ -74,8 +75,36 @@ cc_library(
 )
 
 # The loadable plugin.  METALJAX_PLUGIN_PATH should point at this file.
+#
+# The executor runtime rides along before anything calls it: it is alwayslink,
+# so every one of its objects is really in this dylib, and that is what proves
+# the tape, libmlx and XLA's statically-linked LLVM/MLIR/absl can share one
+# image.  Discovering otherwise while wiring up CompileAndLoad would be a much
+# worse place to find out.
 metaljax_cc_binary(
     name = "libmetal_pjrt_native.dylib",
     linkshared = True,
-    deps = [":metal_c_pjrt"],
+    deps = [
+        ":metal_c_pjrt",
+        "@metaljax_runtime//:runtime",
+    ],
+)
+
+# Phase 2 P1: the executor runtime driven from a process with no interpreter
+# in it.  Depends on @metaljax_runtime and @mlx and on nothing else -- no XLA,
+# no plugin -- because the claim being tested is exactly that the tape stands
+# on its own.
+#
+# `local`: the test talks to the Metal device and MLX writes its compiled
+# kernels to the user's cache directory, neither of which survives bazel's
+# darwin sandbox.
+cc_test(
+    name = "runtime_gil_free_test",
+    size = "small",
+    srcs = ["runtime_gil_free_test.cc"],
+    tags = ["local"],
+    deps = [
+        "@metaljax_runtime//:runtime",
+        "@mlx",
+    ],
 )

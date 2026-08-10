@@ -157,3 +157,15 @@ nvshmem_redist_init_repository(
 load("//third_party/mlx:workspace.bzl", "mlx_repository")
 
 mlx_repository(name = "mlx")
+
+# The executor runtime (metaljax/native) -- the tape, the op families, the
+# mx::compile integration, the generated Metal kernels.  Shared with, not
+# copied from, the nanobind extension native/build.sh produces: the sources
+# stay in one place and this workspace supplies the build file
+# (third_party/metaljax_runtime/BUILD.runtime, which lists exactly the
+# Python-free translation units).
+new_local_repository(
+    name = "metaljax_runtime",
+    build_file = "//third_party/metaljax_runtime:BUILD.runtime",
+    path = "/Users/oleg/metaljax/native",
+)

@@ -236,6 +236,12 @@ Small and stable, which is much of why this route is cheap:
 
 ## Integrating the executor runtime (`native/`) later
 
+> **Done, 2026-08-10 — see [`cpp-p1-runtime.md`](cpp-p1-runtime.md).** Route
+> (a) below was taken and works; the de-Python refactor it was waiting on
+> landed at the same time, and the runtime now links into
+> `//metal:libmetal_pjrt_native.dylib` (+0.21 % dylib, zero linker friction).
+> The rest of this section is the analysis that led there.
+
 Oleg's directive: the runtime behind `native/program.h` will eventually be a
 bazel `cc_library` the plugin links directly, replacing the prebuilt-dylib
 arrangement. It is not in P0 scope (11 of `native/`'s 21 translation units

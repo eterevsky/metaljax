@@ -15,7 +15,10 @@
 #
 # One clang invocation over every source: the sources are listed below in
 # the order program.h documents them, and a new op family is a new file
-# added to that list and nowhere else.
+# added to that list and nowhere else. The first two are the whole of the
+# nanobind boundary; everything after them is the interpreter-free runtime
+# the phase-2 plugin builds under bazel (plugin-native/third_party/
+# metaljax_runtime/BUILD.runtime lists exactly the same set, minus those two).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -34,7 +37,7 @@ clang++ -std=c++17 -O2 -fPIC -shared \
   -I "$(dirname "$NBINC")/ext/robin_map/include" \
   -DNDEBUG -DNB_COMPACT_ASSERTIONS \
   -DNB_DOMAIN=mlx \
-  metaljax_native.cc \
+  metaljax_native.cc bindings.cc \
   program.cc config.cc dtypes.cc runtime.cc compile.cc \
   ops_elementwise.cc ops_shape.cc ops_reduce.cc ops_index.cc \
   ops_linalg.cc ops_rng.cc emits.cc control.cc msl.cc host.cc \

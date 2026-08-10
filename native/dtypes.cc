@@ -202,10 +202,11 @@ mx::array csqrt(const mx::array& z) {
                    mx::sqrt(z));
 }
 
-nb::dict dtype_codes() {
-  nb::dict d;
-  for (int i = 0; i < kNumDtypes; i++) d[kDtypes[i].name] = i;
-  return d;
+std::vector<std::pair<std::string, int>> dtype_codes() {
+  std::vector<std::pair<std::string, int>> v;
+  v.reserve(static_cast<size_t>(kNumDtypes));
+  for (int i = 0; i < kNumDtypes; i++) v.emplace_back(kDtypes[i].name, i);
+  return v;
 }
 
 }  // namespace metaljax

@@ -60,13 +60,13 @@ void Program::add(int op, std::vector<int> ins, std::vector<int> outs,
                   std::vector<int> drops,
                   std::vector<std::shared_ptr<Program>> regions, int64_t bytes,
                   std::vector<double> fattrs, std::shared_ptr<MslPlan> msl,
-                  nb::object host) {
+                  HostFn host) {
   for (int s : ins) check_slot(s);
   for (int s : outs) check_slot(s);
   for (int s : drops) check_slot(s);
   if ((op == kMslScan) != (msl != nullptr))
     throw std::invalid_argument("tape: msl plan without an msl entry");
-  if ((op == kHostCall) != (host.is_valid() && !host.is_none()))
+  if ((op == kHostCall) != static_cast<bool>(host))
     throw std::invalid_argument("tape: host callable without a host entry");
   ops_.push_back(Entry{op, std::move(ins), std::move(outs),
                        std::move(attrs), std::move(fattrs),
@@ -93,17 +93,17 @@ std::vector<mx::array> Program::run(std::vector<mx::array> inputs) {
     throw std::invalid_argument("tape: wrong number of inputs");
   std::vector<mx::array> outs;
   {
-    // Nothing below touches Python: MLX builds a lazy graph and the
-    // arrays are already C++ objects. The GIL comes back for the cast
-    // of the results, in nanobind's own code (and briefly, deliberately,
-    // in the recovery paths, which call the cycle collector).
-    nb::gil_scoped_release nogil;
     // Everything below builds on the CALLING thread's default MLX
     // stream, which engine.execute has already pointed at a
     // cross-thread-evaluable stream of this thread's own
     // (engine.bind_thread) — it is the one entry point a native run can
     // be reached through, so a threadbare caller is bound before it gets
     // here.
+    //
+    // An embedder that has an interpreter drops its lock before calling
+    // this (bindings.cc releases the GIL around it): nothing below needs
+    // one, and a waiter on `lock_` that held the GIL would deadlock
+    // against the recovery paths, which reacquire it through g_gc_hook.
     std::lock_guard<std::mutex> guard(lock_);
     t_msl_pending.clear();
     outs = run_recovering(inputs);
@@ -113,9 +113,9 @@ std::vector<mx::array> Program::run(std::vector<mx::array> inputs) {
         outs[i] = fresh_copy(outs[i]);
     }
     // XLA's no-alias contract, the half object identity cannot express
-    // across the language boundary: two outputs reading the SAME slot
-    // are one array, and nanobind hands each of them a fresh Python
-    // wrapper, so engine.execute's `seen_out` pass cannot see the
+    // across a language boundary: two outputs reading the SAME slot are
+    // one array, and nanobind hands each of them a fresh Python wrapper,
+    // so engine.execute's `seen_out` pass cannot see the
     // duplicate. (Input aliasing is a static property of the program and
     // is handled where it belongs — tape.py declines the shapes of
     // forwarding that would reach here.)
@@ -146,14 +146,6 @@ void Program::tally(std::map<int, int64_t>& counts) const {
     counts[e.op]++;
     for (const auto& r : e.regions) r->tally(counts);
   }
-}
-
-nb::dict Program::op_histogram() const {
-  std::map<int, int64_t> counts;
-  tally(counts);
-  nb::dict d;
-  for (const auto& kv : counts) d[nb::int_(kv.first)] = kv.second;
-  return d;
 }
 
 bool Program::reads_host() const {

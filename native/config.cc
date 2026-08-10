@@ -1,18 +1,18 @@
-// metaljax native engine — the Python-facing surface.
+// metaljax native engine — the registries and the cadences.
 //
-// Four things Python asks of the extension, and nothing a replay touches:
-// the opcode registry (an op name absent from it declines the WHOLE program,
-// which is why there is no second table anywhere), the runtime cadences
-// copied in from the modules that parse the environment, the counters, and
-// the nanobind registration that makes Program and MslPlan constructible.
+// Three things a tape builder asks of the engine, and nothing a replay
+// touches: the opcode registry (an op name absent from it declines the WHOLE
+// program, which is why there is no second table anywhere), the runtime
+// cadences copied in from the modules that parse the environment, and the
+// counters. bindings.cc is what puts a Python face on them.
 
 #include "program.h"
-#include "msl.h"
 
 namespace metaljax {
 
 Config g_cfg;
 Stats g_stats;
+std::function<void()> g_gc_hook;
 
 // StableHLO name -> opcode. Several names may share an opcode (chlo.erf is
 // stablehlo.erf's handler verbatim); the emulated-dtype regrid the Python
@@ -132,10 +132,11 @@ const NamedOp kOpNames[] = {
     {"stablehlo.after_all", kToken},
 };
 
-nb::dict opcodes() {
-  nb::dict d;
-  for (const NamedOp& n : kOpNames) d[n.name] = n.op;
-  return d;
+std::vector<std::pair<std::string, int>> opcodes() {
+  std::vector<std::pair<std::string, int>> v;
+  v.reserve(sizeof(kOpNames) / sizeof(kOpNames[0]));
+  for (const NamedOp& n : kOpNames) v.emplace_back(n.name, n.op);
+  return v;
 }
 
 // The runtime cadences, copied in from the Python modules that parse the
@@ -154,78 +155,4 @@ void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
   g_cfg.memdbg = memdbg;
 }
 
-nb::dict stats() {
-  nb::dict d;
-  d["flushes"] = g_stats.flushes;
-  d["cache_clears"] = g_stats.cache_clears;
-  d["loop_flushes"] = g_stats.loop_flushes;
-  d["loop_clears"] = g_stats.loop_clears;
-  d["limit_retries"] = g_stats.limit_retries;
-  d["compiled_calls"] = g_stats.compiled_calls;
-  d["compiles"] = g_stats.compiles;
-  d["compile_drops"] = g_stats.compile_drops;
-  d["chunk_drops"] = g_stats.chunk_drops;
-  d["unrolls"] = g_stats.unrolls;
-  d["pipelined_loops"] = g_stats.pipelined_loops;
-  d["pipelined_steps"] = g_stats.pipelined_steps;
-  d["serial_loops"] = g_stats.serial_loops;
-  d["msl_launches"] = g_stats.msl_launches;
-  d["msl_failures"] = g_stats.msl_failures;
-  d["host_calls"] = g_stats.host_calls;
-  return d;
-}
-
 }  // namespace metaljax
-
-// Outside the namespace: metaljax_native.cc declares this one function and
-// nothing else, so the extension's two halves share exactly one symbol.
-void register_tape(nb::module_& m) {
-  using namespace metaljax;  // the tape's own names, unqualified
-  m.def("opcodes", &opcodes,
-        "StableHLO op name -> opcode; a name absent here declines");
-  m.def("dtype_codes", &dtype_codes,
-        "MLIR element type -> dtype code; absent means unsupported");
-  m.def("configure", &configure, nb::arg("eager_flush_bytes"),
-        nb::arg("flush_sync_every"), nb::arg("flush_clear_bytes"),
-        nb::arg("loop_clear_cost"), nb::arg("while_pipeline"),
-        nb::arg("debug"), nb::arg("memdbg"),
-        "Copy the Python-side runtime cadences into the native engine");
-  m.def("stats", &stats, "Native-engine counters (sync points, compiles)");
-  // M5b: one generated persistent kernel's launch recipe. Built by
-  // metaljax.tape._lower_msl from an msl_scan Plan; `layout` is the
-  // Cursor-encoded rest of it (documented at MslPlan::parse).
-  nb::class_<MslPlan>(m, "MslPlan")
-      .def(nb::init<std::string, std::string, std::string,
-                    std::vector<std::string>, std::vector<std::string>,
-                    std::vector<std::vector<int>>, std::vector<int>,
-                    std::vector<int64_t>>(),
-           nb::arg("name"), nb::arg("source"), nb::arg("header"),
-           nb::arg("input_names"), nb::arg("output_names"),
-           nb::arg("out_shapes"), nb::arg("out_dtypes"), nb::arg("layout"))
-      .def_prop_ro("dead", &MslPlan::dead)
-      .def_prop_ro("validated", &MslPlan::validated)
-      .def_prop_ro("name", &MslPlan::name);
-  nb::class_<Program>(m, "Program")
-      .def(nb::init<int, int>(), nb::arg("num_slots"), nb::arg("num_args"))
-      .def("add", &Program::add, nb::arg("opcode"), nb::arg("operands"),
-           nb::arg("results"), nb::arg("attrs"),
-           nb::arg("payload").none(), nb::arg("drops"),
-           nb::arg("regions") = std::vector<std::shared_ptr<Program>>(),
-           nb::arg("bytes") = 0,
-           nb::arg("fattrs") = std::vector<double>(),
-           nb::arg("msl").none() = nb::none(),
-           nb::arg("host").none() = nb::none())
-      .def("set_outputs", &Program::set_outputs, nb::arg("slots"),
-           nb::arg("copies") = std::vector<int>())
-      .def("set_compile", &Program::set_compile, nb::arg("compile"),
-           nb::arg("anchors") = std::vector<int>(),
-           nb::arg("max_repeat") = 1)
-      .def("run", &Program::run, nb::arg("inputs"))
-      .def_prop_ro("compiled_dropped", &Program::compiled_dropped)
-      .def_prop_ro("num_ops", &Program::num_ops)
-      .def_prop_ro("num_slots", &Program::num_slots)
-      .def_prop_ro("num_args", &Program::num_args)
-      .def("op_histogram", &Program::op_histogram,
-           "opcode -> entry count, this program and its regions")
-      .def_prop_ro("max_live", &Program::max_live);
-}
