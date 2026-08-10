@@ -1,6 +1,7 @@
 # reference clones (not part of this repo)
 /jax/
 /llvm-project/
+/xla/
 
 .venv/
 __pycache__/
@@ -11,3 +12,6 @@ src/metaljax/lib/
 .DS_Store
 jax-v0.11.0/
 native/build/
+# bazel convenience symlinks for the native PJRT plugin workspace
+plugin-native/bazel-*
+plugin-native/.bazelrc.user

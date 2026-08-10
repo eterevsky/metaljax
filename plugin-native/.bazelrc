@@ -1,0 +1,41 @@
+# metaljax native PJRT plugin build configuration.
+#
+# Most of this is XLA's own configuration: we import xla/tensorflow.bazelrc
+# verbatim (absolute path, because %workspace% would resolve to *this*
+# workspace) and then re-add the handful of flags that live in xla/.bazelrc
+# itself plus the macOS toolchain selection that jax's .bazelrc contributes.
+
+# --- from xla/.bazelrc -------------------------------------------------------
+# XLA at this pin is still a WORKSPACE-mode build; Bazel 8 defaults the other
+# way, so both flags are required.
+common --noenable_bzlmod --enable_workspace
+
+# Turn off empty glob check (flipped in Bazel 8).
+common --incompatible_disallow_empty_glob=false
+
+# Enable legacy external runfiles (false in Bazel 8, breaks XLA targets).
+common --legacy_external_runfiles=true
+
+common --incompatible_enable_cc_toolchain_resolution
+common --repo_env USE_HERMETIC_CC_TOOLCHAIN=1
+
+# Non-hermetic (system clang) toolchain; the only thing that works on Darwin.
+common:clang_local --noincompatible_enable_cc_toolchain_resolution
+common:clang_local --@rules_ml_toolchain//common:enable_hermetic_cc=False
+common:clang_local --repo_env USE_HERMETIC_CC_TOOLCHAIN=0
+
+# --- XLA's shared TF configuration ------------------------------------------
+import /Users/oleg/metaljax/xla/tensorflow.bazelrc
+
+# --- macOS toolchain (from jax/.bazelrc) ------------------------------------
+# tensorflow.bazelrc sets --apple_crosstool_top etc. for :macos, but selecting
+# the local clang toolchain is jax's addition and is what makes an out-of-tree
+# Darwin build work.
+common:macos --config=clang_local
+
+# --- local conveniences ------------------------------------------------------
+build --disk_cache=~/.cache/metaljax-bazel
+build --verbose_failures
+common --announce_rc
+
+try-import %workspace%/.bazelrc.user
