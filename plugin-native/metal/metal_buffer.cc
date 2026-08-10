@@ -45,6 +45,7 @@ absl::StatusOr<mx::array> MetalBuffer::Settled() const {
     return absl::FailedPreconditionError("metaljax: buffer has been deleted.");
   }
   BindThread();
+  std::unique_lock<std::mutex> submission = SubmissionLock();
   // Settle the array ITSELF and build a `contiguous` only for a layout that
   // needs gathering.  Wrapping every result in a fresh `contiguous` node and
   // evaluating THAT costs a full round trip through the stream -- 20us,

@@ -11,6 +11,7 @@ Licensed under the Apache License, Version 2.0.
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,6 +29,7 @@ Licensed under the Apache License, Version 2.0.
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
 #include "metal/metal_dtypes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Block.h"
@@ -104,7 +106,25 @@ bool IsViewOp(absl::string_view name) {
   return name == "stablehlo.reshape" || name == "stablehlo.transpose" ||
          name == "stablehlo.convert" || name == "stablehlo.slice" ||
          name == "stablehlo.broadcast_in_dim" ||
-         name == "stablehlo.concatenate" || name == "stablehlo.dynamic_slice";
+         name == "stablehlo.concatenate" || name == "stablehlo.dynamic_slice" ||
+         name == "stablehlo.bitcast_convert";
+}
+
+// tape.py `_scatter_noop`: whether ops/gather.py `_scatter` hands the operand
+// straight back.  Empty updates apply nothing, and a zero-size operand drops
+// every update as out of bounds.  The result IS the operand array, so the
+// tape aliases the slot (and the taints ride along) rather than emitting an
+// entry that happens to compute nothing.
+bool IsScatterNoop(mlir::Operation* op) {
+  if (op->getNumOperands() != 3 || op->getNumResults() != 1) return false;
+  auto empty = [](mlir::Value v) {
+    auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+    if (!t) return false;
+    for (int64_t d : t.getShape())
+      if (d == 0) return true;
+    return false;
+  };
+  return empty(op->getOperand(2)) || empty(op->getOperand(0));
 }
 
 // The three ops that carry regions and become sub-Programs (tape.py
@@ -179,6 +199,16 @@ int64_t ValueBytes(mlir::Value v) {
 // executor decodes both.
 const bool kDumpTape = [] {
   const char* v = std::getenv("METALJAX_DUMP_TAPE");
+  return v != nullptr && std::string(v) == "1";
+}();
+
+// METALJAX_DUMP_MODULE=1 prints the module this plugin was HANDED, which is
+// not the module jax printed: XLA's own parse runs ahead of `CompileAndLoad`
+// and legalizes chlo, CSEs and hoists constants out of regions.  A tape diff
+// against the Stage 1 lowering is meaningless without it -- the two builders
+// would be walking different programs -- so the text is dumpable on its own.
+const bool kDumpModule = [] {
+  const char* v = std::getenv("METALJAX_DUMP_MODULE");
   return v != nullptr && std::string(v) == "1";
 }();
 
@@ -413,17 +443,113 @@ std::optional<Counted> AnalyzeCounted(LowerContext& ctx, mlir::Operation* op) {
   return result;
 }
 
+// ops/gather.py `_scatter_combiner`: which `.at[]` method the update
+// computation is, read structurally out of the region.  `kApply` is a body
+// that computes something else entirely (jax's scatter_apply); it is not in
+// this opcode's plan, but it IS what decides the cost of the op, so it is a
+// value here rather than an error.
+enum class Combiner { kSet, kAdd, kMultiply, kMaximum, kMinimum, kSubtract,
+                      kApply, kNonUpdate, kBad };
+
+// The tape's method code, in the order native/ops_index.cc switches on
+// (tape.py `_SCATTER_METHODS`).  Nothing else is a method.
+std::optional<int64_t> MethodCode(Combiner c) {
+  switch (c) {
+    case Combiner::kSet: return 0;
+    case Combiner::kAdd: return 1;
+    case Combiner::kMultiply: return 2;
+    case Combiner::kMaximum: return 3;
+    case Combiner::kMinimum: return 4;
+    case Combiner::kSubtract: return 5;
+    default: return std::nullopt;
+  }
+}
+
+Combiner ScatterCombiner(mlir::Operation* op) {
+  if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
+    return Combiner::kBad;
+  mlir::Block& block = op->getRegion(0).front();
+  std::vector<mlir::Operation*> body;
+  for (mlir::Operation& o : block) body.push_back(&o);
+  const std::vector<mlir::Value> args(block.getArguments().begin(),
+                                      block.getArguments().end());
+  auto is_return = [](mlir::Operation* o) {
+    return o->getName().getStringRef() == "stablehlo.return";
+  };
+  if (body.size() == 1 && is_return(body[0])) {
+    // `return %update`: an assignment.  Returning anything else (the OPERAND,
+    // say) is a body this opcode cannot express.
+    if (body[0]->getNumOperands() == 1 && args.size() == 2 &&
+        body[0]->getOperand(0) == args[1])
+      return Combiner::kSet;
+    return Combiner::kNonUpdate;
+  }
+  if (body.size() == 2 && is_return(body[1])) {
+    const absl::string_view n = View(body[0]->getName().getStringRef());
+    Combiner c = Combiner::kBad;
+    if (n == "stablehlo.add") c = Combiner::kAdd;
+    else if (n == "stablehlo.multiply") c = Combiner::kMultiply;
+    else if (n == "stablehlo.maximum") c = Combiner::kMaximum;
+    else if (n == "stablehlo.minimum") c = Combiner::kMinimum;
+    else if (n == "stablehlo.subtract") c = Combiner::kSubtract;
+    // A genuine combiner takes BOTH block arguments: an f(operand)-style body
+    // (scatter_apply's) must not be mistaken for one, and subtract is
+    // order-sensitive where the rest are commutative.
+    if (c != Combiner::kBad && args.size() == 2 &&
+        body[0]->getNumOperands() == 2) {
+      const mlir::Value x = body[0]->getOperand(0), y = body[0]->getOperand(1);
+      if (c == Combiner::kSubtract) {
+        if (x == args[0] && y == args[1]) return c;
+      } else if ((x == args[0] && y == args[1]) ||
+                 (x == args[1] && y == args[0])) {
+        return c;
+      }
+    }
+  }
+  // Anything else built out of stablehlo/chlo ops is jax's scatter_apply.
+  for (mlir::Operation* o : body) {
+    const llvm::StringRef n = o->getName().getStringRef();
+    if (!n.starts_with("stablehlo.") && !n.starts_with("chlo."))
+      return Combiner::kBad;
+  }
+  return Combiner::kApply;
+}
+
+int64_t BlockCost(LowerContext& ctx, mlir::Block& block);
+
+// ops/control.py `_scatter_cost`: a computed body with possibly-duplicate
+// indices is replayed once per update (the sequential apply path in
+// ops/gather.py), so charge the whole expansion rather than a single body.
+// Never fails -- every uncertain answer falls back to one body, which is what
+// the Python function's bare `except` does.
+int64_t ScatterCost(LowerContext& ctx, mlir::Operation* op) {
+  int64_t body = 0;
+  for (mlir::Region& r : op->getRegions())
+    for (mlir::Block& b : r.getBlocks()) body += BlockCost(ctx, b);
+  auto unique = op->getAttrOfType<mlir::BoolAttr>("unique_indices");
+  if (unique && unique.getValue()) return body;
+  if (ScatterCombiner(op) != Combiner::kApply) return body;
+  if (op->getNumOperands() < 2) return body;
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(1).getType());
+  auto dn = op->getAttrOfType<mlir::stablehlo::ScatterDimensionNumbersAttr>(
+      "scatter_dimension_numbers");
+  if (!t || !dn) return body;
+  const int64_t ivd = dn.getIndexVectorDim();
+  int64_t n = 1;
+  for (int64_t i = 0; i < t.getRank(); i++) {
+    if (i == ivd) continue;
+    if (t.getShape()[i] < 0) return body;
+    n *= t.getShape()[i];
+  }
+  return std::max<int64_t>(n, 1) * body;
+}
+
 // ops/control.py `_block_cost`: the approximate op count of this block when
 // it is TRACED, loops unrolled.  It sizes the loop's flush period, so it is
 // a cadence number and a wrong one is a memory-pressure question rather than
 // a wrong answer -- but an UNDER-count is what once compiled a whole 256-step
 // chunk into one trace and exhausted the buffer pool, so callees are recursed
 // into and an unknown trip count is charged pessimistically.
-//
-// One deliberate omission from the Python: `_scatter_cost`'s apply-body
-// expansion.  Nothing containing a scatter lowers in this plugin yet, so the
-// generic region walk below is reached instead; when scatter lands, so does
-// that arm.
 int64_t BlockCost(LowerContext& ctx, mlir::Block& block) {
   auto cached = ctx.cost.find(&block);
   if (cached != ctx.cost.end()) return cached->second;
@@ -444,6 +570,8 @@ int64_t BlockCost(LowerContext& ctx, mlir::Block& block) {
       }
       if (o.getNumRegions() >= 2 && !o.getRegion(1).empty())
         cost += trip * BlockCost(ctx, o.getRegion(1).front());
+    } else if (n == "stablehlo.scatter") {
+      cost += ScatterCost(ctx, &o);
     } else if (n == "func.call" || n == "stablehlo.composite") {
       auto sym = o.getAttrOfType<mlir::FlatSymbolRefAttr>(
           n == "func.call" ? "callee" : "decomposition");
@@ -592,8 +720,17 @@ class Lowering {
   absl::StatusOr<std::vector<int64_t>> LowerDynamicSlice(mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerDynamicUpdateSlice(
       mlir::Operation* op);
+  absl::StatusOr<std::vector<int64_t>> LowerShift(mlir::Operation* op);
+  absl::StatusOr<std::vector<int64_t>> LowerBitcastConvert(
+      mlir::Operation* op);
+  absl::StatusOr<std::vector<int64_t>> LowerReverse(mlir::Operation* op);
+  absl::StatusOr<std::vector<int64_t>> LowerPopcnt(mlir::Operation* op);
+  absl::StatusOr<std::vector<int64_t>> LowerGather(mlir::Operation* op);
   absl::Status LowerConstant(mlir::Operation* op);
   absl::Status LowerReduce(mlir::Operation* op);
+  // Scatter emits itself: its drop strategy may carry a neutral VALUE, which
+  // is a payload rather than an attribute (tape.py returns one too).
+  absl::Status LowerScatter(mlir::Operation* op);
 
   // Whether MLX may hand this op's operand array back as its result (an
   // exact no-op).  tape.py's `_is_identity`, on the ops this phase lowers.
@@ -1113,6 +1250,582 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDynamicUpdateSlice(
   return attrs;
 }
 
+// The tape's dtype code for an element-type NAME.  The dtype table is the
+// runtime's, keyed by the names src/metaljax/tape.py gates on, so a handler
+// that needs the code of a type no VALUE has (popcnt's unsigned twin) asks
+// for it the same way tape.py's `_dtype_code` does.
+std::optional<int> CodeForName(absl::string_view name) {
+  static const auto* codes = [] {
+    auto* m = new absl::flat_hash_map<std::string, int>();
+    for (const std::pair<std::string, int>& kv : dtype_codes()) m->emplace(kv);
+    return m;
+  }();
+  auto it = codes->find(std::string(name));
+  if (it == codes->end()) return std::nullopt;
+  return it->second;
+}
+
+// ops/elementwise.py `_static_splat_int`: the value of an integer SSA value
+// that is statically a splat constant, possibly broadcast or reshaped to the
+// operand's shape.  A shift amount almost always is one, and knowing it lets
+// the guard emit one arm instead of a compare and a select.
+std::optional<int64_t> StaticSplatInt(mlir::Value v) {
+  while (mlir::Operation* def = v.getDefiningOp()) {
+    const llvm::StringRef n = def->getName().getStringRef();
+    if (n == "stablehlo.broadcast_in_dim" || n == "stablehlo.reshape" ||
+        n == "stablehlo.broadcast") {
+      if (def->getNumOperands() < 1) return std::nullopt;
+      v = def->getOperand(0);
+      continue;
+    }
+    auto cst = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(def);
+    if (!cst) return std::nullopt;
+    auto t = mlir::dyn_cast<mlir::RankedTensorType>(def->getResult(0).getType());
+    if (!t) return std::nullopt;
+    std::optional<mx::Dtype> dt = MxDtypeOf(t.getElementType());
+    if (!dt.has_value() || !is_int(*dt)) return std::nullopt;
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+    // A splat's value, or a rank-0 constant's: a real multi-valued constant
+    // has no single amount, which is the Python's `return None` there.
+    if (!dense || dense.getNumElements() < 1) return std::nullopt;
+    if (!dense.isSplat() && t.getRank() != 0) return std::nullopt;
+    auto it = mlir::dyn_cast<mlir::IntegerType>(t.getElementType());
+    if (!it || it.getWidth() > 64) return std::nullopt;
+    const llvm::APInt a = *dense.getValues<llvm::APInt>().begin();
+    if (it.isUnsigned()) return static_cast<int64_t>(a.getZExtValue());
+    return a.getSExtValue();
+  }
+  return std::nullopt;
+}
+
+// tape.py `_lower_shift`.  XLA defines a shift by >= the operand's bit width
+// as 0 (logical/left) or the sign fill (arithmetic); Metal's shifts are
+// mod-width.  Whether the amount is a compile-time splat is a pure IR
+// question, answered once here; which side of the width it falls on stays in
+// C++, where the operand's byte width is known.
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerShift(
+    mlir::Operation* op) {
+  if (op->getNumOperands() != 2) return Decline("a shift without an amount");
+  std::optional<int64_t> c = StaticSplatInt(op->getOperand(1));
+  if (c.has_value() && *c >= 0) return std::vector<int64_t>{1, *c};
+  return std::vector<int64_t>{0, 0};
+}
+
+// tape.py `_lower_bitcast_convert`, the byte-multiple arm.  Which arm runs is
+// a static property of the two element widths, and the other arm -- the
+// 4-bit one -- cannot be reached: i4/ui4 have no dtype code, so a program
+// holding one declines on its element type long before this.
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerBitcastConvert(
+    mlir::Operation* op) {
+  ASSIGN_OR_RETURN(int code, DtypeCode(op->getResult(0)));
+  auto src_t =
+      mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType());
+  auto dst_t =
+      mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+  if (!src_t || !dst_t) return Decline("bitcast_convert on a non-tensor");
+  std::optional<mx::Dtype> src = MxDtypeOf(src_t.getElementType());
+  std::optional<mx::Dtype> dst = MxDtypeOf(dst_t.getElementType());
+  if (!src.has_value() || !dst.has_value())
+    return Decline("bitcast_convert element type");
+  int64_t kind = 0;
+  if (dst->size() < src->size()) kind = 1;
+  else if (dst->size() > src->size()) kind = 2;
+  return std::vector<int64_t>{code, kind};
+}
+
+// tape.py `_lower_reverse`: one descending take per reversed dim.  A dim of
+// extent 0 or 1 is skipped (mx::take chokes on empties), and both the dims
+// and their extents are static.
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerReverse(
+    mlir::Operation* op) {
+  auto rev = mlir::dyn_cast<mlir::stablehlo::ReverseOp>(op);
+  if (!rev) return Decline("stablehlo.reverse in an unexpected form");
+  ASSIGN_OR_RETURN(std::vector<int64_t> shape, Dims(op->getOperand(0)));
+  std::vector<int64_t> attrs{0};
+  int64_t n = 0;
+  for (int64_t d : rev.getDimensions()) {
+    if (d < 0 || d >= static_cast<int64_t>(shape.size()))
+      return Decline("reverse dimension out of range");
+    if (shape[static_cast<size_t>(d)] <= 1) continue;
+    attrs.push_back(d);
+    attrs.push_back(shape[static_cast<size_t>(d)]);
+    n++;
+  }
+  attrs[0] = n;
+  return attrs;
+}
+
+// tape.py `_lower_popcnt`: ops/elementwise's `_as_unsigned` then SWAR, whose
+// width is the operand's.  Both choices are dtype questions the element type
+// answers statically, so the tape carries the answers and the C++ handler
+// carries the arithmetic.
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerPopcnt(
+    mlir::Operation* op) {
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType());
+  if (!t) return Decline("popcnt on a non-tensor");
+  std::optional<std::string> el = TapeElementName(t.getElementType());
+  if (!el.has_value()) return Decline("popcnt element type");
+  ASSIGN_OR_RETURN(int code, DtypeCode(op->getOperand(0)));
+  std::string unsigned_name = *el;
+  if (*el == "i8") unsigned_name = "ui8";
+  else if (*el == "i16") unsigned_name = "ui16";
+  else if (*el == "i32") unsigned_name = "ui32";
+  else if (*el == "i64") unsigned_name = "ui64";
+  else if (*el == "i1") unsigned_name = "ui8";
+  if (unsigned_name.rfind("ui", 0) != 0)
+    return Decline(absl::StrCat("popcnt/clz on ", *el));
+  std::optional<int> ucode = CodeForName(unsigned_name);
+  if (!ucode.has_value()) return Decline("popcnt unsigned dtype");
+  // `_as_unsigned` VIEWS a signed operand (same bits) but CASTS a bool.
+  const int64_t view = *el == "i1" ? 0 : (*el != unsigned_name ? 1 : 2);
+  const bool wide = unsigned_name == "ui64";
+  int64_t bits = 32;
+  if (unsigned_name == "ui8") bits = 8;
+  else if (unsigned_name == "ui16") bits = 16;
+  else if (unsigned_name == "ui64") bits = 64;
+  // A bool widens to uint8, and the handler counts over mx::bool_'s byte.
+  if (*el == "i1") bits = 8;
+  return std::vector<int64_t>{*ucode, view, wide ? 1 : 0, bits, code};
+}
+
+// --------------------------------------------------------------------------
+// gather / scatter (src/metaljax/tape.py `_index_plan` / `_lower_gather` /
+// `_lower_scatter`)
+// --------------------------------------------------------------------------
+//
+// Both StableHLO ops carry the same two index sources: the COMPONENTS of the
+// start-index vector (one per mapped operand dim, clamped so the whole window
+// fits -- XLA's rule, and MLX's own primitives clamp nothing: gather wraps a
+// negative index like `take` and reads past the end otherwise, and scatter
+// does no bounds checking at all, which for a write is memory corruption
+// rather than a wrong number) and the implicit BATCHING coordinates, an iota
+// along the index dim paired with the operand dim.
+
+struct IndexEntry {
+  int64_t kind;   // 0 index-vector component, 1 batching iota, 2 constant zero
+  int64_t a;      // component number, or the iota's length
+  int64_t b;      // clamp bound, or the iota's batch position
+  int64_t axis;   // the operand dim this index array is keyed to
+};
+
+struct IndexPlan {
+  std::vector<IndexEntry> entries;
+  std::vector<int64_t> batch_shape;
+  bool split = false;
+  int64_t ivd = 0;
+};
+
+absl::StatusOr<IndexPlan> BuildIndexPlan(
+    int64_t ivd, const std::vector<int64_t>& op_batching,
+    const std::vector<int64_t>& idx_batching,
+    const std::vector<int64_t>& idx_shape,
+    const std::vector<int64_t>& op_shape, const std::vector<int64_t>& sizes,
+    const std::vector<int64_t>& smap, absl::string_view name) {
+  const int64_t idx_rank = static_cast<int64_t>(idx_shape.size());
+  // Python reaches a negative index_vector_dim through numpy-style negative
+  // indexing rather than declining; StableHLO's verifier forbids one, and
+  // guessing which end it meant is exactly the kind of thing that becomes a
+  // wrong answer, so it is refused here.
+  if (ivd < 0 || ivd > idx_rank)
+    return Decline(absl::StrCat(name, " index_vector_dim out of range"));
+
+  IndexPlan plan;
+  plan.ivd = ivd;
+  std::vector<int64_t> batch_dims_idx;
+  for (int64_t i = 0; i < idx_rank; i++) {
+    if (i == ivd) continue;
+    batch_dims_idx.push_back(i);
+    plan.batch_shape.push_back(idx_shape[static_cast<size_t>(i)]);
+  }
+  // index_vector_dim == rank means the whole array IS one component, which is
+  // the shape ops/gather.py's `index_arrays` builds too.
+  plan.split = ivd != idx_rank;
+  const int64_t k = plan.split ? idx_shape[static_cast<size_t>(ivd)] : 1;
+  if (static_cast<int64_t>(smap.size()) != k)
+    return Decline(absl::StrCat(name, " index map does not match the index "
+                                      "vector"));
+
+  const int64_t op_rank = static_cast<int64_t>(op_shape.size());
+  for (size_t j = 0; j < smap.size(); j++) {
+    const int64_t dim = smap[j];
+    if (dim < 0 || dim >= op_rank)
+      return Decline(absl::StrCat(name, " index map dim out of range"));
+    const int64_t bound = std::max<int64_t>(
+        op_shape[static_cast<size_t>(dim)] - sizes[static_cast<size_t>(dim)],
+        0);
+    plan.entries.push_back(
+        IndexEntry{0, static_cast<int64_t>(j), bound, dim});
+  }
+  // `zip` stops at the shorter list, and so does this.
+  const size_t nb = std::min(op_batching.size(), idx_batching.size());
+  for (size_t i = 0; i < nb; i++) {
+    const int64_t op_dim = op_batching[i], i_dim = idx_batching[i];
+    int64_t pos = -1;
+    for (size_t p = 0; p < batch_dims_idx.size(); p++)
+      if (batch_dims_idx[p] == i_dim) pos = static_cast<int64_t>(p);
+    if (pos < 0 || op_dim < 0 || op_dim >= op_rank)
+      return Decline(absl::StrCat(name, " batching dims out of range"));
+    plan.entries.push_back(
+        IndexEntry{1, idx_shape[static_cast<size_t>(i_dim)], pos, op_dim});
+  }
+  absl::flat_hash_set<int64_t> axes;
+  for (const IndexEntry& e : plan.entries) {
+    if (!axes.insert(e.axis).second)
+      return Decline(absl::StrCat(name, " indexes an operand dim twice"));
+  }
+  if (plan.entries.empty()) {
+    // An op that maps NO index component and carries no batching dim: every
+    // start index is 0, so the whole thing is a static read (or write) at the
+    // origin.  Both primitives want at least one index array, so synthesize
+    // the constant zero -- its clamp bound is 0, so there is nothing it could
+    // ever be out of.
+    if (op_shape.empty())
+      return Decline(absl::StrCat(name, " on a rank-0 operand with no "
+                                        "indices"));
+    plan.entries.push_back(IndexEntry{2, 0, 0, 0});
+  }
+  return plan;
+}
+
+// tape.py `_index_attrs`: n, then n (kind, a, b, axis) quads.
+void AppendIndexAttrs(const IndexPlan& plan, std::vector<int64_t>* out) {
+  out->push_back(static_cast<int64_t>(plan.entries.size()));
+  for (const IndexEntry& e : plan.entries) {
+    out->push_back(e.kind);
+    out->push_back(e.a);
+    out->push_back(e.b);
+    out->push_back(e.axis);
+  }
+}
+
+// tape.py `_lower_gather`, as ONE mx::gather.  StableHLO's gather IS MLX's,
+// modulo three static rearrangements: the coordinate vector is split into one
+// index array per mapped operand dim (all of the index batch shape, which
+// makes MLX's broadcast rule a no-op); `slice_sizes` crosses verbatim, since
+// MLX starts an unindexed axis at 0 and an indexed one at its index --
+// exactly XLA's rule, windows on indexed dims included; and the result is
+// reshaped past the collapsed (extent-1) dims, then transposed into the
+// offset_dims interleaving.
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerGather(
+    mlir::Operation* op) {
+  auto ga = mlir::dyn_cast<mlir::stablehlo::GatherOp>(op);
+  if (!ga) return Decline("stablehlo.gather in an unexpected form");
+  mlir::stablehlo::GatherDimensionNumbersAttr d = ga.getDimensionNumbers();
+  std::vector<int64_t> slice_sizes(ga.getSliceSizes().begin(),
+                                   ga.getSliceSizes().end());
+  ASSIGN_OR_RETURN(std::vector<int64_t> op_shape, Dims(op->getOperand(0)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> idx_shape, Dims(op->getOperand(1)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> out_shape, Dims(op->getResult(0)));
+  ASSIGN_OR_RETURN(int out_dt, DtypeCode(op->getResult(0)));
+  if (slice_sizes.size() != op_shape.size())
+    return Decline("gather slice_sizes rank mismatch");
+
+  const int64_t out_rank = static_cast<int64_t>(out_shape.size());
+  for (int64_t s : out_shape) {
+    if (s == 0) {
+      // The Python handler's short-circuit: nothing to gather, and the
+      // decomposition mis-shapes empty batches.  The attrs stop here.
+      std::vector<int64_t> attrs{1, out_dt, out_rank};
+      attrs.insert(attrs.end(), out_shape.begin(), out_shape.end());
+      return attrs;
+    }
+  }
+  for (size_t i = 0; i < slice_sizes.size(); i++) {
+    if (slice_sizes[i] < 0 || slice_sizes[i] > op_shape[i])
+      return Decline("gather slice does not fit the operand");
+  }
+
+  std::vector<int64_t> op_batching(d.getOperandBatchingDims().begin(),
+                                   d.getOperandBatchingDims().end());
+  std::vector<int64_t> idx_batching(d.getStartIndicesBatchingDims().begin(),
+                                    d.getStartIndicesBatchingDims().end());
+  std::vector<int64_t> smap(d.getStartIndexMap().begin(),
+                            d.getStartIndexMap().end());
+  ASSIGN_OR_RETURN(
+      IndexPlan plan,
+      BuildIndexPlan(d.getIndexVectorDim(), op_batching, idx_batching,
+                     idx_shape, op_shape, slice_sizes, smap, "gather"));
+
+  absl::flat_hash_set<int64_t> collapsed(d.getCollapsedSliceDims().begin(),
+                                         d.getCollapsedSliceDims().end());
+  collapsed.insert(op_batching.begin(), op_batching.end());
+  for (int64_t i : collapsed) {
+    if (i < 0 || i >= static_cast<int64_t>(op_shape.size()) ||
+        slice_sizes[static_cast<size_t>(i)] != 1)
+      return Decline("gather collapses a dim whose slice is not 1");
+  }
+  std::vector<int64_t> mid = plan.batch_shape;
+  int64_t nuncollapsed = 0;
+  for (size_t i = 0; i < op_shape.size(); i++) {
+    if (collapsed.contains(static_cast<int64_t>(i))) continue;
+    mid.push_back(slice_sizes[i]);
+    nuncollapsed++;
+  }
+
+  std::vector<int64_t> offset_dims(d.getOffsetDims().begin(),
+                                   d.getOffsetDims().end());
+  absl::flat_hash_set<int64_t> offset_set(offset_dims.begin(),
+                                          offset_dims.end());
+  std::vector<int64_t> out_batch;
+  for (int64_t i = 0; i < out_rank; i++)
+    if (!offset_set.contains(i)) out_batch.push_back(i);
+  if (out_batch.size() != plan.batch_shape.size() ||
+      static_cast<int64_t>(offset_dims.size()) != nuncollapsed)
+    return Decline("gather output rank does not match its dimension numbers");
+  for (int64_t i : offset_dims) {
+    if (i < 0 || i >= out_rank)
+      return Decline("gather output rank does not match its dimension "
+                     "numbers");
+  }
+  std::vector<int64_t> perm(static_cast<size_t>(out_rank), 0);
+  for (size_t cur = 0; cur < out_batch.size(); cur++)
+    perm[static_cast<size_t>(out_batch[cur])] = static_cast<int64_t>(cur);
+  for (size_t cur = 0; cur < offset_dims.size(); cur++)
+    perm[static_cast<size_t>(offset_dims[cur])] =
+        static_cast<int64_t>(plan.batch_shape.size() + cur);
+  // What the rearrangement lands on must be what the IR declares.  Free here,
+  // and it turns any future disagreement about a dimension-numbers corner
+  // into a decline rather than a wrong answer.
+  for (int64_t i = 0; i < out_rank; i++) {
+    const int64_t p = perm[static_cast<size_t>(i)];
+    // The size checks above make an out-of-range `p` unreachable; Python
+    // would raise IndexError here and decline, and a C++ read past the end
+    // would be undefined, so it is spelled out.
+    if (p < 0 || p >= static_cast<int64_t>(mid.size()) ||
+        mid[static_cast<size_t>(p)] != out_shape[static_cast<size_t>(i)])
+      return Decline("gather result shape does not follow from its dims");
+  }
+
+  std::vector<int64_t> attrs{0, out_dt, out_rank};
+  attrs.insert(attrs.end(), out_shape.begin(), out_shape.end());
+  attrs.push_back(static_cast<int64_t>(plan.batch_shape.size()));
+  attrs.insert(attrs.end(), plan.batch_shape.begin(), plan.batch_shape.end());
+  attrs.push_back(plan.split ? 1 : 0);
+  attrs.push_back(plan.ivd);
+  attrs.push_back(static_cast<int64_t>(slice_sizes.size()));
+  attrs.insert(attrs.end(), slice_sizes.begin(), slice_sizes.end());
+  AppendIndexAttrs(plan, &attrs);
+  attrs.push_back(static_cast<int64_t>(mid.size()));
+  attrs.insert(attrs.end(), mid.begin(), mid.end());
+  attrs.push_back(static_cast<int64_t>(perm.size()));
+  attrs.insert(attrs.end(), perm.begin(), perm.end());
+  return attrs;
+}
+
+// ops/gather.py `_combiner_neutral`: the update value that makes the combiner
+// a no-op, for the drop strategy that neutralizes rather than redirects.  The
+// payload has to be the same BITS the Python engine's is -- adding a neutral
+// 0 and not adding it disagree at -0.0 -- so the integer extremes are built
+// from the C++ types rather than through a double.
+std::optional<mx::array> CombinerNeutral(int64_t method, mx::Dtype dt) {
+  if (method == 1 || method == 5) return mx::array(0, dt);   // add / subtract
+  if (method == 2) return mx::array(1, dt);                  // multiply
+  if (method != 3 && method != 4) return std::nullopt;
+  const bool least = method == 3;              // maximum's identity is lowest
+  if (dt == mx::bool_) return mx::array(!least);
+  if (is_float(dt)) {
+    const float inf = std::numeric_limits<float>::infinity();
+    return mx::array(least ? -inf : inf, dt);
+  }
+  auto pick = [least](auto lo, auto hi, mx::Dtype d) {
+    return least ? mx::array(lo, d) : mx::array(hi, d);
+  };
+  if (dt == mx::int8)
+    return pick(std::numeric_limits<int8_t>::min(),
+                std::numeric_limits<int8_t>::max(), dt);
+  if (dt == mx::int16)
+    return pick(std::numeric_limits<int16_t>::min(),
+                std::numeric_limits<int16_t>::max(), dt);
+  if (dt == mx::int32)
+    return pick(std::numeric_limits<int32_t>::min(),
+                std::numeric_limits<int32_t>::max(), dt);
+  if (dt == mx::int64)
+    return pick(std::numeric_limits<int64_t>::min(),
+                std::numeric_limits<int64_t>::max(), dt);
+  if (dt == mx::uint8)
+    return pick(std::numeric_limits<uint8_t>::min(),
+                std::numeric_limits<uint8_t>::max(), dt);
+  if (dt == mx::uint16)
+    return pick(std::numeric_limits<uint16_t>::min(),
+                std::numeric_limits<uint16_t>::max(), dt);
+  if (dt == mx::uint32)
+    return pick(std::numeric_limits<uint32_t>::min(),
+                std::numeric_limits<uint32_t>::max(), dt);
+  if (dt == mx::uint64)
+    return pick(std::numeric_limits<uint64_t>::min(),
+                std::numeric_limits<uint64_t>::max(), dt);
+  return std::nullopt;
+}
+
+// tape.py `_lower_scatter`, as one mx::scatter/_add/_prod/_max/_min.  The
+// combiner picks the primitive; everything else is index and update
+// preprocessing, resolved here:
+//
+//  * the start vector splits into one clamped index array per mapped operand
+//    dim, plus an iota per batching dim (`BuildIndexPlan`);
+//  * the updates are transposed into [index batch dims, window dims in
+//    OPERAND order] and reshaped to insert an extent-1 axis for every
+//    inserted window dim -- MLX wants `updates.ndim == indices.ndim +
+//    operand.ndim`, and its update slice starts at the index on an indexed
+//    axis and at 0 elsewhere, which is XLA's window rule for the windowed
+//    dims and for the partial windows on free dims alike;
+//  * XLA's OOB-DROP semantics, of which MLX has none, through the same two
+//    strategies ops/gather.py picks between, chosen from the same static
+//    sizes so the two engines cannot pick differently.
+absl::Status Lowering::LowerScatter(mlir::Operation* op) {
+  if (op->getNumOperands() != 3 || op->getNumResults() != 1)
+    return Decline("variadic scatter");
+  if (IsComplexElement(op->getOperand(0))) {
+    // MLX has no complex GPU scatter kernels at all: the Python handler
+    // scatters the two parts separately and recombines them, which is a
+    // different composition from the single primitive this entry calls.
+    return Decline("scatter on complex");
+  }
+  ASSIGN_OR_RETURN(std::vector<int64_t> op_shape, Dims(op->getOperand(0)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> idx_shape, Dims(op->getOperand(1)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> upd_shape, Dims(op->getOperand(2)));
+  auto sc = mlir::dyn_cast<mlir::stablehlo::ScatterOp>(op);
+  if (!sc) return Decline("stablehlo.scatter in an unexpected form");
+  mlir::stablehlo::ScatterDimensionNumbersAttr d =
+      sc.getScatterDimensionNumbers();
+
+  const Combiner combiner = ScatterCombiner(op);
+  std::optional<int64_t> method = MethodCode(combiner);
+  if (!method.has_value()) {
+    if (combiner == Combiner::kApply) return Decline("scatter combiner apply");
+    if (combiner == Combiner::kNonUpdate)
+      return Decline("scatter body: scatter body returns non-update value");
+    return Decline("scatter body: not implemented");
+  }
+
+  absl::flat_hash_set<int64_t> inserted(d.getInsertedWindowDims().begin(),
+                                        d.getInsertedWindowDims().end());
+  std::vector<int64_t> op_batching(d.getInputBatchingDims().begin(),
+                                   d.getInputBatchingDims().end());
+  inserted.insert(op_batching.begin(), op_batching.end());
+  std::vector<int64_t> uwd(d.getUpdateWindowDims().begin(),
+                           d.getUpdateWindowDims().end());
+  std::vector<int64_t> window_dims;
+  for (size_t i = 0; i < op_shape.size(); i++)
+    if (!inserted.contains(static_cast<int64_t>(i)))
+      window_dims.push_back(static_cast<int64_t>(i));
+  if (uwd.size() != window_dims.size())
+    return Decline("scatter window rank mismatch");
+  for (int64_t w : uwd) {
+    if (w < 0 || w >= static_cast<int64_t>(upd_shape.size()))
+      return Decline("scatter update_window_dims out of range");
+  }
+  absl::flat_hash_map<int64_t, int64_t> uwd_of;   // operand dim -> update axis
+  for (size_t i = 0; i < window_dims.size(); i++) uwd_of[window_dims[i]] = uwd[i];
+
+  // The update slice, per operand dim: an inserted window dim has an implicit
+  // extent of 1, every other dim takes its update axis.
+  std::vector<int64_t> sshape;
+  for (size_t i = 0; i < op_shape.size(); i++) {
+    const int64_t dim = static_cast<int64_t>(i);
+    sshape.push_back(inserted.contains(dim)
+                         ? 1
+                         : upd_shape[static_cast<size_t>(uwd_of[dim])]);
+    if (sshape.back() <= 0 || sshape.back() > op_shape[i])
+      return Decline("scatter window does not fit the operand");
+  }
+
+  std::vector<int64_t> idx_batching(d.getScatterIndicesBatchingDims().begin(),
+                                    d.getScatterIndicesBatchingDims().end());
+  std::vector<int64_t> smap(d.getScatterDimsToOperandDims().begin(),
+                            d.getScatterDimsToOperandDims().end());
+  ASSIGN_OR_RETURN(
+      IndexPlan plan,
+      BuildIndexPlan(d.getIndexVectorDim(), op_batching, idx_batching,
+                     idx_shape, op_shape, sshape, smap, "scatter"));
+
+  absl::flat_hash_set<int64_t> uwd_set(uwd.begin(), uwd.end());
+  std::vector<int64_t> uperm;
+  for (size_t i = 0; i < upd_shape.size(); i++)
+    if (!uwd_set.contains(static_cast<int64_t>(i)))
+      uperm.push_back(static_cast<int64_t>(i));
+  for (int64_t dim : window_dims) uperm.push_back(uwd_of[dim]);
+  {
+    std::vector<int64_t> got, want = plan.batch_shape;
+    for (int64_t p : uperm) got.push_back(upd_shape[static_cast<size_t>(p)]);
+    for (int64_t dim : window_dims)
+      want.push_back(sshape[static_cast<size_t>(dim)]);
+    if (got != want)
+      return Decline("scatter updates do not match its dimension numbers");
+  }
+  std::vector<int64_t> ushape = plan.batch_shape;
+  ushape.insert(ushape.end(), sshape.begin(), sshape.end());
+
+  // XLA drops an update whose start is out of bounds in ANY component, and
+  // only the mapped components can be (a batching iota never is).
+  std::optional<mx::array> payload;
+  int64_t strategy = 0;
+  std::vector<int64_t> extra;
+  if (!smap.empty()) {
+    int64_t op_numel = 1, upd_numel = 1;
+    for (int64_t s : op_shape) op_numel *= s;
+    for (int64_t s : upd_shape) upd_numel *= s;
+    if (combiner == Combiner::kSet || op_numel < upd_numel) {
+      strategy = 2;
+      // Pad the LOWEST indexed axis, which is the one the Python handler pads
+      // (it transposes that dim to the front and concatenates there).  Any of
+      // them would do; agreeing keeps the two engines' allocation shapes
+      // comparable.
+      size_t pos = 0;
+      for (size_t i = 1; i < plan.entries.size(); i++)
+        if (plan.entries[i].axis < plan.entries[pos].axis) pos = i;
+      const int64_t axis = plan.entries[pos].axis;
+      extra = {static_cast<int64_t>(pos), sshape[static_cast<size_t>(axis)],
+               op_shape[static_cast<size_t>(axis)]};
+    } else {
+      strategy = 1;
+      auto t =
+          mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType());
+      std::optional<mx::Dtype> dt =
+          t ? MxDtypeOf(t.getElementType()) : std::nullopt;
+      if (!dt.has_value()) return Decline("scatter neutral: element type");
+      payload = CombinerNeutral(*method, *dt);
+      if (!payload.has_value())
+        return Decline("scatter neutral: no neutral for this combiner");
+      // The mask broadcasts against the updates: one axis per batch dim, then
+      // an extent-1 axis per operand dim.
+      extra.push_back(static_cast<int64_t>(plan.batch_shape.size() +
+                                           op_shape.size()));
+      extra.insert(extra.end(), plan.batch_shape.begin(),
+                   plan.batch_shape.end());
+      extra.insert(extra.end(), op_shape.size(), 1);
+    }
+  }
+
+  // `strategy` rides second, ahead of everything variable-length, so a reader
+  // (the C++ handler, a test) can see which drop rule this scatter took
+  // without walking the whole vector.
+  std::vector<int64_t> attrs{*method, strategy,
+                             static_cast<int64_t>(plan.batch_shape.size())};
+  attrs.insert(attrs.end(), plan.batch_shape.begin(), plan.batch_shape.end());
+  attrs.push_back(plan.split ? 1 : 0);
+  attrs.push_back(plan.ivd);
+  AppendIndexAttrs(plan, &attrs);
+  attrs.push_back(static_cast<int64_t>(sshape.size()));
+  attrs.insert(attrs.end(), sshape.begin(), sshape.end());
+  attrs.push_back(static_cast<int64_t>(uperm.size()));
+  attrs.insert(attrs.end(), uperm.begin(), uperm.end());
+  attrs.push_back(static_cast<int64_t>(ushape.size()));
+  attrs.insert(attrs.end(), ushape.begin(), ushape.end());
+  attrs.insert(attrs.end(), extra.begin(), extra.end());
+
+  ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.scatter"));
+  std::vector<int> ins;
+  for (mlir::Value v : op->getOperands()) {
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    ins.push_back(s);
+  }
+  std::vector<int> outs{Bind(op->getResult(0))};
+  Emit(opcode, std::move(ins), std::move(outs), std::move(attrs),
+       std::move(payload), ResultBytes(op));
+  return absl::OkStatus();
+}
+
 absl::Status Lowering::LowerConstant(mlir::Operation* op) {
   auto cst = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(op);
   if (!cst) return Decline("stablehlo.constant in an unexpected form");
@@ -1594,10 +2307,18 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
     Alias(op->getResult(0), s);   // the update replaces all of the operand
     return absl::OkStatus();
   }
+  // Empty updates or a zero-size operand: the same kind of alias, and it sits
+  // here -- ahead of the dtype checks -- exactly where tape.py's does.
+  if (name == "stablehlo.scatter" && IsScatterNoop(op)) {
+    ASSIGN_OR_RETURN(int s, Slot(op->getOperand(0)));
+    Alias(op->getResult(0), s);
+    return absl::OkStatus();
+  }
 
   if (IsControlOp(name)) return LowerControl(op);
 
-  if (!op->getRegions().empty() && name != "stablehlo.reduce")
+  if (!op->getRegions().empty() && name != "stablehlo.reduce" &&
+      name != "stablehlo.scatter")
     return Decline(absl::StrCat("op ", name, " (it carries a region)"));
 
   for (mlir::Value v : op->getOperands()) RETURN_IF_ERROR(CheckValue(v));
@@ -1605,6 +2326,10 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
 
   if (name == "stablehlo.constant") return LowerConstant(op);
   if (name == "stablehlo.reduce") return LowerReduce(op);
+  // Scatter binds and emits itself: a drop strategy may carry a neutral VALUE
+  // rather than an attribute, and a variadic scatter must decline as one
+  // instead of as "an op with two results".
+  if (name == "stablehlo.scatter") return LowerScatter(op);
 
   if (op->getNumResults() != 1)
     return Decline(absl::StrCat("op ", name, " with ", op->getNumResults(),
@@ -1635,6 +2360,19 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
     ASSIGN_OR_RETURN(attrs, LowerDynamicSlice(op));
   } else if (name == "stablehlo.dynamic_update_slice") {
     ASSIGN_OR_RETURN(attrs, LowerDynamicUpdateSlice(op));
+  } else if (name == "stablehlo.shift_left" ||
+             name == "stablehlo.shift_right_logical" ||
+             name == "stablehlo.shift_right_arithmetic") {
+    ASSIGN_OR_RETURN(attrs, LowerShift(op));
+  } else if (name == "stablehlo.bitcast_convert") {
+    ASSIGN_OR_RETURN(attrs, LowerBitcastConvert(op));
+  } else if (name == "stablehlo.reverse") {
+    ASSIGN_OR_RETURN(attrs, LowerReverse(op));
+  } else if (name == "stablehlo.popcnt" ||
+             name == "stablehlo.count_leading_zeros") {
+    ASSIGN_OR_RETURN(attrs, LowerPopcnt(op));
+  } else if (name == "stablehlo.gather") {
+    ASSIGN_OR_RETURN(attrs, LowerGather(op));
   } else if (SimpleOps().contains(name)) {
     // no attributes
   } else {
@@ -1804,6 +2542,15 @@ int64_t ValueSpec::element_count() const {
 
 absl::StatusOr<LoweredProgram> LowerModule(mlir::ModuleOp module) {
   if (!module) return Decline("an empty module");
+  if (kDumpModule) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    module.print(os);
+    std::fputs("[module]\n", stderr);
+    std::fputs(text.c_str(), stderr);
+    std::fputs("\n[/module]\n", stderr);
+    std::fflush(stderr);
+  }
   mlir::func::FuncOp main = module.lookupSymbol<mlir::func::FuncOp>("main");
   if (!main) {
     // jax always names it @main; anything else is a program shape this

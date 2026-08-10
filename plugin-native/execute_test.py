@@ -332,6 +332,189 @@ def _cases():
          lambda x: jax.lax.fori_loop(0, 10000, lambda i, c: c + 1.0, x),
          [np.float32(0.0)], *EXACT),
 
+        # gather (P4).  StableHLO's gather goes straight to mx::gather, whose
+        # index arrays, clamps, window sizes and offset_dims transpose are all
+        # resolved at lowering.  MLX clamps NOTHING -- it wraps a negative
+        # index like `take` and reads past the end otherwise -- so an
+        # out-of-range index is silent wrongness if the bounds are wrong, and
+        # the CPU comparison IS the test of XLA's clamp rule.
+        ("take", lambda a, i: a[i],
+         [np.arange(6, dtype=f), np.array([0, 5, 2], np.int32)], *EXACT),
+        ("embedding lookup", lambda a, i: a[i],
+         [np.arange(24, dtype=f).reshape(6, 4),
+          np.array([0, 3, 5, 2], np.int32)], *EXACT),
+        ("embedding lookup (2-D indices)", lambda a, i: a[i],
+         [np.arange(24, dtype=f).reshape(6, 4),
+          np.array([[0, 1], [2, 3]], np.int32)], *EXACT),
+        ("gather (indices out of range)", lambda a, i: a[i],
+         [np.arange(6, dtype=f), np.array([-3, 0, 9, 5], np.int32)], *EXACT),
+        ("gather rows and columns", lambda a, i, j: a[i, j],
+         [np.arange(24, dtype=f).reshape(6, 4),
+          np.array([0, 2], np.int32), np.array([3, 1], np.int32)], *EXACT),
+        # slice_sizes > 1 on an indexed dim: a WINDOW per index, which is the
+        # arm that crosses verbatim into mx::gather.
+        ("windowed gather",
+         lambda a, i: jax.vmap(
+             lambda k: jax.lax.dynamic_slice(a, (k,), (3,)))(i),
+         [np.arange(10, dtype=f), np.array([0, 4, 8], np.int32)], *EXACT),
+        # operand_batching_dims: the implicit iota index a vmapped gather
+        # carries, paired with its operand dim.
+        ("gather with batching dims",
+         lambda a, i: jax.vmap(lambda r, k: r[k])(a, i),
+         [np.arange(12, dtype=f).reshape(3, 4),
+          np.array([[0, 3], [1, 1], [2, 0]], np.int32)], *EXACT),
+        ("take_along_axis", lambda a, i: jnp.take_along_axis(a, i, -1),
+         [np.arange(24, dtype=f).reshape(6, 4),
+          np.array([[0], [1], [2], [3], [0], [1]], np.int32)], *EXACT),
+        ("cross-entropy (gather of a log-softmax)",
+         lambda logits, t: -jnp.take_along_axis(
+             jax.nn.log_softmax(logits, -1), t[:, None], -1).mean(),
+         [_rand((12, 32), 60), np.arange(12, dtype=np.int32) % 32], *F32),
+        ("gather with an empty result", lambda a, i: a[i],
+         [np.arange(6, dtype=f), np.zeros((0,), np.int32)], *EXACT),
+        ("gather at a rank-0 index", lambda a: a[jnp.int32(2)],
+         [np.arange(6, dtype=f)], *EXACT),
+
+        # scatter (P4).  XLA DROPS an update whose start is out of bounds;
+        # MLX has no such rule and does no bounds checking at all, so the
+        # tape picks one of two drop strategies from the static sizes.  Every
+        # case below is compared against the CPU backend, which is the only
+        # honest statement of those semantics -- and the pairs with and
+        # without an out-of-range index are what separates "dropped" from
+        # "clamped onto a real slot", which is a wrong ANSWER, not an error.
+        ("scatter set (a slice)", lambda x, u: x.at[2:5].set(u),
+         [np.arange(8, dtype=f), np.full(3, -1.0, f)], *EXACT),
+        ("scatter set (indices)", lambda x, i, u: x.at[i].set(u),
+         [np.arange(8, dtype=f), np.array([1, 3, 6], np.int32),
+          np.array([-1, -2, -3], f)], *EXACT),
+        ("scatter set (out of bounds)", lambda x, i, u: x.at[i].set(u),
+         [np.arange(8, dtype=f), np.array([1, 8, -2, 20], np.int32),
+          np.array([-1, -2, -3, -4], f)], *EXACT),
+        ("scatter add (duplicate indices)", lambda x, i, u: x.at[i].add(u),
+         [np.zeros(5, f), np.array([0, 1, 1, 4], np.int32),
+          np.array([1, 2, 3, 4], f)], *EXACT),
+        ("scatter add (out of bounds)", lambda x, i, u: x.at[i].add(u),
+         [np.zeros(5, f), np.array([0, 7, 1, -1], np.int32),
+          np.array([1, 2, 3, 4], f)], *EXACT),
+        # Updates bigger than the operand: the drop strategy flips to the
+        # dummy pad, which is the arm "set" always takes.
+        ("scatter add (updates > operand)", lambda x, i, u: x.at[i].add(u),
+         [np.zeros(4, f), np.arange(64, dtype=np.int32) % 6,
+          np.arange(64, dtype=f)], *F32),
+        ("scatter multiply", lambda x, i, u: x.at[i].multiply(u),
+         [np.ones(5, f), np.array([0, 1, 1, 9], np.int32),
+          np.array([2, 3, 4, 5], f)], *EXACT),
+        ("scatter max / min",
+         lambda x, i, u: (x.at[i].max(u), x.at[i].min(u)),
+         [np.zeros(5, f), np.array([0, 1, 1, 9], np.int32),
+          np.array([2, -3, 4, 5], f)], *EXACT),
+        ("scatter add (int32)", lambda x, i, u: x.at[i].add(u),
+         [np.zeros(5, np.int32), np.array([0, 1, 1, 9], np.int32),
+          np.array([2, -3, 4, 5], np.int32)], *EXACT),
+        ("segment_sum", lambda x, s: jax.ops.segment_sum(x, s, 4),
+         [np.arange(8, dtype=f), np.arange(8, dtype=np.int32) % 4], *EXACT),
+        # bincount's overflow slot is the OOB-drop rule in production: an
+        # index past the length must vanish, not land on the last bucket.
+        ("bincount", lambda x: jnp.bincount(x, length=5),
+         [np.array([0, 1, 1, 4, 9, 2], np.int32)], *EXACT),
+        ("scatter whole rows", lambda x, i, u: x.at[i].set(u),
+         [np.zeros((4, 3), f), np.array([0, 3], np.int32),
+          np.ones((2, 3), f)], *EXACT),
+        ("scatter along the middle axis", lambda x, i, u: x.at[:, i].set(u),
+         [np.zeros((2, 4, 3), f), np.array([1, 3], np.int32),
+          np.ones((2, 2, 3), f)], *EXACT),
+        # A vmapped scatter: size-1 update windows on the mapped dims, which
+        # is where the 0.4.1 expand-transpose bug lived.
+        ("vmapped scatter set",
+         lambda x, i, u: jax.vmap(lambda r, k, v: r.at[k].set(v))(x, i, u),
+         [np.zeros((3, 4), f), np.array([[0], [2], [3]], np.int32),
+          np.ones((3, 1), f)], *EXACT),
+        ("vmapped scatter add (one lane out of bounds)",
+         lambda x, i, u: jax.vmap(lambda r, k, v: r.at[k].add(v))(x, i, u),
+         [np.zeros((3, 4), f), np.array([[0], [2], [5]], np.int32),
+          np.full((3, 1), 2.0, f)], *EXACT),
+        ("embedding gradient (a scatter-add through AD)",
+         lambda e, t: jax.grad(lambda a: (a[t] ** 2).sum())(e),
+         [np.arange(24, dtype=f).reshape(6, 4),
+          np.array([0, 3, 5, 2, 3], np.int32)], *EXACT),
+        # Empty updates: the handler returns the OPERAND array, so the tape
+        # aliases the slot and the output-copy rule has to notice.
+        ("scatter with empty updates", lambda x, i, u: x.at[i].add(u),
+         [np.arange(4, dtype=f), np.zeros((0,), np.int32),
+          np.zeros((0,), f)], *EXACT),
+
+        # the small-op tail (P4)
+        ("shift left", lambda x: x << 3, [np.arange(8, dtype=np.uint32)],
+         *EXACT),
+        # XLA defines a shift by >= the operand's bit width as 0 (logical and
+        # left) or the sign fill (arithmetic); Metal's shifts are mod-width,
+        # so the widths at and past 32 are the whole point of this row.
+        ("shifts across the operand width",
+         lambda x, s: (jax.lax.shift_left(x, s),
+                       jax.lax.shift_right_logical(x, s),
+                       jax.lax.shift_right_arithmetic(x, s)),
+         [np.array([-8, -1, 1, 255, 1 << 30], np.int32),
+          np.array([0, 1, 31, 32, 40], np.int32)], *EXACT),
+        ("shifts on uint8 (overflow widths)",
+         lambda x, s: (jax.lax.shift_left(x, s),
+                       jax.lax.shift_right_logical(x, s)),
+         [np.array([1, 128, 255, 7], np.uint8),
+          np.array([1, 7, 8, 9], np.uint8)], *EXACT),
+        # A constant amount past the width: the lowering resolves it and the
+        # handler emits one arm instead of a compare and a select.
+        ("shift by a static overflow amount", lambda x: (x << 40, x >> 40),
+         [np.arange(4, dtype=np.int32)], *EXACT),
+        ("reverse", lambda x: x[::-1], [np.arange(5, dtype=f)], *EXACT),
+        ("reverse both axes", lambda x: x[::-1, ::-1],
+         [np.arange(12, dtype=f).reshape(3, 4)], *EXACT),
+        # An extent-1 dim is dropped at lowering (mx::take chokes on empties).
+        ("reverse with a unit dim", lambda x: jax.lax.rev(x, (0, 1)),
+         [np.arange(4, dtype=f).reshape(1, 4)], *EXACT),
+        ("roll", lambda x: jnp.roll(x, 2), [np.arange(5, dtype=f)], *EXACT),
+        ("bitcast f32 -> i32",
+         lambda x: jax.lax.bitcast_convert_type(x, jnp.int32),
+         [np.array([1.0, -2.5, 0.0], f)], *EXACT),
+        ("bitcast i32 -> f32",
+         lambda x: jax.lax.bitcast_convert_type(x, jnp.float32),
+         [np.array([1065353216, -1, 0], np.int32)], *EXACT),
+        ("bitcast widening (i16 -> i32)",
+         lambda x: jax.lax.bitcast_convert_type(x, jnp.int32),
+         [np.array([[1, 2], [3, 4]], np.int16)], *EXACT),
+        ("bitcast narrowing (i32 -> i16)",
+         lambda x: jax.lax.bitcast_convert_type(x, jnp.int16),
+         [np.array([1, -2], np.int32)], *EXACT),
+        ("popcount", lambda x: jax.lax.population_count(x),
+         [np.array([0, 1, 255, 1 << 30, -1], np.int32)], *EXACT),
+        ("count_leading_zeros", lambda x: jax.lax.clz(x),
+         [np.array([0, 1, 255, 1 << 30, -1], np.int32)], *EXACT),
+
+        # threefry (P4): with the shifts in the op set, jax's RNG is ordinary
+        # elementwise arithmetic and must be BIT-exact against the CPU
+        # backend, not merely close.  `bits`, `split` and `fold_in` are the
+        # raw words, compared exactly; `normal` goes through erf_inv, whose
+        # last ULP is MLX's rather than the CPU's, so it gets a tolerance.
+        ("threefry bits",
+         lambda k: jax.random.bits(jax.random.wrap_key_data(k), (16,)),
+         [np.array([1, 2], np.uint32)], *EXACT),
+        ("threefry split",
+         lambda k: jax.random.key_data(
+             jax.random.split(jax.random.wrap_key_data(k), 4)),
+         [np.array([0, 7], np.uint32)], *EXACT),
+        ("threefry fold_in",
+         lambda k: jax.random.key_data(
+             jax.random.fold_in(jax.random.wrap_key_data(k), 7)),
+         [np.array([0, 7], np.uint32)], *EXACT),
+        ("threefry uniform",
+         lambda k: jax.random.uniform(jax.random.wrap_key_data(k), (3, 5)),
+         [np.array([12345, 6789], np.uint32)], *EXACT),
+        ("threefry randint",
+         lambda k: jax.random.randint(jax.random.wrap_key_data(k), (6,), 0,
+                                      10),
+         [np.array([3, 4], np.uint32)], *EXACT),
+        ("threefry normal",
+         lambda k: jax.random.normal(jax.random.wrap_key_data(k), (4, 4)),
+         [np.array([0, 7], np.uint32)], *F32),
+
         # a realistic little block: the shapes a model's forward pass has
         ("dense + norm + gelu",
          lambda x, w, b: jax.nn.gelu(
@@ -434,9 +617,25 @@ def _declines():
     return [
         ("sort", lambda x: jnp.sort(x), [np.array([3.0, 1.0, 2.0], np.float32)],
          "stablehlo.sort"),
-        ("gather", lambda x, i: x[i],
-         [np.arange(6, dtype=np.float32), np.array([0, 2], np.int32)],
-         "stablehlo.gather"),
+        ("cumsum (a reduce_window)", lambda x: jnp.cumsum(x),
+         [np.arange(4, dtype=np.float32)], "stablehlo.reduce_window"),
+        # A scatter whose update computation is neither an assignment nor a
+        # combiner (jax's scatter_apply): running it means evaluating block
+        # code on the gathered current values, which this opcode's plan does
+        # not carry.  It declines rather than guessing, exactly as tape.py
+        # does.
+        ("scatter with a computed body",
+         lambda x, i: x.at[i].apply(jnp.sin),
+         [np.arange(4, dtype=np.float32), np.array([0, 2], np.int32)],
+         "scatter combiner apply"),
+        # MLX has no complex scatter kernels at all; the Python handler
+        # scatters the two parts, which is a different composition from the
+        # single primitive this entry calls.
+        ("scatter on complex", lambda x, i, u: x.at[i].set(u),
+         [np.array([1 + 1j, 2 - 2j, 0j], np.complex64),
+          np.array([0, 2], np.int32),
+          np.array([5 + 0j, 6 + 1j], np.complex64)],
+         "scatter on complex"),
         # A loop whose BODY holds an op outside the set declines the whole
         # program, naming that op -- the region is lowered by the same
         # `Lowering` as main, so its declines are main's.
@@ -726,6 +925,15 @@ def main():
     # One executable, called from many threads at once.  MLX streams are
     # thread-bound; the plugin's answer is a cross-thread-evaluable stream per
     # entering thread (metal_stream.cc), and this is what exercises it.
+    #
+    # Truly concurrent evals used to SEGFAULT ~5 % of runs inside
+    # mlx::core::metal::get_command_encoder (a `new_thread_unsafe_stream`
+    # routes through one process-wide encoder map; 4 crashes in 74 runs at
+    # the pinned command-buffer budgets, 0 through the GIL-serialized Stage 1
+    # plugin).  metal_stream.cc's SubmissionLock now serializes submission --
+    # 0 crashes in 30 full-suite runs -- so a segfault here means the lock
+    # was lifted (METALJAX_CONCURRENT_EXECUTE=1) or regressed; see
+    # notes/cpp-p4-gather-scatter.md.
     import concurrent.futures
 
     try:

@@ -8,6 +8,8 @@ Licensed under the Apache License, Version 2.0.
 #ifndef METALJAX_PLUGIN_NATIVE_METAL_METAL_STREAM_H_
 #define METALJAX_PLUGIN_NATIVE_METAL_METAL_STREAM_H_
 
+#include <mutex>
+
 namespace metaljax {
 
 // Give this thread a cross-thread-evaluable default MLX stream, once.
@@ -28,6 +30,18 @@ namespace metaljax {
 // Every entry point that touches MLX calls this first: transfers in, transfers
 // out, and execute.
 void BindThread();
+
+// Serialize MLX submission across threads.  Per-thread streams make graphs
+// EVALUABLE from any thread, but MLX 0.32 routes every stream through one
+// process-wide command-encoder map, and eight genuinely concurrent evals
+// segfault inside metal::get_command_encoder ~5% of runs (measured 4/74 at
+// the pinned command-buffer budgets; the Stage 1 plugin never sees this only
+// because the GIL serializes its entries).  Until MLX's map is safe, every
+// path that drives evaluation -- execute, host transfers in -- holds this
+// lock.  METALJAX_CONCURRENT_EXECUTE=1 lifts it, for measuring the day an
+// MLX fix lands; a returned lock that owns nothing is that flag, not an
+// error.
+std::unique_lock<std::mutex> SubmissionLock();
 
 }  // namespace metaljax
 

@@ -107,6 +107,7 @@ MetalLoadedExecutable::RunOnce(
         lowered_->parameters.size(), argument_handles.size()));
   }
   BindThread();
+  std::unique_lock<std::mutex> submission = SubmissionLock();
 
   std::vector<mx::array> inputs;
   inputs.reserve(argument_handles.size());

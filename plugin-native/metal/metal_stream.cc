@@ -5,6 +5,9 @@ Licensed under the Apache License, Version 2.0.
 
 #include "metal/metal_stream.h"
 
+#include <cstdlib>
+#include <string>
+
 #include "mlx/mlx.h"
 
 namespace metaljax {
@@ -20,6 +23,16 @@ void BindThread() {
     return true;
   }();
   (void)bound;
+}
+
+std::unique_lock<std::mutex> SubmissionLock() {
+  static std::mutex mu;
+  static const bool concurrent = [] {
+    const char* v = std::getenv("METALJAX_CONCURRENT_EXECUTE");
+    return v != nullptr && std::string(v) == "1";
+  }();
+  if (concurrent) return std::unique_lock<std::mutex>();
+  return std::unique_lock<std::mutex>(mu);
 }
 
 }  // namespace metaljax

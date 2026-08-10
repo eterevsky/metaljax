@@ -773,7 +773,29 @@ fork authorized but not needed.
   cross-check vs the Stage 1 tape over 9 probes / 170 lines is identical
   but the dead `kmax` field. Census: **gather and scatter are the only two
   ops between this plugin and a texmo training step**.
-* Next: gather/scatter, then sort/top_k and rng, then the compile
-  decisions, then async execute + donation. Suite-vs-suite as the standing
-  gate. (North star per Oleg: everything through the new stack,
-  correctness first, performance second.)
+* **P4 landed** (notes/cpp-p4-gather-scatter.md): gather, scatter (both OOB
+  drop strategies, batching dims, windowed updates) and the small-op tail —
+  the shifts, reverse, bitcast_convert, popcnt/clz — so jax's threefry RNG
+  lowers as plain elementwise and is BIT-exact vs CPU. **All 106 texmo suite
+  configurations now train through the native stack and match jax-CPU**
+  (`plugin-native/texmo_gate.py`, phase 2's standing gate: 106 ok, 0 decline,
+  0 FAIL, 6m15s). execute_test 152 checks; the tape cross-check is
+  byte-identical over 12 probes plus a real training chunk, but the dead
+  `kmax`. Two findings worth the ledger: (a) the plugin was missing MLX's own
+  command-buffer budgets (`MLX_MAX_{OPS,MB}_PER_BUFFER`, which
+  src/metaljax/__init__.py pins for Stage 1) and was therefore hitting MLX
+  0.32's split corruption — nondeterministically wrong training steps, 2 runs
+  in 5; now pinned in metal_client.cc — at the price of exposing MLX's
+  process-wide command-encoder map, which segfaults ~5% of the 8-thread
+  execute_test row (0 of 74 at MLX's smaller defaults, 0 of 20 through the
+  GIL-serialized Stage 1 plugin: being GIL-free is what makes it reachable).
+  (b) The same corruption still reaches
+  one suite row through the EAGER path, and the Stage 1 engine reproduces it
+  exactly under METALJAX_COMPILE=0 — so the compile decisions are correctness
+  for long loops, not only performance. Also: XLA's parse rewrites the module
+  before CompileAndLoad (chlo legalized, constants CSE'd and hoisted out of
+  regions), so tape diffs now start from METALJAX_DUMP_MODULE=1.
+* Next: the compile decisions (see above), then sort/top_k, then
+  reduce_window / convolution / fft, then async execute + donation.
+  Suite-vs-suite as the standing gate. (North star per Oleg: everything
+  through the new stack, correctness first, performance second.)

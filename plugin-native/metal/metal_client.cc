@@ -94,6 +94,43 @@ bool EnvFlag(const char* name) {
   return v != nullptr && std::string(v) == "1";
 }
 
+// MLX's own budgets, which src/metaljax/__init__.py pins for the Stage 1
+// engine before `import mlx.core` and which nothing pinned here: this plugin
+// never imports that module, and until gather/scatter landed no program big
+// enough to split a command buffer ever lowered.  Both are CORRECTNESS, not
+// tuning:
+//
+//  * `MLX_MAX_MB_PER_BUFFER`: splitting one eval across command buffers
+//    corrupts results in MLX 0.32 -- silently, and differently on every call
+//    (notes/mlx-command-buffer-split.md).  At MLX's 40 MB default a
+//    `bytes|gru.512` training chunk through this plugin computed weights ~1e-2
+//    off jax-CPU on 2 of 5 runs and exactly right on the other 3; at 512 it is
+//    right 5 of 5, which is what the Stage 1 engine has always run at.
+//  * `MLX_MAX_OPS_PER_BUFFER`: 800 rather than 400, because 400 exactly is a
+//    corrupting alignment for a 28-layer init scan (CLAUDE.md, and
+//    tests/test_command_buffer.py replays it).
+//  * `MLX_METAL_GPU_ARCH`: the M5's f32 GEMM goes through the neural
+//    accelerators at ~4e-3 unless the kernel arch is pinned back a
+//    generation.  `src/jax_plugins/metal/__init__.py` sets this before
+//    dlopening us and is the one that matters for jax; repeating it keeps a
+//    C++ embedder (`//metal:runtime_gil_free_test`, anything linking this
+//    dylib directly) from silently getting the fast, inaccurate path.
+//
+// MLX reads each one ONCE, from a function-local static, when it builds its
+// Metal device -- which happens at the first `mx::` call, inside this plugin
+// -- so a static initializer here lands early enough.  `overwrite = 0` is
+// Python's `os.environ.setdefault`: a value the user exported still wins.
+// KEEP IN SYNC with src/metaljax/__init__.py, which owns the numbers and the
+// measurements behind them.
+[[maybe_unused]] const bool kMlxEnvPinned = [] {
+  ::setenv("MLX_MAX_OPS_PER_BUFFER", "800", /*overwrite=*/0);
+  ::setenv("MLX_MAX_MB_PER_BUFFER", "512", /*overwrite=*/0);
+  const char* precision = std::getenv("METALJAX_MATMUL_PRECISION");
+  if (precision == nullptr || std::string(precision) == "highest")
+    ::setenv("MLX_METAL_GPU_ARCH", "applegpu_g16g", /*overwrite=*/0);
+  return true;
+}();
+
 void ConfigureFromEnv() {
   const int64_t flush_mb = EnvInt("METALJAX_EAGER_FLUSH_MB", 1024);
   configure(
@@ -266,6 +303,7 @@ MetalClient::BufferFromHostBuffer(
   }
 
   BindThread();
+  std::unique_lock<std::mutex> submission = SubmissionLock();
   mx::Shape shape;
   shape.reserve(dims.size());
   int64_t total = 1;
