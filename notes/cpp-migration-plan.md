@@ -149,3 +149,26 @@ milestones also run the topconfs sweep vs the 2026-08-05 anchor)
 3. Threading/GIL: phase 1 releases the GIL for the duration of a
    native execute (host callbacks re-acquire). Decide during M3
    whether while-loop host syncs need finer-grained handling.
+
+## M4 real-model verdict (2026-08-10)
+
+Correctness: row 7 native 23.3 ms/tok (anchor 22.2), row 5 native
+59.5 (anchor 57.8) — ok, memory identical, tokens in the ladder
+class. Perf: PARITY, not a win. The decode hot loop was already a
+compiled replay under the Python engine; stripping the remaining
+Python dispatch bought ~nothing on these rows, so the 1.9-2.5x
+mlx-lm gap does NOT live in Python dispatch. Where it lives (M3's
+decode-shaped benchmark said the same: 420 -> 392 us/step, ~7%):
+the PER-TOKEN pipeline stall — our lax.while decode evaluates the
+cond on the host every iteration (a full submit-wait per token),
+where mlx-lm's Python decode loop pipelines tokens with async_eval
+and never blocks on a device condition; plus KV-cache
+dynamic_update_slice copies vs mlx-lm's in-place cache.
+
+CONSEQUENCE for M5/M6: reorder priorities. M5a = decode-loop
+pipelining (async cond: dispatch iteration N+1 speculatively while
+N's cond settles — the cond is `i < N`, its value is knowable
+host-side for counted segments; for dynamic conds, double-buffer
+the carry) + KV donation/in-place update on the native tape. M5b =
+msl_scan port (the texmo floor). M6 targets unchanged but their
+path runs through M5a, not dispatch removal.
