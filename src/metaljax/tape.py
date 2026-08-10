@@ -83,8 +83,8 @@ _ALIAS_OPS = ("stablehlo.optimization_barrier", "sdy.sharding_constraint",
 _REGION_OPS = ("stablehlo.while", "stablehlo.if", "stablehlo.case")
 
 # Ops whose region is a BODY the lowering reads structurally rather than
-# executing: a reduce's monoid, a sort's comparator.
-_REGION_BODY_OPS = ("stablehlo.reduce", "stablehlo.sort")
+# executing: a reduce's monoid, a sort's comparator, a scatter's combiner.
+_REGION_BODY_OPS = ("stablehlo.reduce", "stablehlo.sort", "stablehlo.scatter")
 
 # Ops a handler may give more than one result. Everything else has to
 # produce exactly one array, since that is all the tape can bind.
@@ -407,6 +407,12 @@ class _Lowering:
         passthrough = _rank0_passthrough(o)
         if passthrough is not None:
             self._alias(o.results[0], self._slot(o.operands[passthrough]))
+            return
+        if name == "stablehlo.scatter" and _scatter_noop(self, o):
+            # Empty updates or a zero-size operand: ops/gather.py returns the
+            # operand ARRAY, so this is an alias like the ones above and not
+            # an entry that happens to compute nothing.
+            self._alias(o.results[0], self._slot(o.operands[0]))
             return
         if name in _REGION_OPS:
             self._control(o)
@@ -1268,6 +1274,272 @@ def _lower_dynamic_update_slice(lo, o):
     return [len(sizes), *bounds], None
 
 
+def _index_plan(lo, dims, idx_shape, op_shape, sizes, smap, name):
+    """The index arrays a gather/scatter hands to the MLX primitive.
+
+    Both StableHLO ops carry the same two index sources: the COMPONENTS of
+    the start-index vector (one per mapped operand dim, clamped so the whole
+    window fits — XLA's rule, and MLX's own primitives clamp nothing: gather
+    wraps a negative index like `take` and reads past the end otherwise, and
+    scatter does no bounds checking at all, which for a write is memory
+    corruption rather than a wrong number; both measured) and the implicit
+    BATCHING coordinates, which are an iota along the index dim paired with
+    the operand dim.
+
+    Returns (entries, batch shape, split?, index_vector_dim). Each entry is
+    (kind, a, b, operand axis): kind 0 is index-vector component `a` clamped
+    to [0, b], kind 1 an iota of length `a` living at batch position `b`,
+    kind 2 a constant zero (an op that indexes nothing at all — see below).
+    The ORDER of the entries is free — MLX pairs `indices[i]` with `axes[i]`
+    and lays the slice dims out in operand order whatever order the axes
+    come in (probed) — so it is simply the IR's.
+    """
+    batching_key = ("start_indices_batching_dims" if name == "gather"
+                    else "scatter_indices_batching_dims")
+    ivd = dims["index_vector_dim"]
+    if ivd > len(idx_shape):
+        raise _Decline(f"{name} index_vector_dim out of range")
+    batch_dims_idx = [i for i in range(len(idx_shape)) if i != ivd]
+    batch_shape = [idx_shape[i] for i in batch_dims_idx]
+    # index_vector_dim == rank means the whole array IS one component, which
+    # is the shape ops/gather.py's `index_arrays` builds too.
+    split = ivd != len(idx_shape)
+    k = idx_shape[ivd] if split else 1
+    if len(smap) != k:
+        raise _Decline(f"{name} index map does not match the index vector")
+
+    entries = []
+    for j, dim in enumerate(smap):
+        if not 0 <= dim < len(op_shape):
+            raise _Decline(f"{name} index map dim out of range")
+        entries.append((0, j, max(op_shape[dim] - sizes[dim], 0), dim))
+    for op_dim, i_dim in zip(dims["operand_batching_dims"],
+                             dims[batching_key]):
+        if i_dim not in batch_dims_idx or not 0 <= op_dim < len(op_shape):
+            raise _Decline(f"{name} batching dims out of range")
+        entries.append((1, idx_shape[i_dim], batch_dims_idx.index(i_dim),
+                        op_dim))
+    axes = [e[3] for e in entries]
+    if len(set(axes)) != len(axes):
+        raise _Decline(f"{name} indexes an operand dim twice")
+    if not entries:
+        # An op that maps NO index component and carries no batching dim:
+        # every start index is 0, so the whole thing is a static write at
+        # the origin (shape-polymorphic LU emits three of them). Both
+        # primitives want at least one index array, so synthesize the
+        # constant zero — the clamp bound is 0 too, so there is nothing it
+        # could ever be out of.
+        if not op_shape:
+            raise _Decline(f"{name} on a rank-0 operand with no indices")
+        entries.append((2, 0, 0, 0))
+    return entries, batch_shape, split, ivd
+
+
+def _index_attrs(entries):
+    out = [len(entries)]
+    for e in entries:
+        out.extend(int(x) for x in e)
+    return out
+
+
+def _lower_gather(lo, o):
+    """ops/gather.py `_gather`, as ONE mx::gather.
+
+    StableHLO's gather IS MLX's, modulo three static rearrangements: the
+    coordinate vector is split into one index array per mapped operand dim
+    (all of the index batch shape, which makes MLX's broadcast rule a
+    no-op); `slice_sizes` crosses verbatim, since MLX starts an unindexed
+    axis at 0 and an indexed one at its index — exactly XLA's rule, windows
+    on indexed dims included; and the result is reshaped past the collapsed
+    (extent-1) dims, then transposed into the offset_dims interleaving.
+
+    The Python handler reaches the same values through numpy-style advanced
+    indexing, which expands every window into an explicit arange axis and
+    pre-slices the free dims. Same data movement, different composition —
+    and a gather moves bits rather than computing on them, so the
+    differential has no tolerance to hide behind.
+    """
+    from metaljax.ops.gather import _gather_dims
+
+    d = _gather_dims(o)
+    slice_sizes = _ir.i64_list(o, "slice_sizes")
+    op_shape = lo._shape(o.operands[0])
+    idx_shape = lo._shape(o.operands[1])
+    out_shape = lo._shape(o.results[0])
+    out_dt = lo._dtype_code(lo._element(o.results[0]))
+    if len(slice_sizes) != len(op_shape):
+        raise _Decline("gather slice_sizes rank mismatch")
+    if any(s == 0 for s in out_shape):
+        # The Python handler's short-circuit: nothing to gather, and the
+        # decomposition mis-shapes empty batches. The attrs stop here.
+        return [1, out_dt, len(out_shape), *out_shape], None
+    if any(not 0 <= s <= op_shape[i] for i, s in enumerate(slice_sizes)):
+        raise _Decline("gather slice does not fit the operand")
+
+    entries, batch_shape, split, ivd = _index_plan(
+        lo, d, idx_shape, op_shape, slice_sizes, d["start_index_map"],
+        "gather")
+
+    collapsed = (set(d["collapsed_slice_dims"])
+                 | set(d["operand_batching_dims"]))
+    if any(not 0 <= i < len(op_shape) or slice_sizes[i] != 1
+           for i in collapsed):
+        raise _Decline("gather collapses a dim whose slice is not 1")
+    uncollapsed = [i for i in range(len(op_shape)) if i not in collapsed]
+    mid = batch_shape + [slice_sizes[i] for i in uncollapsed]
+
+    offset_dims = d["offset_dims"]
+    out_rank = len(out_shape)
+    out_batch = [i for i in range(out_rank) if i not in offset_dims]
+    if (len(out_batch) != len(batch_shape)
+            or len(offset_dims) != len(uncollapsed)
+            or any(not 0 <= i < out_rank for i in offset_dims)):
+        raise _Decline("gather output rank does not match its dimension "
+                       "numbers")
+    perm = [0] * out_rank
+    for cur, pos in enumerate(out_batch):
+        perm[pos] = cur
+    for cur, pos in enumerate(offset_dims):
+        perm[pos] = len(batch_shape) + cur
+    # What the rearrangement lands on must be what the IR declares. Free
+    # here, and it turns any future disagreement about a dimension-numbers
+    # corner into a decline rather than a wrong answer.
+    if [mid[p] for p in perm] != out_shape:
+        raise _Decline("gather result shape does not follow from its dims")
+
+    return ([0, out_dt, len(out_shape), *out_shape,
+             len(batch_shape), *batch_shape, 1 if split else 0, ivd,
+             len(slice_sizes), *slice_sizes] + _index_attrs(entries)
+            + [len(mid), *mid, len(perm), *perm], None)
+
+
+# ops/gather.py `_scatter_combiner`'s method names, in the order
+# native/tape.cc switches on. "apply" — an arbitrary elementwise body, which
+# jax's scatter_apply emits — is deliberately absent: running it means
+# evaluating block code on the gathered current values, and with duplicate
+# indices doing so one update at a time, which is a plan this opcode does
+# not carry. Those programs decline and run the identical body in Python.
+_SCATTER_METHODS = {"set": 0, "add": 1, "multiply": 2, "maximum": 3,
+                    "minimum": 4, "subtract": 5}
+
+
+def _scatter_noop(lo, o) -> bool:
+    """Whether ops/gather.py `_scatter` hands the operand straight back.
+
+    Empty updates apply nothing, and a zero-size operand drops every update
+    as out of bounds. The result IS the operand array, so the tape aliases
+    the slot (and the taints ride along) rather than emitting an entry.
+    """
+    if len(o.operands) != 3 or len(o.results) != 1:
+        return False
+    return (any(s == 0 for s in lo._shape(o.operands[2]))
+            or any(s == 0 for s in lo._shape(o.operands[0])))
+
+
+def _lower_scatter(lo, o):
+    """ops/gather.py `_scatter`, as one mx::scatter/_add/_prod/_max/_min.
+
+    The combiner picks the primitive; everything else is index and update
+    preprocessing, resolved here:
+
+    * the start vector splits into one clamped index array per mapped
+      operand dim, plus an iota per batching dim (`_index_plan`);
+    * the updates are transposed into [index batch dims, window dims in
+      OPERAND order] and reshaped to insert an extent-1 axis for every
+      inserted window dim — MLX wants `updates.ndim == indices.ndim +
+      operand.ndim`, and its update slice starts at the index on an indexed
+      axis and at 0 elsewhere, which is XLA's window rule for the windowed
+      dims and for the partial windows on free dims alike;
+    * XLA's OOB-DROP semantics, of which MLX has none, through the same two
+      strategies ops/gather.py picks between, chosen by the same static
+      sizes so the two engines cannot pick differently (adding a neutral 0
+      and not adding it disagree in the bits at -0.0): redirect dropped
+      updates into a pad on one indexed axis — required for "set", where
+      neutralizing would race a genuine duplicate write at the clamped slot
+      — or rewrite them to the combiner's identity.
+    """
+    from metaljax import dtypes as _dt
+    from metaljax.interpreter import UnsupportedOpError
+    from metaljax.ops.gather import (_combiner_neutral, _scatter_combiner,
+                                     _scatter_dims)
+
+    if len(o.operands) != 3 or len(o.results) != 1:
+        raise _Decline("variadic scatter")
+    op_shape = lo._shape(o.operands[0])
+    idx_shape = lo._shape(o.operands[1])
+    upd_shape = lo._shape(o.operands[2])
+    d = _scatter_dims(o)
+    try:
+        method = _scatter_combiner(o)
+    except UnsupportedOpError as e:
+        raise _Decline(f"scatter body: {e}") from None
+    code = _SCATTER_METHODS.get(method)
+    if code is None:
+        raise _Decline(f"scatter combiner {method}")
+
+    inserted = set(d["inserted_window_dims"]) | set(d["operand_batching_dims"])
+    uwd = d["update_window_dims"]
+    window_dims = [i for i in range(len(op_shape)) if i not in inserted]
+    if len(uwd) != len(window_dims):
+        raise _Decline("scatter window rank mismatch")
+    if any(not 0 <= w < len(upd_shape) for w in uwd):
+        raise _Decline("scatter update_window_dims out of range")
+    uwd_of = {dim: w for w, dim in zip(uwd, window_dims)}
+    # The update slice, per operand dim: an inserted window dim has an
+    # implicit extent of 1, every other dim takes its update axis.
+    sshape = [1 if i in inserted else upd_shape[uwd_of[i]]
+              for i in range(len(op_shape))]
+    if any(not 0 < s <= op_shape[i] for i, s in enumerate(sshape)):
+        raise _Decline("scatter window does not fit the operand")
+
+    entries, batch_shape, split, ivd = _index_plan(
+        lo, d, idx_shape, op_shape, sshape,
+        d["scatter_dims_to_operand_dims"], "scatter")
+
+    upd_batch = [i for i in range(len(upd_shape)) if i not in uwd]
+    uperm = upd_batch + [uwd_of[dim] for dim in window_dims]
+    if ([upd_shape[p] for p in uperm]
+            != batch_shape + [sshape[dim] for dim in window_dims]):
+        raise _Decline("scatter updates do not match its dimension numbers")
+    ushape = batch_shape + sshape
+
+    # XLA drops an update whose start is out of bounds in ANY component, and
+    # only the mapped components can be (a batching iota never is).
+    payload = None
+    strategy = 0
+    extra: list = []
+    if d["scatter_dims_to_operand_dims"]:
+        if method == "set" or _prod(op_shape) < _prod(upd_shape):
+            strategy = 2
+            # Pad the LOWEST indexed axis, which is the one the Python
+            # handler pads (it transposes that dim to the front and
+            # concatenates there). Any of them would do; agreeing keeps the
+            # two engines' allocation shapes comparable.
+            axes = [e[3] for e in entries]
+            pos = min(range(len(axes)), key=lambda i: axes[i])
+            extra = [pos, sshape[axes[pos]], op_shape[axes[pos]]]
+        else:
+            strategy = 1
+            dt = _dt.mx_dtype_for(
+                ir.RankedTensorType(o.operands[0].type).element_type)
+            try:
+                payload = _combiner_neutral(method, dt)
+            except UnsupportedOpError as e:
+                raise _Decline(f"scatter neutral: {e}") from None
+            # The mask broadcasts against the updates: one axis per batch
+            # dim, then an extent-1 axis per operand dim.
+            extra = [len(batch_shape) + len(op_shape),
+                     *batch_shape, *([1] * len(op_shape))]
+
+    # `strategy` rides second, ahead of everything variable-length, so a
+    # reader (the C++ handler, a test) can see which drop rule this scatter
+    # took without walking the whole vector.
+    return ([code, strategy, len(batch_shape), *batch_shape,
+             1 if split else 0, ivd] + _index_attrs(entries)
+            + [len(sshape), *sshape, len(uperm), *uperm, len(ushape), *ushape]
+            + extra, payload)
+
+
 _HANDLERS = {
     "stablehlo.compare": _lower_compare,
     "stablehlo.bitcast_convert": _lower_bitcast_convert,
@@ -1288,6 +1560,8 @@ _HANDLERS = {
     "stablehlo.sort": _lower_sort,
     "chlo.top_k": _lower_top_k,
     "stablehlo.dot_general": _lower_dot_general,
+    "stablehlo.gather": _lower_gather,
+    "stablehlo.scatter": _lower_scatter,
 }
 
 
