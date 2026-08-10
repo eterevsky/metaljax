@@ -2039,8 +2039,20 @@ class Program {
     // graph is pure and lazy, so a body built for an iteration that turns
     // out not to run is simply dropped -- unless the body reads something
     // back to the host, which would make "building" it mean RUNNING it.
+    //
+    // AND is it worth it? Building costs ~per-op Python-free but real
+    // work; the saved host round trip is ~150 us. On a 4-matmul synthetic
+    // body the build is noise and pipelining won 1.9x; on a whole-model
+    // decode body (~2000 entries) the speculative build costs ~4.5 ms/tok
+    // and LOSES (row 5 measured 65.1 vs 60.6 with pipeline off). Gate on
+    // tape size: above ~256 entries the round trip is the cheaper side.
+    // g_cfg.while_pipeline doubles as the threshold when > 1.
+    const int64_t max_entries =
+        g_cfg.while_pipeline > 1 ? g_cfg.while_pipeline : 256;
     const bool pipeline =
-        g_cfg.while_pipeline > 0 && !body->reads_host() && !cond->reads_host();
+        g_cfg.while_pipeline > 0 &&
+        static_cast<int64_t>(body->num_ops()) <= max_entries &&
+        !body->reads_host() && !cond->reads_host();
     if (!pipeline) {
       g_stats.serial_loops++;
       for (;;) {

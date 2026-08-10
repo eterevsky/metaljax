@@ -364,7 +364,11 @@ def _pipeline_mismatches():
     saved_pipe = control._WHILE_PIPELINE
     control._BODY_COMPILE = False
     try:
-        control._WHILE_PIPELINE = 1
+        # > 1 doubles as the size threshold (native gate); the
+        # detector asset's body is ~3000 entries, far over the
+        # production cutoff of 256, so force it high — the whole
+        # point is exercising the PIPELINED layout.
+        control._WHILE_PIPELINE = 1 << 20
         want = once()
         control._WHILE_PIPELINE = 0
         got = once()
