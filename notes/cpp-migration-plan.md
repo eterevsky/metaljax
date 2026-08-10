@@ -432,3 +432,31 @@ Steps 3/4 may swap depending on post-migration state.
   lay of the land; the only planned form is targeted hand-written
   kernels for specific ops during perf work (the msl_scan/
   metal_kernel mechanism we already use).
+
+## Phase-2 decline dispositions (every decline must die: the Python
+## fallback is deleted with the rest of the Python engine)
+
+- sub-byte floats (7): PORT — implement quantize_emulated as a native
+  mx-op sequence + a per-site regrid flag on elementwise entries; the
+  silent-wrongness risk is contained by the static registry audit and
+  goldens frozen while both engines coexist.
+- complex scatter (3): PORT — by-parts decomposition (real/imag
+  scatters), same shape as the Python handler.
+- convolution (2): PORT (already queued with the census-blind-spot
+  audit).
+- sort-with-key-chain (2): PORT — key chain as a sub-Program feeding
+  stable argsort (general-reduce-body mechanism).
+- select_and_scatter (1): PORT — GPU-nondeterministic like the Python
+  engine; goldens with tolerance, not byte-pins.
+- scatter apply-body (1): PORT — per-update sub-Program under
+  unique_indices.
+- asserted declines (3: unknown custom call, recursive callee, f64
+  strict): become COMPILE ERRORS — strict failure is the correct
+  phase-2 semantics, matching today's f64 policy.
+- Host ops: LAPACK targets move to Accelerate (direct C, no Python);
+  jax user callbacks (debug.print/pure/io_callback) keep a C-level
+  trampoline — that is the USER'S Python, not ours, and every PJRT
+  backend needs it.
+- Tests-to-engine-path migration (Interpreter-direct files) + the
+  static opcode-vs-REGISTRY audit: scheduled with the M6 flip prep
+  (per Oleg, 2026-08-10).
