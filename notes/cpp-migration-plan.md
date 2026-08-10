@@ -533,3 +533,26 @@ the migration completes.
 ## when unbuilt. Phase 2 begins: StableHLO/MLIR C++ compile path,
 ## recognizers as passes, exotic-decline ports (conv first), fallback
 ## retirement, goldens freeze, then the XLA optimization layer.
+
+## Phase 2 architecture — REVISED (Oleg, 2026-08-11)
+
+TWO COMPLETE PLUGINS side by side, not migration-under-the-trampoline:
+- plugin/ (current, trampoline) FREEZES as the reference; selected any
+  time via METALJAX_PLUGIN_PATH for feature-by-feature comparison.
+- plugin-native/ built TOP-DOWN from scratch: PJRT C API -> native
+  StableHLO/MLIR parse -> analyses/recognizers (as passes) -> tape
+  build -> the SHARED executor (native/ tape modules; program.h is the
+  interface line). Free to structure for C++, unconstrained by the
+  Python architecture. Forking the executor allowed if ever needed.
+- No releases until migration completes -> half-working plugin-native
+  is acceptable; validation = suite-vs-suite via the jaxlib PJRT
+  client (same StableHLO through both plugins, bytes compared), not
+  per-program fallback.
+- Sequencing: P0 StableHLO/MLIR C++ build proof from the llvm-project
+  clone (deserialize + round-trip a portable artifact — this phase's
+  M0 handshake) + plugin-native skeleton; then parse/analyses (bit-
+  identical lottery-pinned numbers, canaries), recognizers-as-passes,
+  pack building (Accelerate for LAPACK), exotic ports + goldens
+  freeze + trampoline retirement, XLA optimization layer last.
+- tape.cc split into modules (in flight) — its report is the
+  executor's structural doc for the plugin-native author.
