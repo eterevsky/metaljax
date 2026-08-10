@@ -937,17 +937,18 @@ def test_argpair_reduce_i64_indices():
     check(mod, [_f32((3, 4)), _iota_idx((3, 4), 1, np.int64)])
 
 
-def test_decline_argpair_on_bools():
+def test_argpair_on_bools_takes_the_generic_path():
     # dtypes.is_bool(values) sends the Python handler to _generic_reduce,
-    # which walks the body block; the tape must not shortcut past it.
+    # which walks the body block; the tape must not shortcut past it into
+    # the argmax pair, and now lowers the body as a sub-Program instead.
     mod, _, _ = _argpair_mod("GT", el="i1", shape=(3, 4))
     x = RNG.integers(0, 2, (3, 4)) > 0
-    check(mod, [x, _iota_idx((3, 4), 1)], lowered=False)
+    check(mod, [x, _iota_idx((3, 4), 1)])
 
 
-def test_decline_pair_reduce_without_a_compare():
+def test_pair_reduce_without_a_compare_is_generic():
     # A two-operand reduce whose body is arithmetic is a generic variadic
-    # fold, not an argmax.
+    # fold, not an argmax — the same distinction on both engines.
     t = "tensor<3x4xf32>"
     mod = _mod([("a", t), ("b", t)], ["tensor<3xf32>", "tensor<3xf32>"], f"""
     %i0 = stablehlo.constant dense<0.0> : tensor<f32>
@@ -959,7 +960,7 @@ def test_decline_pair_reduce_without_a_compare():
       stablehlo.return %s, %m : tensor<f32>, tensor<f32>
     }}) : ({t}, {t}, tensor<f32>, tensor<f32>) -> (tensor<3xf32>, tensor<3xf32>)
     return %0#0, %0#1 : tensor<3xf32>, tensor<3xf32>""")
-    check(mod, [_f32(), _f32()], lowered=False)
+    check(mod, [_f32(), _f32()])
 
 
 # --------------------------------------------------------------------------
@@ -1262,16 +1263,20 @@ def test_call_forwarding_an_argument_is_copied():
 
 def test_decline_call_with_an_unsupported_body():
     # The decline is WHOLESALE: one unported op anywhere, callee included,
-    # and the whole program keeps the Python engine.
-    t = "tensor<6xi32>"
+    # and the whole program keeps the Python engine. (Convolution is the
+    # stand-in for "an op with no opcode"; popcnt was, and then fft, until
+    # each was ported.)
+    t = "tensor<1x1x5xf32>"
     mod = _with_funcs(
         [("a", t)], [t],
         f"    %0 = call @h(%a) : ({t}) -> {t}\n"
         f"    return %0 : {t}",
         [_helper("h", [("x", t)], t,
-                 f"    %0 = stablehlo.popcnt %x : {t}\n"
+                 "    %k = stablehlo.constant dense<1.0> : "
+                 "tensor<1x1x3xf32>\n"
+                 f"    %0 = {_CONV}\n"
                  f"    return %0 : {t}")])
-    check(mod, [np.array([0, 1, -1, 7, 255, 9], np.int32)], lowered=False)
+    check(mod, [_f32((1, 1, 5))], lowered=False)
 
 
 def test_decline_recursive_call():
@@ -1295,18 +1300,31 @@ def test_decline_recursive_call():
 # --------------------------------------------------------------------------
 
 
+# An op the Python engine runs and the tape has no opcode for. Written as
+# a same-shape convolution against a unit kernel so the reference value is
+# obvious; what is under test is the opcode registry as the gate.
+_CONV = (
+    "stablehlo.convolution(%x, %k) "
+    "dim_numbers = [b, f, 0]x[o, i, 0]->[b, f, 0], "
+    "window = {stride = [1], pad = [[1, 1]], lhs_dilate = [1], "
+    "rhs_dilate = [1], reverse = [false]} "
+    "{batch_group_count = 1 : i64, feature_group_count = 1 : i64} : "
+    "(tensor<1x1x5xf32>, tensor<1x1x3xf32>) -> tensor<1x1x5xf32>")
+
+
 def test_decline_unsupported_op():
-    # popcnt is a SWAR chain in the Python handler and has no opcode: the
-    # opcode registry is the gate, so the whole program declines.
-    t = "tensor<6xi32>"
-    mod = _mod([("a", t)], [t], f"""
-    %0 = stablehlo.popcnt %a : {t}
+    t = "tensor<1x1x5xf32>"
+    mod = _mod([("x", t)], [t], f"""
+    %k = stablehlo.constant dense<1.0> : tensor<1x1x3xf32>
+    %0 = {_CONV}
     return %0 : {t}""")
-    check(mod, [np.array([0, 1, -1, 7, 255, -2147483648], np.int32)],
-          lowered=False)
+    check(mod, [_f32((1, 1, 5))], lowered=False)
 
 
-def test_decline_region_op():
+def test_non_monoid_reduce_body_takes_the_generic_path():
+    # `subtract` is in neither reducer table, so ops/reduction.py folds the
+    # reduced axis pairwise with the body itself; the tape lowers the body
+    # into a sub-Program and calls it once per halving round.
     t = "tensor<3x4xf32>"
     mod = _mod([("a", t)], ["tensor<3xf32>"], f"""
     %init = stablehlo.constant dense<0.0> : tensor<f32>
@@ -1316,7 +1334,7 @@ def test_decline_region_op():
       stablehlo.return %s : tensor<f32>
     }}) : ({t}, tensor<f32>) -> tensor<3xf32>
     return %0 : tensor<3xf32>""")
-    check(mod, [_f32()], lowered=False)
+    check(mod, [_f32()])
 
 
 def test_control_flow_lowers_but_a_forwarding_branch_is_copied():
@@ -1337,14 +1355,15 @@ def test_control_flow_lowers_but_a_forwarding_branch_is_copied():
     fresh_outputs(mod, [np.float32(1.5)], [0], args_too=[0])
 
 
-def test_decline_complex():
+def test_complex_add():
+    # complex64 joined the dtype table with the tail sweep.
     t = "tensor<4xcomplex<f32>>"
     mod = _mod([("a", t), ("b", t)], [t], f"""
     %0 = stablehlo.add %a, %b : {t}
     return %0 : {t}""")
     z = (RNG.standard_normal(4) + 1j * RNG.standard_normal(4)).astype(
         np.complex64)
-    check(mod, [z, z * 2], lowered=False)
+    check(mod, [z, z * 2])
 
 
 def test_decline_f64_passthrough():
@@ -1366,9 +1385,9 @@ def test_decline_emulated_dtype():
           lowered=False)
 
 
-def test_decline_variadic_reduce():
+def test_variadic_reduce_is_generic():
     # Three operands: past the argmax pair, into _generic_reduce's pairwise
-    # halving, which evaluates the body block op by op.
+    # halving, which the tape runs as a sub-Program per round.
     t = "tensor<3x4xf32>"
     mod = _mod([("a", t), ("b", t), ("c", t)],
                ["tensor<3xf32>", "tensor<3xf32>", "tensor<3xf32>"], f"""
@@ -1381,17 +1400,17 @@ def test_decline_variadic_reduce():
       stablehlo.return %s0, %s1, %s2 : tensor<f32>, tensor<f32>, tensor<f32>
     }}) : ({t}, {t}, {t}, tensor<f32>, tensor<f32>, tensor<f32>) -> (tensor<3xf32>, tensor<3xf32>, tensor<3xf32>)
     return %0#0, %0#1, %0#2 : tensor<3xf32>, tensor<3xf32>, tensor<3xf32>""")
-    check(mod, [_f32(), _f32(), _f32()], lowered=False)
+    check(mod, [_f32(), _f32(), _f32()])
 
 
-def test_decline_totalorder_compare():
+def test_totalorder_compare():
     t = "tensor<6xf32>"
     ot = "tensor<6xi1>"
     mod = _mod([("a", t), ("b", t)], [ot], f"""
     %0 = stablehlo.compare LT, %a, %b, TOTALORDER : ({t}, {t}) -> {ot}
     return %0 : {ot}""")
     x = np.array([np.nan, -np.nan, 0.0, -0.0, np.inf, -np.inf], np.float32)
-    check(mod, [x, np.roll(x, 2)], lowered=False)
+    check(mod, [x, np.roll(x, 2)])
 
 
 def test_constant_output_is_copied():

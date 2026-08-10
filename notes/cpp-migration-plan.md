@@ -349,6 +349,69 @@ sources as `("free", id, value)` while `source_id` keyed them as
 `("hoist", value)` — a pre-existing inconsistency, left alone here). The
 capture case, one step short of it, is tested.
 
+## M5c landed (2026-08-10): the decline tail
+
+Everything M5b's census itemized, transliterated from `src/metaljax/ops/`
+the same way: what the Python handler decides from the IR is decided at
+lowering, what it computes on arrays is a C++ handler, and the differential
+compares BYTES on both the eager and the mx::compile'd path.
+
+**Census** (whole pytest suite, `METALJAX_ENGINE=native`): 83 -> 19
+declined. What landed, family by family:
+
+| family | was | now |
+|---|---:|---|
+| complex64 (+ `real`/`imag`/`complex`) | 29 | dtype-table entry + the C99 arms: scaled-hypot `abs`, `sign`, `exp`/`expm1`'s exact zero-sin, Kahan `csqrt`/`rsqrt`, `tan`'s pole, complex->real `convert`, complex `iota`/`dot_general` |
+| `rng_bit_generator` | 23 | Philox4x32 + ThreeFry2x32, bit-exact (the whole block/half schedule is static and resolved in Python) |
+| `fft` | 9 | `mx::fft::{fftn,ifftn,rfftn,irfftn}` + both MLX workarounds (empty transform, unit last length) + the eager input barrier, which reads the `in_trace` flag the interpreter already threads |
+| general reduce bodies | 4 | the body becomes a sub-Program; the pairwise halving, the odd-extent init pad and the final init fold are the handler's, in its order |
+| `popcnt` / `count_leading_zeros` | 2 | SWAR, u64 for 64-bit operands and u32 below |
+| TOTALORDER compare | 1 | the integer keys `total_order_key` already built for sort |
+| `pad` | 1 | interior dilation (slice_update into an init-valued array), edge pads, negative-pad crop |
+| `reduce_window` | 1 | the cum-op peephole, the as_strided window path (base dilation, padding, the materialization MLX's strided reductions need), monoid / select_and_gather_add / generic-body folds |
+| `reverse` | — | a latent op-set gap with no test behind it, found by a complex case |
+
+**Declined, on purpose.** Sub-byte floats (7: f4/f6/f8 grids) are NOT
+ported. Their values live in a WIDER storage dtype, which breaks the
+invariant the dtype table exists for (storage IS the logical bits, which
+is what makes `bitcast_convert` and every `mx::view` in the tape correct),
+and a faithful port would have to re-grid after every arithmetic op — a
+per-site flag on every elementwise entry, where one missed site is silent
+wrongness rather than a decline. `dtypes.quantize_emulated` cannot be
+called from the tape either: it is device computation, so binding it as a
+Python callable would reacquire the GIL in the hot path and could not be
+traced into `mx::compile`.
+
+Also still declining, each for a reason the tape cannot paper over:
+`select_and_scatter` (its scatter-add over overlapping windows is
+order-nondeterministic on the GPU, so no byte differential could hold it
+to the Python engine), scatter on complex (MLX has no complex scatter
+kernels; the Python handler scatters the two parts), a sort comparator
+that computes a KEY, a scatter apply-body, `convolution` (never in the op
+set), f64, and the two test programs that assert a decline.
+
+**Floor probe** (bench_spec.py, nsteps=16, ms/step; the M5b table's three
+db-class configs). `stablehlo.pad` was the blocker: every texmo train
+chunk declined on it, and all three now lower with no declines at all.
+
+| config | native | python engine | jax-CPU |
+|---|---:|---:|---:|
+| db02-b4l1024 | 0.985 | 0.914 | 0.121 |
+| db09-b128l128 | 1.598 | 1.572 | 2.238 |
+| db11-b64l256 | 0.843 | 0.825 | 3.087 |
+
+So the floor did not move — and the native path is now 2-10% SLOWER than
+the Python one on these (repeated interleaved: db02 0.971/1.014 native vs
+0.921/0.920 python, db11 0.834/0.818 vs 0.801/0.805 — consistent, not
+noise). These chunks are one compiled replay per step on both engines, so
+nothing is left for dispatch removal to win; the likely cost is the tape's
+STATIC output-copy rule (a carry an optimizer leaves untouched is tainted
+as an argument alias and copied, where the Python engine's `id()` check
+copies nothing) plus the nanobind crossing. Worth measuring before M6
+flips the default — it is the first row where native is behind.
+
+Canaries: 10/10 on both engines, no band moved.
+
 ## Grand plan (Oleg, 2026-08-10)
 
 1) Migrate ALL non-test code to C++ (phase 2 included);

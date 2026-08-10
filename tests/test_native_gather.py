@@ -591,7 +591,18 @@ def test_decline_scatter_apply_body():
           np.array([[0], [1], [7]], np.int32), lowered=False)
 
 
-def test_decline_complex_gather():
+def test_complex_gather():
+    # complex64 joined the dtype table with the tail sweep, and a gather
+    # MOVES bits rather than computing on them, so mx::gather carries it
+    # (mx::scatter, which has no complex kernels, still declines below).
     x = np.array([1 + 2j, 3 - 4j, -5 + 6j], np.complex64)
     i = np.array([2, 0], np.int32)
-    _diff(lambda x, i: x[i], x, i, lowered=False)
+    _diff(lambda x, i: x[i], x, i)
+
+
+def test_decline_complex_scatter():
+    # MLX has no complex GPU scatter kernels; ops/gather.py scatters the
+    # two parts separately, which is not this entry's single primitive.
+    x = np.array([1 + 2j, 3 - 4j, -5 + 6j], np.complex64)
+    u = np.array([7 - 1j], np.complex64)
+    _diff(lambda x, u: x.at[np.array([1])].set(u), x, u, lowered=False)

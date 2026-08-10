@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -62,12 +63,17 @@ enum Op : int {
   kCompare, kSelect, kClamp,
   // dtype
   kConvert,
+  // complex64 (ops/elementwise.py _real / _imag / _complex / _fft)
+  kReal, kImag, kMakeComplex, kFft,
+  // bit counting (SWAR, ops/elementwise.py)
+  kPopcnt, kClz,
   // shape
-  kReshape, kTranspose, kBroadcastInDim, kSlice, kConcatenate, kIota,
+  kReshape, kTranspose, kBroadcastInDim, kSlice, kConcatenate, kIota, kPad,
+  kReverse,
   // data / structured
-  kConstant, kReduce, kArgReduce, kDotGeneral,
+  kConstant, kReduce, kArgReduce, kGenericReduce, kReduceWindow, kDotGeneral,
   kBitcastConvert, kDynamicSlice, kDynamicUpdateSlice, kSort, kTopK,
-  kGather, kScatter,
+  kGather, kScatter, kRng,
   // control flow (M3): each carries its regions as sub-Programs
   kWhile, kIf, kCase,
   // recognizer emits (M4): a REWRITTEN program's roots. These are not
@@ -137,12 +143,20 @@ const NamedOp kOpNames[] = {
     {"stablehlo.select", kSelect},
     {"stablehlo.clamp", kClamp},
     {"stablehlo.convert", kConvert},
+    {"stablehlo.real", kReal},
+    {"stablehlo.imag", kImag},
+    {"stablehlo.complex", kMakeComplex},
+    {"stablehlo.fft", kFft},
     {"stablehlo.reshape", kReshape},
     {"stablehlo.transpose", kTranspose},
     {"stablehlo.broadcast_in_dim", kBroadcastInDim},
     {"stablehlo.slice", kSlice},
     {"stablehlo.concatenate", kConcatenate},
     {"stablehlo.iota", kIota},
+    {"stablehlo.pad", kPad},
+    {"stablehlo.reverse", kReverse},
+    {"stablehlo.popcnt", kPopcnt},
+    {"stablehlo.count_leading_zeros", kClz},
     {"stablehlo.constant", kConstant},
     {"stablehlo.reduce", kReduce},
     // ops/reduction.py reads ONE stablehlo.reduce two ways depending on the
@@ -150,6 +164,11 @@ const NamedOp kOpNames[] = {
     // lowers argmax/argmin to. tape.py decides which, then asks for the
     // opcode by this pseudo-name; C++ still owns both enum values.
     {"stablehlo.reduce.arg_pair", kArgReduce},
+    // ...and a third way: a body neither table recognizes runs on whole
+    // arrays, pairwise (ops/reduction.py _generic_reduce). The body is a
+    // sub-Program; the halving schedule is this handler's.
+    {"stablehlo.reduce.generic", kGenericReduce},
+    {"stablehlo.reduce_window", kReduceWindow},
     {"stablehlo.dot_general", kDotGeneral},
     {"stablehlo.bitcast_convert", kBitcastConvert},
     {"stablehlo.dynamic_slice", kDynamicSlice},
@@ -166,6 +185,7 @@ const NamedOp kOpNames[] = {
     // semantics the primitives already have.
     {"stablehlo.gather", kGather},
     {"stablehlo.scatter", kScatter},
+    {"stablehlo.rng_bit_generator", kRng},
     {"stablehlo.while", kWhile},
     {"stablehlo.if", kIf},
     {"stablehlo.case", kCase},
@@ -205,6 +225,11 @@ const NamedDtype kDtypes[] = {
     {"i32", mx::int32},    {"i64", mx::int64},   {"ui8", mx::uint8},
     {"ui16", mx::uint16},  {"ui32", mx::uint32}, {"ui64", mx::uint64},
     {"f16", mx::float16},  {"f32", mx::float32}, {"bf16", mx::bfloat16},
+    // complex64 IS its own bits on the device (two f32 lanes), so it
+    // belongs here; what it does NOT share with the real types is the
+    // arithmetic, and every handler whose Python counterpart branches on
+    // complex64 branches on it below.
+    {"complex<f32>", mx::complex64},
 };
 constexpr int kNumDtypes = sizeof(kDtypes) / sizeof(kDtypes[0]);
 
@@ -216,9 +241,14 @@ mx::Dtype dtype_of(int64_t code) {
 
 bool is_bool(const mx::Dtype& d) { return d == mx::bool_; }
 
+// dtypes.is_float: complex is NOT float here, exactly as in Python — the
+// handlers that ask this question (sign's NaN rule, argmax's NaN rule)
+// have a separate complex arm or none at all.
 bool is_float(const mx::Dtype& d) {
   return d == mx::float32 || d == mx::float16 || d == mx::bfloat16;
 }
+
+bool is_complex(const mx::Dtype& d) { return d == mx::complex64; }
 
 // dtypes.is_unsigned / dtypes.is_int: bool is NEITHER, which several
 // handlers below depend on (a bool `divide` takes the float arm).
@@ -247,7 +277,9 @@ mx::Dtype unsigned_of(const mx::Dtype& d) {
 // f32. Every literal in the ported handlers below therefore carries the
 // operand's dtype explicitly. Not cosmetic — it changes the result bits.
 mx::array weak(double v, const mx::array& a) {
-  return mx::array(v, is_float(a.dtype()) ? a.dtype() : mx::float32);
+  return mx::array(v, is_float(a.dtype()) || is_complex(a.dtype())
+                          ? a.dtype()
+                          : mx::float32);
 }
 
 // The same rule for a python INT literal, which adopts the array's dtype
@@ -687,6 +719,39 @@ mx::array int_trunc_div(const mx::array& a, const mx::array& b) {
   return mx::astype(mx::where(neg, mx::negative(q), q), a.dtype());
 }
 
+// ops/elementwise._popcount: SWAR, in u64 for 64-bit operands and in u32
+// for everything narrower (which is where the Python handler's astype
+// goes). Every literal adopts the working dtype, as a python int does.
+mx::array popcount_swar(mx::array u, bool wide) {
+  mx::Dtype dt = mx::uint32;
+  int64_t c1 = 0x55555555, c2 = 0x33333333, c4 = 0x0F0F0F0F, m = 0x01010101;
+  int shift = 24;
+  if (wide) {
+    dt = mx::uint64;
+    c1 = 0x5555555555555555LL;
+    c2 = 0x3333333333333333LL;
+    c4 = 0x0F0F0F0F0F0F0F0FLL;
+    m = 0x0101010101010101LL;
+    shift = 56;
+  } else {
+    u = mx::astype(u, mx::uint32);
+  }
+  auto k = [&](int64_t v) { return mx::array(v, dt); };
+  u = mx::subtract(u, mx::bitwise_and(mx::right_shift(u, k(1)), k(c1)));
+  u = mx::add(mx::bitwise_and(u, k(c2)),
+              mx::bitwise_and(mx::right_shift(u, k(2)), k(c2)));
+  u = mx::bitwise_and(mx::add(u, mx::right_shift(u, k(4))), k(c4));
+  return mx::right_shift(mx::multiply(u, k(m)), k(shift));
+}
+
+// ops/elementwise._as_unsigned, resolved by tape.py: 0 casts (bool), 1
+// views (signed), 2 leaves the operand alone (already unsigned).
+mx::array as_unsigned(const mx::array& x, int64_t how, mx::Dtype u) {
+  if (how == 0) return mx::astype(x, u);
+  if (how == 1) return mx::view(x, u);
+  return x;
+}
+
 // ops/elementwise._shift_right_logical: a signed operand shifts as its
 // unsigned twin so the sign bit does not fill.
 mx::array shift_right_logical(const mx::array& a, const mx::array& b) {
@@ -726,6 +791,152 @@ mx::array shift_guard(int kind, const mx::array& a, const mx::array& b,
   mx::array over = mx::greater_equal(mx::astype(b, mx::int32),
                                      mx::array(w, mx::int32));
   return mx::where(over, shift_fill(kind, a, b), shift_apply(kind, a, b));
+}
+
+// --------------------------------------------------------------------------
+// complex64 (src/metaljax/dtypes.py, ops/elementwise.py)
+// --------------------------------------------------------------------------
+//
+// MLX's complex kernels compute the naive formulas, which overflow or go
+// NaN exactly where C99 Annex G (and XLA) are exact. The Python handlers
+// carry a rearrangement per function; these are those rearrangements, and
+// like them they exist only on the complex arm — a real program emits the
+// same ops it always did.
+
+const double kInf = std::numeric_limits<double>::infinity();
+
+// dtypes.make_complex: build the value by writing the halves into place.
+// Doing it arithmetically (re + im*1j) runs a complex multiply that
+// destroys the very values this exists to preserve — (1, inf) becomes
+// (nan, inf) because inf*0 is nan, and -0 + 0 collapses to +0.
+mx::array make_complex(mx::array re, mx::array im) {
+  re = mx::astype(re, mx::float32);
+  im = mx::astype(im, mx::float32);
+  if (re.shape() != im.shape()) {
+    std::vector<mx::array> both = mx::broadcast_arrays({re, im});
+    re = both[0];
+    im = both[1];
+  }
+  return mx::reshape(mx::view(mx::stack({re, im}, -1), mx::complex64),
+                     re.shape());
+}
+
+// _cabs: |z| by scaled hypot — the naive sqrt(re^2+im^2) overflows for
+// large parts and underflows for tiny ones.
+mx::array cabs(const mx::array& z) {
+  mx::array a = mx::abs(mx::real(z)), b = mx::abs(mx::imag(z));
+  mx::array big = mx::maximum(a, b), small = mx::minimum(a, b);
+  mx::array zero = mx::array(0.0f, mx::float32);
+  mx::array is0 = mx::equal(big, zero);
+  mx::array safe = mx::where(is0, mx::ones_like(big), big);
+  mx::array r = mx::where(is0, mx::zeros_like(big), mx::divide(small, safe));
+  mx::array out = mx::multiply(
+      big, mx::sqrt(mx::add(mx::array(1.0f, mx::float32),
+                            mx::multiply(r, r))));
+  return mx::where(mx::logical_or(mx::isinf(a), mx::isinf(b)),
+                   mx::full(a.shape(), kInf, mx::float32), out);
+}
+
+// _expm1_f32: MLX's Metal expm1 kernel is fast-math; exp(x)-1 is ~1 ULP
+// except near zero where it cancels, so expm1 is used only there.
+mx::array expm1_f32(const mx::array& x) {
+  return mx::where(mx::less(mx::abs(x), weak(0.25, x)), mx::expm1(x),
+                   mx::subtract(mx::exp(x), weak(1.0, x)));
+}
+
+// _csqrt: Kahan's rearrangement of the C99 formula. The textbook
+// expression underflows the real part to a spurious 0 near the negative
+// real axis and overflows once 2|z| leaves f32; taking the small component
+// from `y` directly cancels in neither branch. Non-finite inputs keep
+// MLX's own answers, as the Python handler leaves them.
+mx::array csqrt(const mx::array& z) {
+  mx::array x = mx::real(z), y = mx::imag(z);
+  mx::array huge = mx::greater(mx::maximum(mx::abs(x), mx::abs(y)),
+                               mx::array(1e18f, mx::float32));
+  mx::array scale = mx::where(huge, mx::array(std::pow(2.0, -60), mx::float32),
+                              mx::array(1.0f, mx::float32));
+  mx::array xs = mx::multiply(x, scale), ys = mx::multiply(y, scale);
+  mx::array t = mx::sqrt(mx::multiply(
+      mx::array(2.0f, mx::float32),
+      mx::add(cabs(make_complex(xs, ys)), mx::abs(xs))));
+  mx::array tsafe =
+      mx::where(mx::equal(t, mx::array(0.0f, mx::float32)), mx::ones_like(t), t);
+  mx::array half = mx::divide(t, mx::array(2.0f, mx::float32));
+  // copysign(half, ys): MLX has no signbit, so read the bit (-0.0 counts).
+  mx::array neg = mx::less(mx::view(ys, mx::int32), mx::array(0, mx::int32));
+  mx::array pos_re = mx::greater_equal(xs, mx::array(0.0f, mx::float32));
+  mx::array re = mx::where(pos_re, half, mx::divide(mx::abs(ys), tsafe));
+  mx::array im = mx::where(pos_re, mx::divide(ys, tsafe),
+                           mx::where(neg, mx::negative(half), half));
+  mx::array unscale = mx::where(huge, mx::array(std::pow(2.0, 30), mx::float32),
+                                mx::array(1.0f, mx::float32));
+  mx::array out =
+      make_complex(mx::multiply(re, unscale), mx::multiply(im, unscale));
+  return mx::where(mx::logical_and(mx::isfinite(x), mx::isfinite(y)), out,
+                   mx::sqrt(z));
+}
+
+// --------------------------------------------------------------------------
+// rng_bit_generator (src/metaljax/ops/rng.py)
+// --------------------------------------------------------------------------
+//
+// XLA's Philox4x32 and ThreeFry2x32, transliterated from the Python handler
+// that was reverse-engineered from xla/hlo/builder/lib/prng.cc and verified
+// word for word against the CPU backend. Nothing here is "an implementation
+// of philox": it is THAT implementation, in the same order, with the same
+// widths, because the whole value of the family is that its bits match.
+
+constexpr int64_t kM0 = 0xD2511F53;
+constexpr int64_t kM1 = 0xCD9E8D57;
+constexpr int64_t kW0 = 0x9E3779B9;
+constexpr int64_t kW1 = 0xBB67AE85;
+constexpr int64_t kLo32 = 0xFFFFFFFF;
+
+mx::array u64c(int64_t v) { return mx::array(v, mx::uint64); }
+mx::array u32c(int64_t v) { return mx::array(v, mx::uint32); }
+
+// _philox_blocks: ten rounds over vectors of u32 counter words.
+void philox_blocks(mx::array& x0, mx::array& x1, mx::array& x2, mx::array& x3,
+                   mx::array k0, mx::array k1) {
+  for (int i = 0; i < 10; i++) {
+    mx::array p0 = mx::multiply(mx::astype(x0, mx::uint64), u64c(kM0));
+    mx::array p1 = mx::multiply(mx::astype(x2, mx::uint64), u64c(kM1));
+    mx::array hi0 = mx::astype(mx::right_shift(p0, u64c(32)), mx::uint32);
+    mx::array lo0 = mx::astype(mx::bitwise_and(p0, u64c(kLo32)), mx::uint32);
+    mx::array hi1 = mx::astype(mx::right_shift(p1, u64c(32)), mx::uint32);
+    mx::array lo1 = mx::astype(mx::bitwise_and(p1, u64c(kLo32)), mx::uint32);
+    mx::array n0 = mx::bitwise_xor(mx::bitwise_xor(hi1, x1), k0);
+    mx::array n2 = mx::bitwise_xor(mx::bitwise_xor(hi0, x3), k1);
+    x0 = n0;
+    x1 = lo1;
+    x2 = n2;
+    x3 = lo0;
+    k0 = mx::add(k0, u32c(kW0));
+    k1 = mx::add(k1, u32c(kW1));
+  }
+}
+
+const int kTfRot[8] = {13, 15, 26, 6, 17, 29, 16, 24};
+
+// _threefry2x32: 20 rounds, key injection every 4.
+void threefry2x32(mx::array& x0, mx::array& x1, const mx::array& k0,
+                  const mx::array& k1) {
+  mx::array ks2 = mx::bitwise_xor(mx::bitwise_xor(u32c(0x1BD11BDA), k0), k1);
+  mx::array ks[3] = {k0, k1, ks2};
+  x0 = mx::add(x0, ks[0]);
+  x1 = mx::add(x1, ks[1]);
+  for (int g = 0; g < 5; g++) {
+    for (int r = 0; r < 4; r++) {
+      int rot = kTfRot[(g % 2) * 4 + r];
+      x0 = mx::add(x0, x1);
+      x1 = mx::bitwise_or(mx::left_shift(x1, u32c(rot)),
+                          mx::right_shift(x1, u32c(32 - rot)));
+      x1 = mx::bitwise_xor(x0, x1);
+    }
+    int j = g + 1;
+    x0 = mx::add(x0, ks[j % 3]);
+    x1 = mx::add(mx::add(x1, ks[(j + 1) % 3]), u32c(j));
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -819,6 +1030,82 @@ mx::array reduce_combine(int64_t kind, const mx::array& a,
     case 5: return mx::logical_and(a, b);
     default: throw std::invalid_argument("tape: bad reduce kind");
   }
+}
+
+// --------------------------------------------------------------------------
+// reduce_window (src/metaljax/ops/reduction.py `_extract_windows`)
+// --------------------------------------------------------------------------
+//
+// Base-dilate with the init, pad with the init, then read every window out
+// of ONE strided view. Every shape here is static and tape.py resolved it;
+// what is left is the four MLX calls, in the handler's order — including
+// the materialization at the end, which is not an optimization but a
+// workaround: MLX 0.32 reductions over a strided view read stale device
+// memory once the reshape folds the window block into a non-unit stride.
+
+struct WindowPlan {
+  struct Dil {
+    int axis;
+    int b;
+    mx::Shape shape;   // the array's shape with this axis dilated
+    int end;           // ...and the extent kept after the holes are cut
+  };
+  std::vector<Dil> dils;
+  bool padded = false;
+  std::vector<int> lo, hi;
+  mx::Shape view_shape;
+  mx::Strides view_strides;
+  mx::Shape flat;      // out_sizes + [prod(window)]
+  bool empty = false;
+  mx::Shape out_sizes;
+};
+
+WindowPlan read_window_plan(Cursor& c) {
+  WindowPlan p;
+  int64_t ndil = c.next();
+  for (int64_t i = 0; i < ndil; i++) {
+    WindowPlan::Dil d;
+    d.axis = static_cast<int>(c.next());
+    d.b = static_cast<int>(c.next());
+    d.shape = c.shp();
+    d.end = static_cast<int>(c.next());
+    p.dils.push_back(std::move(d));
+  }
+  p.padded = c.flag();
+  p.lo = c.vec();
+  p.hi = c.vec();
+  p.view_shape = c.shp();
+  std::vector<int64_t> st = c.vec64();
+  p.view_strides = mx::Strides(st.begin(), st.end());
+  p.flat = c.shp();
+  p.empty = c.flag();
+  p.out_sizes = c.shp();
+  return p;
+}
+
+mx::array extract_windows(const WindowPlan& p, mx::array x,
+                          const mx::array& init) {
+  for (const WindowPlan::Dil& d : p.dils) {
+    // Holes of the init value, the operand written into every b-th slot.
+    mx::array holes =
+        mx::contiguous(mx::broadcast_to(mx::astype(init, x.dtype()), d.shape));
+    mx::Shape start(d.shape.size(), 0), strides(d.shape.size(), 1);
+    strides[static_cast<size_t>(d.axis)] = d.b;
+    holes = mx::slice_update(holes, x, start, d.shape, strides);
+    mx::Shape stop = d.shape;
+    stop[static_cast<size_t>(d.axis)] = d.end;
+    x = mx::slice(holes, start, stop);
+  }
+  if (p.padded) {
+    std::vector<int> ax(p.lo.size());
+    for (size_t i = 0; i < ax.size(); i++) ax[i] = static_cast<int>(i);
+    x = mx::pad(x, ax, mx::Shape(p.lo.begin(), p.lo.end()),
+                mx::Shape(p.hi.begin(), p.hi.end()),
+                mx::astype(init, x.dtype()), "constant");
+  }
+  x = mx::contiguous(x);   // as_strided needs row-contiguous storage
+  return mx::contiguous(
+      mx::reshape(mx::as_strided(x, p.view_shape, p.view_strides, 0), p.flat));
 }
 
 // --------------------------------------------------------------------------
@@ -1578,23 +1865,84 @@ class Program {
     const std::vector<int64_t>& at = e.attrs;
 
     switch (e.op) {
-      // --- unary (ops/elementwise.py _UNARY, real-dtype branches) ---
-      case kAbs: env[e.outs[0]] = mx::abs(in(0)); break;
+      // --- unary (ops/elementwise.py _UNARY) ---
+      //
+      // The functions with a complex arm in the Python table have one here
+      // too, dispatched on the same question (`x.dtype == mx.complex64`);
+      // the rest call the same MLX function whatever the dtype is, which is
+      // what the Python table does.
+      case kAbs:
+        env[e.outs[0]] = is_complex(in(0).dtype()) ? cabs(in(0))
+                                                   : mx::abs(in(0));
+        break;
       case kCeil: env[e.outs[0]] = mx::ceil(in(0)); break;
       case kCos: env[e.outs[0]] = mx::cos(in(0)); break;
       case kErf: env[e.outs[0]] = mx::erf(in(0)); break;
       case kErfInv: env[e.outs[0]] = mx::erfinv(in(0)); break;
-      case kExp: env[e.outs[0]] = mx::exp(in(0)); break;
+      case kExp: {
+        const mx::array& x = in(0);
+        if (!is_complex(x.dtype())) {
+          env[e.outs[0]] = mx::exp(x);
+          break;
+        }
+        // _exp: e^a * (cos b, sin b), with sin's zero kept exact so that
+        // inf * 0 does not become NaN.
+        mx::array a = mx::real(x), b = mx::imag(x);
+        mx::array ex = mx::exp(a);
+        env[e.outs[0]] = make_complex(
+            mx::multiply(ex, mx::cos(b)),
+            mx::where(mx::equal(b, weak(0.0, b)), b,
+                      mx::multiply(ex, mx::sin(b))));
+        break;
+      }
       case kFloor: env[e.outs[0]] = mx::floor(in(0)); break;
       case kIsFinite: env[e.outs[0]] = mx::isfinite(in(0)); break;
       case kLog: env[e.outs[0]] = mx::log(in(0)); break;
       case kLog1p: env[e.outs[0]] = mx::log1p(in(0)); break;
       case kLogistic: env[e.outs[0]] = mx::sigmoid(in(0)); break;
       case kNegate: env[e.outs[0]] = mx::negative(in(0)); break;
-      case kRsqrt: env[e.outs[0]] = mx::rsqrt(in(0)); break;
+      case kRsqrt: {
+        const mx::array& x = in(0);
+        if (!is_complex(x.dtype())) {
+          env[e.outs[0]] = mx::rsqrt(x);
+          break;
+        }
+        // _rsqrt: conj(sqrt(z))/|z| -- both factors cancellation-free.
+        mx::array s = csqrt(x);
+        mx::array m = cabs(x);
+        mx::array zero = mx::array(0.0f, mx::float32);
+        mx::array msafe = mx::where(mx::equal(m, zero), mx::ones_like(m), m);
+        mx::array out = make_complex(mx::divide(mx::real(s), msafe),
+                                     mx::negative(mx::divide(mx::imag(s),
+                                                             msafe)));
+        mx::array ok = mx::logical_and(
+            mx::logical_and(mx::isfinite(mx::real(x)),
+                            mx::isfinite(mx::imag(x))),
+            mx::not_equal(m, zero));
+        env[e.outs[0]] = mx::where(ok, out, mx::rsqrt(x));
+        break;
+      }
       case kSin: env[e.outs[0]] = mx::sin(in(0)); break;
-      case kSqrt: env[e.outs[0]] = mx::sqrt(in(0)); break;
-      case kTan: env[e.outs[0]] = mx::tan(in(0)); break;
+      case kSqrt:
+        env[e.outs[0]] = is_complex(in(0).dtype()) ? csqrt(in(0))
+                                                   : mx::sqrt(in(0));
+        break;
+      case kTan: {
+        const mx::array& x = in(0);
+        if (!is_complex(x.dtype())) {
+          env[e.outs[0]] = mx::tan(x);
+          break;
+        }
+        // _tan: C99 says tan(x +- i*inf) = +-i whatever the real part.
+        mx::array im = mx::imag(x);
+        mx::array pole = mx::isinf(im);
+        mx::array safe =
+            mx::where(pole, make_complex(mx::zeros_like(im), im), x);
+        env[e.outs[0]] = mx::where(
+            pole, make_complex(mx::zeros_like(im), mx::sign(im)),
+            mx::tan(safe));
+        break;
+      }
       case kTanh: env[e.outs[0]] = mx::tanh(in(0)); break;
       case kSquare: env[e.outs[0]] = mx::square(in(0)); break;
 
@@ -1607,8 +1955,19 @@ class Program {
         break;
       }
       case kSign: {
-        // _sign: mx.sign returns 0 for NaN, stablehlo.sign propagates it.
+        // _sign: mx.sign returns 0 for NaN, stablehlo.sign propagates it;
+        // on complex the sign is z/|z|, with zero mapping to itself (which
+        // keeps a signed zero's own bits).
         const mx::array& x = in(0);
+        if (is_complex(x.dtype())) {
+          mx::array re = mx::real(x), im = mx::imag(x);
+          mx::array m = cabs(x);
+          mx::array zero = mx::array(0.0f, mx::float32);
+          env[e.outs[0]] = mx::where(
+              mx::logical_and(mx::equal(re, zero), mx::equal(im, zero)), x,
+              make_complex(mx::divide(re, m), mx::divide(im, m)));
+          break;
+        }
         env[e.outs[0]] = is_float(x.dtype())
                              ? mx::where(mx::isnan(x), x, mx::sign(x))
                              : mx::sign(x);
@@ -1627,10 +1986,22 @@ class Program {
         // where it cancels -- so use expm1 only there. Halves keep their
         // own expm1, which is already accurate.
         const mx::array& x = in(0);
+        if (is_complex(x.dtype())) {
+          // exp(z)-1 cancels catastrophically; the C99 reconstruction.
+          mx::array a = mx::real(x), b = mx::imag(x);
+          mx::array hs = mx::sin(mx::divide(b, weak(2.0, b)));
+          env[e.outs[0]] = make_complex(
+              // `2 * hs * hs` associates left in Python, and the order is
+              // visible once hs * hs is subnormal.
+              mx::subtract(mx::multiply(expm1_f32(a), mx::cos(b)),
+                           mx::multiply(mx::multiply(weak(2.0, hs), hs), hs)),
+              mx::where(mx::equal(b, weak(0.0, b)), b,
+                        mx::multiply(mx::exp(a), mx::sin(b))));
+          break;
+        }
         env[e.outs[0]] =
             x.dtype() == mx::float32
-                ? mx::where(mx::less(mx::abs(x), weak(0.25, x)), mx::expm1(x),
-                            mx::subtract(mx::exp(x), weak(1.0, x)))
+                ? expm1_f32(x)
                 : mx::expm1(x);
         break;
       }
@@ -1736,8 +2107,14 @@ class Program {
 
       // --- selection ---
       case kCompare: {
-        const mx::array& a = in(0);
-        const mx::array& b = in(1);
+        mx::array a = in(0);
+        mx::array b = in(1);
+        if (at[1]) {
+          // IEEE totalOrder: compare the order-preserving integer keys
+          // instead of the raw floats (_compare's TOTALORDER arm).
+          a = total_order_key(a);
+          b = total_order_key(b);
+        }
         switch (at[0]) {
           case 0: env[e.outs[0]] = mx::equal(a, b); break;
           case 1: env[e.outs[0]] = mx::not_equal(a, b); break;
@@ -1758,8 +2135,75 @@ class Program {
         break;
 
       case kConvert:
-        env[e.outs[0]] = mx::astype(in(0), dtype_of(at[0]));
+        // _convert. XLA's complex -> real convert keeps the REAL part,
+        // which mx::astype would not do on its own; whether that arm runs
+        // is a question about two element types, so tape.py answered it.
+        env[e.outs[0]] = mx::astype(at[1] ? mx::real(in(0)) : in(0),
+                                    dtype_of(at[0]));
         break;
+
+      // --- complex64 (ops/elementwise.py) ---
+      case kReal: env[e.outs[0]] = mx::real(in(0)); break;
+      case kImag:
+        // _imag on a real operand is zeros, not an error.
+        env[e.outs[0]] = is_complex(in(0).dtype()) ? mx::imag(in(0))
+                                                   : mx::zeros_like(in(0));
+        break;
+      case kMakeComplex:
+        env[e.outs[0]] = make_complex(in(0), in(1));
+        break;
+      case kFft: {
+        // _fft. Which transform runs, over which axes and lengths, and
+        // whether the empty or unit-length rewrite applies are all static;
+        // the two MLX workarounds behind those rewrites are documented in
+        // the Python handler.
+        Cursor c(at);
+        int64_t form = c.next();
+        if (form == 0) {
+          // MLX rejects zero-size transforms; XLA returns the typed empty
+          // result, and a transform of nothing is a sum over nothing.
+          mx::Dtype dt = dtype_of(c.next());
+          env[e.outs[0]] = mx::zeros(c.shp(), dt);
+          break;
+        }
+        const mx::array& x = in(0);
+        // MLX's FFT kernels can read an input buffer whose producing copy
+        // is still in flight. Inside a trace the whole program is one
+        // graph MLX orders itself, so only the eager path needs this.
+        if (!in_trace) {
+          std::vector<mx::array> one{x};
+          mx::eval(one);
+        }
+        if (form == 1) {
+          int64_t kind = c.next();
+          std::vector<int> n = c.vec();
+          std::vector<int> axes = c.vec();
+          mx::Shape s(n.begin(), n.end());
+          switch (kind) {
+            case 0: env[e.outs[0]] = mx::fft::fftn(x, s, axes); break;
+            case 1: env[e.outs[0]] = mx::fft::ifftn(x, s, axes); break;
+            case 2: env[e.outs[0]] = mx::fft::rfftn(x, s, axes); break;
+            default: env[e.outs[0]] = mx::fft::irfftn(x, s, axes); break;
+          }
+          break;
+        }
+        // The unit-length rewrite: a length-1 real transform is the
+        // identity on the single DC bin, so the real axis just drops its
+        // imaginary part (irfft) or gains one (rfft), and the leading axes
+        // take an ordinary complex transform.
+        bool has_lead = c.flag();
+        std::vector<int> n = c.vec();
+        std::vector<int> axes = c.vec();
+        mx::Shape s(n.begin(), n.end());
+        if (form == 2) {  // IRFFT
+          mx::array y = has_lead ? mx::fft::ifftn(x, s, axes) : x;
+          env[e.outs[0]] = mx::real(y);
+        } else {          // RFFT
+          mx::array y = mx::astype(x, mx::complex64);
+          env[e.outs[0]] = has_lead ? mx::fft::fftn(y, s, axes) : y;
+        }
+        break;
+      }
 
       // --- shape (ops/shape.py) ---
       case kReshape:
@@ -1816,6 +2260,76 @@ class Program {
         view[dim] = out[dim];
         env[e.outs[0]] =
             mx::astype(mx::broadcast_to(mx::reshape(ramp, view), out), dt);
+        break;
+      }
+
+      case kPad: {
+        // ops/shape.py _pad: interior dilation, then edge pads, then the
+        // crop negative pads mean. tape.py resolved which stages run and
+        // every shape they produce; each is read whether it runs or not so
+        // the cursor stays aligned.
+        Cursor c(at);
+        mx::array x = in(0);
+        mx::array fill = mx::astype(in(1), x.dtype());
+        bool interior = c.flag();
+        mx::Shape dilated = c.shp();
+        std::vector<int> istrides = c.vec();
+        if (interior) {
+          // The Python handler materializes the broadcast before writing
+          // into its strided slice (`mx.array(exp)`); mx::contiguous is
+          // that materialization, and slice_update is the write.
+          mx::array base = mx::contiguous(mx::broadcast_to(fill, dilated));
+          mx::Shape start(dilated.size(), 0);
+          mx::Shape strides(istrides.begin(), istrides.end());
+          x = mx::slice_update(base, x, start, dilated, strides);
+        }
+        bool padded = c.flag();
+        std::vector<int> lo_w = c.vec(), hi_w = c.vec();
+        if (padded) {
+          std::vector<int> ax(lo_w.size());
+          for (size_t i = 0; i < ax.size(); i++) ax[i] = static_cast<int>(i);
+          x = mx::pad(x, ax, mx::Shape(lo_w.begin(), lo_w.end()),
+                      mx::Shape(hi_w.begin(), hi_w.end()), fill, "constant");
+        }
+        bool crop = c.flag();
+        mx::Shape begin = c.shp(), end = c.shp();
+        if (crop) x = mx::slice(x, begin, end);
+        env[e.outs[0]] = x;
+        break;
+      }
+
+      case kReverse: {
+        // ops/shape.py _reverse: a descending take per reversed dim. Dims
+        // of extent 0 or 1 are identity and tape.py already dropped them.
+        mx::array x = in(0);
+        for (int64_t i = 0; i < at[0]; i++) {
+          int d = static_cast<int>(at[1 + 2 * i]);
+          double n = static_cast<double>(at[2 + 2 * i]);
+          x = mx::take(x, mx::arange(n - 1, -1.0, -1.0, mx::int32), d);
+        }
+        env[e.outs[0]] = x;
+        break;
+      }
+
+      case kPopcnt:
+      case kClz: {
+        // ops/elementwise._popcnt / _clz. `_as_unsigned` then SWAR; clz
+        // first smears the highest set bit down (log2(width) rounds) so
+        // the population count of the smear is width - leading zeros.
+        const mx::array& x = in(0);
+        mx::Dtype u_dt = dtype_of(at[0]);
+        bool wide = at[2] != 0;
+        int64_t bits = at[3];
+        mx::array u = as_unsigned(x, at[1], u_dt);
+        if (e.op == kClz) {
+          for (int64_t s = 1; s < bits; s *= 2)
+            u = mx::bitwise_or(u, mx::right_shift(u, mx::array(s, u.dtype())));
+          mx::array pc = popcount_swar(u, wide);
+          env[e.outs[0]] = mx::astype(
+              mx::subtract(mx::array(bits, pc.dtype()), pc), dtype_of(at[4]));
+        } else {
+          env[e.outs[0]] = mx::astype(popcount_swar(u, wide), dtype_of(at[4]));
+        }
         break;
       }
 
@@ -1896,6 +2410,201 @@ class Program {
         mx::array idx = mx::take_along_axis(ids, mx::expand_dims(arg, d), d);
         env[e.outs[0]] = val;
         env[e.outs[1]] = mx::squeeze(idx, d);
+        break;
+      }
+
+      case kGenericReduce: {
+        // ops/reduction.py _reduce's last arm. Operands are the n inputs,
+        // the n inits, then the body's captures.
+        Cursor c(at);
+        size_t n = static_cast<size_t>(c.next());
+        std::vector<int> keep = c.vec();
+        std::vector<int> dims = c.vec();
+        int64_t ncaps = c.next();
+        std::vector<mx::array> inputs, inits, caps;
+        for (size_t i = 0; i < n; i++) inputs.push_back(in(i));
+        for (size_t i = 0; i < n; i++) inits.push_back(in(n + i));
+        for (int64_t i = 0; i < ncaps; i++) caps.push_back(in(2 * n + i));
+        std::vector<mx::array> outs = generic_reduce(
+            inputs, inits, caps, keep, dims, e.regions[0].get(), in_trace);
+        if (outs.size() != e.outs.size())
+          throw std::runtime_error("tape: generic reduce result count");
+        for (size_t i = 0; i < outs.size(); i++) env[e.outs[i]] = outs[i];
+        break;
+      }
+
+      case kRng: {
+        // ops/rng.py _rng_bit_generator. tape.py resolved the algorithm,
+        // the block/half counts and every shape; what is left is the
+        // arithmetic and the two ways of laying the words out.
+        Cursor c(at);
+        bool threefry = c.flag();
+        bool state_u32 = c.flag();
+        mx::Dtype out_dt = dtype_of(c.next());
+        mx::Dtype unsigned_dt = dtype_of(c.next());
+        mx::Shape out_shape = c.shp();
+
+        mx::array state = in(0);
+        if (state_u32) state = mx::view(state, mx::uint64);
+        mx::array key = mx::squeeze(
+            mx::slice(state, mx::Shape{0}, mx::Shape{1}), 0);
+        mx::array ctr = mx::squeeze(
+            mx::slice(state, mx::Shape{1}, mx::Shape{2}), 0);
+        mx::array k0 = mx::astype(mx::bitwise_and(key, u64c(kLo32)),
+                                  mx::uint32);
+        mx::array k1 = mx::astype(mx::right_shift(key, u64c(32)), mx::uint32);
+
+        mx::array bits = state;   // replaced below on every path
+        int64_t consumed = 0;
+        if (threefry) {
+          int64_t n_half = c.next();
+          int split = static_cast<int>(c.next());
+          bool scalar = c.flag();
+          bool needs_slice = c.flag();
+          mx::Shape h = c.shp(), rounded = c.shp(), dims = c.shp();
+          // One threefry block per half-element pair; the counter is the
+          // state's plus the row-major linear index.
+          mx::array u64s = mx::add(
+              ctr, mx::arange(static_cast<double>(n_half), mx::uint64));
+          mx::array x0 = mx::astype(mx::bitwise_and(u64s, u64c(kLo32)),
+                                    mx::uint32);
+          mx::array x1 = mx::astype(mx::right_shift(u64s, u64c(32)),
+                                    mx::uint32);
+          threefry2x32(x0, x1, k0, k1);
+          mx::array both = mx::concatenate(
+              {mx::reshape(x0, h), mx::reshape(x1, h)}, split + 1);
+          both = mx::reshape(both, rounded);
+          if (needs_slice) {
+            mx::Shape start(dims.size(), 0), stop = rounded;
+            stop[static_cast<size_t>(split)] = dims[split];
+            both = mx::slice(both, start, stop);
+          }
+          if (scalar) both = mx::reshape(both, mx::Shape{});
+          // The narrow arm casts (truncating each element); the handler
+          // does NOT view a signed output back, so neither does this.
+          if (unsigned_dt != mx::uint32) both = mx::astype(both, unsigned_dt);
+          bits = both;
+          consumed = n_half;
+        } else {
+          int64_t n = c.next(), width = c.next(), num_u32 = c.next(),
+                  nv4 = c.next();
+          if (nv4 == 0) {
+            // Empty output: XLA consumes no blocks, so the state comes
+            // back unchanged.
+            mx::array st = state_u32 ? mx::view(state, mx::uint32) : state;
+            env[e.outs[0]] = st;
+            env[e.outs[1]] = mx::zeros(out_shape, out_dt);
+            break;
+          }
+          mx::array low = mx::add(
+              ctr, mx::arange(static_cast<double>(nv4), mx::uint64));
+          mx::array carry = mx::astype(mx::less(low, ctr), mx::uint64);
+          mx::array high = mx::add(key, carry);
+          mx::array x0 = mx::astype(mx::bitwise_and(low, u64c(kLo32)),
+                                    mx::uint32);
+          mx::array x1 = mx::astype(mx::right_shift(low, u64c(32)),
+                                    mx::uint32);
+          mx::array x2 = mx::astype(mx::bitwise_and(high, u64c(kLo32)),
+                                    mx::uint32);
+          mx::array x3 = mx::astype(mx::right_shift(high, u64c(32)),
+                                    mx::uint32);
+          philox_blocks(x0, x1, x2, x3, k0, k1);
+          if (width == 64) {
+            mx::array b0 = mx::bitwise_or(
+                mx::astype(x0, mx::uint64),
+                mx::left_shift(mx::astype(x1, mx::uint64), u64c(32)));
+            mx::array b1 = mx::bitwise_or(
+                mx::astype(x2, mx::uint64),
+                mx::left_shift(mx::astype(x3, mx::uint64), u64c(32)));
+            bits = mx::slice(
+                mx::reshape(mx::stack({b0, b1}, 1),
+                            mx::Shape{static_cast<mx::ShapeElem>(2 * nv4)}),
+                mx::Shape{0}, mx::Shape{static_cast<mx::ShapeElem>(n)});
+          } else {
+            bits = mx::slice(
+                mx::reshape(mx::stack({x0, x1, x2, x3}, 1),
+                            mx::Shape{static_cast<mx::ShapeElem>(4 * nv4)}),
+                mx::Shape{0},
+                mx::Shape{static_cast<mx::ShapeElem>(num_u32)});
+            // Narrow types truncate one u32 per element.
+            if (width < 32) bits = mx::astype(bits, unsigned_dt);
+          }
+          // Signed variants are the same bits, reinterpreted.
+          if (out_dt != unsigned_dt) bits = mx::view(bits, out_dt);
+          bits = mx::reshape(bits, out_shape);
+          consumed = nv4;
+        }
+        mx::array new_state =
+            mx::stack({key, mx::add(ctr, u64c(consumed))}, 0);
+        if (state_u32) new_state = mx::view(new_state, mx::uint32);
+        env[e.outs[0]] = new_state;
+        env[e.outs[1]] = bits;
+        break;
+      }
+
+      case kReduceWindow: {
+        // ops/reduction.py _reduce_window: the cumulative peephole, or one
+        // windowed reduction whose fold is a monoid, a single compare
+        // (select_and_gather_add), or the body itself.
+        Cursor c(at);
+        if (c.next() == 0) {
+          int64_t cum = c.next();
+          int ax = static_cast<int>(c.next());
+          bool rev = c.flag();
+          const mx::array& x = in(0);
+          switch (cum) {
+            case 0: env[e.outs[0]] = mx::cumsum(x, ax, rev, true); break;
+            case 1: env[e.outs[0]] = mx::cummax(x, ax, rev, true); break;
+            case 2: env[e.outs[0]] = mx::cummin(x, ax, rev, true); break;
+            default: env[e.outs[0]] = mx::cumprod(x, ax, rev, true); break;
+          }
+          break;
+        }
+        size_t n = static_cast<size_t>(c.next());
+        WindowPlan plan = read_window_plan(c);
+        if (plan.empty) {
+          for (size_t i = 0; i < n; i++)
+            env[e.outs[i]] = mx::broadcast_to(
+                mx::astype(in(n + i), in(i).dtype()), plan.out_sizes);
+          break;
+        }
+        std::vector<mx::array> wins;
+        wins.reserve(n);
+        for (size_t i = 0; i < n; i++)
+          wins.push_back(extract_windows(plan, in(i), in(n + i)));
+        int last = static_cast<int>(wins[0].ndim()) - 1;
+        int64_t mode = c.next();
+        if (mode == 0) {
+          // Monoid: reduce the flattened window axis, then fold the init.
+          int64_t kind = c.next();
+          env[e.outs[0]] = reduce_combine(
+              kind, reduce_apply(kind, wins[0], std::vector<int>{last}),
+              in(n));
+        } else if (mode == 1) {
+          // select_and_gather_add: the compare picks ONE window element and
+          // every output is read at that position.
+          bool is_max = c.flag();
+          mx::array arg =
+              is_max ? mx::argmax(wins[0], last) : mx::argmin(wins[0], last);
+          mx::array idx = mx::expand_dims(arg, last);
+          for (size_t i = 0; i < n; i++)
+            env[e.outs[i]] =
+                mx::squeeze(mx::take_along_axis(wins[i], idx, last), last);
+        } else {
+          size_t bn = static_cast<size_t>(c.next());
+          std::vector<int> keep = c.vec();
+          std::vector<int> dims = c.vec();
+          int64_t ncaps = c.next();
+          std::vector<mx::array> inits, caps;
+          for (size_t i = 0; i < bn; i++) inits.push_back(in(n + i));
+          for (int64_t i = 0; i < ncaps; i++)
+            caps.push_back(in(2 * n + static_cast<size_t>(i)));
+          std::vector<mx::array> outs = generic_reduce(
+              wins, inits, caps, keep, dims, e.regions[0].get(), in_trace);
+          if (outs.size() != e.outs.size())
+            throw std::runtime_error("tape: reduce_window result count");
+          for (size_t i = 0; i < outs.size(); i++) env[e.outs[i]] = outs[i];
+        }
         break;
       }
 
@@ -2663,6 +3372,76 @@ class Program {
     }
 
     for (int s : e.drops) env[s].reset();
+  }
+
+  // ops/reduction.py `_generic_reduce`: any associative body, any number of
+  // operands. The reduced dims move to one trailing axis and the body runs
+  // on the two halves of it until one element is left, padding an odd
+  // extent with the init; the init is folded in once at the end (XLA leaves
+  // the order unspecified, and this is the order the Python engine picks).
+  // The body is a sub-Program whose arguments are the 2n operands and whose
+  // trailing arguments are the values it captures from the enclosing block.
+  std::vector<mx::array> generic_reduce(
+      const std::vector<mx::array>& inputs,
+      const std::vector<mx::array>& inits,
+      const std::vector<mx::array>& caps, const std::vector<int>& keep,
+      const std::vector<int>& dims, Program* body, bool in_trace) const {
+    const size_t n = inputs.size();
+    int64_t r = 1;
+    for (int d : dims) r *= inputs[0].shape()[d];
+    std::vector<int> perm = keep;
+    perm.insert(perm.end(), dims.begin(), dims.end());
+    mx::Shape kept;
+    for (int i : keep) kept.push_back(inputs[0].shape()[i]);
+    mx::Shape flat = kept;
+    flat.push_back(static_cast<mx::ShapeElem>(r));
+    std::vector<mx::array> xs;
+    xs.reserve(n);
+    for (const mx::array& x : inputs)
+      xs.push_back(mx::reshape(mx::transpose(x, perm), flat));
+    if (r == 0) {
+      std::vector<mx::array> outs;
+      outs.reserve(n);
+      for (const mx::array& init : inits)
+        outs.push_back(mx::broadcast_to(init, kept));
+      return outs;
+    }
+    auto run_body = [&](std::vector<mx::array> args) {
+      args.insert(args.end(), caps.begin(), caps.end());
+      std::vector<mx::array> out = body->call(args, in_trace);
+      if (out.size() != n)
+        throw std::runtime_error("tape: reduce body result count mismatch");
+      return out;
+    };
+    // x[..., off::2]
+    auto half = [](const mx::array& x, int off) {
+      mx::Shape start(x.ndim(), 0), stop = x.shape(), strides(x.ndim(), 1);
+      start.back() = off;
+      strides.back() = 2;
+      return mx::slice(x, start, stop, strides);
+    };
+    while (r > 1) {
+      if (r % 2) {
+        for (size_t j = 0; j < n; j++) {
+          mx::Shape s = xs[j].shape();
+          s.back() = 1;
+          xs[j] = mx::concatenate(
+              {xs[j], mx::broadcast_to(mx::astype(inits[j], xs[j].dtype()), s)},
+              -1);
+        }
+        r += 1;
+      }
+      std::vector<mx::array> args;
+      args.reserve(2 * n);
+      for (size_t j = 0; j < n; j++) args.push_back(half(xs[j], 0));
+      for (size_t j = 0; j < n; j++) args.push_back(half(xs[j], 1));
+      xs = run_body(std::move(args));
+      r /= 2;
+    }
+    for (size_t j = 0; j < n; j++) xs[j] = mx::squeeze(xs[j], -1);
+    std::vector<mx::array> args(inits.begin(), inits.end());
+    args.insert(args.end(), xs.begin(), xs.end());
+    return run_body(std::move(args));
   }
 
   // A counted loop msl_scan planned into one generated kernel. The entry is

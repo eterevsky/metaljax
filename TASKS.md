@@ -261,3 +261,13 @@ predicted peak memory, and only then retry the big model.
   during function transformations; except RuntimeError misses
   ValueError) — native engine survives the same module. Fix with the
   post-C++ batch.
+
+- PRE-M6 BLOCKERS (tail sweep, 2026-08-10): (a) native 2-10% behind
+  python on fully-lowered texmo chunks (db02 0.985 vs 0.914) —
+  suspect the static output-copy taint copying carries the id() pass
+  would not; measure + fix before the default flip. (b) census blind
+  spot: Interpreter-direct tests (test_conv 13) never hit
+  engine.execute — stablehlo.reverse was missing with no test
+  noticing; audit op-set vs the full registry, port convolution.
+  (c) ThreeFry bits stay uint32 for signed result types in
+  ops/rng.py (latent; differential pins both engines to it).

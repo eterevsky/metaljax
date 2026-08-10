@@ -66,6 +66,11 @@ _BOOL_REDUCE_KINDS = {
 
 _FLOAT_ELEMENTS = ("f16", "f32", "bf16")
 
+# The one complex type this device has (dtypes._MLIR_TO_MX). Several
+# handlers branch on `x.dtype == mx.complex64` in Python; here the element
+# type answers the same question statically.
+_COMPLEX = "complex<f32>"
+
 # Symbol-carrying call ops and the attribute naming their callee. Both run
 # `interp.run_func(callee, ins)` in ops/control.py, so inlining the callee's
 # block into the tape is a transliteration of the handler, not an
@@ -84,11 +89,13 @@ _REGION_OPS = ("stablehlo.while", "stablehlo.if", "stablehlo.case")
 
 # Ops whose region is a BODY the lowering reads structurally rather than
 # executing: a reduce's monoid, a sort's comparator, a scatter's combiner.
-_REGION_BODY_OPS = ("stablehlo.reduce", "stablehlo.sort", "stablehlo.scatter")
+_REGION_BODY_OPS = ("stablehlo.reduce", "stablehlo.sort", "stablehlo.scatter",
+                    "stablehlo.reduce_window")
 
 # Ops a handler may give more than one result. Everything else has to
 # produce exactly one array, since that is all the tape can bind.
-_MULTI_RESULT_OPS = _REGION_BODY_OPS + ("chlo.top_k",)
+_MULTI_RESULT_OPS = _REGION_BODY_OPS + ("chlo.top_k",
+                                        "stablehlo.rng_bit_generator")
 
 # Ops whose handler computes on the host through numpy/scipy: they lower to
 # a host-call entry (see `_host`), never to a native handler.
@@ -444,17 +451,39 @@ class _Lowering:
         # the (values, indices) pair, which are separate C++ handlers.
         handler = _HANDLERS.get(name)
         res = handler(self, o) if handler else ([], None)
-        if len(res) == 3:
+        # A handler may name a different opcode than the op does, and one
+        # whose op carries a BODY it cannot read structurally (a general
+        # reduce combiner) lowers that body into a sub-Program, whose
+        # captures ride as extra operands after the op's own.
+        regions, extra = (), []
+        if len(res) == 5:
+            attrs, payload, opname, regions, extra = res
+        elif len(res) == 3:
             attrs, payload, opname = res
+        else:
+            attrs, payload = res
+            opname = None
+        if opname is not None:
             opcode = self.opcodes.get(opname)
             if opcode is None:
                 raise _Decline(f"op {opname}")
-        else:
-            attrs, payload = res
 
-        ins = [self._slot(v) for v in o.operands]
+        ins = [self._slot(v) for v in o.operands] + list(extra)
         outs = [self._bind(v) for v in o.results]
-        if name == "stablehlo.constant":
+        if regions or name in _TAINTING_OPS:
+            # A body that returns one of its own arguments hands an
+            # operand's array straight back (a degenerate combiner does
+            # exactly that), so every result inherits every operand's
+            # taints. Conservative: the cost of being wrong here is an
+            # output aliasing an argument or a constant across calls.
+            src = frozenset().union(
+                *[self.arg_alias.get(s, frozenset()) for s in ins])
+            for s in outs:
+                if src:
+                    self.arg_alias[s] = src
+                if any(i in self.const_view for i in ins):
+                    self.const_view.add(s)
+        elif name == "stablehlo.constant":
             self.const_view.add(outs[0])
         elif nres == 1:
             if any(s in self.const_view for s in ins) and name in _VIEW_OPS:
@@ -464,7 +493,7 @@ class _Lowering:
                     *[self.arg_alias.get(s, frozenset()) for s in ins])
                 if src:
                     self.arg_alias[outs[0]] = src
-        self._emit(opcode, ins, outs, attrs, payload, o)
+        self._emit(opcode, ins, outs, attrs, payload, o, regions=regions)
 
     # --- host ops (M5b) -----------------------------------------------
     #
@@ -996,17 +1025,23 @@ def _lower_compare(lo, o):
     code = _DIRECTIONS.get(_comparison_direction(o))
     if code is None:
         raise _Decline("compare direction")
-    if ("compare_type" in o.attributes
-            and "TOTALORDER" in str(o.attributes["compare_type"])
-            and lo._element(o.operands[0]) in _FLOAT_ELEMENTS):
-        # IEEE totalOrder compares integer keys instead (dtypes.
-        # total_order_key); not ported yet.
-        raise _Decline("TOTALORDER compare")
-    return [code], None
+    # IEEE totalOrder compares the order-preserving integer keys instead of
+    # the raw floats (dtypes.total_order_key, which C++ already carries for
+    # sort). The Python handler asks the operand's DTYPE; the element type
+    # is static, so the answer is resolved here.
+    total = ("compare_type" in o.attributes
+             and "TOTALORDER" in str(o.attributes["compare_type"])
+             and lo._element(o.operands[0]) in _FLOAT_ELEMENTS)
+    return [code, 1 if total else 0], None
 
 
 def _lower_convert(lo, o):
-    return [lo._dtype_code(lo._element(o.results[0]))], None
+    # `_convert`'s complex arm: XLA's complex -> real convert keeps the
+    # real part, and mx.astype alone would not.
+    real_part = (lo._element(o.operands[0]) == _COMPLEX
+                 and lo._element(o.results[0]) != _COMPLEX)
+    return ([lo._dtype_code(lo._element(o.results[0])),
+             1 if real_part else 0], None)
 
 
 def _lower_reshape(lo, o):
@@ -1054,9 +1089,9 @@ def _lower_iota(lo, o):
     el = lo._element(o.results[0])
     shape = lo._shape(o.results[0])
     dim = _ir.int_attr(o, "iota_dimension")
-    # MLX has no bool arange: ramp in i32 and cast (the Python handler's
-    # complex arm is unreachable here — complex declines).
-    ramp = "i32" if el == "i1" else el
+    # MLX has no bool or complex arange: ramp in i32 and cast, which is
+    # what the Python handler's `ramp_dt` picks for both.
+    ramp = "i32" if el in ("i1", _COMPLEX) else el
     return ([dim, lo._dtype_code(ramp), lo._dtype_code(el), len(shape),
              *shape], None)
 
@@ -1076,8 +1111,9 @@ def _lower_reduce(lo, o):
     The order of the tests is the Python handler's: single-operand monoid
     first, then the (values, indices) pair jax lowers argmax/argmin to.
     Anything else — bitwise bodies, variadic min-with-index chains,
-    arbitrary combiners — is _generic_reduce, which walks the body block
-    op by op and is not ported.
+    arbitrary combiners — is _generic_reduce, which runs the body block on
+    whole arrays; the tape lowers that body into a sub-Program and the C++
+    handler calls it once per halving round.
     """
     n = len(o.operands) // 2
     dims = _ir.i64_list(o, "dimensions")
@@ -1103,7 +1139,244 @@ def _lower_reduce(lo, o):
             return ([1 if first in ("GT", "GE") else 0, dims[0]], None,
                     "stablehlo.reduce.arg_pair")
 
-    raise _Decline(f"reduce body {[x.name for x in body_ops]}")
+    # _generic_reduce: any associative body, any arity. The reduced dims
+    # move to one trailing axis and the body combines the two halves of it
+    # until one element is left, then folds the init in. Everything the
+    # Python version derives from the arrays is static here; the BODY is
+    # the one thing that is not, so it becomes a sub-Program.
+    if len(o.results) != n:
+        raise _Decline("generic reduce result count")
+    return _generic_reduce_attrs(lo, o, n, dims, body)
+
+
+def _generic_reduce_attrs(lo, o, n, dims, body, rank=None):
+    """(attrs, payload, opcode name, regions) for a generic reduce body.
+
+    Shared with reduce_window, whose variadic and non-monoid arms hand
+    their window axis to the same routine (ops/reduction.py calls
+    `_generic_reduce` there too) — with `rank` the WINDOW rank, since what
+    that call reduces is the extracted window view, not the operand.
+    """
+    if rank is None:
+        rank = len(lo._shape(o.operands[0]))
+    if any(d < 0 or d >= rank for d in dims):
+        raise _Decline("reduce dimension out of range")
+    keep = [i for i in range(rank) if i not in dims]
+    args = list(body.arguments)
+    if len(args) != 2 * n:
+        raise _Decline("reduce body arity")
+    prog, _free, cap_slots, outs, _child = lo._region(body)
+    if len(outs) != n:
+        raise _Decline("reduce body result count")
+    return ([n, len(keep), *keep, len(dims), *dims, len(cap_slots)], None,
+            "stablehlo.reduce.generic", [prog], cap_slots)
+
+
+def _lower_rng(lo, o):
+    """ops/rng.py `_rng_bit_generator`, whose whole schedule is static.
+
+    How many philox blocks are consumed, where a threefry output shape
+    splits in half, which halves are sliced back down, whether the state
+    arrives as four u32 words or two u64 ones — all of it follows from the
+    result type and the state's type, so it is resolved here and the C++
+    handler is the arithmetic only. Bit-exactness against the Python engine
+    (and so against XLA) is the whole point of the family, so nothing here
+    rounds a shape differently: every expression below is copied from the
+    handler.
+    """
+    try:
+        algo = str(o.attributes["rng_algorithm"])
+    except Exception:
+        algo = "DEFAULT"
+    if len(o.results) != 2:
+        raise _Decline("rng_bit_generator result count")
+    st_el = lo._element(o.operands[0])
+    st_shape = lo._shape(o.operands[0])
+    if st_el == "ui32" and st_shape == [4]:
+        state_u32 = 1
+    elif st_el == "ui64" and st_shape == [2]:
+        state_u32 = 0
+    else:
+        raise _Decline(f"rng_bit_generator state {st_el}{st_shape}")
+
+    out_el = lo._element(o.results[1])
+    out_shape = lo._shape(o.results[1])
+    out_code = lo._dtype_code(out_el)
+    width = {"ui8": 8, "i8": 8, "ui16": 16, "i16": 16, "ui32": 32, "i32": 32,
+             "ui64": 64, "i64": 64}.get(out_el)
+    if width is None:
+        raise _Decline(f"rng_bit_generator output {out_el}")
+    unsigned = {8: "ui8", 16: "ui16", 32: "ui32", 64: "ui64"}[width]
+
+    n = _prod(out_shape)
+    head = [state_u32, out_code, lo._dtype_code(unsigned),
+            len(out_shape), *out_shape]
+
+    if "THREE_FRY" in algo:
+        if width > 32:
+            raise _Decline("rng_bit_generator THREE_FRY 64-bit")
+        # _threefry_bits: one block per half-element pair, the output shape
+        # split at the first even dim (else the largest).
+        dims = list(out_shape) or [1]
+        scalar = 1 if not out_shape else 0
+        split = next((i for i, d in enumerate(dims) if d % 2 == 0), None)
+        if split is None:
+            split = max(range(len(dims)), key=lambda i: dims[i])
+        half = list(dims)
+        half[split] = -(-dims[split] // 2)
+        n_half = _prod(half)
+        h = half[:split + 1] + [1] + half[split + 1:]
+        rounded = list(dims)
+        rounded[split] = half[split] * 2
+        return ([1, *head, n_half, split, scalar,
+                 1 if rounded[split] != dims[split] else 0,
+                 len(h), *h, len(rounded), *rounded, len(dims), *dims],
+                None, "stablehlo.rng_bit_generator")
+
+    num_u32 = n * 2 if width == 64 else n
+    nv4 = -(-num_u32 // 4)
+    return ([0, *head, n, width, num_u32, nv4], None,
+            "stablehlo.rng_bit_generator")
+
+
+_CUM_KINDS = {"stablehlo.add": 0, "stablehlo.maximum": 1,
+              "stablehlo.minimum": 2, "stablehlo.multiply": 3}
+
+# reduce_window's own materialization cap (ops/reduction.py raises above it).
+_WINDOW_MAX = 200_000_000
+
+
+def _opt_i64_list(o, name, default):
+    return _ir.i64_list(o, name) if name in o.attributes else list(default)
+
+
+def _window_plan(rank, src, wd, strides, bdil, wdil, pad):
+    """The static half of ops/reduction.py `_extract_windows`.
+
+    Base dilation, then padding, then the strided window view — every
+    shape of which follows from the attributes. Returns (attrs, out_sizes,
+    wflat); the arrays never enter into it.
+    """
+    attrs = []
+    shape = list(src)
+    dil = [(ax, b) for ax, b in enumerate(bdil) if b != 1]
+    attrs.append(len(dil))
+    for ax, b in dil:
+        if b < 1:
+            raise _Decline("reduce_window base dilation")
+        shape[ax] = shape[ax] * b
+        attrs += [ax, b, len(shape), *shape]
+        shape[ax] = shape[ax] - (b - 1)
+        attrs.append(shape[ax])
+    if any(p != 0 for row in pad for p in row):
+        if any(p < 0 for row in pad for p in row):
+            # ops/reduction.py raises here (mx.pad has no negative widths).
+            raise _Decline("reduce_window negative padding")
+        attrs += [1, rank, *[int(p[0]) for p in pad],
+                  rank, *[int(p[1]) for p in pad]]
+        shape = [s + int(p[0]) + int(p[1]) for s, p in zip(shape, pad)]
+    else:
+        attrs += [0, 0, 0]
+
+    out_sizes = []
+    for i in range(rank):
+        span = (wd[i] - 1) * wdil[i] + 1
+        out_sizes.append(max(0, (shape[i] - span) // strides[i] + 1))
+    wflat = _prod(wd)
+    if wflat * _prod(out_sizes) > _WINDOW_MAX:
+        raise _Decline("reduce_window materialization too large")
+    elem = [1] * rank
+    for i in range(rank - 2, -1, -1):
+        elem[i] = elem[i + 1] * shape[i + 1]
+    view_shape = out_sizes + list(wd)
+    view_strides = ([elem[i] * strides[i] for i in range(rank)]
+                    + [elem[i] * wdil[i] for i in range(rank)])
+    flat = out_sizes + [wflat]
+    attrs += [len(view_shape), *view_shape, len(view_strides), *view_strides,
+              len(flat), *flat]
+    empty = any(s == 0 for s in out_sizes) or wflat == 0
+    attrs += [1 if empty else 0, len(out_sizes), *out_sizes]
+    return attrs, out_sizes, wflat
+
+
+def _lower_reduce_window(lo, o):
+    """ops/reduction.py `_reduce_window`, with its three arms resolved.
+
+    The cum-op peephole (jax lowers cumsum and friends as a full-width
+    window with prefix padding), the windowed reduction over an as_strided
+    view, and — where the body is neither a monoid nor the single compare
+    of select_and_gather_add — the generic pairwise reduce over the window
+    axis, whose body becomes a sub-Program.
+    """
+    import numpy as _np
+    n = len(o.operands) // 2
+    if len(o.results) != n:
+        raise _Decline("reduce_window result count")
+    src = lo._shape(o.operands[0])
+    rank = len(src)
+    wd = _opt_i64_list(o, "window_dimensions", [1] * rank)
+    strides = _opt_i64_list(o, "window_strides", [1] * rank)
+    bdil = _opt_i64_list(o, "base_dilations", [1] * rank)
+    wdil = _opt_i64_list(o, "window_dilations", [1] * rank)
+    if "padding" in o.attributes:
+        pad = _np.array(ir.DenseIntElementsAttr(
+            o.attributes["padding"])).reshape(rank, 2).tolist()
+    else:
+        pad = [[0, 0]] * rank
+    if (len(wd) != rank or len(strides) != rank or len(bdil) != rank
+            or len(wdil) != rank):
+        raise _Decline("reduce_window attribute rank")
+    if any(s < 1 for s in strides) or any(d < 1 for d in wdil):
+        raise _Decline("reduce_window stride or dilation")
+    body = o.regions[0].blocks[0]
+    body_ops = [x.operation for x in body.operations]
+
+    # The cumulative pattern, recognized exactly as the handler does.
+    if (n == 1 and len(body_ops) == 2 and body_ops[0].name in _CUM_KINDS
+            and all(s == 1 for s in strides)
+            and all(d == 1 for d in bdil + wdil)):
+        big = [i for i, w in enumerate(wd) if w > 1]
+        if len(big) == 1:
+            ax = big[0]
+            size = src[ax]
+            others = all(wd[i] == 1 and pad[i][0] == 0 and pad[i][1] == 0
+                         for i in range(rank) if i != ax)
+            if others and wd[ax] == size:
+                kind = _CUM_KINDS[body_ops[0].name]
+                if pad[ax][0] == size - 1 and pad[ax][1] == 0:
+                    return [0, kind, ax, 0], None
+                if pad[ax][0] == 0 and pad[ax][1] == size - 1:
+                    return [0, kind, ax, 1], None
+
+    for i in range(1, n):
+        if lo._shape(o.operands[i]) != src:
+            raise _Decline("reduce_window inputs of different shapes")
+    plan, out_sizes, _wflat = _window_plan(
+        rank, src, wd, strides, bdil, wdil, pad)
+    attrs = [1, n, *plan]
+
+    from metaljax.ops.elementwise import _comparison_direction
+    if n >= 2:
+        # select_and_gather_add: one compare on the first pair plus selects
+        # picks a single window element for every output.
+        cmps = [x for x in body_ops if x.name == "stablehlo.compare"]
+        nsel = sum(x.name == "stablehlo.select" for x in body_ops)
+        if len(cmps) == 1 and nsel >= n:
+            d = _comparison_direction(cmps[0])
+            return (attrs + [1, 1 if d in ("GE", "GT") else 0], None,
+                    "stablehlo.reduce_window")
+    elif len(body_ops) == 2:
+        table = (_BOOL_REDUCE_KINDS if lo._element(o.operands[0]) == "i1"
+                 else _REDUCE_KINDS)
+        kind = table.get(body_ops[0].name)
+        if kind is not None:
+            return attrs + [0, kind], None, "stablehlo.reduce_window"
+
+    # Everything else folds the window axis with the body itself.
+    rest, payload, _name, regions, extra = _generic_reduce_attrs(
+        lo, o, n, [len(out_sizes)], body, rank=len(out_sizes) + 1)
+    return (attrs + [2, *rest], payload, "stablehlo.reduce_window",
+            regions, extra)
 
 
 def _lower_sort(lo, o):
@@ -1147,6 +1420,11 @@ def _lower_sort(lo, o):
         kind = 1
     elif el == "i1":
         kind = 2
+    elif el == _COMPLEX:
+        # `_sort_key`'s complex arm packs canonicalized (re, im) order keys
+        # into one u64. Not a `kind` this opcode carries — and taking the
+        # integer arm would sort by raw complex values, so it declines.
+        raise _Decline("sort on complex")
     else:
         kind = 0
     return [dim, 1 if d == "GT" else 0, k, kind], None
@@ -1160,6 +1438,8 @@ def _lower_top_k(lo, o):
         kind = 1
     elif el == "i1":
         kind = 2
+    elif el == _COMPLEX:
+        raise _Decline("top_k on complex")  # see _lower_sort
     else:
         kind = 0
     if len(o.results) != 2:
@@ -1202,7 +1482,9 @@ def _lower_dot_general(lo, o):
         kind = 2
     elif _dt.is_bool(out_dt):
         kind = 3
-    elif out_el in _FLOAT_ELEMENTS:
+    elif out_el in _FLOAT_ELEMENTS or out_el == _COMPLEX:
+        # complex takes the matmul arm exactly as floats do (the Python
+        # handler's last `else`).
         kind = 0
     else:
         raise _Decline(f"dot_general result {out_el}")
@@ -1251,6 +1533,135 @@ def _lower_bitcast_convert(lo, o):
     else:
         kind = 2
     return [lo._dtype_code(out_el), kind], None
+
+
+def _lower_pad(lo, o):
+    """ops/shape.py `_pad`: interior dilation, then edge pads, then crops.
+
+    All three stages are shape arithmetic on static attributes, so which of
+    them runs — and the exact shapes each produces — is resolved here. The
+    C++ handler reads three (flag, vectors) groups in this order and applies
+    the ones whose flag is set, which is what the Python handler's three
+    `if`s do.
+    """
+    low = _ir.i64_list(o, "edge_padding_low")
+    high = _ir.i64_list(o, "edge_padding_high")
+    interior = _ir.i64_list(o, "interior_padding")
+    src = lo._shape(o.operands[0])
+    rank = len(src)
+    if not (len(low) == len(high) == len(interior) == rank):
+        raise _Decline("pad attributes do not match the operand rank")
+    if any(i < 0 for i in interior):
+        raise _Decline("negative interior padding")
+
+    attrs = []
+    shape = list(src)
+    if any(i > 0 for i in interior):
+        # Holes between elements: a pad-valued array of the dilated shape
+        # with the operand written into its strided slice.
+        shape = [(s - 1) * (i + 1) + 1 if s > 0 else 0
+                 for s, i in zip(src, interior)]
+        attrs += [1, len(shape), *shape, rank, *[i + 1 for i in interior]]
+    else:
+        attrs += [0, 0, 0]
+
+    pos = [(max(0, lo_), max(0, hi)) for lo_, hi in zip(low, high)]
+    if any(p != (0, 0) for p in pos):
+        attrs += [1, rank, *[p[0] for p in pos], rank, *[p[1] for p in pos]]
+        shape = [s + p[0] + p[1] for s, p in zip(shape, pos)]
+    else:
+        attrs += [0, 0, 0]
+
+    if any(lo_ < 0 or hi < 0 for lo_, hi in zip(low, high)):
+        # Negative pads CROP: the Python handler slices the padded array.
+        begin = [-lo_ if lo_ < 0 else 0 for lo_ in low]
+        end = [s + hi if hi < 0 else s for s, hi in zip(shape, high)]
+        attrs += [1, rank, *begin, rank, *end]
+    else:
+        attrs += [0, 0, 0]
+    return attrs, None
+
+
+def _lower_reverse(lo, o):
+    """ops/shape.py `_reverse`: one descending take per reversed dim.
+
+    A dim of extent 0 or 1 is skipped there (mx.take chokes on empties),
+    and both the dims and their extents are static.
+    """
+    shape = lo._shape(o.operands[0])
+    dims = _ir.i64_list(o, "dimensions")
+    if any(d < 0 or d >= len(shape) for d in dims):
+        raise _Decline("reverse dimension out of range")
+    takes = [(d, shape[d]) for d in dims if shape[d] > 1]
+    attrs = [len(takes)]
+    for d, n in takes:
+        attrs += [d, n]
+    return attrs, None
+
+
+def _lower_fft(lo, o):
+    """ops/elementwise.py `_fft`, with its two workarounds intact.
+
+    Both are MLX bugs the Python handler documents: a transform of an empty
+    input is the (typed) empty result rather than an MLX error, and a unit
+    LAST length on a real transform silently drops the transforms over the
+    remaining axes — so that case is spelled out as the identity on the DC
+    bin plus an ordinary complex transform over the leading axes. The
+    barrier before an eager transform (MLX's FFT kernels can read an input
+    whose producing copy is still in flight) rides on the same `in_trace`
+    flag the C++ interpreter already threads.
+    """
+    kind = str(o.attributes["fft_type"])
+    length = _ir.i64_list(o, "fft_length")
+    in_shape = lo._shape(o.operands[0])
+    out_shape = lo._shape(o.results[0])
+    out_code = lo._dtype_code(lo._element(o.results[0]))
+    rank = len(in_shape)
+    if not length or len(length) > rank:
+        raise _Decline("fft length rank")
+    axes = list(range(rank - len(length), rank))
+    s = [int(v) for v in length]
+
+    if _prod(in_shape) == 0 or any(d == 0 for d in s):
+        return [0, out_code, len(out_shape), *out_shape], None
+
+    for name, code in (("IRFFT", 3), ("RFFT", 2), ("IFFT", 1)):
+        if name in kind:
+            break
+    else:
+        code = 0
+    if s[-1] == 1 and code in (2, 3):
+        # The unit-length rewrite: `1` for the real axis, the leading axes
+        # transformed (or not, when there are none).
+        lead_s, lead_axes = s[:-1], axes[:-1]
+        return ([2 if code == 3 else 3, 1 if lead_axes else 0,
+                 len(lead_s), *lead_s, len(lead_axes), *lead_axes], None)
+    return [1, code, len(s), *s, len(axes), *axes], None
+
+
+def _lower_popcnt(lo, o):
+    """ops/elementwise._popcnt / _clz, whose SWAR width is the operand's.
+
+    `_as_unsigned` views a signed operand as its unsigned twin and casts a
+    bool to uint8; `_popcount` then computes in u64 for 64-bit operands and
+    in u32 for everything else. Both choices are dtype questions the element
+    type answers statically, so the tape carries the answers and the C++
+    handler carries the arithmetic.
+    """
+    el = lo._element(o.operands[0])
+    code = lo._dtype_code(el)
+    unsigned = {"i8": "ui8", "i16": "ui16", "i32": "ui32", "i64": "ui64",
+                "i1": "ui8"}.get(el, el)
+    if not unsigned.startswith("ui"):
+        raise _Decline(f"popcnt/clz on {el}")
+    # `_as_unsigned` VIEWS a signed operand (same bits) but CASTS a bool.
+    view = 0 if el == "i1" else (1 if el != unsigned else 2)
+    wide = unsigned == "ui64"
+    bits = {"ui8": 8, "ui16": 16, "ui32": 32, "ui64": 64}[unsigned]
+    if el == "i1":
+        bits = 8  # mx.bool_.size * 8, which is what the handler uses
+    return ([lo._dtype_code(unsigned), view, 1 if wide else 0, bits, code],
+            None)
 
 
 def _lower_dynamic_slice(lo, o):
@@ -1465,6 +1876,11 @@ def _lower_scatter(lo, o):
 
     if len(o.operands) != 3 or len(o.results) != 1:
         raise _Decline("variadic scatter")
+    if lo._element(o.operands[0]) == _COMPLEX:
+        # MLX has no complex GPU scatter kernels at all: the Python handler
+        # scatters the two parts separately and recombines them, which is a
+        # different composition from the single primitive this entry calls.
+        raise _Decline("scatter on complex")
     op_shape = lo._shape(o.operands[0])
     idx_shape = lo._shape(o.operands[1])
     upd_shape = lo._shape(o.operands[2])
@@ -1557,12 +1973,26 @@ _HANDLERS = {
     "stablehlo.iota": _lower_iota,
     "stablehlo.constant": _lower_constant,
     "stablehlo.reduce": _lower_reduce,
+    "stablehlo.reduce_window": _lower_reduce_window,
     "stablehlo.sort": _lower_sort,
     "chlo.top_k": _lower_top_k,
     "stablehlo.dot_general": _lower_dot_general,
     "stablehlo.gather": _lower_gather,
     "stablehlo.scatter": _lower_scatter,
+    "stablehlo.pad": _lower_pad,
+    "stablehlo.reverse": _lower_reverse,
+    "stablehlo.popcnt": _lower_popcnt,
+    "stablehlo.count_leading_zeros": _lower_popcnt,
+    "stablehlo.rng_bit_generator": _lower_rng,
+    "stablehlo.fft": _lower_fft,
 }
+
+# Ops whose result may be a VIEW of an operand rather than a value computed
+# from it: rng's empty-output arm hands the state array straight back
+# (through two mx.view calls), and a generic reduce's body may return one of
+# its own arguments. Their results inherit every operand's aliasing taints,
+# which costs an output copy in the cases where nothing actually aliases.
+_TAINTING_OPS = ("stablehlo.rng_bit_generator",)
 
 
 # --------------------------------------------------------------------------
