@@ -324,3 +324,261 @@ The ongoing costs are real but bounded, and worth naming:
 - **`local_repository` hardcodes an absolute path.** Fine for this machine;
   CI/another checkout needs either the `tf_http_archive` fallback (jax's
   `revision.bzl` + sha256 are ready to copy) or a `--override_repository` flag.
+
+---
+
+# Wheel PoC: shipping the native plugin (2026-08-10)
+
+Second half of the same experiment: does the native plugin survive *packaging*?
+Not "does it work when I point `METALJAX_PLUGIN_PATH` at `bazel-bin`", but the
+whole consumer path — `pip install <wheel>` into a fresh venv → jax's
+`jax_plugins` entry point → the wheel's own dylib → MLX → numpy, with no
+repo checkout on `sys.path` and no environment override anywhere.
+
+**It does.** All four checkpoints pass in a fresh **Python 3.13** venv (the
+wheel is built on 3.14 — the native plugin embeds no CPython, and this proves
+it), and `jax.jit` fails exactly where it should: inside `CompileAndLoad`,
+after the module has been parsed into `stablehlo.*`.
+
+## What changed
+
+| file | change |
+|---|---|
+| `plugin-native/third_party/mlx/workspace.bzl` | second `-Wl,-rpath` for the wheel layout, **first** in the list |
+| `plugin-native/.bazelrc` | `build --incompatible_strict_action_env` — makes wheel builds cache-hit (gotcha 2): 5.5 min → 4 s |
+| `hatch_build.py` | `METALJAX_WHEEL_PLUGIN=native` selects the bazel-built plugin; `finalize()` restores the tree |
+| `src/jax_plugins/metal/__init__.py` | load a bundled native dylib if present, without importing `metaljax` |
+| `plugin-native/wheel_poc_test.py` | new: the four checkpoints, run against an *installed* wheel |
+
+## Sizes
+
+| artifact | bytes | note |
+|---|---|---|
+| default wheel (trampoline) | 288,948 | dylib inside: 107,984 |
+| native wheel | 41,736,182 | dylib inside: 165,127,736 (compresses ~4:1) |
+
+40 MB to download, **157 MB on disk** after install — 1,500× the trampoline
+dylib, all of it statically-linked LLVM/MLIR/absl. That is the distribution
+question item 3 of the verdict flagged, now with numbers: it is a tolerable
+download and an eye-watering install footprint, and it is the reason to keep
+the two wheel variants side by side rather than switching.
+
+## The rpath mechanism
+
+`libmlx.dylib`'s install name is `@rpath/libmlx.dylib` and it pulls
+`@rpath/libjaccl.dylib` from the same directory, so the plugin must carry a
+run-path that finds MLX *in the consumer's venv*. Done at link time, in the
+`@mlx` repo rule's `linkopts`, so nothing post-processes the Mach-O:
+
+```
+-Wl,-rpath,@loader_path/../../mlx/lib      # wheel: metaljax/lib -> mlx/lib
+-Wl,-rpath,<build venv>/site-packages/mlx/lib
+```
+
+`otool -l` shows four `LC_RPATH`s (two are bazel's `_solib`/runfiles paths).
+Because the rpaths are baked by `ld`, the dylib keeps its ad-hoc
+**linker-signed** signature (`codesign -dv`: `flags=0x20002(adhoc,linker-signed)`)
+and copying it into the wheel preserves that — no `install_name_tool`, hence no
+`codesign -f -s -` re-signing step, which would have been required had we
+patched the load commands afterwards.
+
+**Order is load-bearing, and getting it wrong is silent.** With the absolute
+build-venv path first, the 3.13 test venv loaded the *3.14 repo venv's* MLX and
+every checkpoint still passed:
+
+```
+$ DYLD_PRINT_LIBRARIES=1 <venv-3.13>/bin/python -c "import jax; jax.devices()"
+dyld: /Users/oleg/metaljax/.venv/lib/python3.14/site-packages/mlx/lib/libmlx.dylib
+dyld: /Users/oleg/metaljax/.venv/lib/python3.14/site-packages/mlx/lib/libjaccl.dylib
+```
+
+dyld walks `LC_RPATH`s in order and takes the first hit; the build machine's
+absolute path still exists *on the build machine*, so it shadowed the wheel's
+own MLX and would have shipped a plugin that works only here. With the relative
+rpath first, the same trace shows the venv's own copy — and that is also the
+correct precedence in general: a process must not end up with two `libmlx`
+images, and the consumer's mlx is the one its Python side has loaded. Always
+verify this with `DYLD_PRINT_LIBRARIES=1`, not by reading `otool -l`.
+
+## Build-time plugin selection
+
+`METALJAX_WHEEL_PLUGIN=native` makes `hatch_build.py` run
+`bazel build //metal:libmetal_pjrt_native.dylib` (loudly refusing if bazel or
+the `plugin-native/` workspace is missing — the sdist does not ship the
+workspace) and stage that dylib instead of compiling `plugin/metal_pjrt.cc`.
+Unset, the hook is behaviourally identical to before.
+
+Cross-contamination is prevented in both directions, because `pyproject.toml`
+packages `src/metaljax/lib/*.dylib` by glob and that directory is *also* what
+an editable checkout loads from:
+
+- the default build deletes `libmetal_pjrt_native.dylib` before compiling;
+- the native build renames the trampoline to `libmetal_pjrt.dylib.parked`
+  (not a `*.dylib` name, so the glob misses it) and `finalize()` puts it back
+  and removes the native dylib.
+
+Verified: each wheel contains exactly one dylib, and `src/metaljax/lib/` is
+back to holding only `libmetal_pjrt.dylib` after a native build.
+
+Two packaging traps worth knowing:
+
+- **Both variants produce the identical filename**
+  `metaljax-0.11.3-py3-none-macosx_14_0_arm64.whl`, with identical metadata.
+  Build them into different `--out-dir`s (this PoC did) or the second
+  silently overwrites the first. If a native wheel is ever *distributed*, it
+  needs to be distinguishable — a local version segment (`0.11.3+native`) or
+  a separate project name. Nothing in the current metadata says which plugin
+  is inside.
+- Bazel's outputs are mode `0555`; `shutil.copy2` propagates that and the
+  *next* build then fails with `EACCES` overwriting its own artifact. The hook
+  uses `copyfile` + explicit `chmod`, and unlinks read-only files by chmod'ing
+  first.
+
+## Loader change (release-critical file)
+
+`src/jax_plugins/metal/__init__.py` gains one probe ahead of the existing
+logic:
+
+1. `METALJAX_PLUGIN_PATH` still wins over everything; if it names
+   `libmetal_pjrt_native.dylib`, the native branch is taken.
+2. Otherwise, if `metaljax/lib/libmetal_pjrt_native.dylib` exists in the
+   install, register that and stop.
+3. Otherwise — the production wheel, and every dev checkout — the code path is
+   byte-for-byte today's: packaged trampoline, then `plugin/build/` fallback,
+   then `_register_linalg_lowerings()`.
+
+Two deliberate details on the native branch:
+
+- **`metaljax` is never imported.** The lib directory is found with
+  `importlib.util.find_spec`, which does not execute the package. Importing it
+  would drag in the whole Stage 1 interpreter + ops tree — the thing this
+  plugin exists to replace — and `wheel_poc_test.py` asserts neither
+  `metaljax.engine` nor `metaljax.interpreter` is in `sys.modules`.
+- **`_register_linalg_lowerings()` is not called.** Those rules emit
+  `metaljax_*` custom calls that only the Stage 1 *host* handlers implement;
+  registering them against a native client would lower eigh/svd/LU/callbacks
+  into ops it can never grow. jax's own default rules are the right fallback.
+  (This also applies when `METALJAX_PLUGIN_PATH` names the native dylib, so
+  `smoke_test.py` now takes the same branch — it still passes.)
+
+Cost to the production path: one `find_spec` and one `stat` before anything
+else happens.
+
+## The fresh-venv run
+
+```sh
+# build both variants (different out-dirs -- same filename!)
+METALJAX_WHEEL_PLUGIN=native uv build --wheel --out-dir /tmp/wheel-native
+uv build --wheel --out-dir /tmp/wheel-default
+
+# 5. native wheel, fresh 3.13 venv, no overrides
+uv venv --python 3.13 /tmp/venv-native
+uv pip install -p /tmp/venv-native/bin/python /tmp/wheel-native/*.whl
+env -u METALJAX_PLUGIN_PATH JAX_PLATFORMS=metal \
+  /tmp/venv-native/bin/python plugin-native/wheel_poc_test.py
+
+# 6. default wheel, second fresh 3.13 venv: production must still work
+uv venv --python 3.13 /tmp/venv-default
+uv pip install -p /tmp/venv-default/bin/python /tmp/wheel-default/*.whl
+env -u METALJAX_PLUGIN_PATH JAX_PLATFORMS=metal /tmp/venv-default/bin/python \
+  -c "import jax, jax.numpy as jnp; print(jax.devices()); print(2*jnp.array([1,2,3]))"
+```
+
+`uv pip install` of the native wheel resolves
+`jax/jaxlib 0.11.0, mlx 0.32.0, mlx-metal 0.32.0, ml-dtypes, numpy, scipy` —
+nine packages, none of them the repo.
+
+**5. Native wheel — all four checkpoints pass** (exit 0):
+
+```
+python : 3.13.5 (/tmp/venv-native/bin/python)
+plugin : .../site-packages/metaljax/lib/libmetal_pjrt_native.dylib (165.1 MB)
+[metaljax-native] CompileAndLoad(mlir): 6 ops: stablehlo.constant
+  stablehlo.broadcast_in_dim stablehlo.multiply func.return func.func builtin.module
+a: jax.devices() -> [MetalDevice(id=0)]  platform_version "PJRT C API\nmetaljax-native-p0"
+b: metaljax.engine imported: False (fully native)
+c: device_put/np.asarray f32[3,4] round-trip exact
+d: compile raised: UNIMPLEMENTED: metaljax-native P0: received a parsed MLIR
+   module with 6 ops; no executor yet.
+```
+
+(d) is the whole point: the failure comes from *our* `CompileAndLoad`, after
+XLA's wrapper parsed the portable artifact into live `stablehlo.*` ops, not
+from plugin loading, symbol resolution, or jax's dispatch.
+
+**6. Default wheel — production unaffected**: `[MetalDevice(id=0)]`,
+`2 * jnp.array([1,2,3]) = [2 4 6]`, `metaljax.engine` *is* imported (the
+trampoline path, as it must be).
+
+**7. Repo dev setup unaffected**:
+`JAX_PLATFORMS=metal .venv/bin/python -c "print(2*jnp.array([1,2,3]))"` →
+`[2 4 6]` on the trampoline (a repo checkout still defaults to Stage 1 —
+there is deliberately no `bazel-bin` fallback in the loader);
+`.venv/bin/python plugin-native/smoke_test.py` → all three checkpoints pass;
+`pytest tests/test_linalg.py tests/test_pjrt_surface.py tests/test_elementwise.py`
+→ 144 passed (the lowering-registration path the loader edit touches).
+
+## Gotchas
+
+1. **The rpath-order trap above.** It is silent, it only misfires on machines
+   that are *not* the build machine, and every functional test passes while it
+   is wrong. `DYLD_PRINT_LIBRARIES=1` is the only way to see it.
+
+2. **`uv build` was recompiling all ~5,200 bazel actions, every time**
+   (5.5 min per native wheel), for byte-identical outputs, while a plain
+   `bazel build` in the same tree was a 2-second no-op. Cause: uv runs the
+   build backend in a **fresh temp venv per invocation** and prepends it to
+   `PATH` (`VIRTUAL_ENV=~/.cache/uv/builds-v0/.tmpYnhbcf`,
+   `PATH=~/.cache/uv/builds-v0/.tmpYnhbcf/bin:...`). Bazel's default action
+   environment inherits `PATH`, so every wheel build had unique action keys —
+   zero action-cache *and* zero disk-cache hits (`5215 local`, versus
+   `5214 disk cache hit, 1 local` from a shell). Note `bazel aquery`'s
+   `Environment:` line does **not** show the inherited `PATH`, so it looks
+   innocent there; the env diff is what proved it. Fix:
+   `build --incompatible_strict_action_env` in `plugin-native/.bazelrc`, which
+   pins the action `PATH` to a fixed value — after which shell builds and
+   wheel builds share one cache. Measured: the flag costs **one** full rebuild
+   (355 s, all keys change) and then a native wheel build is **1.5 s of bazel
+   / 4.2 s wall**, down from 5.5 min. The rebuilt dylib is byte-identical to
+   the pre-flag one (`sha256 aa0a917d…`), which is the check that matters —
+   the flag changes action keys, not outputs.
+
+3. **Do not `copy2` bazel outputs** (mode `0555`), and unlink read-only files
+   by `chmod`ing first — otherwise the second wheel build dies on `EACCES`.
+
+4. **No re-signing needed** because the rpath is a link-time `linkopt`. If a
+   future change patches load commands with `install_name_tool` instead, macOS
+   invalidates the ad-hoc signature and the dylib must be re-signed
+   (`codesign -f -s -`) or dyld refuses to load it.
+
+5. **`hatch_build.finalize()` is what restores the tree** after a native
+   build. Hatchling calls it after the artifact is written but *not* if the
+   build raised, so a failed native wheel build leaves
+   `src/metaljax/lib/libmetal_pjrt.dylib.parked` behind; rename it back (or
+   re-run `plugin/build.sh`) before using the repo venv.
+
+## MLX pin: ABI skew is possible and unguarded
+
+`pyproject.toml` declares `mlx>=0.32` with **no upper bound**, unchanged here
+(flagged, not touched — the pin is Oleg's call). For the trampoline wheel that
+is fine: it talks to MLX through `mlx.core`'s Python API. For the native wheel
+it is a real exposure, on two levels:
+
+- **ABI.** The dylib is compiled against MLX 0.32.0's headers and links
+  mangled `mlx::core::*` C++ symbols. `libmlx.dylib`'s install name carries
+  `compatibility version 0.0.0`, so dyld will happily bind it to *any* future
+  `libmlx.dylib`. Removed or renamed symbols would at least fail loudly at
+  load; changed struct layouts, inline functions or template internals would
+  not — that is silent corruption. MLX publishes no ABI stability guarantee.
+- **Layout.** The rpath assumes `site-packages/mlx/lib/libmlx.dylib`. As of
+  0.32.0 that file is shipped by the separate **`mlx-metal`** wheel (which
+  installs *into* the `mlx` package directory) — so the path we depend on is
+  produced by a package our metadata does not name at all, and its version is
+  chosen by `mlx`'s own dependency. If mlx-metal ever installs into its own
+  directory, the rpath misses and the plugin fails to load.
+
+Today the resolver picks exactly 0.32.0 (it is the newest on PyPI), so nothing
+is broken. Before a native wheel is ever published, the mlx dependency should
+be pinned to the version it was compiled against (`mlx==0.32.*`) — as an extra
+or a variant-specific requirement, since the trampoline wheel does not need
+the restriction.

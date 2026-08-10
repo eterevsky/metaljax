@@ -4,11 +4,19 @@ jax discovers this via the `jax_plugins` namespace package and calls
 initialize() at backend-discovery time.
 """
 
+import importlib.util
 import logging
 import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# The Stage 1 plugin, which trampolines into metaljax.engine (Python), and
+# the Stage 2 one, which is a self-contained xla::PjRtClient. A wheel carries
+# exactly one of them (chosen at wheel-build time by METALJAX_WHEEL_PLUGIN);
+# the released wheel carries the trampoline.
+_TRAMPOLINE_DYLIB = "libmetal_pjrt.dylib"
+_NATIVE_DYLIB = "libmetal_pjrt_native.dylib"
 
 
 def _library_path() -> Path | None:
@@ -18,18 +26,46 @@ def _library_path() -> Path | None:
     # Packaged location (works for wheel and editable installs alike).
     try:
         import metaljax
-        p = Path(metaljax.__file__).parent / "lib" / "libmetal_pjrt.dylib"
+        p = Path(metaljax.__file__).parent / "lib" / _TRAMPOLINE_DYLIB
         if p.exists():
             return p
     except ImportError:
         pass
     # Repo layout fallback: <root>/src/jax_plugins/metal/__init__.py
     root = Path(__file__).resolve().parents[3]
-    p = root / "plugin" / "build" / "libmetal_pjrt.dylib"
+    p = root / "plugin" / "build" / _TRAMPOLINE_DYLIB
+    return p if p.exists() else None
+
+
+def _native_library_path() -> Path | None:
+    """The bundled fully-native plugin, if this install carries one.
+
+    Deliberately locates metaljax/lib/ with find_spec instead of importing
+    metaljax: on the native path nothing may pull the Stage 1 Python engine
+    into the process (it is exactly what the native plugin exists to
+    replace, and importing it would run the whole interpreter/ops import
+    tree for nothing).
+    """
+    env = os.environ.get("METALJAX_PLUGIN_PATH")
+    if env:  # an explicit override always wins, whichever plugin it names
+        p = Path(env)
+        return p if p.name == _NATIVE_DYLIB and p.exists() else None
+    try:
+        spec = importlib.util.find_spec("metaljax")
+    except (ImportError, ValueError):
+        return None
+    locations = getattr(spec, "submodule_search_locations", None)
+    if not locations:
+        return None
+    p = Path(next(iter(locations))) / "lib" / _NATIVE_DYLIB
     return p if p.exists() else None
 
 
 def initialize():
+    native = _native_library_path()
+    if native is not None:
+        _initialize_native(native)
+        return
     path = _library_path()
     if path is None or not path.exists():
         logger.warning("metaljax plugin dylib not found; run plugin/build.sh")
@@ -41,6 +77,23 @@ def initialize():
     # or jax.devices('metal').
     xb.register_plugin("metal", priority=-1, library_path=str(path))
     _register_linalg_lowerings()
+
+
+def _initialize_native(path: Path) -> None:
+    """Register the Stage 2 plugin. Nothing else: the metaljax_* lowerings
+    below emit custom calls that only the Stage 1 host handlers implement,
+    and registering them would make jax lower to ops this plugin cannot
+    know about."""
+    # The MLX precision default that src/metaljax/__init__.py applies for
+    # the Stage 1 engine, repeated here because that module is not imported
+    # on this path. MLX reads it when it initializes its Metal device --
+    # inside the plugin, at client-create time -- so it must be set before
+    # jax dlopens the dylib below. Keep the two copies in sync.
+    if os.environ.get("METALJAX_MATMUL_PRECISION", "highest") == "highest":
+        os.environ.setdefault("MLX_METAL_GPU_ARCH", "applegpu_g16g")
+    import jax._src.xla_bridge as xb
+
+    xb.register_plugin("metal", priority=-1, library_path=str(path))
 
 
 def _register_linalg_lowerings():

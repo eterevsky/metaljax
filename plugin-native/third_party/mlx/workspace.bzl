@@ -25,7 +25,29 @@ cc_library(
         "include/mlx/**/*.hpp",
     ]),
     includes = ["include"],
-    linkopts = ["-Wl,-rpath,{mlx_dir}/lib"],
+    # libmlx.dylib's install name is @rpath/libmlx.dylib (and it pulls
+    # @rpath/libjaccl.dylib from the same directory), so every binary that
+    # links it needs a run-path that finds it.  Two are baked in:
+    #
+    #   * @loader_path/../../mlx/lib -- the *wheel* layout, where the plugin
+    #     sits at site-packages/metaljax/lib/ and mlx at site-packages/mlx/lib/.
+    #     Resolved relative to the dylib itself, so it follows the consumer's
+    #     venv wherever that is;
+    #   * the absolute path of the *build* venv -- what bazel-bin binaries
+    #     (smoke_test.py, any cc_test) load, from any process, even one that
+    #     has not imported mlx.
+    #
+    # ORDER IS LOAD-BEARING.  dyld walks LC_RPATHs in order and takes the
+    # first hit, and the build venv's absolute path still exists on the
+    # build machine -- with it first, a wheel installed into another venv on
+    # this machine silently loaded *the build venv's* libmlx (observed with
+    # DYLD_PRINT_LIBRARIES: a 3.13 venv running the 3.14 venv's mlx).  The
+    # consumer's own mlx must win; the absolute path is only a fallback for
+    # bazel-bin, where the relative one misses.
+    linkopts = [
+        "-Wl,-rpath,@loader_path/../../mlx/lib",
+        "-Wl,-rpath,{mlx_dir}/lib",
+    ],
     deps = [":libmlx_import"],
 )
 """

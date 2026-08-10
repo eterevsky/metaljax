@@ -34,6 +34,14 @@ import /Users/oleg/metaljax/xla/tensorflow.bazelrc
 common:macos --config=clang_local
 
 # --- local conveniences ------------------------------------------------------
+# Pin the action environment's PATH to a fixed value instead of inheriting the
+# client's.  Without this, `uv build` (which is how the wheel is produced --
+# see hatch_build.py) misses the cache *completely*: uv prepends a fresh
+# per-invocation temp venv to PATH (~/.cache/uv/builds-v0/.tmpXXXXXX/bin), so
+# every wheel build had different action keys and recompiled all ~5,200
+# actions, 5.5 minutes, for byte-identical outputs.  With it, wheel builds and
+# plain `bazel build` share one cache and a wheel relink is seconds.
+build --incompatible_strict_action_env
 build --disk_cache=~/.cache/metaljax-bazel
 build --verbose_failures
 common --announce_rc
