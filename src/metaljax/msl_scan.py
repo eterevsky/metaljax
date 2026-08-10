@@ -2203,6 +2203,11 @@ class Plan:
         global _KERNEL_SEQ
         _KERNEL_SEQ += 1
         name = f"mj_scan_{_KERNEL_SEQ}"
+        # Kept because the native tape builds the SAME kernel through MLX's
+        # C++ API (metaljax.tape._lower_msl): same name, same source, so the
+        # two engines share MLX's compiled-library cache rather than
+        # generating two copies of one shader.
+        self.kernel_name = name
         self.kernel = mx.fast.metal_kernel(
             name=name,
             input_names=[f"inp{i}" for i in self._unpacked]

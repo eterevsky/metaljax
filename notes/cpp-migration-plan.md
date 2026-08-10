@@ -117,10 +117,10 @@ milestones also run the topconfs sweep vs the 2026-08-05 anchor)
   test_sdpa): 11 -> 87 of 102 executables lowered; whole suite 454 ->
   556 of ~670. The 15 that still decline are all `stablehlo.gather`
   (an M2-era op-set gap, not an emit gap).
-- **M5 — msl_scan + host ops**: generated kernels via the C++
-  metal_kernel API; host LAPACK/callbacks stay Python (impure ops
-  already leave traces — the tape marks host-op sites and the C++
-  engine calls back only there).
+- **M5 — msl_scan + host ops** (M5a landed 2026-08-10, M5b below):
+  generated kernels via the C++ metal_kernel API; host LAPACK/callbacks
+  stay Python (impure ops already leave traces — the tape marks host-op
+  sites and the C++ engine calls back only there).
 - **M6 — flip the default**: METALJAX_ENGINE=native default with
   per-program fallback; full release-style gates; perf acceptance:
   texmo sub-crossover floor ≤0.3 ms/step (from 0.7–1.0), dense-decode
@@ -248,6 +248,106 @@ the shipped budgets 3/3; corrupts at 128 MB (5 of 66 outputs) and 64
 MB per buffer, clean at 100 and 50 kernels — so only the BYTE axis
 bites this layout, where the serial native detector's band is the
 other way round. The three existing detectors' bands did not move.
+
+## M5b landed (2026-08-10): msl_scan kernels + host ops on the tape
+
+Phase-1 doctrine held exactly: **Python compiles, C++ runs**. msl_scan's
+planning, pattern matching and MSL source generation did not move at all;
+what moved is the LAUNCH, and the one thing added to `msl_scan.py` is
+`Plan.kernel_name` (the native side rebuilds the same kernel through
+`mx::fast::metal_kernel` under the same name, so both engines share MLX's
+compiled-library cache).
+
+**kMslScan.** `tape.py::_while` now asks `ops.control._msl_plan_for` — the
+same function, the same cache, the same eligibility questions the Python
+engine asks — and lowers a `metaljax.msl_scan` entry when it answers. A
+plan the tape cannot express declines the whole PROGRAM rather than running
+the loop op by op: a loop that took a kernel on one engine and an
+interpreted loop on the other would compute its carries by different
+arithmetic, and no byte-level differential could hold. The entry is a
+`kWhile` in every other respect — same attrs, same cond/body sub-programs —
+so a kernel Metal rejects falls back to the interpreted loop *in the same
+call* (the carries are untouched; `msl_scan.try_run` does exactly this),
+and the plan stays dead for the process. Where the body is outside the
+native op set the loop lowers with no fallback regions at all, and a
+failure there hands the program back to the Python engine instead.
+
+`Plan.run` is transliterated, resolved statically: its `bufs` loop becomes
+slots plus a per-source weight-normalization recipe (as_strided ->
+transpose -> contiguous, the layout canonicalization the backward pass
+needs), its `feed` becomes the unpacked list plus the per-dtype pools of
+0.4.3's input packing, and its `vals` assembly becomes four static lists
+(pass-through carries, affine counters, stacked outputs, final states) plus
+the accumulator recipes of loop fission, which are encoded as little trees
+(hidden stack / buffer slice / post-kernel sum / post-kernel batched
+matmul). The lowering checks that every carry position is produced by
+exactly one rule.
+
+Two disciplines carried over verbatim: the first launch of an unproven
+plan evaluates SYNCHRONOUSLY (a Metal build error on an async worker aborts
+the process), and when the kernel was traced into an `mx::compile` graph —
+where nothing can be evaluated at the point it is built — the plan goes on
+a pending list and `Program::run` settles the call synchronously, kills the
+plans, drops the compiled graphs that embedded them and reruns. That is
+`engine.execute`'s `_msl_pending` + `disable_msl` on the native side; it is
+skipped (and the failure rethrown) for programs holding a host call, since
+a rerun repeats what the first attempt already did to the world.
+
+**kHostCall.** A `stablehlo.custom_call` whose target has a host handler
+(`ops.lapack.TARGETS`, which includes `metaljax_callback`), plus
+`stablehlo.cholesky` and `stablehlo.triangular_solve`, lowers to an entry
+holding a Python callable bound at lowering time; C++ reacquires the GIL
+there and nowhere else, so the arithmetic around a host op stays native.
+`Sharding`/`annotate_device_placement` lower as aliases and
+`shape_assertion` as nothing, exactly as the Python handler treats them.
+Ordering is the tape's order, which is the block's order; ordered-effect
+tokens are now ordinary (empty bool) values with `create_token`/`after_all`
+as entries, so a program with ordered effects lowers instead of declining
+on a non-tensor type.
+
+**Census** (whole pytest suite, `METALJAX_ENGINE=native`): 605 -> 622
+executables lowered, 116 -> 99 declined. The decline classes that remain
+are all M2-era op-set gaps, itemized: complex 26, rng_bit_generator 23,
+`stablehlo.gather` 19, fft 9, popcnt 2, sub-byte float types 5, general
+reduce bodies 4, and singletons (scatter, pad, real, sort comparator,
+TOTALORDER compare, recursive call, f64). Not one msl or host decline is
+left.
+
+**Floor probe** (3 db-class sub-ms configs, `scripts/texmo_topconfs.py
+--bench-only`, ms/step):
+
+| config | native (M5b) | python engine | jax-CPU |
+|---|---:|---:|---:|
+| db02-b4l1024 `bits.1+bp\|split.cat(rnn.1.tanh, pass)-norm-dense.1.tanh-suffix.2` | 0.764 | 0.761 | 0.115 |
+| db09-b128l128 `tokens.32.fold.emb.8\|mingru.4-latent.8.2` | 1.407 | 1.405 | 2.149 |
+| db11-b64l256 `bits.4.oh+bp\|rnn.16.gelu-dense.8.gelu-rmsnorm` | 0.645 | 0.648 | 2.951 |
+
+Unmoved, and the reason is not msl: **every texmo train chunk declines on
+`stablehlo.gather`** (the cross-entropy target gather; the tokenized inputs
+add more), so the native tape never runs one. The floor cannot move until
+gather (and scatter, for the optimizer's index updates) join the op set —
+that, not kernel invocation, is what M6 needs next. On a gather-free
+texmo-shaped chunk (256 training steps, each a scan + its AD transpose +
+an SGD update, lowering with 2 msl entries inside a 256-step while) the two
+engines are at parity: 0.1962 vs 0.1959 ms/step at L128/H32/B32, 0.0499 vs
+0.0497 at L32/H16/B16 — consistent with M4's verdict that a body which is
+already one compiled replay has no Python dispatch left to remove.
+
+**Canaries** (tests/test_command_buffer.py): all 10 pass, and the init-scan
+detectors are untouched by this milestone — that scan's body contains RNG
+shifts msl_scan rejects (`not eligible (op stablehlo.shift_right_logical)`),
+so its sync-point layout is the same one M3/M5a measured. No band moved.
+
+Not covered by a test: a plan source that msl_scan HOISTED out of the body
+(an invariant op inside the loop). The tape lowers its defining ops into
+the enclosing frame, which is what `Plan.run`'s `hoisted` does by
+re-evaluating them, but no program in reach produces one — jax's `lax.scan`
+threads every closed-over value through the carry list, so jax-lowered
+plans have carry sources only, and the hand-written loop that does trigger
+a hoist dies earlier inside msl_scan itself (`_source_key` keys hoisted
+sources as `("free", id, value)` while `source_id` keyed them as
+`("hoist", value)` — a pre-existing inconsistency, left alone here). The
+capture case, one step short of it, is tested.
 
 ## Grand plan (Oleg, 2026-08-10)
 

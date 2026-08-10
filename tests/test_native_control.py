@@ -20,8 +20,8 @@ Which of the two is the fair reference is not a matter of taste:
 
 The loops here run with msl_scan OFF on both engines. That is not a
 workaround: a counted loop with an elementwise body compiles to ONE
-generated Metal kernel (src/metaljax/msl_scan.py), the native tape declines
-any loop that has such a plan (native msl is M5 -- see the gate test), and a
+generated Metal kernel (src/metaljax/msl_scan.py), which since M5b both
+engines run instead of the loop (tests/test_native_msl.py), and a
 differential test of the loop machinery has to be about the loop machinery.
 """
 import contextlib
@@ -387,20 +387,13 @@ def test_while_with_a_statically_known_trip_may_return_its_carry():
         check(mod, [_x()])
 
 
-def test_while_with_an_msl_plan_declines():
-    """The M5 boundary: a loop msl_scan can turn into one generated kernel
-    is worth more than anything this milestone would do with it."""
-    from metaljax.ops import control
-    mod = _counted_mod(8, _STEP)
-    with _patched(control, "_msl_plan_for", lambda interp, op: object()):
-        with _native_engine():
-            ex = engine.compile_program(mod, "mlir")
-            assert ex.native_program() is None
-
-
-def test_while_with_a_real_msl_plan_declines():
-    """The same boundary without the patch: this loop really does get a
-    plan, which is why every other loop test here turns msl off."""
+def test_while_with_a_real_msl_plan_takes_the_kernel():
+    """Why every other loop test here turns msl off: this loop really does
+    get a plan, and since M5b the tape takes it (tests/test_native_msl.py
+    is where the kernels themselves are pinned). What belongs HERE is the
+    other half of that entry — it still carries the interpreted loop, which
+    is what a rejected kernel falls back to.
+    """
     from metaljax.ops import control
     with _native_engine():
         ex = engine.compile_program(_counted_mod(8, _STEP), "mlir")
@@ -408,7 +401,16 @@ def test_while_with_a_real_msl_plan_declines():
             wop = next(o.operation for o in ex.interpreter._main_block()
                        .operations if o.operation.name == "stablehlo.while")
             assert control._msl_plan_for(ex.interpreter, wop) is not None
-        assert ex.native_program() is None
+        prog = ex.native_program()
+        assert prog is not None
+        ops = native.opcodes()
+        hist = prog.op_histogram()
+        assert hist.get(ops["metaljax.msl_scan"], 0) == 1
+        assert hist.get(ops["stablehlo.while"], 0) == 0
+        # The fallback regions are on the tape: the body's ops and the
+        # cond's compare are counted through them.
+        assert hist.get(ops["stablehlo.tanh"], 0) == 1
+        assert hist.get(ops["stablehlo.compare"], 0) == 1
 
 
 # --------------------------------------------------------------------------

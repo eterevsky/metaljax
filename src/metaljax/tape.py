@@ -38,6 +38,12 @@ _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 
 _TERMINATORS = ("func.return", "stablehlo.return")
 
+# dtypes.token_value: what an ordered-effect token IS at run time on both
+# engines — an empty bool array, whose only job is to be somewhere in the
+# data flow so effects keep their order.
+_TOKEN_ELEMENT = "i1"
+_TOKEN_SHAPE = (0,)
+
 # stablehlo.compare directions, in the order native/tape.cc switches on.
 _DIRECTIONS = {"EQ": 0, "NE": 1, "LT": 2, "LE": 3, "GT": 4, "GE": 5}
 
@@ -83,6 +89,10 @@ _REGION_BODY_OPS = ("stablehlo.reduce", "stablehlo.sort")
 # Ops a handler may give more than one result. Everything else has to
 # produce exactly one array, since that is all the tape can bind.
 _MULTI_RESULT_OPS = _REGION_BODY_OPS + ("chlo.top_k",)
+
+# Ops whose handler computes on the host through numpy/scipy: they lower to
+# a host-call entry (see `_host`), never to a native handler.
+_HOST_OPS = ("stablehlo.triangular_solve", "stablehlo.cholesky")
 
 
 def _rank0_passthrough(o):
@@ -167,7 +177,13 @@ class _Lowering:
         return t
 
     def _shape(self, v) -> list[int]:
-        t = self._tensor(v)
+        try:
+            t = ir.RankedTensorType(v.type)
+        except Exception:
+            if _ir.is_token(v.type):
+                return list(_TOKEN_SHAPE)
+            raise _Decline(
+                f"value is not a ranked tensor: {v.type}") from None
         shape = list(t.shape)
         for d in shape:
             if d < 0:
@@ -177,7 +193,21 @@ class _Lowering:
         return shape
 
     def _element(self, v) -> str:
-        return str(self._tensor(v).element_type)
+        # An ordered-effect token is not a tensor and carries no data; it
+        # crosses the runtime boundary — and lives in the environment of
+        # both engines — as the empty bool array dtypes.token_value builds.
+        # Sequencing is the tape's own order, so a token is an ordinary
+        # value here and the ops that make one are ordinary entries.
+        # Asked only when the tensor cast fails: this runs for every operand
+        # and result of every op, and a whole-model main has tens of
+        # thousands of them.
+        try:
+            return str(ir.RankedTensorType(v.type).element_type)
+        except Exception:
+            pass
+        if _ir.is_token(v.type):
+            return _TOKEN_ELEMENT
+        raise _Decline(f"value is not a ranked tensor: {v.type}")
 
     def _dtype_code(self, el: str) -> int:
         """The extension's code for an MLIR element type, or decline.
@@ -298,10 +328,10 @@ class _Lowering:
         drops = self._liveness(outputs)
         prog = self.native.Program(num_slots=self.nslots, num_args=nargs)
         for (opcode, ins, outs, attrs, payload, regions, nbytes,
-             fattrs), drop in zip(self.entries, drops):
+             fattrs, msl, host), drop in zip(self.entries, drops):
             prog.add(opcode=opcode, operands=ins, results=outs, attrs=attrs,
                      payload=payload, drops=drop, regions=regions,
-                     bytes=nbytes, fattrs=fattrs)
+                     bytes=nbytes, fattrs=fattrs, msl=msl, host=host)
         # Region programs never need output copies: their results are a
         # loop's carries or a branch's values, which stay inside this
         # engine. Only a whole program's outputs cross to a caller, and
@@ -381,6 +411,12 @@ class _Lowering:
         if name in _REGION_OPS:
             self._control(o)
             return
+        if name == "stablehlo.custom_call":
+            self._custom_call(o)
+            return
+        if name in _HOST_OPS:
+            self._host(o)
+            return
         opcode = self.opcodes.get(name)
         if opcode is None:
             raise _Decline(f"op {name}")
@@ -423,6 +459,78 @@ class _Lowering:
                 if src:
                     self.arg_alias[outs[0]] = src
         self._emit(opcode, ins, outs, attrs, payload, o)
+
+    # --- host ops (M5b) -----------------------------------------------
+    #
+    # Some handlers compute on the HOST: the LAPACK family through
+    # numpy/scipy (ops/lapack.py), and the in-process callbacks
+    # jax.debug.print / pure_callback / io_callback lower to
+    # (ops/callbacks.py). There is nothing to port — a native LU would be a
+    # different LU — so the tape marks the SITE and the C++ interpreter
+    # reacquires the GIL there and nowhere else. Everything around them,
+    # which is the whole rest of an impure program, still runs natively.
+    #
+    # Ordering is the tape's own order, which is the block's order, which is
+    # what sequences effects on the Python engine too: an ordered-effect
+    # token is an ordinary (empty) value threaded through the entries, and
+    # the entries run one after another.
+
+    def _custom_call(self, o):
+        """ops/control.py's `_custom_call`, resolved at lowering time."""
+        try:
+            target = _ir.str_attr(o, "call_target_name")
+        except Exception:
+            raise _Decline("custom_call without a target name") from None
+        if target in ("Sharding", "annotate_device_placement"):
+            if len(o.results) != len(o.operands):
+                raise _Decline(f"custom_call {target} is not an alias")
+            for r, v in zip(o.results, o.operands):
+                self._alias(r, self._slot(v))
+            return
+        if target == "shape_assertion":
+            # `return []`: nothing is computed and nothing is bound.
+            if len(o.results):
+                raise _Decline("shape_assertion with results")
+            return
+        from metaljax.ops import lapack
+        if target in lapack.TARGETS:
+            self._host(o)
+            return
+        raise _Decline(f"custom_call target {target!r}")
+
+    def _host(self, o):
+        """Bind this op's Python handler as a host-call entry.
+
+        The closure is the handler, the op and the interpreter — the same
+        three things `run_block` brings together — with the MLIR context
+        entered around the call, since a host handler reads the op's
+        attributes and result types to size its outputs. `env` is empty on
+        purpose: no host handler reads it (they take their inputs as
+        arrays), and passing the tape's environment would mean rebuilding a
+        dict of MLIR values the tape does not keep.
+        """
+        from metaljax.interpreter import REGISTRY
+        fn = REGISTRY.get(o.name)
+        if fn is None:
+            raise _Decline(f"op {o.name} has no handler")
+        for v in list(o.operands) + list(o.results):
+            self._dtype_code(self._element(v))
+            self._shape(v)
+        interp, op = self.interp, o
+
+        def call(ins):
+            with interp.context:
+                res = fn(interp, op, list(ins), {})
+            if res is None:
+                return []
+            if isinstance(res, mx.array):
+                return [res]
+            return list(res)
+
+        ins = [self._slot(v) for v in o.operands]
+        outs = [self._bind(v) for v in o.results]
+        self._emit(self._opcode("metaljax.host_call"), ins, outs, [], None, o,
+                   host=call)
 
     # --- recognizer roots ---------------------------------------------
     #
@@ -470,7 +578,7 @@ class _Lowering:
         return list(self.pack_slots[m.slot:m.slot + m.nvals])
 
     def _emit(self, opcode, ins, outs, attrs, payload, o, regions=(),
-              fattrs=()):
+              fattrs=(), msl=None, host=None):
         """Append one tape entry, charged the result bytes the eager flush
         cadence meters (interpreter.eager_plan's `out_bytes`: the plain
         value_bytes sum, splat corrections deliberately absent — see the
@@ -484,7 +592,7 @@ class _Lowering:
         nbytes = 0 if o is None else sum(
             value_bytes(r, self._tcache) for r in o.results)
         self.entries.append((opcode, ins, outs, attrs, payload, list(regions),
-                             nbytes, list(fattrs)))
+                             nbytes, list(fattrs), msl, host))
 
     def _opcode(self, name) -> int:
         code = self.opcodes.get(name)
@@ -590,10 +698,16 @@ class _Lowering:
         from metaljax.interpreter import COMPILE_ENABLED
         from metaljax.ops import control
 
-        if control._msl_plan_for(self.interp, o) is not None:
-            # A generated persistent kernel beats anything this milestone
-            # can do with the loop; native msl_scan is M5.
-            raise _Decline("while has an msl_scan plan")
+        # M5b: a loop msl_scan planned into one generated kernel takes the
+        # kernel here too, and the question is asked through the SAME
+        # `_msl_plan_for` (same cache, same eligibility) that ops/control.py
+        # asks, so the two engines can never disagree about which loops get
+        # kernels. A plan that cannot be expressed on the tape declines the
+        # whole program rather than running the loop op by op: that would
+        # be a second answer to a question only one of them may answer.
+        plan = control._msl_plan_for(self.interp, o)
+        if plan is not None:
+            opcode = self._opcode("metaljax.msl_scan")
 
         cond_block = o.regions[0].blocks[0]
         body_block = o.regions[1].blocks[0]
@@ -603,14 +717,33 @@ class _Lowering:
         if len(list(cond_block.arguments)) != ncarry:
             raise _Decline("while cond arity mismatch")
 
-        cond_prog, cond_free, cond_caps, cond_outs, _ = self._region(
-            cond_block)
-        if len(cond_outs) != 1:
-            raise _Decline("while cond does not return one value")
-        body_prog, body_free, body_caps, body_outs, body_lo = self._region(
-            body_block)
-        if len(body_outs) != ncarry:
-            raise _Decline("while body result count mismatch")
+        # The loop op by op, as regions. With an msl plan these are the
+        # FALLBACK: the kernel is what runs, and the interpreted loop is
+        # what the native engine retires to if Metal's shader compiler
+        # rejects the generated source (the C++ half of `disable_msl`). A
+        # body outside the native op set is no reason to lose the kernel,
+        # so with a plan the regions are optional — without them a build
+        # failure hands the whole program back to the Python engine, which
+        # runs its own recovery.
+        try:
+            cond_prog, cond_free, cond_caps, cond_outs, _ = self._region(
+                cond_block)
+            if len(cond_outs) != 1:
+                raise _Decline("while cond does not return one value")
+            body_prog, body_free, body_caps, body_outs, body_lo = self._region(
+                body_block)
+            if len(body_outs) != ncarry:
+                raise _Decline("while body result count mismatch")
+        except _Decline:
+            if plan is None:
+                raise
+            if _DEBUG:
+                print("[metaljax] msl_scan loop lowered without an "
+                      "interpreted fallback", flush=True)
+            cond_prog = body_prog = None
+            cond_free = body_free = []
+            cond_caps = body_caps = []
+            body_outs, body_lo = [], None
 
         counted = control._analyze_counted(self.interp, o)
         is_counted, k, bound_kind, bound = 0, 0, 0, 0
@@ -657,7 +790,7 @@ class _Lowering:
         if (COMPILE_ENABLED and control._BODY_COMPILE and pure
                 and body_block not in self.interp._no_body_compile):
             body_compile_max = max(0, min(by_cost, by_bytes))
-        if body_compile_max:
+        if body_compile_max and body_prog is not None:
             body_prog.set_compile(
                 True,
                 anchors=control._underived_outputs(body_block, body_free),
@@ -667,6 +800,13 @@ class _Lowering:
                  bound_kind, bound, cost, period, chunkable, kmax,
                  body_compile_max]
         ins = [self._slot(v) for v in o.operands] + cond_caps + body_caps
+        msl = None
+        if plan is not None:
+            # The kernel's own inputs ride after the loop's: the arrays it
+            # reads are the loop's carries and values from the enclosing
+            # scope, which are slots here like any other.
+            msl, msl_ins, msl_taints = _lower_msl(self, o, plan)
+            ins = ins + msl_ins
         outs = [self._bind(v) for v in o.results]
 
         # A loop's result j is its carry j: the body's output when the loop
@@ -680,7 +820,13 @@ class _Lowering:
             if start is not None:
                 static_trip = max(bound - start, 0)
         body_parents = [self._slot(v) for v in o.operands] + body_caps
-        taints = self._region_taints(body_lo, body_outs, body_parents)
+        if body_lo is not None:
+            taints = self._region_taints(body_lo, body_outs, body_parents)
+        else:
+            # No interpreted fallback: the kernel is the only thing that
+            # runs, and the only carry it can hand back untouched is one it
+            # classified as pass-through (see `_lower_msl`).
+            taints = msl_taints
         for j, (alias, cv) in enumerate(taints):
             init = ins[j]
             if static_trip == 0:
@@ -692,8 +838,9 @@ class _Lowering:
                 self.const_view.add(outs[j])
             if alias:
                 self.arg_alias[outs[j]] = frozenset(alias)
-        self._emit(opcode, ins, outs, attrs, None, o,
-                   regions=[cond_prog, body_prog])
+        regions = [] if cond_prog is None else [cond_prog, body_prog]
+        self._emit(opcode, ins, outs, attrs, None, o, regions=regions,
+                   msl=msl)
 
     def _branch(self, o, opcode):
         """stablehlo.if / stablehlo.case: branch blocks take no arguments
@@ -1491,6 +1638,237 @@ def _lower_moe(lo, o, m):
     lo._emit(lo._opcode("metaljax.moe.tail"),
              [vals[id(m.out)], lo._slot(r.weights)],
              [lo._bind(o.results[0])], attrs, None, o)
+
+
+# --------------------------------------------------------------------------
+# msl_scan plans (M5b)
+# --------------------------------------------------------------------------
+#
+# metaljax.msl_scan turns a counted loop whose body is elementwise (plus
+# small matvecs) into ONE generated Metal kernel: a thread per lane, the
+# state in registers, the whole time loop inside the shader. Planning it —
+# the IR pattern match, the mode choice, the MSL source generation — is
+# compile-time work and stays exactly where it is, in Python. What the tape
+# carries is the LAUNCH: the generated source, the binding order, the
+# geometry, and the little post-kernel recipe `Plan.run` applies to turn the
+# kernel's outputs back into the loop's carries.
+#
+# So this is a transliteration of `Plan.run`, resolved statically:
+#
+#   * its `bufs` loop becomes a list of slots (one per plan source) plus a
+#     weight-normalization recipe per source;
+#   * its `feed` becomes the unpacked-source list and the per-dtype pools of
+#     the 0.4.3 input packing, in the order the kernel's `input_names` names;
+#   * its `vals` assembly becomes four static lists (pass-through carries,
+#     affine counters, stacked outputs, final states) plus the accumulator
+#     recipes of loop fission, encoded as little trees.
+#
+# Anything the recipe cannot express declines the PROGRAM (never just the
+# loop): both engines ask `_msl_plan_for`, so a loop that has a plan must
+# take it on whichever engine runs, or the two would compute a carry by
+# different arithmetic.
+
+
+def _msl_vec(out, xs):
+    """A length-prefixed vector, the shape native/tape.cc's Cursor reads."""
+    out.append(len(xs))
+    out.extend(int(x) for x in xs)
+
+
+def _msl_value_slot(lo, v):
+    """The slot holding `v` here, hoisting its defining ops if it has none.
+
+    `Plan.run`'s `hoisted` reads the value out of the enclosing environment
+    when it is bound there, and otherwise RE-EVALUATES its defining op with
+    the ordinary handlers — which is what happens to a loop-invariant op the
+    analyzer lifted out of the body (`_try_hoist`), and to a value the
+    enclosing block never computed because a recognizer absorbed it. Both
+    are transliterated here by lowering that op into this frame, ahead of
+    the loop: the same ops on the same arrays, in the same order.
+    """
+    s = lo.slots.get(v)
+    if s is not None:
+        return s
+    if not isinstance(v, ir.OpResult):
+        raise _Decline("msl: source is defined outside the block")
+    op = v.owner
+    op = getattr(op, "operation", op)
+    if op.regions:
+        raise _Decline(f"msl: hoisted op {op.name} carries a region")
+    for x in op.operands:
+        _msl_value_slot(lo, x)
+    lo._op(op)
+    s = lo.slots.get(v)
+    if s is None:
+        raise _Decline("msl: hoisted op bound no slot")
+    return s
+
+
+def _msl_spec(lo, spec, out, source_index):
+    """One accumulator node of `Plan.run`'s `stacked`, as a little tree.
+
+    kinds: 0 a hidden per-step stack (a kernel output), 1 a slice of a
+    device buffer, 2 a post-kernel sum, 3 a post-kernel batched matmul.
+    """
+    kind = spec[0]
+    if kind == "hidden":
+        out.extend([0, int(spec[2])])
+    elif kind == "buffer":
+        leaf = spec[1]
+        idx = getattr(leaf, "idx", None)
+        a = getattr(idx, "a", None)
+        if a not in (1, -1):
+            raise _Decline("msl: accumulator buffer with a non-unit stride")
+        out.extend([1, source_index(leaf.source), int(a), int(idx.b)])
+        _msl_vec(out, leaf.shape)
+    elif kind == "red":
+        _, inner, dims, perm, shape = spec
+        out.append(2)
+        _msl_spec(lo, inner, out, source_index)
+        _msl_vec(out, dims)
+        _msl_vec(out, perm)
+        _msl_vec(out, shape)
+    elif kind == "dot":
+        _, lspec, rspec, dims, perm, lshape, rshape = spec
+        if len(dims) != 4:
+            raise _Decline("msl: accumulator dot without four dim lists")
+        out.append(3)
+        _msl_spec(lo, lspec, out, source_index)
+        _msl_spec(lo, rspec, out, source_index)
+        for d in dims:
+            _msl_vec(out, d)
+        _msl_vec(out, perm)
+        _msl_vec(out, lshape)
+        _msl_vec(out, rshape)
+    else:
+        raise _Decline(f"msl: accumulator node {kind}")
+
+
+def _lower_msl(lo, o, plan):
+    """(MslPlan, extra input slots, per-carry taints) for a planned loop."""
+    from metaljax import msl_scan
+
+    if msl_scan._VOLATILE == "tmap":
+        # The table-driven loop counter binds an extra input the plan builds
+        # per call (`_tmap`). A retest knob, never the shipped path.
+        raise _Decline("msl: METALJAX_MSL_VOLATILE=tmap")
+    if plan.mode not in ("scalar", "vector", "coop"):
+        raise _Decline(f"msl: mode {plan.mode}")
+
+    carries = [lo._slot(v) for v in o.operands]
+    ncarry = len(carries)
+
+    # Sources, in the plan's own order: the sids the generated source, the
+    # packing groups and the weight norms are all keyed by. Accumulator
+    # recipes may name a buffer the kernel itself never reads (a stacked
+    # input consumed whole, post-kernel); those append after.
+    slots: list = []
+    seen: dict = {}
+
+    def key_of(src):
+        return ("carry", src[1]) if src[0] == "carry" else ("value", src[1])
+
+    def slot_of(src):
+        if src[0] == "carry":
+            j = src[1]
+            if not 0 <= j < ncarry:
+                raise _Decline("msl: source carry out of range")
+            return carries[j]
+        return _msl_value_slot(lo, src[1])
+
+    for src in plan.sources:
+        seen.setdefault(key_of(src), len(slots))
+        slots.append(slot_of(src))
+
+    def source_index(src):
+        k = key_of(src)
+        got = seen.get(k)
+        if got is not None:
+            return got
+        seen[k] = len(slots)
+        slots.append(slot_of(src))
+        return seen[k]
+
+    # `Plan.run`'s output_shapes / output_dtypes, in binding order.
+    out_shapes, out_dtypes = [], []
+    for pos, _idx, _val in plan.stacked:
+        out_shapes.append(list(plan.arg_shapes[pos]))
+        out_dtypes.append(lo._dtype_code(plan.arg_dtypes[pos]))
+    for h, _nm in plan.hidden:
+        out_shapes.append([plan.trip, *h.shape])
+        out_dtypes.append(lo._dtype_code("f32"))
+    for pos, _expr in plan.states:
+        out_shapes.append(list(plan.arg_shapes[pos]))
+        out_dtypes.append(lo._dtype_code(plan.arg_dtypes[pos]))
+
+    # Every carry position must be produced by exactly one rule: the kernel
+    # writes the states and the stacked outputs, the post-kernel arithmetic
+    # does the counters and the accumulators, and a pass-through carry is
+    # handed back as it came. A position claimed twice (or not at all) would
+    # silently take whichever rule ran last.
+    acc_pos = [pos for pos, _ in plan.acc_plans]
+    covered = (list(plan.passthrough) + [p for p, _ in plan.counters]
+               + [p for p, _, _ in plan.stacked] + [p for p, _ in plan.states]
+               + acc_pos)
+    if sorted(covered) != list(range(ncarry)):
+        raise _Decline("msl: carries are not covered exactly once")
+
+    # The accumulator recipes go FIRST, because encoding one may name a
+    # buffer the kernel itself never reads and so APPEND a source — and the
+    # source count, the weight norms and the pack groups are all written
+    # against the final list.
+    acc: list = []
+    for pos, specs in plan.acc_plans:
+        acc.extend([int(pos), len(specs)])
+        for spec in specs:
+            _msl_spec(lo, spec, acc, source_index)
+
+    tg = plan.F if plan.mode == "coop" else min(plan.N, 256)
+    layout = [plan.N, tg, plan.trip, plan.start, len(slots),
+              len(plan.hidden), ncarry]
+    for sid in range(len(slots)):
+        norm = plan._weight_norms.get(sid) if sid < len(plan.sources) else None
+        if norm is None:
+            layout.append(0)
+            continue
+        shape, strides, offset, perm = norm
+        layout.append(1)
+        _msl_vec(layout, shape)
+        _msl_vec(layout, strides)
+        layout.append(int(offset))
+        _msl_vec(layout, perm)
+    _msl_vec(layout, plan._unpacked)
+    layout.append(len(plan._pack_groups))
+    for _nm, dt, sids in plan._pack_groups:
+        layout.append(lo._dtype_code(dt))
+        _msl_vec(layout, sids)
+    _msl_vec(layout, [pos for pos, _ in plan.states])
+    _msl_vec(layout, [pos for pos, _, _ in plan.stacked])
+    _msl_vec(layout, plan.passthrough)
+    layout.append(len(plan.counters))
+    for pos, delta in plan.counters:
+        layout.extend([int(pos), int(delta)])
+    layout.append(len(plan.acc_plans))
+    layout.extend(acc)
+
+    names_in = ([f"inp{i}" for i in plan._unpacked]
+                + [nm for nm, _, _ in plan._pack_groups]
+                + [f"init{j}" for j in range(len(plan.states))])
+    names_out = ([f"out{q}" for q in range(len(plan.stacked))]
+                 + [nm for _, nm in plan.hidden]
+                 + [f"fin{j}" for j in range(len(plan.states))])
+    msl = lo.native.MslPlan(
+        name=plan.kernel_name, source=plan.source,
+        header=msl_scan._KERNEL_HEADER, input_names=names_in,
+        output_names=names_out, out_shapes=out_shapes,
+        out_dtypes=out_dtypes, layout=layout)
+
+    # Only a pass-through carry can be the very array an input holds; every
+    # other position is a kernel output or post-kernel arithmetic.
+    through = set(plan.passthrough)
+    taints = [lo._tainted(carries[j]) if j in through
+              else (frozenset(), False) for j in range(ncarry)]
+    return msl, slots, taints
 
 
 # --------------------------------------------------------------------------
