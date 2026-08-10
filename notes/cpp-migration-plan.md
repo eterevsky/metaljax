@@ -357,3 +357,15 @@ capture case, one step short of it, is tested.
 run on metaljax (rows 8/10/12/15 + the llama.cpp expansion);
 5) tackle performance disparities one by one.
 Steps 3/4 may swap depending on post-migration state.
+
+## Dispositions (Oleg, 2026-08-10)
+
+- f64 emulation: ASPIRATIONAL, last roadmap stage only (perf phase),
+  mainly to satisfy the JAX suite's f64 entries. At double-double's
+  5-15x, host-CPU execution of f64 programs (the existing host-op
+  callback machinery fits) may beat on-device emulation — evaluate
+  both then. Not a priority.
+- Off-MLX migration: NON-GOAL. Understanding recorded above for the
+  lay of the land; the only planned form is targeted hand-written
+  kernels for specific ops during perf work (the msl_scan/
+  metal_kernel mechanism we already use).
