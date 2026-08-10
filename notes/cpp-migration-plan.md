@@ -714,3 +714,40 @@ eight predictable branches on a path that is about to acquire the GIL).
 * The nanobind stl casters are included by `program.h` deliberately:
   they must be visible in every TU that crosses the boundary, and a
   missing one is silent (nanobind falls back to an opaque type).
+
+## Phase 2 ledger (2026-08-10..11)
+
+Route decision (Oleg): the **C++ PJRT API** — subclass xla::PjRtClient,
+let pjrt_c_api_wrapper_impl manufacture the C surface. Chosen over the
+hand-rolled C API after the P0 measurement (notes/pjrt-native-p0.md);
+the deciding synergies: one bazel workspace supplies the wrapper,
+StableHLO/MLIR at jax's exact pin, real protos, and the later XLA
+optimization layer as a deps entry. Runtime is bazel-compiled too (Oleg);
+fork authorized but not needed.
+
+* **P0 landed** (603c092): plugin-native/ bazel workspace, xla via
+  local_repository at 131bf41a (= jax-v0.11.0's pin), MetalClient stub
+  through the wrapper; jax.devices() serves from it; f32 round trip;
+  CompileAndLoad receives a PARSED stablehlo module (the VHLO dance is
+  free). Cold build 399 s, warm 3 s, edit loop 4-6 s, dylib 157 MB.
+* **Wheel PoC landed** (8f2511b): METALJAX_WHEEL_PLUGIN=native bundles
+  the native plugin; fresh-venv full stack on py3.13 passes; rpath
+  order is load-bearing (consumer's libmlx must win over the build
+  venv's); --incompatible_strict_action_env vs uv's per-invocation
+  PATH; identical-filename + unbounded-mlx-pin traps recorded.
+* **P1 landed** (c8736db): program.h is Python-free (HostFn, g_gc_hook,
+  GIL contract on the caller); bindings.cc is the adapter;
+  @metaljax_runtime = new_local_repository over native/ (SHARED sources,
+  15 TUs); runtime linked into the plugin dylib; GIL-free cc_test proves
+  interpreted + mx::compile execution with no interpreter in the
+  process. pytest 1258/1258, gate 106/106.
+  Supersedes two lines of the file-layout section above: register_tape
+  now lives in bindings.cc (not config.cc), and the nanobind stl casters
+  ride in bindings.cc (program.h includes no nanobind at all).
+* **P2 in flight**: native lowering (tape.py's attr encodings are the
+  spec), MetalLoadedExecutable::Execute, M1 dtype table on the buffers,
+  differential execute_test vs CPU. Then P3 control flow + regions,
+  then coverage families (gather/scatter, rng), suite-vs-suite as the
+  standing gate. Recognizers/msl/compile decisions come after
+  correctness coverage (north star per Oleg: everything through the new
+  stack, correctness first, performance second).
