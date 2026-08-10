@@ -52,7 +52,7 @@ import jax.numpy as jnp  # noqa: E402
 
 from helpers import lower_bytes  # noqa: E402
 
-# Opcodes, as native/tape.cc numbers them. Read from the extension so a new
+# Opcodes, as native/program.h numbers them. Read from the extension so a new
 # op in the middle of the enum cannot silently re-point these.
 OPS = native.opcodes()
 MSL = OPS["metaljax.msl_scan"]

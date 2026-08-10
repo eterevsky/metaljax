@@ -1,7 +1,7 @@
 """Stage 2 M2: the native tape, differential against the Python engine.
 
 Every case runs the SAME executable twice — once with the tape lowered
-(native/tape.cc) and once with it forced off — and compares output BYTES.
+(native/, program.h) and once with it forced off — and compares output BYTES.
 Both engines call the same MLX kernels, so a difference is a mis-ported
 handler, never a tolerance question.
 
@@ -1416,7 +1416,7 @@ def test_totalorder_compare():
 def test_constant_output_is_copied():
     # A constant returned directly would alias across calls: the Program
     # holds it for the executable's life. The tape says so statically and
-    # native/tape.cc hands out a copy (XLA's no-alias contract).
+    # native/program.cc hands out a copy (XLA's no-alias contract).
     t = "tensor<3xf32>"
     mod = _mod([("a", t)], [t, t], f"""
     %c = stablehlo.constant dense<[1.0, 2.0, 3.0]> : {t}

@@ -556,3 +556,161 @@ TWO COMPLETE PLUGINS side by side, not migration-under-the-trampoline:
   freeze + trampoline retirement, XLA optimization layer last.
 - tape.cc split into modules (in flight) — its report is the
   executor's structural doc for the plugin-native author.
+## The native engine's file layout (2026-08-11)
+
+`native/tape.cc` had grown to 4,128 lines holding everything from the
+opcode enum to the msl launch recipe, with `Program::step` a single
+1,500-line switch. It is now one translation unit per concern behind
+one header. Movement only: the code is the same lines in the same
+order, and the differential suites are the proof (1258/1258 on both
+engines before and after, canaries 11/11, per-entry dispatch
+unchanged at ~105 ns on a 2,000-entry elementwise tape).
+
+**`program.h` is the interface line.** A phase-2 plugin that wants to
+build tapes and run them includes this and nothing else: the opcode
+enum, the attribute layouts, `Entry`, `Cursor`, `Program`, the dtype
+predicates and the runtime disciplines. `msl.h` is separate on
+purpose — a tape carries a generated kernel only as an opaque handle
+(`Entry::msl`), so nothing but msl.cc and the nanobind registration
+needs to know what a launch recipe is made of.
+
+| file | lines | what lives there |
+|---|---:|---|
+| `program.h` | 585 | the interface: opcodes, attrs layouts, Entry, Cursor, Program, dtype + runtime declarations |
+| `msl.h` | 114 | `MslPlan` + `AccNode`, for the two files that touch a kernel |
+| `program.cc` | 306 | Program: slots, the environment, the walk, the eager flush, the recovery ladder |
+| `config.cc` | 231 | the Python-facing surface: op-name registry, `configure`, `stats`, `register_tape` |
+| `dtypes.cc` | 211 | dtypes.py: the element-type table, predicates, weak literals, complex64 |
+| `runtime.cc` | 134 | interpreter.py + ops/control.py cadences: flushes, loop accounting, host reads |
+| `compile.cc` | 111 | mx::compile integration: cache ids, output anchoring, one-way retirement |
+| `ops_elementwise.cc` | 492 | ops/elementwise.py (+ compare/select/convert, fft, popcnt/clz) |
+| `ops_shape.cc` | 199 | ops/shape.py (+ `stablehlo.constant`) |
+| `ops_reduce.cc` | 373 | ops/reduction.py: monoid, arg pair, general bodies, reduce_window |
+| `ops_index.cc` | 264 | ops/gather.py + ops/sort.py: index plans, OOB-drop strategies, sort/top_k |
+| `ops_linalg.cc` | 118 | ops/linalg.py: dot_general's three arms |
+| `ops_rng.cc` | 205 | ops/rng.py: Philox + ThreeFry, bit for bit |
+| `emits.cc` | 485 | the M4 recognizer emits: qmm, sdpa, moe |
+| `control.cc` | 449 | ops/control.py: while/if/case, chunked replay, pipelining, `BodyRunner` |
+| `msl.cc` | 495 | M5b: MslPlan's launch + the entry that dispatches one + settle/retire |
+| `host.cc` | 93 | ops/callbacks.py: the two entries that take the GIL, and `gc_collect` |
+
+The op files mirror `src/metaljax/ops/` one for one, which is the
+point: every handler is a transliteration of the Python one, and the
+differential test compares output BYTES, so a reader (or a reviewer of
+a phase-2 port) can put the two engines' files side by side.
+
+**How dispatch works now.** `Program::step` holds no handler. It offers
+the entry to one `step_*` per family in turn; each switches on the
+opcodes it owns and returns false for the rest, and the `throw` at the
+end of the chain is what asserts the partition. Adding an op is
+therefore: an enum value in `program.h`, a name in `config.cc`'s
+registry, a case in the family file. Nothing else, and no table that
+can disagree with a switch. Measured cost of the chain: nil (an
+elementwise entry hits the first probe; the deepest, a host call, is
+eight predictable branches on a path that is about to acquire the GIL).
+
+**What a phase-2 author should know about the coupling.**
+
+* `Program` is the only class with private state, and the op families
+  are its private member functions — not free functions — because the
+  handlers reach four things: `shape()`/`axes()` (attribute readers),
+  `generic_reduce` (a sub-Program run pairwise), `run_while`/`run_msl`
+  (control flow) and `write_results`. A family in a new file is a new
+  method declared in `program.h`; that is the whole ceremony.
+* Region programs are reached through `Entry::regions` and called with
+  the public API (`call`, `interpret`, `may_compile`, `compiled`,
+  `drop_compiled`), so a loop body is compiled, replayed and recovered
+  exactly like a top-level program. `control.cc`'s `BodyRunner`,
+  `run_body` and `run_chunked` are file-local for that reason: they
+  need nothing private.
+* The runtime globals (`g_cfg`, `g_stats`, `t_msl_pending`) are
+  declared in `program.h` and defined once — config.cc for the first
+  two, msl.cc for the pending list. They were file-statics inside one
+  anonymous namespace before; everything is now in `namespace
+  metaljax`, and helpers used by exactly one file stayed file-local in
+  an anonymous namespace of their own.
+* `register_tape` remains the single symbol between the extension's
+  two halves (metaljax_native.cc declares it; config.cc defines it at
+  global scope with a `using namespace metaljax` inside).
+* The nanobind stl casters are included by `program.h` deliberately:
+  they must be visible in every TU that crosses the boundary, and a
+  missing one is silent (nanobind falls back to an opaque type).
+## The native engine's file layout (2026-08-11)
+
+`native/tape.cc` had grown to 4,128 lines holding everything from the
+opcode enum to the msl launch recipe, with `Program::step` a single
+1,500-line switch. It is now one translation unit per concern behind
+one header. Movement only: the code is the same lines in the same
+order, and the differential suites are the proof (1258/1258 on both
+engines before and after, canaries 11/11, per-entry dispatch
+unchanged at ~105 ns on a 2,000-entry elementwise tape).
+
+**`program.h` is the interface line.** A phase-2 plugin that wants to
+build tapes and run them includes this and nothing else: the opcode
+enum, the attribute layouts, `Entry`, `Cursor`, `Program`, the dtype
+predicates and the runtime disciplines. `msl.h` is separate on
+purpose — a tape carries a generated kernel only as an opaque handle
+(`Entry::msl`), so nothing but msl.cc and the nanobind registration
+needs to know what a launch recipe is made of.
+
+| file | lines | what lives there |
+|---|---:|---|
+| `program.h` | 585 | the interface: opcodes, attrs layouts, Entry, Cursor, Program, dtype + runtime declarations |
+| `msl.h` | 114 | `MslPlan` + `AccNode`, for the two files that touch a kernel |
+| `program.cc` | 306 | Program: slots, the environment, the walk, the eager flush, the recovery ladder |
+| `config.cc` | 231 | the Python-facing surface: op-name registry, `configure`, `stats`, `register_tape` |
+| `dtypes.cc` | 211 | dtypes.py: the element-type table, predicates, weak literals, complex64 |
+| `runtime.cc` | 134 | interpreter.py + ops/control.py cadences: flushes, loop accounting, host reads |
+| `compile.cc` | 111 | mx::compile integration: cache ids, output anchoring, one-way retirement |
+| `ops_elementwise.cc` | 492 | ops/elementwise.py (+ compare/select/convert, fft, popcnt/clz) |
+| `ops_shape.cc` | 199 | ops/shape.py (+ `stablehlo.constant`) |
+| `ops_reduce.cc` | 373 | ops/reduction.py: monoid, arg pair, general bodies, reduce_window |
+| `ops_index.cc` | 264 | ops/gather.py + ops/sort.py: index plans, OOB-drop strategies, sort/top_k |
+| `ops_linalg.cc` | 118 | ops/linalg.py: dot_general's three arms |
+| `ops_rng.cc` | 205 | ops/rng.py: Philox + ThreeFry, bit for bit |
+| `emits.cc` | 485 | the M4 recognizer emits: qmm, sdpa, moe |
+| `control.cc` | 449 | ops/control.py: while/if/case, chunked replay, pipelining, `BodyRunner` |
+| `msl.cc` | 495 | M5b: MslPlan's launch + the entry that dispatches one + settle/retire |
+| `host.cc` | 93 | ops/callbacks.py: the two entries that take the GIL, and `gc_collect` |
+
+The op files mirror `src/metaljax/ops/` one for one, which is the
+point: every handler is a transliteration of the Python one, and the
+differential test compares output BYTES, so a reader (or a reviewer of
+a phase-2 port) can put the two engines' files side by side.
+
+**How dispatch works now.** `Program::step` holds no handler. It offers
+the entry to one `step_*` per family in turn; each switches on the
+opcodes it owns and returns false for the rest, and the `throw` at the
+end of the chain is what asserts the partition. Adding an op is
+therefore: an enum value in `program.h`, a name in `config.cc`'s
+registry, a case in the family file. Nothing else, and no table that
+can disagree with a switch. Measured cost of the chain: nil (an
+elementwise entry hits the first probe; the deepest, a host call, is
+eight predictable branches on a path that is about to acquire the GIL).
+
+**What a phase-2 author should know about the coupling.**
+
+* `Program` is the only class with private state, and the op families
+  are its private member functions — not free functions — because the
+  handlers reach four things: `shape()`/`axes()` (attribute readers),
+  `generic_reduce` (a sub-Program run pairwise), `run_while`/`run_msl`
+  (control flow) and `write_results`. A family in a new file is a new
+  method declared in `program.h`; that is the whole ceremony.
+* Region programs are reached through `Entry::regions` and called with
+  the public API (`call`, `interpret`, `may_compile`, `compiled`,
+  `drop_compiled`), so a loop body is compiled, replayed and recovered
+  exactly like a top-level program. `control.cc`'s `BodyRunner`,
+  `run_body` and `run_chunked` are file-local for that reason: they
+  need nothing private.
+* The runtime globals (`g_cfg`, `g_stats`, `t_msl_pending`) are
+  declared in `program.h` and defined once — config.cc for the first
+  two, msl.cc for the pending list. They were file-statics inside one
+  anonymous namespace before; everything is now in `namespace
+  metaljax`, and helpers used by exactly one file stayed file-local in
+  an anonymous namespace of their own.
+* `register_tape` remains the single symbol between the extension's
+  two halves (metaljax_native.cc declares it; config.cc defines it at
+  global scope with a `using namespace metaljax` inside).
+* The nanobind stl casters are included by `program.h` deliberately:
+  they must be visible in every TU that crosses the boundary, and a
+  missing one is silent (nanobind falls back to an opaque type).

@@ -1,7 +1,7 @@
 """Stage 2 M2: lowering an analyzed executable into a native tape.
 
 `lower(interp)` walks main's block once and builds the C++ `Program`
-(native/tape.cc) that will replay it: SSA values become integer slots,
+(native/program.h) that will replay it: SSA values become integer slots,
 attributes become integer vectors, constants are decoded here — by the
 same battle-tested paths the eager engine uses — and cross to the device
 once. From then on an execute is a switch in C++ with no MLIR, no Python
@@ -14,7 +14,7 @@ recognize — the program returns None and runs on the Python engine
 exactly as before. So the native op set grows monotonically and a gap is
 a performance question, never a correctness one.
 
-Every handler here has a counterpart in native/tape.cc that is a
+Every handler here has a counterpart in native/ops_*.cc that is a
 transliteration of the Python handler in metaljax.ops. Where a Python
 handler branches on dtype, the C++ one branches on dtype too; where it
 resolves something static (a broadcast's interim shape, a dot's
@@ -44,7 +44,7 @@ _TERMINATORS = ("func.return", "stablehlo.return")
 _TOKEN_ELEMENT = "i1"
 _TOKEN_SHAPE = (0,)
 
-# stablehlo.compare directions, in the order native/tape.cc switches on.
+# stablehlo.compare directions, in the order the native engine switches on.
 _DIRECTIONS = {"EQ": 0, "NE": 1, "LT": 2, "LE": 3, "GT": 4, "GE": 5}
 
 # Reduce monoids: body op -> kind, mirroring ops.reduction._REDUCERS and
@@ -370,7 +370,7 @@ class _Lowering:
         # by comparing `id()`, which cannot survive the language boundary
         # (nanobind hands out a fresh wrapper per call), and its constants
         # are rebuilt per call so they never alias at all. So the tape says
-        # statically which outputs to copy, and native/tape.cc copies them.
+        # statically which outputs to copy, and native/program.cc copies them.
         # (Duplicate outputs — one array read twice — it catches by array
         # identity at run time; no static analysis needed for those.)
         #
@@ -1017,7 +1017,7 @@ class _Lowering:
 # --------------------------------------------------------------------------
 #
 # Each returns (attrs, payload) for the layout documented in
-# native/tape.cc. Ops with no attributes have no entry.
+# native/program.h. Ops with no attributes have no entry.
 
 
 def _lower_compare(lo, o):
@@ -1825,8 +1825,8 @@ def _lower_gather(lo, o):
 
 
 # ops/gather.py `_scatter_combiner`'s method names, in the order
-# native/tape.cc switches on. "apply" — an arbitrary elementwise body, which
-# jax's scatter_apply emits — is deliberately absent: running it means
+# native/ops_index.cc switches on. "apply" — an arbitrary elementwise body,
+# which jax's scatter_apply emits — is deliberately absent: running it means
 # evaluating block code on the gathered current values, and with duplicate
 # indices doing so one update at a time, which is a plan this opcode does
 # not carry. Those programs decline and run the identical body in Python.
@@ -2374,7 +2374,7 @@ def _lower_moe(lo, o, m):
 
 
 def _msl_vec(out, xs):
-    """A length-prefixed vector, the shape native/tape.cc's Cursor reads."""
+    """A length-prefixed vector, the shape native/program.h's Cursor reads."""
     out.append(len(xs))
     out.extend(int(x) for x in xs)
 

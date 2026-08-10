@@ -12,6 +12,10 @@
 # API — this artifact is per-Python-version. Wheel packaging for the
 # native engine is an M6 question; for now it builds into native/build/
 # and METALJAX_ENGINE=native finds it there.
+#
+# One clang invocation over every source: the sources are listed below in
+# the order program.h documents them, and a new op family is a new file
+# added to that list and nowhere else.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -30,7 +34,11 @@ clang++ -std=c++17 -O2 -fPIC -shared \
   -I "$(dirname "$NBINC")/ext/robin_map/include" \
   -DNDEBUG -DNB_COMPACT_ASSERTIONS \
   -DNB_DOMAIN=mlx \
-  metaljax_native.cc tape.cc "$NBSRC/nb_combined.cpp" \
+  metaljax_native.cc \
+  program.cc config.cc dtypes.cc runtime.cc compile.cc \
+  ops_elementwise.cc ops_shape.cc ops_reduce.cc ops_index.cc \
+  ops_linalg.cc ops_rng.cc emits.cc control.cc msl.cc host.cc \
+  "$NBSRC/nb_combined.cpp" \
   -L "$MLX/lib" -lmlx -Wl,-rpath,"$MLX/lib" \
   -undefined dynamic_lookup \
   -o "build/metaljax_native$EXT_SUFFIX"
