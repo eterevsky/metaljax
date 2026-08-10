@@ -86,11 +86,37 @@ milestones also run the topconfs sweep vs the 2026-08-05 anchor)
   it: an output that reads a constant the Program holds, or an
   argument's array through no-ops, is COPIED in C++ instead of
   declining the whole program.
-- **M4 — recognizer emits native**: qmm/sdpa/moe emits become native
-  calls (mx::quantized_matmul, mx::gather_qmm/gather_mm,
-  mx::fast::scaled_dot_product_attention). Pack BUILDING stays in
-  Python (compile-time/prologue, once per process — the build cache
-  makes it cheap); the tape references pack slots by index.
+- **M4 — recognizer emits native** (landed 2026-08-10): qmm/sdpa/moe
+  emits become native calls (mx::quantized_matmul,
+  mx::gather_qmm/gather_mm, mx::fast::scaled_dot_product_attention).
+  Pack BUILDING stays in Python (compile-time/prologue, once per
+  process — the build cache makes it cheap); the tape references pack
+  slots by index. What landed with it:
+  - The lowering follows `interpreter._rewrite_plan`, in `lower_block`
+    AND in `_inline` (a root or an absorbed op is as likely to sit
+    inside a callee): absorbed ops get no entry and no slot, so no
+    static last use can land on one; roots lower to the new opcodes.
+    moe's plan of pair-space nodes becomes a RUN of entries in the
+    plan's own order, with the root's bytes charged only to the tail,
+    so the eager flush cadence lands where the Python engine's lands.
+  - Packed arrays are trailing INPUTS (never captures — mx.compile
+    bakes those), of main and of any region that holds a pack-reading
+    root. A repack that changes mode/group/bits/perm ARITY re-lowers:
+    `invalidate_traces` drops the Program on qmm's `changed`, and
+    `engine._native_ready` re-checks the arity every execute anyway.
+  - `stablehlo.sort` (comparator == one compare, which is what every
+    top_k lowers to) and `chlo.top_k` had to come with it: without
+    them every MoE program declines on its router. jnp.sort's float
+    comparator computes a key first and still declines.
+  - The region-capture rule gained ops/control._captures' stand-in: an
+    op absorbed in the ENCLOSING block still shows up in a region's
+    syntactic `free_values`, has no slot, and is never read.
+  - Emit-time diagnostics (moe's gather kind, sdpa's `fused`) are
+    counted at lowering, once, rather than per execute.
+  Recognizer-family census (test_qmm/test_qmm_mxfp4/test_moe/
+  test_sdpa): 11 -> 87 of 102 executables lowered; whole suite 454 ->
+  556 of ~670. The 15 that still decline are all `stablehlo.gather`
+  (an M2-era op-set gap, not an emit gap).
 - **M5 — msl_scan + host ops**: generated kernels via the C++
   metal_kernel API; host LAPACK/callbacks stay Python (impure ops
   already leave traces — the tape marks host-op sites and the C++

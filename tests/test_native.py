@@ -17,10 +17,14 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "native", "build")
 
+sys.path.insert(0, BUILD)  # before the import: the extension lives there
+                           # and nothing else puts native/build on the path,
+                           # so an importorskip ahead of it would skip this
+                           # file under the default-engine suite and make the
+                           # tally read as if the tests had run.
 native = pytest.importorskip(
     "metaljax_native",
     reason="native engine not built (native/build.sh)")
-sys.path.insert(0, BUILD)  # no-op when already importable
 
 import mlx.core as mx  # noqa: E402
 

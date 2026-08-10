@@ -1468,6 +1468,10 @@ def test_run_time_failure_falls_back(monkeypatch):
     """A tape that explodes mid-call hands the program back, once."""
 
     class _Boom:
+        # `num_args` is part of the Program contract engine.execute checks
+        # before it calls (the packed-weight arity guard, M4).
+        num_args = 1
+
         def run(self, inputs):
             raise RuntimeError("boom")
 
@@ -1628,3 +1632,403 @@ def test_compile_eligible_programs_take_the_native_path():
         assert engine.NATIVE_STATS["lowered"] == before["lowered"] + 1
         assert ex._can_compile is True
         assert native.stats()["compiled_calls"] > calls
+
+
+# --------------------------------------------------------------------------
+# M4: the recognizer emits
+# --------------------------------------------------------------------------
+#
+# The recognizer suites (test_qmm, test_qmm_mxfp4, test_moe, test_sdpa)
+# already drive these programs through engine.execute and check them against
+# jax-CPU, so run under METALJAX_ENGINE=native they are this milestone's
+# end-to-end harness. What they cannot say is that the two ENGINES agree bit
+# for bit on the SAME rewritten program — the recognizer suites compare
+# against CPU with tolerances, and a tape that quietly declined would pass
+# them unchanged. These do both: identical output bytes, AND the fused op
+# really on the tape.
+#
+# The graphs come from the recognizer suites themselves rather than being
+# rewritten here, so the differential tests can never drift onto a program
+# the recognizers no longer match.
+
+import jax                              # noqa: E402
+import jax.numpy as jnp                 # noqa: E402
+
+from helpers import lower_bytes         # noqa: E402
+from metaljax import interpreter, moe, qmm, sdpa  # noqa: E402
+
+OPS = native.opcodes()
+
+needs_qmm = pytest.mark.skipif(not qmm.QMM_ENABLED, reason="METALJAX_QMM=0")
+needs_moe = pytest.mark.skipif(not moe.ENABLED, reason="METALJAX_MOE=0")
+needs_sdpa = pytest.mark.skipif(not sdpa.ENABLED, reason="METALJAX_SDPA=0")
+
+
+def _count(ex, name):
+    """How many `name` entries the lowered Program holds (regions too)."""
+    return ex._native_prog.op_histogram().get(OPS[name], 0)
+
+
+def _fused(f, args, name, n=1, **kw):
+    """Run `f` on both engines, and assert `n` fused ops on the tape."""
+    mod = lower_bytes(f, *args)
+    ex = check(mod, [np.asarray(a) for a in args], **kw)
+    got = _count(ex, name)
+    assert got == n, f"tape holds {got} {name} entries, expected {n}"
+    return ex
+
+
+# --- quantized matmul -----------------------------------------------------
+
+
+@needs_qmm
+def test_qmm_emit_matches_the_python_engine():
+    """keras' sub-channel int4 Dense: affine mode, a bias table, no perm."""
+    from test_qmm import _quantize, dense_sub
+    rows, cols = 256, 64
+    _q, packed, scale, zero, g_idx, _ref = _quantize(rows, cols, 128,
+                                                     np.float32)
+    x = RNG.standard_normal((3, rows)).astype(np.float32)
+    ex = _fused(lambda *a: dense_sub(*a, columns=cols),
+                [packed, scale, zero, g_idx, x], "metaljax.qmm")
+    m = ex.interpreter._qmm.matches[0]
+    assert (m.mode, m.has_perm, m.bshape) == ("affine", False, [])
+
+
+@needs_qmm
+def test_qmm_emit_with_a_group_permutation():
+    """keras' attention output projection: the reversed contracting-dim
+    pairing interleaves the groups, so the weight is packed with its K axis
+    permuted and `emit` takes the same permutation of the activations."""
+    from test_qmm import _out_proj_case, einsum_out_proj
+    n, h, d = 8, 32, 96
+    args, _exact = _out_proj_case(n, h, d)
+    ex = _fused(lambda *a: einsum_out_proj(*a, n=n, h=h, d=d), args,
+                "metaljax.qmm")
+    assert ex.interpreter._qmm.matches[0].has_perm
+
+
+@needs_qmm
+def test_qmm_emit_mxfp4_and_batched():
+    """MXFP4 mode (no bias table) over a stack of per-expert weights, which
+    is also the batched arm: [B, M, K] x [B, N, K]."""
+    from test_qmm_mxfp4 import _random_mxfp4, experts_mxfp4
+    e, h, m, t = 4, 32, 64, 2
+    _codes, blocks, sb, _w = _random_mxfp4((e, h, m), np.random.default_rng(2))
+    x = (RNG.standard_normal((e, t, m)) * 0.4).astype(np.float32)
+    ex = _fused(lambda *a: experts_mxfp4(*a, k=m), [blocks, sb, x],
+                "metaljax.qmm")
+    match = ex.interpreter._qmm.matches[0]
+    assert match.mode == "mxfp4" and match.bshape == [e]
+
+
+@needs_qmm
+def test_qmm_emit_with_the_weight_on_the_left():
+    """`th,emh->etm` — the expert gate/up projection, which jax lowers with
+    the QUANTIZED operand as the dot's LHS. `emit` then has to swap the last
+    two axes of the product back."""
+    from test_qmm import _quantize, _unpack_nibbles
+    E, H, M, T = 4, 64, 32, 3
+    cols = E * M
+    _q, packed, scale, zero, g_idx, _ref = _quantize(H, cols, 64, np.float32)
+    x = (RNG.standard_normal((T, H)) * 0.2).astype(np.float32)
+
+    def f(packed_, scale_, zero_, g_idx_, x_):
+        w = _unpack_nibbles(packed_, cols)
+        g = g_idx_.astype(jnp.int32)
+        wf = ((w.astype(x_.dtype) - jnp.take(zero_, g, axis=0).astype(x_.dtype))
+              * jnp.take(scale_, g, axis=0))
+        wf = jnp.transpose(jnp.reshape(wf, (H, E, M)), (1, 2, 0))
+        return jnp.einsum("th,emh->etm", x_, wf)
+
+    ex = _fused(f, [packed, scale, zero, g_idx, x], "metaljax.qmm")
+    assert ex.interpreter._qmm.matches[0].swapped
+
+
+@needs_qmm
+def test_qmm_emit_inside_a_decode_loop():
+    """The weight is loop-carried state, so the root lives in the while
+    BODY: its Program takes the packed arrays as extra captures."""
+    from test_qmm import _quantize, dense_sub
+    rows, steps = 128, 3
+    _q, packed, scale, zero, g_idx, _ref = _quantize(rows, rows, 128,
+                                                     np.float32)
+    x = (RNG.standard_normal((1, rows)) * 0.1).astype(np.float32)
+
+    def f(packed_, scale_, zero_, g_idx_, x_):
+        def body(state):
+            i, acc = state
+            y = dense_sub(packed_, scale_, zero_, g_idx_, acc, columns=rows)
+            return i + 1, acc + y
+
+        _i, out = jax.lax.while_loop(lambda s: s[0] < steps, body, (0, x_))
+        return out
+
+    ex = _fused(f, [packed, scale, zero, g_idx, x], "metaljax.qmm")
+    # ...and the body Program really did get them: its own arity grew by the
+    # pack's arrays, not by a capture of a constant.
+    assert ex._native_prog.num_args == 5 + len(qmm.values(ex.interpreter))
+
+
+@needs_qmm
+def test_qmm_repack_relowers_the_tape():
+    """A repack that changes the pack's STRUCTURE invalidates the Program.
+
+    The permutation is the case that bites hardest: interleaved groups make
+    the pack carry a fourth array, so the fused op's operand list — and the
+    Program's arity — are different from the call before. Same buffers'
+    SHAPES throughout, only the grouping changes, which is exactly what a
+    second weight set can do to a program compiled for the first.
+    `prologue` reports it through `changed`; this is the test that the
+    native side acts on it rather than replaying a stale plan.
+    """
+    from test_qmm import _quantize, dense_sub
+    rows, cols = 256, 64
+    x = RNG.standard_normal((3, rows)).astype(np.float32)
+    ramp = _quantize(rows, cols, 128, np.float32)
+    woven = _quantize(rows, cols, 128, np.float32, seed=3,
+                      g_idx=(np.arange(rows) % 2).astype(np.float32))
+    mod = lower_bytes(lambda *a: dense_sub(*a, columns=cols),
+                      ramp[1], ramp[2], ramp[3], ramp[4], x)
+
+    with _native_engine():
+        # NB a snapshot, not zero: NATIVE_STATS is process-wide, and
+        # test_run_time_failure_falls_back deliberately fails a run.
+        failures = engine.NATIVE_STATS["run_failures"]
+        ex = engine.compile_program(mod, "mlir")
+        seen, perms = [], []
+        for w in (ramp, woven, ramp):
+            args = [w[1], w[2], w[3], w[4], x]
+            outs = engine.execute(ex, _buffers(args))
+            seen.append((args, [engine.to_host(o) for o in outs]))
+            assert ex._native_prog is not False, "the tape was retired"
+            m = ex.interpreter._qmm.matches[0]
+            perms.append(m.has_perm)
+            assert ex._native_prog.num_args == 5 + m.nvals
+        assert engine.NATIVE_STATS["run_failures"] == failures
+    assert perms == [False, True, False], perms
+    # Each call still agrees with the Python engine on its own weights.
+    for args, got in seen:
+        ref, _ = _run(mod, args, False)
+        assert got == ref
+
+
+# --- attention ------------------------------------------------------------
+
+
+@needs_sdpa
+@pytest.mark.parametrize("name,fn,shapes", [
+    (s[0], s[1], s[2]) for s in __import__("test_sdpa").SPELLINGS])
+def test_sdpa_emit_matches_the_python_engine(name, fn, shapes):
+    """Every spelling test_sdpa recognizes, through both engines."""
+    from test_sdpa import _arrays
+    args = _arrays(shapes, jnp.float32)
+    _fused(fn, args, "metaljax.sdpa")
+
+
+@needs_sdpa
+def test_sdpa_emit_scales_the_mask():
+    """`(QK + mask) * s`: the scale is applied AFTER the mask, so the mask
+    the fused kernel is handed has to carry it (`Match.mask`'s multiplier —
+    the one branch of `_mask_array` no spelling in test_sdpa reaches)."""
+    from test_sdpa import B, D, H, T, _arrays
+    q, k, v, m = _arrays([(B, H, T, D)] * 3 + [(B, 1, T, T)], jnp.float32)
+
+    def attn(q_, k_, v_, m_):
+        lg = (jnp.einsum("bhqd,bhkd->bhqk", q_, k_) + m_) * (D ** -0.5)
+        return jnp.einsum("bhqk,bhkd->bhqd", jax.nn.softmax(lg, -1), v_)
+
+    ex = _fused(attn, [q, k, v, m], "metaljax.sdpa")
+    assert ex.interpreter._sdpa.matches[0].mask[3] != 1.0
+
+
+@needs_sdpa
+def test_sdpa_mask_is_built_once_for_the_whole_block():
+    """`_mask_array`'s cache, as a tape entry: two attentions sharing one
+    mask build the additive form ONCE (it is a full [.., Tq, Tk] tensor, and
+    a transformer shares one mask across every layer, so recomputing it per
+    root would allocate half a gigabyte per token on a 60-layer model)."""
+    from test_sdpa import B, D, H, T, attn_bias, _arrays
+    q, k, v, m = _arrays([(B, H, T, D)] * 3 + [(B, 1, T, T)], jnp.float32)
+
+    def two_layers(q_, k_, v_, m_):
+        first = attn_bias(q_, k_, v_, m_)
+        return attn_bias(first, k_, v_, m_)
+
+    ex = _fused(two_layers, [q, k, v, m], "metaljax.sdpa", n=2)
+    assert _count(ex, "metaljax.sdpa.mask") == 1
+
+
+# --- the MoE expert gather ------------------------------------------------
+
+
+@needs_moe
+@pytest.mark.parametrize("T", [1, 5])
+def test_moe_emit_matches_the_python_engine(T):
+    """Float experts: gather_mm, the pair-space plan, the weighted sum."""
+    from test_moe import _args, make_weights, moe_block
+    w = make_weights(4, T, 64, 32, seed=T)
+    ex = _fused(lambda *a: moe_block(*a, k=2), _args(w), "metaljax.moe.tail")
+    assert _count(ex, "metaljax.moe.dot") == 2      # both projections
+    assert _count(ex, "metaljax.qmm") == 0          # nothing was packed
+
+
+@needs_moe
+def test_moe_emit_pair_space_views():
+    """The plan nodes the keras-hub and gpt-oss blocks never produce.
+
+    `extra` carries BOTH the expert and the token axis and is computed
+    outside the region, so it is gathered on the (e, t) grid rather than
+    along one axis; the activation is CONCATENATED in pair space; and the
+    expert output is RESHAPED over its trailing axes. Each is a branch of
+    `emit` with no other test.
+    """
+    from test_moe import router_scores
+    E, T, H, I, k = 4, 5, 64, 32, 2
+    rng = np.random.default_rng(11)
+
+    def n(*shape):
+        return (rng.standard_normal(shape) / np.sqrt(H)).astype(np.float32)
+
+    args = [n(T, H), n(H, E), n(E), n(E, H, 2 * I), n(E, 2 * I),
+            n(E, 2 * I, H), n(E, H), n(E, T, H)]
+
+    def f(x, wr, br, wgu, bgu, wd, bd, extra):
+        s = router_scores(x, wr, br, k)
+        gu = jnp.einsum("th,ehm->etm", x, wgu) + bgu[:, None, :]
+        act = jnp.concatenate([jax.nn.sigmoid(gu[..., :I]),
+                               jnp.tanh(gu[..., I:])], axis=-1)
+        y = jnp.einsum("etm,emh->eth", act, wd) + bd[:, None, :]
+        y = jnp.reshape(y + extra, (E, T, H // 2, 2))
+        return jnp.sum(y * s.T[..., None, None], axis=0)
+
+    ex = _fused(f, args, "metaljax.moe.tail")
+    assert _count(ex, "metaljax.moe.dot") == 2
+
+
+@needs_moe
+@needs_qmm
+def test_moe_emit_reads_the_packed_experts():
+    """gpt-oss' MXFP4 block: the expert dots were packed by metaljax.qmm and
+    the gather reads those packs (gather_qmm) instead of a dense weight."""
+    from test_moe import make_mxfp4, moe_block_mxfp4, router_scores  # noqa
+    E, k, T, H, I = 4, 2, 3, 64, 32
+    rng = np.random.default_rng(E)
+    gu_c, gu_s, _gu = make_mxfp4(2 * I, H, E, seed=E)
+    d_c, d_s, _d = make_mxfp4(H, I, E, seed=E + 1)
+    args = [(rng.standard_normal((T, H)) / 8).astype(np.float32),
+            (rng.standard_normal((H, E)) / 8).astype(np.float32),
+            rng.standard_normal(E).astype(np.float32),
+            gu_c, gu_s, d_c, d_s,
+            (rng.standard_normal((E, 2 * I)) / 8).astype(np.float32),
+            (rng.standard_normal((E, H)) / 8).astype(np.float32)]
+    ex = _fused(lambda *a: moe_block_mxfp4(*a, H=H, I=I, k=k), args,
+                "metaljax.moe.tail")
+    assert _count(ex, "metaljax.moe.dot") == 2
+    # The dense quantized_matmul is NOT emitted: moe took those dots over.
+    assert _count(ex, "metaljax.qmm") == 0
+    assert all(m.absorbed for m in ex.interpreter._qmm.matches)
+
+
+@pytest.mark.skipif(not interpreter.COMPILE_ENABLED,
+                    reason="METALJAX_COMPILE=0")
+@pytest.mark.parametrize("which", ["qmm", "sdpa", "moe"])
+def test_emits_are_identical_through_mx_compile(which):
+    """All three rewrites again, with the tape traced through mx::compile.
+
+    Everything above compares the two EAGER interpreters (see the module
+    docstring on why eager is the reference). This is the other path, and
+    the one a real program takes: both engines compile, so the fused
+    kernels are the same on both sides and the bytes must still agree.
+    """
+    if which == "qmm":
+        if not qmm.QMM_ENABLED:
+            pytest.skip("METALJAX_QMM=0")
+        from test_qmm import _quantize, dense_sub
+        rows, cols = 256, 64
+        _q, packed, scale, zero, g_idx, _ref = _quantize(rows, cols, 128,
+                                                         np.float32)
+        x = RNG.standard_normal((3, rows)).astype(np.float32)
+        ex = _fused(lambda *a: dense_sub(*a, columns=cols),
+                    [packed, scale, zero, g_idx, x], "metaljax.qmm",
+                    compiled=True)
+    elif which == "sdpa":
+        if not sdpa.ENABLED:
+            pytest.skip("METALJAX_SDPA=0")
+        from test_sdpa import B, D, H, T, attn_causal, _arrays
+        args = _arrays([(B, H, T, D)] * 3, jnp.float32)
+        ex = _fused(attn_causal, args, "metaljax.sdpa", compiled=True)
+    else:
+        if not moe.ENABLED:
+            pytest.skip("METALJAX_MOE=0")
+        from test_moe import _args, make_weights, moe_block
+        w = make_weights(4, 5, 64, 32, seed=5)
+        ex = _fused(lambda *a: moe_block(*a, k=2), _args(w),
+                    "metaljax.moe.tail", compiled=True)
+    assert ex._can_compile, "this program was supposed to compile"
+
+
+# --- the ordering ops the router needs ------------------------------------
+#
+# A top_k is what makes an MoE router a router, so M4 had to lower it or
+# every MoE program would decline on the way in. It arrives two ways — as
+# chlo.top_k from a direct lowering, as the sort it decomposes to through a
+# portable artifact — and both are here, with the key kinds the handler
+# branches on.
+
+
+@pytest.mark.parametrize("dt", [np.float32, np.int32])
+def test_top_k_matches_the_python_engine(dt):
+    x = (RNG.standard_normal((3, 8)) * 4).astype(dt)
+    mod = lower_bytes(lambda a: jax.lax.top_k(a, 3), x)
+    ex = check(mod, [x])
+    assert _count(ex, "chlo.top_k") == 1
+
+
+@pytest.mark.parametrize("dt", [np.int32, np.uint16, np.bool_])
+def test_sort_of_an_ordered_key_matches_the_python_engine(dt):
+    """A comparator that IS a compare: no canonicalization chain, because
+    integers and bools are already in total order."""
+    x = (RNG.standard_normal((3, 8)) * 4).astype(dt)
+    mod = lower_bytes(lambda a: jnp.sort(a, axis=-1), x)
+    ex = check(mod, [x])
+    assert _count(ex, "stablehlo.sort") == 1
+
+
+def test_descending_totalorder_sort_matches_the_python_engine():
+    """chlo.top_k's decomposition, which is what the PLUGIN receives: a
+    portable artifact has legalized the chlo op away, leaving
+    `sort(values, iota)` under a strict TOTALORDER GT. Written out here
+    because a module holding chlo.top_k cannot be serialized as one.
+
+    The input carries the values that separate a totalOrder key from a
+    plain compare: NaN sorts above +inf, and -0 below +0.
+    """
+    t, ti = "tensor<2x6xf32>", "tensor<2x6xi32>"
+    mod = _mod([("a", t)], [t, ti], f"""
+    %0 = stablehlo.iota dim = 1 : {ti}
+    %1:2 = "stablehlo.sort"(%a, %0) <{{dimension = 1 : i64, is_stable = true}}> ({{
+    ^bb0(%al: tensor<f32>, %ar: tensor<f32>, %bl: tensor<i32>, %br: tensor<i32>):
+      %2 = stablehlo.compare GT, %al, %ar, TOTALORDER : (tensor<f32>, tensor<f32>) -> tensor<i1>
+      stablehlo.return %2 : tensor<i1>
+    }}) : ({t}, {ti}) -> ({t}, {ti})
+    return %1#0, %1#1 : {t}, {ti}""")
+    x = np.array([[0.0, -0.0, np.inf, -np.inf, np.nan, 1.5],
+                  [2.0, 2.0, -1.0, 0.5, -0.0, 0.0]], np.float32)
+    ex = check(mod, [x])
+    assert _count(ex, "stablehlo.sort") == 1
+
+
+# --- what does not lower --------------------------------------------------
+
+
+def test_sort_with_a_key_chain_declines():
+    """The sort opcode carries a plan, not a program: it can only run a
+    comparator that compares an operand pair directly (what every top_k
+    lowers to). jnp.sort's float comparator canonicalizes -0 and NaN first,
+    which means running block code on arrays — that declines, wholesale."""
+    x = RNG.standard_normal((3, 8)).astype(np.float32)
+    with _native_engine():
+        ex = engine.compile_program(
+            lower_bytes(lambda a: jnp.sort(a, axis=-1), x), "mlir")
+        assert ex.native_program() is None

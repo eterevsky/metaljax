@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import os
 
+import mlx.core as mx
+
 from jaxlib.mlir import ir
 
 from metaljax import _ir
-from metaljax.interpreter import free_values, value_bytes
+from metaljax.interpreter import _SKIP, free_values, value_bytes
 
 _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 
@@ -73,6 +75,14 @@ _ALIAS_OPS = ("stablehlo.optimization_barrier", "sdy.sharding_constraint",
 
 # Ops carrying regions the tape lowers into sub-Programs (see _control).
 _REGION_OPS = ("stablehlo.while", "stablehlo.if", "stablehlo.case")
+
+# Ops whose region is a BODY the lowering reads structurally rather than
+# executing: a reduce's monoid, a sort's comparator.
+_REGION_BODY_OPS = ("stablehlo.reduce", "stablehlo.sort")
+
+# Ops a handler may give more than one result. Everything else has to
+# produce exactly one array, since that is all the tape can bind.
+_MULTI_RESULT_OPS = _REGION_BODY_OPS + ("chlo.top_k",)
 
 
 def _rank0_passthrough(o):
@@ -134,6 +144,18 @@ class _Lowering:
         self.arg_alias: dict = {}
         self.const_view: set = set()
         self._tcache: dict = {}      # ir.Type -> bytes (see value_bytes)
+        # M4: the packed quantized weights, threaded in as trailing
+        # arguments exactly as engine.MetalExecutable.runner threads them
+        # into an mx.compile trace (never captured — mx.compile would bake
+        # the first pack by value and never see a repack). Filled by
+        # `lower_block`; a region that holds a pack-reading root gets the
+        # parent's slots as extra captures (see `_region`).
+        self.pack_slots: list = []
+        # metaljax.sdpa._mask_array's per-block cache, as tape entries: one
+        # kSdpaMask per distinct mask key, read by every root that shares it.
+        self.masks: dict = {}
+        self._absorbed = None    # slot of the stand-in below, once built
+        self._skip = None        # the recognizers' absorbed-op set, memoized
 
     # --- types --------------------------------------------------------
 
@@ -185,6 +207,35 @@ class _Lowering:
         return (self.arg_alias.get(slot, frozenset()),
                 slot in self.const_view)
 
+    def _skipped(self):
+        """Every recognizer's absorbed-op set (their first results)."""
+        if self._skip is None:
+            from metaljax import sdpa as _sdpa
+            skip: set = set()
+            for st in (self.interp._qmm, _sdpa.analyze(self.interp)):
+                if st is not None and st.active:
+                    skip |= st.skip
+            self._skip = skip
+        return self._skip
+
+    def _absorbed_slot(self) -> int:
+        """ops/control.py's `_ABSORBED`: the stand-in a region is handed for
+        a capture that was absorbed. Never read — see `_region`."""
+        if self._absorbed is None:
+            s = self._new_slot()
+            self._emit(self.opcodes["stablehlo.constant"], [], [s], [],
+                       mx.zeros((), mx.uint8), None)
+            self.const_view.add(s)
+            self._absorbed = s
+        return self._absorbed
+
+    def _new_slot(self) -> int:
+        """A slot with no SSA value behind it (a pack array, or one of the
+        intermediates a recognizer's `emit` builds)."""
+        s = self.nslots
+        self.nslots += 1
+        return s
+
     def _bind(self, v) -> int:
         s = self.nslots
         self.nslots += 1
@@ -204,12 +255,14 @@ class _Lowering:
 
     # --- the walk -----------------------------------------------------
 
-    def lower_block(self, block, captures=()):
+    def lower_block(self, block, captures=(), npacks=0):
         """Walk `block` into this frame; return (Program, output slots).
 
         `captures` are the values the block reads from enclosing scopes,
         already resolved to parent slots by the caller: they become extra
-        arguments of the Program, after the block's own.
+        arguments of the Program, after the block's own. `npacks` more
+        arguments follow those — the packed quantized weights, which are
+        arrays rather than SSA values and so are bound to bare slots.
         """
         returned = None
         for v in list(block.arguments) + list(captures):
@@ -217,27 +270,38 @@ class _Lowering:
             self._shape(v)
             s = self._bind(v)
             self.arg_alias[s] = frozenset({s})
-        for op in block.operations:
-            o = op.operation
+        for _ in range(npacks):
+            s = self._new_slot()
+            self.arg_alias[s] = frozenset({s})
+            self.pack_slots.append(s)
+        # What each op DOES (metaljax.interpreter._rewrite_plan): an absorbed
+        # op is not executed and gets no slot, a root executes its
+        # recognizer's `emit` instead of itself.
+        for o, entry in self._walk(block):
             if o.name in _TERMINATORS:
                 returned = list(o.operands)
                 break
+            if entry is _SKIP:
+                continue          # absorbed: no entry, no slot, no drops
+            if entry is not None:
+                self._root(o, entry[1])
+                continue
             self._op(o)
         if returned is None:
             raise _Decline("block without a terminator")
         outputs = [self._slot(v) for v in returned]
-        nargs = len(list(block.arguments)) + len(captures)
+        nargs = len(list(block.arguments)) + len(captures) + npacks
         prog = self._build(nargs, outputs)
         return prog, outputs
 
     def _build(self, nargs, outputs):
         drops = self._liveness(outputs)
         prog = self.native.Program(num_slots=self.nslots, num_args=nargs)
-        for (opcode, ins, outs, attrs, payload, regions, nbytes), drop in zip(
-                self.entries, drops):
+        for (opcode, ins, outs, attrs, payload, regions, nbytes,
+             fattrs), drop in zip(self.entries, drops):
             prog.add(opcode=opcode, operands=ins, results=outs, attrs=attrs,
                      payload=payload, drops=drop, regions=regions,
-                     bytes=nbytes)
+                     bytes=nbytes, fattrs=fattrs)
         # Region programs never need output copies: their results are a
         # loop's carries or a branch's values, which stay inside this
         # engine. Only a whole program's outputs cross to a caller, and
@@ -245,7 +309,7 @@ class _Lowering:
         prog.set_outputs(slots=outputs)
         return prog
 
-    def run(self, compile_main=False):
+    def run(self, compile_main=False, npacks=0):
         func = self.interp.main
         if len(func.regions[0].blocks) != 1:
             raise _Decline("multi-block function")
@@ -256,7 +320,7 @@ class _Lowering:
         arg_slots = set(range(nargs))
         argset = set(args)
 
-        prog, outputs = self.lower_block(block)
+        prog, outputs = self.lower_block(block, npacks=npacks)
 
         # Which outputs may not be handed out as they stand: one that IS an
         # argument's array object, or one that reads a constant the Program
@@ -320,13 +384,10 @@ class _Lowering:
         opcode = self.opcodes.get(name)
         if opcode is None:
             raise _Decline(f"op {name}")
-        if o.regions and name != "stablehlo.reduce":
+        if o.regions and name not in _REGION_BODY_OPS:
             raise _Decline(f"op {name} carries a region")
         nres = len(o.results)
-        # Multi-result ops exist only where a handler asks for them (the
-        # argmax/argmin (values, indices) reduce); everything else has to
-        # produce exactly one array, since that is all the tape can bind.
-        if nres != 1 and name != "stablehlo.reduce":
+        if nres != 1 and name not in _MULTI_RESULT_OPS:
             raise _Decline(f"op {name} has {nres} results")
         for v in o.operands:
             self._dtype_code(self._element(v))
@@ -363,14 +424,80 @@ class _Lowering:
                     self.arg_alias[outs[0]] = src
         self._emit(opcode, ins, outs, attrs, payload, o)
 
-    def _emit(self, opcode, ins, outs, attrs, payload, o, regions=()):
+    # --- recognizer roots ---------------------------------------------
+    #
+    # A root does not run itself: it runs its recognizer's `emit`, on the
+    # values `emit_reads` names, and the ops it absorbed never run at all.
+    # The lowerings below are the same rewrite, resolved statically — every
+    # branch of `emit` that depends only on the match becomes an attribute,
+    # and the arrays it reads out of `env` (or out of the packing prologue)
+    # become the entry's operands. Anything a lowering cannot express
+    # declines the whole program, which then runs on the Python engine with
+    # the identical rewrite.
+
+    def _root(self, o, m):
+        from metaljax import moe as _moe, qmm as _qmm, sdpa as _sdpa
+        if isinstance(m, _qmm.Match):
+            lower = _lower_qmm
+        elif isinstance(m, _moe.Match):
+            lower = _lower_moe
+        elif isinstance(m, _sdpa.Match):
+            lower = _lower_sdpa
+        else:
+            raise _Decline(f"unknown recognizer match {type(m).__name__}")
+        if len(o.results) != 1:
+            raise _Decline("recognizer root with several results")
+        for v in o.results:
+            self._dtype_code(self._element(v))
+            self._shape(v)
+        lower(self, o, m)
+
+    def _pack_ins(self, m):
+        """Slots of `m`'s packed arrays (qmm.pack_arrays, by index)."""
+        if m.slot < 0 or m.nvals <= 0:
+            raise _Decline("quantized match has no pack")
+        if not self.pack_slots:
+            raise _Decline("packed weights are not in scope")
+        want = 2 + (1 if m.mode == "affine" else 0) + (1 if m.has_perm else 0)
+        if m.nvals != want:
+            # `emit` reads vals[0..2] and vals[-1] positionally; a pack that
+            # does not have that shape would be read wrong rather than
+            # rejected, so say so here.
+            raise _Decline(f"pack arity {m.nvals} does not match "
+                           f"mode={m.mode} perm={m.has_perm}")
+        if m.slot + m.nvals > len(self.pack_slots):
+            raise _Decline("pack slot out of range")
+        return list(self.pack_slots[m.slot:m.slot + m.nvals])
+
+    def _emit(self, opcode, ins, outs, attrs, payload, o, regions=(),
+              fattrs=()):
         """Append one tape entry, charged the result bytes the eager flush
         cadence meters (interpreter.eager_plan's `out_bytes`: the plain
         value_bytes sum, splat corrections deliberately absent — see the
-        note there on why a cadence over-counts rather than under-counts)."""
-        nbytes = sum(value_bytes(r, self._tcache) for r in o.results)
+        note there on why a cadence over-counts rather than under-counts).
+
+        `o` may be None for the intermediate entries a recognizer's `emit`
+        expands into: eager_plan charges a ROOT its declared result and
+        nothing else, so the whole expansion's bytes ride on its last entry
+        and the flush lands where the Python engine's lands.
+        """
+        nbytes = 0 if o is None else sum(
+            value_bytes(r, self._tcache) for r in o.results)
         self.entries.append((opcode, ins, outs, attrs, payload, list(regions),
-                             nbytes))
+                             nbytes, list(fattrs)))
+
+    def _opcode(self, name) -> int:
+        code = self.opcodes.get(name)
+        if code is None:
+            raise _Decline(f"op {name}")
+        return code
+
+    def _mx_code(self, dt) -> int:
+        """Dtype code for an mx.Dtype a recognizer match recorded."""
+        name = _mx_name(dt)
+        if name is None:
+            raise _Decline(f"dtype {dt}")
+        return self._dtype_code(name)
 
     # --- control flow -------------------------------------------------
     #
@@ -393,9 +520,32 @@ class _Lowering:
         if len(list(block.operations)) == 0:
             raise _Decline("empty region")
         free = free_values(block)
-        cap_slots = [self._slot(v) for v in free]
+        # ops/control.py _captures, transliterated: `free_values` is purely
+        # syntactic, so an op the enclosing block ABSORBED still shows up as
+        # a capture of this region — and it has no slot, because it never
+        # runs. Every consumer of it inside the region is absorbed too, so
+        # nothing can read it; a stand-in keeps the region's arity what
+        # `_underived_outputs` and the Python engine both see. A free value
+        # that is missing for any OTHER reason still declines, as it must.
+        cap_slots = []
+        for v in free:
+            s = self.slots.get(v)
+            if s is None and v in self._skipped():
+                s = self._absorbed_slot()
+            elif s is None:
+                raise _Decline("region capture is defined outside the block")
+            cap_slots.append(s)
+        # A region holding a root that reads packed weights needs them too,
+        # and they are not SSA values, so they ride as extra captures after
+        # the free ones. Only when something inside actually reads them:
+        # every capture is an input of the region's Program, and a compiled
+        # body pays for inputs it never uses.
+        npacks = 0
+        if self.pack_slots and _uses_packs(self.interp, block):
+            npacks = len(self.pack_slots)
+            cap_slots = cap_slots + list(self.pack_slots)
         child = _Lowering(self.interp, self.native)
-        prog, outputs = child.lower_block(block, free)
+        prog, outputs = child.lower_block(block, free, npacks)
         return prog, free, cap_slots, outputs, child
 
     def _region_taints(self, child, outputs, parent_slots):
@@ -580,6 +730,18 @@ class _Lowering:
                 self.arg_alias[outs[j]] = frozenset(alias)
         self._emit(opcode, ins, outs, attrs, None, o, regions=regions)
 
+    def _walk(self, block):
+        """(operation, rewrite entry) for each op of `block`, in order.
+
+        The plan is resolved by POSITION, exactly as run_block replays it —
+        and it is consulted here rather than only in `lower_block` because a
+        callee's ops are spliced in by `_inline`, and a recognizer's root or
+        an absorbed op is just as likely to live inside one.
+        """
+        plan = dict(self.interp._rewrite_plan(block))
+        for i, op in enumerate(block.operations):
+            yield op.operation, plan.get(i)
+
     def _inline(self, o, attr):
         """Splice a single-block callee's ops into this tape.
 
@@ -607,11 +769,15 @@ class _Lowering:
             self._alias(a, self._slot(v))
         self.calls.append(name)
         rets = None
-        for inner in block.operations:
-            io = inner.operation
+        for io, entry in self._walk(block):
             if io.name in _TERMINATORS:
                 rets = [self._slot(v) for v in io.operands]
                 break
+            if entry is _SKIP:
+                continue
+            if entry is not None:
+                self._root(io, entry[1])
+                continue
             self._op(io)
         self.calls.pop()
         if rets is None:
@@ -787,6 +953,67 @@ def _lower_reduce(lo, o):
     raise _Decline(f"reduce body {[x.name for x in body_ops]}")
 
 
+def _lower_sort(lo, o):
+    """ops/sort.py `_sort`, the arm whose comparator IS a compare.
+
+    jax lowers every top_k as `sort(values, iota)` under a strict TOTALORDER
+    GT, and a plain jnp.sort/argsort the same way with LT — the comparator's
+    two sides are the (lhs, rhs) block-argument pair themselves, so the sort
+    key is an operand and there is nothing to evaluate. The other arms of
+    the Python handler (a comparator that computes a key first, the complex
+    and multi-key lexicographic select trees) mean running block code on
+    arrays, which is a plan this opcode does not carry: they decline.
+    """
+    from metaljax.ops.elementwise import _comparison_direction
+    dim = _ir.int_attr(o, "dimension")
+    block = o.regions[0].blocks[0]
+    body = [x.operation for x in block.operations]
+    if len(body) != 2 or body[0].name != "stablehlo.compare":
+        raise _Decline("sort comparator is not a bare compare")
+    cmp, ret = body
+    if (ret.name != "stablehlo.return" or len(ret.operands) != 1
+            or ret.operands[0] != cmp.results[0]):
+        raise _Decline("sort comparator does not return its compare")
+    d = _comparison_direction(cmp)
+    if d not in ("LT", "GT"):
+        raise _Decline(f"sort: non-strict compare {d}")
+    args = list(block.arguments)
+    if len(args) != 2 * len(o.operands) or len(o.results) != len(o.operands):
+        raise _Decline("sort arity")
+    pair = []
+    for v in cmp.operands:
+        if not isinstance(v, ir.BlockArgument) or v not in args:
+            raise _Decline("sort comparator computes a key")
+        pair.append(args.index(v))
+    li, ri = pair
+    if ri != li + 1 or li % 2:
+        raise _Decline("sort comparator args are not an (lhs, rhs) pair")
+    k = li // 2
+    el = lo._element(o.operands[k])
+    if el in _FLOAT_ELEMENTS:
+        kind = 1
+    elif el == "i1":
+        kind = 2
+    else:
+        kind = 0
+    return [dim, 1 if d == "GT" else 0, k, kind], None
+
+
+def _lower_top_k(lo, o):
+    """ops/sort.py `_top_k`. Survives a direct jax lowering; a portable
+    artifact decomposes it into the sort above, so both forms are lowered."""
+    el = lo._element(o.operands[0])
+    if el in _FLOAT_ELEMENTS:
+        kind = 1
+    elif el == "i1":
+        kind = 2
+    else:
+        kind = 0
+    if len(o.results) != 2:
+        raise _Decline("top_k does not return (values, indices)")
+    return [_ir.int_attr(o, "k"), kind], None
+
+
 def _lower_dot_general(lo, o):
     from metaljax import dtypes as _dt
     from metaljax.ops.linalg import _dot_dims, _exact_f32_chunk
@@ -911,6 +1138,8 @@ _HANDLERS = {
     "stablehlo.iota": _lower_iota,
     "stablehlo.constant": _lower_constant,
     "stablehlo.reduce": _lower_reduce,
+    "stablehlo.sort": _lower_sort,
+    "chlo.top_k": _lower_top_k,
     "stablehlo.dot_general": _lower_dot_general,
 }
 
@@ -972,6 +1201,299 @@ _VIEW_OPS = frozenset(_IDENTITY_CHECKS) | frozenset(_EXTRA_VIEW_OPS)
 
 
 # --------------------------------------------------------------------------
+# recognizer emits (M4)
+# --------------------------------------------------------------------------
+#
+# One lowering per `emit`, transliterated branch for branch. What the emit
+# decides from the MATCH (a permutation, a reshape, a mode, a dtype) is
+# static and becomes an attribute; what it reads out of `env` becomes an
+# operand; what it reads out of the packing prologue becomes a pack slot.
+# Anything else declines the program, which then runs the identical rewrite
+# on the Python engine.
+
+# mx.Dtype -> the MLIR element name the tape's dtype table is keyed by. Only
+# the types whose device storage IS their own bits; a match recording
+# anything else declines (as the IR-side gate does for the ops).
+_MX_NAMES = [
+    (mx.bool_, "i1"), (mx.int8, "i8"), (mx.int16, "i16"), (mx.int32, "i32"),
+    (mx.int64, "i64"), (mx.uint8, "ui8"), (mx.uint16, "ui16"),
+    (mx.uint32, "ui32"), (mx.uint64, "ui64"), (mx.float16, "f16"),
+    (mx.float32, "f32"), (mx.bfloat16, "bf16"),
+]
+
+
+def _mx_name(dt):
+    for d, name in _MX_NAMES:
+        if d == dt:
+            return name
+    return None
+
+
+def _uses_packs(interp, block, seen=None) -> bool:
+    """Whether `block`, or anything it calls, holds a pack-reading root."""
+    from metaljax import moe as _moe, qmm as _qmm
+    if seen is None:
+        seen = set()
+    for _i, entry in interp._rewrite_plan(block):
+        if entry is _SKIP:
+            continue
+        m = entry[1]
+        if isinstance(m, _qmm.Match) and m.nvals > 0:
+            return True
+        if isinstance(m, _moe.Match) and m.packs:
+            return True
+    for op in block.operations:
+        o = op.operation
+        attr = _CALL_OPS.get(o.name)
+        if attr is not None:
+            name = ir.FlatSymbolRefAttr(o.attributes[attr]).value
+            fn = interp.funcs.get(name)
+            if fn is not None and name not in seen:
+                seen.add(name)
+                if _uses_packs(interp, fn.regions[0].blocks[0], seen):
+                    return True
+        for region in o.regions:
+            for b in region.blocks:
+                if _uses_packs(interp, b, seen):
+                    return True
+    return False
+
+
+# The counters the recognizers keep inside their `emit` (moe's per-dot
+# gather kind, sdpa's fused count). The native tape emits ONCE, at lowering,
+# and replays; so it ticks them there. Diagnostics either way — the analysis
+# counters (recognized, packs, verified, fallbacks) are unaffected, since
+# the analysis and the packing prologue are shared code.
+def _count(mod, key):
+    mod.STATS[key] += 1
+
+
+def _lower_qmm(lo, o, m):
+    """metaljax.qmm.emit: one mx.quantized_matmul for the whole chain."""
+    if m.mode not in ("affine", "mxfp4"):
+        raise _Decline(f"quantized matmul mode {m.mode}")
+    x = m.lhs
+    lo._dtype_code(lo._element(x))
+    rank = len(lo._shape(x))
+    lperm = list(m.lperm)
+    if len(lperm) != rank or sorted(lperm) != list(range(rank)):
+        raise _Decline("quantized matmul lhs permutation")
+    ins = [lo._slot(x)] + lo._pack_ins(m)
+    attrs = [1 if lperm != list(range(rank)) else 0, len(lperm), *lperm,
+             1 if m.bshape else 0, m.B, m.M, m.K,
+             m.gs, m.bits, 0 if m.mode == "affine" else 1,
+             1 if m.has_perm else 0, 1 if m.swapped else 0,
+             lo._mx_code(m.out_dtype),
+             len(m.bshape), *m.bshape,
+             len(m.mshape), *m.mshape,
+             len(m.nshape), *m.nshape]
+    lo._emit(lo._opcode("metaljax.qmm"), ins, [lo._bind(o.results[0])],
+             attrs, None, o)
+
+
+def _rec_attrs(rec):
+    """metaljax.sdpa._apply's (perm, shape) recipe, as attributes."""
+    perm, shape = rec
+    out = [0, 0] if perm is None else [1, len(perm), *perm]
+    out += [0, 0] if shape is None else [1, len(shape), *shape]
+    return out
+
+
+def _lower_sdpa(lo, o, m):
+    """metaljax.sdpa.emit: one mx.fast.scaled_dot_product_attention.
+
+    The mask's additive form is built by an entry of its own, emitted at the
+    first root that needs it — `_mask_array`'s cache, whose whole point is
+    that one causal mask is shared by every layer of a transformer and costs
+    a full [.., .., Tq, Tk] tensor to build.
+    """
+    ins = [lo._slot(m.q), lo._slot(m.k), lo._slot(m.v)]
+    dt = lo._mx_code(m.dtype)
+    attrs = (_rec_attrs(m.q_rec) + _rec_attrs(m.k_rec) + _rec_attrs(m.v_rec)
+             + [dt, lo._mx_code(m.out_dtype)])
+    if m.mask is None:
+        attrs += [0] + _rec_attrs((None, None))
+    else:
+        kind, base, const, mul = m.mask
+        if kind not in ("add", "select"):
+            raise _Decline(f"attention mask kind {kind}")
+        key = (base, kind, const, mul, m.dtype)
+        slot = lo.masks.get(key)
+        if slot is None:
+            lo._dtype_code(lo._element(base))
+            slot = lo._new_slot()
+            lo._emit(lo._opcode("metaljax.sdpa.mask"), [lo._slot(base)],
+                     [slot], [0 if kind == "select" else 1, dt,
+                              1 if float(mul) != 1.0 else 0],
+                     None, None,
+                     fattrs=[float(const) * float(mul), float(mul)])
+            lo.masks[key] = slot
+        ins.append(slot)
+        attrs += [1] + _rec_attrs(m.mask_rec)
+    pre, perm, post = m.out_rec
+    attrs += ([0, 0] if pre is None else [1, len(pre), *pre])
+    attrs += ([0, 0] if perm is None else [1, len(perm), *perm])
+    attrs += ([0, 0] if post is None else [1, len(post), *post])
+    lo._emit(lo._opcode("metaljax.sdpa"), ins, [lo._bind(o.results[0])],
+             attrs, None, o, fattrs=[float(m.scale)])
+    from metaljax import sdpa as _sdpa
+    _count(_sdpa, "fused")
+
+
+def _moe_node(lo, m, node, vals, eidx, tidx):
+    """One node of metaljax.moe's pair-space plan, as one tape entry."""
+    from metaljax import moe as _moe
+
+    if isinstance(node, _moe._Ext):
+        if node.op is not None:
+            # A nullary op bound inside a callee (a constant or an iota):
+            # `_emit_ext` re-runs its handler on an empty environment, so
+            # the tape emits it as the op it is.
+            name = node.op.name
+            handler = _HANDLERS.get(name)
+            res = handler(lo, node.op) if handler else ([], None)
+            if len(res) != 2:
+                raise _Decline(f"moe: {name} needs a different opcode")
+            s = lo._new_slot()
+            lo._emit(lo._opcode(name), [], [s], res[0], res[1], None)
+            if name == "stablehlo.constant":
+                lo.const_view.add(s)
+            return s
+        lo._dtype_code(lo._element(node.value))
+        src = lo._slot(node.value)
+        s = lo._new_slot()
+        lo._emit(lo._opcode("metaljax.moe.gather"), [src, eidx, tidx], [s],
+                 [1 if node.ea is not None else 0, node.ea or 0,
+                  1 if node.ta is not None else 0, node.ta or 0, m.P],
+                 None, None)
+        if node.ea is None and node.ta is None:
+            # The handler hands the array straight back, so the slot may BE
+            # an argument's (or a constant's) storage; carry the taints.
+            alias = lo.arg_alias.get(src)
+            if alias:
+                lo.arg_alias[s] = alias
+            if src in lo.const_view:
+                lo.const_view.add(s)
+        return s
+
+    if isinstance(node, _moe._Elem):
+        op = node.op
+        for v in list(op.operands) + list(op.results):
+            lo._dtype_code(lo._element(v))
+        ins = [vals[id(x)] for x in node.srcs]
+        s = lo._new_slot()
+        if op.name == "stablehlo.concatenate":
+            d = _ir.int_attr(op, "dimension")
+            axis = 1 + _moe._tpos(node.shape, node.ea, node.ta, d)
+            lo._emit(lo._opcode("metaljax.moe.concat"), ins, [s], [axis],
+                     None, None)
+            return s
+        handler = _HANDLERS.get(op.name)
+        res = handler(lo, op) if handler else ([], None)
+        if len(res) != 2:
+            raise _Decline(f"moe: {op.name} needs a different opcode")
+        lo._emit(lo._opcode(op.name), ins, [s], res[0], res[1], None)
+        return s
+
+    if isinstance(node, _moe._View):
+        attrs = [1 if node.src.paired() else 0]
+        kind, arg = node.kind, node.arg
+        if kind == "bcast":
+            keep, trailing = arg
+            attrs += [0, len(keep)]
+            for d in keep:
+                attrs += [0, 0] if d is None else [1, d]
+            attrs += [len(trailing), *trailing]
+        elif kind == "perm":
+            attrs += [1, len(arg), *arg]
+        elif kind == "reshape":
+            attrs += [2, len(arg), *arg]
+        elif kind == "slice":
+            attrs += [3, len(arg)]
+            for a, b, c in arg:
+                attrs += [a, b, c]
+        elif kind == "dotperm":
+            perm, trailing = arg
+            attrs += [4, 1 if list(perm) != sorted(perm) else 0,
+                      len(perm), *perm, len(trailing), *trailing]
+        else:
+            raise _Decline(f"moe view {kind}")
+        s = lo._new_slot()
+        lo._emit(lo._opcode("metaljax.moe.view"), [vals[id(node.src)]], [s],
+                 attrs, None, None)
+        return s
+
+    if isinstance(node, _moe._Dot):
+        data = node.data
+        shortcut = (isinstance(data, _moe._Ext) and data.ea is None
+                    and data.op is None)
+        if shortcut:
+            if data.ta is None:
+                raise _Decline("moe: ungathered dot operand has no token axis")
+            lo._dtype_code(lo._element(data.value))
+            ins = [lo._slot(data.value), eidx, tidx]
+            ta = data.ta
+        else:
+            ins = [vals[id(data)], eidx]
+            ta = 0
+        pack = node.pack
+        if pack is not None:
+            if pack.mode not in ("affine", "mxfp4"):
+                raise _Decline(f"moe: packed mode {pack.mode}")
+            ins = ins + lo._pack_ins(pack)
+            gs, bits = pack.gs, pack.bits
+            mode = 0 if pack.mode == "affine" else 1
+            has_perm = pack.has_perm
+        else:
+            lo._dtype_code(lo._element(node.weight))
+            ins = ins + [lo._slot(node.weight)]
+            gs, bits, mode, has_perm = 0, 0, 0, False
+        attrs = [1 if shortcut else 0, 1 if data.paired() else 0, ta,
+                 1 if pack is not None else 0, m.E,
+                 1 if node.n_first else 0, gs, bits, mode,
+                 1 if has_perm else 0,
+                 m.P, node.M, node.K, node.N, lo._mx_code(node.out_dtype),
+                 len(node.mshape), *node.mshape,
+                 len(node.nshape), *node.nshape]
+        s = lo._new_slot()
+        lo._emit(lo._opcode("metaljax.moe.dot"), ins, [s], attrs, None, None)
+        _count(_moe, "gather_qmm" if pack is not None else "gather_mm")
+        return s
+
+    raise _Decline(f"moe node {type(node).__name__}")
+
+
+def _lower_moe(lo, o, m):
+    """metaljax.moe.emit: the gathered expert dispatch.
+
+    `emit` is an interpreter over a plan of pair-space nodes, so the plan
+    becomes a run of tape entries in its own dependency order. Only the
+    tail is charged the root's bytes (see `_emit`), which keeps the eager
+    flush landing where the Python engine's lands.
+    """
+    r = m.router
+    lo._dtype_code(lo._element(r.indices))
+    lo._dtype_code(lo._element(r.weights))
+    eidx = lo._new_slot()
+    lo._emit(lo._opcode("metaljax.moe.eidx"), [lo._slot(r.indices)], [eidx],
+             [m.P], None, None)
+    tidx = lo._new_slot()
+    lo._emit(lo._opcode("metaljax.moe.tidx"), [], [tidx], [m.T, m.K],
+             None, None)
+    vals: dict = {}
+    for node in m.order:
+        vals[id(node)] = _moe_node(lo, m, node, vals, eidx, tidx)
+    if id(m.out) not in vals:
+        raise _Decline("moe: the plan's output is not in its order")
+    attrs = [1 if m.out.paired() else 0, m.P, m.T, m.K,
+             lo._mx_code(m.sum_dtype), lo._mx_code(m.out_dtype),
+             m.out_axis, len(m.out_shape), *m.out_shape]
+    lo._emit(lo._opcode("metaljax.moe.tail"),
+             [vals[id(m.out)], lo._slot(r.weights)],
+             [lo._bind(o.results[0])], attrs, None, o)
+
+
+# --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
 
@@ -997,6 +1519,19 @@ def configure(native):
     )
 
 
+def pack_count(interp) -> int:
+    """How many packed arrays this program threads in as trailing inputs.
+
+    The packing prologue owns them (metaljax.qmm.prologue, run eagerly by
+    engine.execute before anything is lowered or traced), and the Python
+    engine passes exactly this list after the program's own arguments —
+    see engine.MetalExecutable.runner. The tape does the same, so a repack
+    is picked up by both engines and neither ever bakes one in.
+    """
+    st = getattr(interp, "_qmm", None)
+    return 0 if st is None else len(st.values)
+
+
 def lower(interp, compile_main=False):
     """The interpreter's main block as a native Program, or None.
 
@@ -1015,7 +1550,8 @@ def lower(interp, compile_main=False):
     try:
         with interp.context:
             configure(native)
-            return _Lowering(interp, native).run(compile_main=compile_main)
+            return _Lowering(interp, native).run(
+                compile_main=compile_main, npacks=pack_count(interp))
     except _Decline as e:
         if _DEBUG:
             print(f"[metaljax] native tape declined: {e}", flush=True)

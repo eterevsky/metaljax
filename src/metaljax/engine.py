@@ -315,8 +315,11 @@ class MetalExecutable:
         self._sync_inputs = None  # ditto (a whole-module walk)
         self._msl_build_failed = False  # a generated kernel didn't compile
         # M2 native tape: None = not tried, False = declined or disabled,
-        # else the C++ Program. Resolved on first execute, never retried.
+        # else the C++ Program. Resolved on first execute; re-resolved only
+        # when the recognizers change the program's shape underneath it
+        # (invalidate_traces), and never once retired.
         self._native_prog = None
+        self._native_retired = False
 
     def disable_msl(self, plans=()):
         """Drop msl_scan persistent kernels after Metal's shader compiler
@@ -383,6 +386,14 @@ class MetalExecutable:
         interp._traceable_cache.clear()
         self._compiled = None
         self._can_compile = None
+        # The native tape is built around the same rewrite: a root that has
+        # been disabled, or a repack that changed a mode, a group size or
+        # the pack ARITY, leaves the lowered Program describing a program
+        # that no longer exists. Lower it again on the next execute —
+        # unless the tape has been retired, which only ever happens because
+        # it failed at run time and must never come back.
+        if not self._native_retired:
+            self._native_prog = None
 
     def native_program(self):
         """This program as a native tape (Stage 2 M2), or None.
@@ -393,12 +404,12 @@ class MetalExecutable:
         the program, which is always correct — the native op set is a
         subset and grows monotonically (see metaljax.tape).
 
-        The recognizer gate is here rather than in the lowering because it
-        is about the ANALYSIS, not the ops: a rewritten program's roots
-        execute `emit` instead of themselves and its absorbed ops do not
-        execute at all, so the literal op list the tape would walk is not
-        what the Python engine runs. qmm's prologue has already analyzed by
-        the time execute asks; sdpa analyzes lazily.
+        Since M4 a REWRITTEN program lowers too: the tape follows the same
+        plan the interpreter replays (metaljax.interpreter._rewrite_plan),
+        skipping the absorbed ops and emitting the recognizers' fused ops
+        natively. The plan is resolved in Python, at lowering time; C++
+        never sees MLIR. qmm's prologue has already packed and analyzed by
+        the time execute asks; sdpa analyzes lazily, from the lowering.
         """
         if NATIVE is None or self._native_prog is False:
             return None
@@ -424,31 +435,21 @@ class MetalExecutable:
         return None if self._native_prog is False else self._native_prog
 
     def _lower_native(self, interp, compile_main):
-        qst = interp._qmm
-        if qst is not None and (qst.matches or qst.moe):
-            return None
         # NB no purity gate. Until M3 the tape declined every impure
         # program wholesale, which was really a decline of control flow;
         # now while/if/case lower, and everything else impure — host
         # callbacks, LAPACK on the host, tokens — is still declined where
         # it belongs, by the op set and the dtype table.
-        from metaljax import sdpa as _sdpa, tape
-        prog = tape.lower(interp, compile_main=compile_main)
-        if prog is None:
-            return None
-        # The sdpa question comes LAST, after a program has proved itself
-        # lowerable, because asking it is not free of consequences: sdpa's
-        # analysis consults qmm's candidate list, and control._block_cost
-        # reads `interp._qmm` directly and discounts the ops a candidate
-        # absorbs — so merely ASKING can change the Python engine's compile
-        # decision for a program that was never going to be rewritten
-        # (visible with qmm's packing prologue turned off, where nothing
-        # else would have analyzed). Asking only about programs the tape
-        # can already run keeps the two engines' decisions independent.
-        with interp.context:
-            if _sdpa.analyze(interp).matches:
-                return None
-        return prog
+        #
+        # NB also the ORDER, which M4 preserves deliberately: `compile_main`
+        # has already been decided by the caller, BEFORE anything here asks
+        # the recognizers anything. sdpa analyzes lazily and its rewrite
+        # discounts the ops it absorbs, so asking earlier would give the
+        # native engine a different compile decision from the Python one on
+        # the same program — and the compile decision is what the two
+        # engines must agree on above all.
+        from metaljax import tape
+        return tape.lower(interp, compile_main=compile_main)
 
     def can_compile(self) -> bool:
         """Whether the whole main compiles (resolves the lazy decision)."""
@@ -624,10 +625,14 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
     # for this executable (the fallback is what makes the native op set
     # safe to grow).
     outs = None
-    prog = ex.native_program()
+    prog = _native_ready(ex, args)
     if prog is not None:
         try:
-            outs = _dealias(ex, args, list(prog.run(inputs=args)))
+            # Packed quantized weights follow the program's own arguments,
+            # exactly as they do into an mx.compile trace (runner.traced):
+            # inputs, never captures, so a repack is seen and never baked.
+            outs = _dealias(ex, args, list(
+                prog.run(inputs=args + list(qmm.values(ex.interpreter)))))
             NATIVE_STATS["runs"] += 1
             if outs:
                 if _SYNC:
@@ -637,6 +642,7 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
         except Exception as e:
             NATIVE_STATS["run_failures"] += 1
             ex._native_prog = False
+            ex._native_retired = True
             outs = None
             print(f"[metaljax] native tape failed at run time ({e!r}); "
                   f"falling back to the Python engine for {ex.name}",
@@ -709,6 +715,33 @@ def execute(ex: MetalExecutable, buffers) -> list[MetalBuffer]:
         if outs:
             mx.eval(*outs)
     return _buffers(ex, outs)
+
+
+def _native_ready(ex: MetalExecutable, args):
+    """This executable's native tape, if it still describes the program.
+
+    The tape bakes in how many packed arrays follow the arguments (see
+    metaljax.tape.pack_count). `qmm.prologue` signals every structural
+    change it makes through `changed`, and `invalidate_traces` re-lowers on
+    it — but the arity is what a wrong answer would ride in on, so it is
+    also CHECKED here, once per execute, and a mismatch re-lowers instead
+    of being handed to a Program that would read the wrong slots.
+    """
+    prog = ex.native_program()
+    if prog is None:
+        return None
+    want = len(args) + len(qmm.values(ex.interpreter))
+    if prog.num_args == want:
+        return prog
+    if os.environ.get("METALJAX_DEBUG", "") == "1":
+        print(f"[metaljax] native tape has {prog.num_args} inputs, the "
+              f"program now has {want}; re-lowering", flush=True)
+    ex._native_prog = None
+    prog = ex.native_program()
+    if prog is not None and prog.num_args != want:
+        ex._native_prog = False
+        return None
+    return prog
 
 
 def _dealias(ex: MetalExecutable, args, outs):

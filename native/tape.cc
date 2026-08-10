@@ -66,9 +66,16 @@ enum Op : int {
   kReshape, kTranspose, kBroadcastInDim, kSlice, kConcatenate, kIota,
   // data / structured
   kConstant, kReduce, kArgReduce, kDotGeneral,
-  kBitcastConvert, kDynamicSlice, kDynamicUpdateSlice,
+  kBitcastConvert, kDynamicSlice, kDynamicUpdateSlice, kSort, kTopK,
   // control flow (M3): each carries its regions as sub-Programs
   kWhile, kIf, kCase,
+  // recognizer emits (M4): a REWRITTEN program's roots. These are not
+  // StableHLO ops — src/metaljax/tape.py resolves the recognizer's plan
+  // (metaljax.interpreter._rewrite_plan) at lowering time and asks for
+  // them by the pseudo-names below, exactly as it does for the argmax
+  // reduce. The absorbed ops never reach the tape at all.
+  kQmm, kSdpa, kSdpaMask,
+  kMoeEIdx, kMoeTIdx, kMoeGather, kMoeConcat, kMoeView, kMoeDot, kMoeTail,
 };
 
 // StableHLO name -> opcode. Several names may share an opcode (chlo.erf is
@@ -140,9 +147,27 @@ const NamedOp kOpNames[] = {
     {"stablehlo.bitcast_convert", kBitcastConvert},
     {"stablehlo.dynamic_slice", kDynamicSlice},
     {"stablehlo.dynamic_update_slice", kDynamicUpdateSlice},
+    {"stablehlo.sort", kSort},
+    // chlo.top_k survives a direct jax lowering; through a portable
+    // artifact it arrives already decomposed into the sort above. Both
+    // reach the plugin, so both are here.
+    {"chlo.top_k", kTopK},
     {"stablehlo.while", kWhile},
     {"stablehlo.if", kIf},
     {"stablehlo.case", kCase},
+    // M4 recognizer emits. Pseudo-names: a build that predates a given
+    // emit simply does not offer it, and tape.py declines the program —
+    // which is why there is no version negotiation anywhere else.
+    {"metaljax.qmm", kQmm},
+    {"metaljax.sdpa", kSdpa},
+    {"metaljax.sdpa.mask", kSdpaMask},
+    {"metaljax.moe.eidx", kMoeEIdx},
+    {"metaljax.moe.tidx", kMoeTIdx},
+    {"metaljax.moe.gather", kMoeGather},
+    {"metaljax.moe.concat", kMoeConcat},
+    {"metaljax.moe.view", kMoeView},
+    {"metaljax.moe.dot", kMoeDot},
+    {"metaljax.moe.tail", kMoeTail},
 };
 
 // --------------------------------------------------------------------------
@@ -430,6 +455,9 @@ bool item_bool(const mx::array& a) {
 //                       2 index into the cond's captures
 //   kIf / kCase         [ncaps_0, ncaps_1, ...] one per region
 //                       regions = the branches; ins [pred/index, caps...]
+//   kQmm/kSdpa/kMoe*    documented beside their handlers — the M4 emits'
+//                       layouts are long enough to want reading in place,
+//                       and they are read with a Cursor, not by index
 //
 // A region is a Program of its own, whose arguments are the region block's
 // arguments followed by its CAPTURES -- the values it reads from enclosing
@@ -444,11 +472,103 @@ struct Entry {
   std::vector<int> ins;
   std::vector<int> outs;
   std::vector<int64_t> attrs;
+  // Float attributes. Only the recognizer emits have any: an attention's
+  // scale and a mask sentinel are real numbers, and squeezing them through
+  // the integer vector would be a bit-pattern encoding nobody could read.
+  std::vector<double> fattrs;
   std::optional<mx::array> payload;  // kConstant only
   std::vector<int> drops;            // slots whose last use is this op
   std::vector<std::shared_ptr<Program>> regions;  // control flow only
   int64_t bytes = 0;  // estimated result bytes, for the eager flush cadence
 };
+
+// Sequential reader for the attribute vectors the M4 emits carry: they are
+// long enough (three shape recipes for one attention) that positional
+// indices would be unreadable on both sides. The layouts are documented
+// beside each handler; tape.py writes them in the same order.
+class Cursor {
+ public:
+  explicit Cursor(const std::vector<int64_t>& at) : at_(at) {}
+  int64_t next() {
+    if (p_ >= at_.size()) throw std::invalid_argument("tape: attrs underrun");
+    return at_[p_++];
+  }
+  bool flag() { return next() != 0; }
+  std::vector<int> vec() {
+    int64_t n = next();
+    std::vector<int> v(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; i++) v[i] = static_cast<int>(next());
+    return v;
+  }
+  mx::Shape shp() {
+    int64_t n = next();
+    mx::Shape s(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; i++)
+      s[i] = static_cast<mx::ShapeElem>(next());
+    return s;
+  }
+
+ private:
+  const std::vector<int64_t>& at_;
+  size_t p_ = 0;
+};
+
+// metaljax.sdpa._apply: an optional transpose then an optional reshape.
+struct Rec {
+  bool has_perm = false;
+  std::vector<int> perm;
+  bool has_shape = false;
+  mx::Shape shape;
+};
+
+Rec read_rec(Cursor& c) {
+  Rec r;
+  r.has_perm = c.flag();
+  r.perm = c.vec();
+  r.has_shape = c.flag();
+  r.shape = c.shp();
+  return r;
+}
+
+mx::array apply_rec(const Rec& r, mx::array x) {
+  if (r.has_perm) x = mx::transpose(x, r.perm);
+  if (r.has_shape) x = mx::reshape(x, r.shape);
+  return x;
+}
+
+// MLX names its quantization modes with strings; the tape carries the code
+// the Python match recorded.
+const char* qmode(int64_t mode) { return mode == 0 ? "affine" : "mxfp4"; }
+
+// dtypes.total_order_key: the unsigned key whose ascending order is IEEE
+// totalOrder (-NaN < -inf < ... < -0 < +0 < ... < +inf < +NaN). Only f16/
+// f32/bf16 reach it — f64 and the emulated types are declined — so the
+// top bit is always 1<<15 or 1<<31 and fits an int64 literal.
+mx::array total_order_key(const mx::array& x) {
+  mx::Dtype ut = x.dtype() == mx::float32 ? mx::uint32 : mx::uint16;
+  mx::Dtype it = x.dtype() == mx::float32 ? mx::int32 : mx::int16;
+  mx::array u = mx::view(x, ut);
+  mx::array neg = mx::less(mx::view(x, it), mx::array(0, it));
+  mx::array top =
+      mx::array(int64_t{1} << (static_cast<int>(ut.size()) * 8 - 1), ut);
+  return mx::where(neg, mx::bitwise_invert(u), mx::bitwise_or(u, top));
+}
+
+// moe._pair_lead: `x` with a leading pair axis (size P or 1).
+mx::array pair_lead(const mx::array& x, bool paired) {
+  if (paired) return x;
+  mx::Shape s{1};
+  for (auto d : x.shape()) s.push_back(d);
+  return mx::reshape(x, s);
+}
+
+// moe._split_experts: a qmm pack's leading `E * N` rows as [E, N, ...].
+mx::array split_experts(const mx::array& a, int64_t E) {
+  if (a.ndim() >= 3) return a;
+  return mx::reshape(a, mx::Shape{static_cast<mx::ShapeElem>(E),
+                                  a.shape()[0] / static_cast<int>(E),
+                                  a.shape()[1]});
+}
 
 // Reduce monoids, resolved at lowering time from the body op and the input
 // element type (ops/reduction.py picks _BOOL_REDUCERS vs _REDUCERS on the
@@ -557,13 +677,15 @@ class Program {
   void add(int op, std::vector<int> ins, std::vector<int> outs,
            std::vector<int64_t> attrs, std::optional<mx::array> payload,
            std::vector<int> drops,
-           std::vector<std::shared_ptr<Program>> regions, int64_t bytes) {
+           std::vector<std::shared_ptr<Program>> regions, int64_t bytes,
+           std::vector<double> fattrs) {
     for (int s : ins) check_slot(s);
     for (int s : outs) check_slot(s);
     for (int s : drops) check_slot(s);
     ops_.push_back(Entry{op, std::move(ins), std::move(outs),
-                         std::move(attrs), std::move(payload),
-                         std::move(drops), std::move(regions), bytes});
+                         std::move(attrs), std::move(fattrs),
+                         std::move(payload), std::move(drops),
+                         std::move(regions), bytes});
   }
 
   // `copies` are output POSITIONS whose array may not be handed out as it
@@ -699,6 +821,25 @@ class Program {
   size_t num_ops() const { return ops_.size(); }
   int num_slots() const { return nslots_; }
   int num_args() const { return nargs_; }
+
+  // opcode -> how many entries carry it, THIS program and its regions.
+  // For the tests: it is what says a recognizer's root really became its
+  // fused op on the tape rather than the literal chain it replaces —
+  // including inside a decode loop's body, which is its own Program.
+  void tally(std::map<int, int64_t>& counts) const {
+    for (const Entry& e : ops_) {
+      counts[e.op]++;
+      for (const auto& r : e.regions) r->tally(counts);
+    }
+  }
+
+  nb::dict op_histogram() const {
+    std::map<int, int64_t> counts;
+    tally(counts);
+    nb::dict d;
+    for (const auto& kv : counts) d[nb::int_(kv.first)] = kv.second;
+    return d;
+  }
 
   // The op-by-op walk. `in_trace` is threaded rather than stored: the same
   // Program is walked both ways (a counted loop unrolls its body into an
@@ -1226,6 +1367,456 @@ class Program {
         break;
       }
 
+      case kSort: {
+        // ops/sort.py _sort -> _gather_sorted, the arm whose comparator
+        // compares an operand pair DIRECTLY (no key chain to evaluate).
+        // That is the shape every top_k lowers to — jax's chlo.top_k
+        // decomposition is `sort(values, iota)` under a strict TOTALORDER
+        // GT — and it is what a plain jnp.sort/argsort emits too. A
+        // comparator that computes a key first is declined in tape.py,
+        // where the structural recognizer lives.
+        // attrs [dim, descending?, key operand, key kind]
+        //   key kind: 0 integer (already ordered), 1 float totalOrder,
+        //             2 bool (widened to uint8, as the Python handler does)
+        int dim = static_cast<int>(at[0]);
+        bool descending = at[1] != 0;
+        mx::array key = in(static_cast<size_t>(at[2]));
+        if (at[3] == 1) {
+          key = total_order_key(key);
+        } else if (at[3] == 2) {
+          key = mx::astype(key, mx::uint8);
+        }
+        // Bitwise NOT reverses the order for signed and unsigned alike.
+        if (descending) key = mx::bitwise_invert(key);
+        // mx::argsort reads the WRONG elements from a non-contiguous input
+        // (MLX 0.32), and a non-last-axis sort arrives as a strided view.
+        mx::array idx = mx::argsort(mx::contiguous(key), dim);
+        for (size_t i = 0; i < e.outs.size(); i++)
+          env[e.outs[i]] = mx::take_along_axis(in(i), idx, dim);
+        break;
+      }
+
+      case kTopK: {
+        // ops/sort.py _top_k: a stable DESCENDING argsort of the last axis,
+        // cut to k. attrs [k, key kind] (kinds as kSort's).
+        const mx::array& x = in(0);
+        mx::array key = x;
+        if (at[1] == 1) {
+          key = total_order_key(key);
+        } else if (at[1] == 2) {
+          key = mx::astype(key, mx::uint8);
+        }
+        mx::array idx =
+            mx::argsort(mx::contiguous(mx::bitwise_invert(key)), -1);
+        mx::Shape lo(idx.shape().size(), 0), hi = idx.shape();
+        hi.back() = static_cast<mx::ShapeElem>(at[0]);
+        idx = mx::slice(idx, lo, hi);
+        env[e.outs[0]] = mx::take_along_axis(x, idx, -1);
+        env[e.outs[1]] = mx::astype(idx, mx::int32);
+        break;
+      }
+
+      // --- recognizer emits (M4) -------------------------------------
+      //
+      // Each is a transliteration of the `emit` in the Python module that
+      // owns the recognizer; the analysis, the packing and every static
+      // decision stay there, and what arrives here is the plan. The
+      // differential tests compare output BYTES against those very
+      // functions, so a drift is a failure and not a tolerance question.
+
+      case kQmm: {
+        // metaljax.qmm.emit. attrs:
+        //   [transpose?, lrank, lperm..., batched?, B, M, K,
+        //    group_size, bits, mode, perm?, swapped?, out_dtype,
+        //    bshape, mshape, nshape]     (each shape: rank, dims...)
+        // ins: [activation, w, scales, (biases if affine), (perm if any)]
+        Cursor c(at);
+        bool do_transpose = c.flag();
+        std::vector<int> lperm = c.vec();
+        bool batched = c.flag();
+        int64_t B = c.next(), M = c.next(), K = c.next();
+        int64_t gs = c.next(), bits = c.next(), mode = c.next();
+        bool has_perm = c.flag();
+        bool swapped = c.flag();
+        mx::Dtype out_dt = dtype_of(c.next());
+        mx::Shape bshape = c.shp(), mshape = c.shp(), nshape = c.shp();
+
+        mx::array x = in(0);
+        if (do_transpose) x = mx::transpose(x, lperm);
+        x = mx::reshape(x, batched
+                               ? mx::Shape{static_cast<mx::ShapeElem>(B),
+                                           static_cast<mx::ShapeElem>(M),
+                                           static_cast<mx::ShapeElem>(K)}
+                               : mx::Shape{static_cast<mx::ShapeElem>(M),
+                                           static_cast<mx::ShapeElem>(K)});
+        if (!is_float(x.dtype())) x = mx::astype(x, out_dt);
+        if (has_perm)
+          x = mx::take(x, in(e.ins.size() - 1),
+                       static_cast<int>(x.ndim()) - 1);
+        std::optional<mx::array> biases;
+        if (mode == 0) biases = in(3);
+        mx::array y = mx::quantized_matmul(
+            x, in(1), in(2), biases, /*transpose=*/true,
+            static_cast<int>(gs), static_cast<int>(bits), qmode(mode));
+        mx::Shape out;
+        for (auto d : bshape) out.push_back(d);
+        if (swapped) {
+          // The dot had the weight on its LHS, so the result is [..., N, M].
+          y = mx::swapaxes(y, static_cast<int>(y.ndim()) - 1,
+                           static_cast<int>(y.ndim()) - 2);
+          for (auto d : nshape) out.push_back(d);
+          for (auto d : mshape) out.push_back(d);
+        } else {
+          for (auto d : mshape) out.push_back(d);
+          for (auto d : nshape) out.push_back(d);
+        }
+        y = mx::reshape(y, out);
+        if (y.dtype() != out_dt) y = mx::astype(y, out_dt);
+        env[e.outs[0]] = y;
+        break;
+      }
+
+      case kSdpaMask: {
+        // metaljax.sdpa._mask_array, the cache MISS body. The cache itself
+        // is this entry: tape.py emits one per distinct mask key, at the
+        // first attention that reads it, and every later root reads the
+        // slot — which is what `env`'s tuple-keyed entry does in Python.
+        // attrs [kind (0 select, 1 additive), dtype, scaled?];
+        // fattrs [const * mul, mul].
+        int64_t kind = at[0];
+        mx::Dtype dt = dtype_of(at[1]);
+        mx::array mask = in(0);
+        if (kind == 0) {
+          // Additive, never boolean: MLX's boolean mask gives a
+          // fully-masked row a finite value where the literal chain gives
+          // NaN. `L + C == C` for a sentinel C, so this is exact.
+          mask = mx::where(mask, mx::array(0.0, dt),
+                           mx::array(e.fattrs[0], dt));
+        } else {
+          if (mask.dtype() != dt) mask = mx::astype(mask, dt);
+          if (at[2]) mask = mx::multiply(mask, mx::array(e.fattrs[1],
+                                                         mask.dtype()));
+        }
+        env[e.outs[0]] = mask;
+        break;
+      }
+
+      case kSdpa: {
+        // metaljax.sdpa.emit. attrs [q_rec, k_rec, v_rec, dtype, out_dtype,
+        //   mask?, mask_rec, out_pre, out_perm, out_post]; fattrs [scale].
+        // ins: [q, k, v, (mask)].
+        Cursor c(at);
+        Rec q_rec = read_rec(c), k_rec = read_rec(c), v_rec = read_rec(c);
+        mx::Dtype dt = dtype_of(c.next());
+        mx::Dtype out_dt = dtype_of(c.next());
+        bool has_mask = c.flag();
+        Rec mask_rec = read_rec(c);
+        bool has_pre = c.flag();
+        mx::Shape pre = c.shp();
+        bool has_perm = c.flag();
+        std::vector<int> perm = c.vec();
+        bool has_post = c.flag();
+        mx::Shape post = c.shp();
+
+        mx::array q = apply_rec(q_rec, in(0));
+        mx::array k = apply_rec(k_rec, in(1));
+        mx::array v = apply_rec(v_rec, in(2));
+        if (q.dtype() != dt) q = mx::astype(q, dt);
+        if (k.dtype() != dt) k = mx::astype(k, dt);
+        if (v.dtype() != dt) v = mx::astype(v, dt);
+        std::optional<mx::array> mask;
+        if (has_mask) mask = apply_rec(mask_rec, in(3));
+        mx::array out = mx::fast::scaled_dot_product_attention(
+            q, k, v, static_cast<float>(e.fattrs[0]), /*mask_mode=*/"",
+            mask);
+        if (has_pre) out = mx::reshape(out, pre);
+        if (has_perm) out = mx::transpose(out, perm);
+        if (has_post) out = mx::reshape(out, post);
+        if (out.dtype() != out_dt) out = mx::astype(out, out_dt);
+        env[e.outs[0]] = out;
+        break;
+      }
+
+      // --- the MoE expert gather (metaljax.moe.emit) -------------------
+      //
+      // `emit` is a small interpreter over a plan of pair-space nodes, so
+      // the lowering spreads that plan over the tape: one entry per node,
+      // in the plan's own dependency order, with the root's result written
+      // by the tail. Liveness then prunes the pair-space intermediates
+      // exactly as the tape prunes anything else, and only the tail is
+      // charged the root's bytes — so the eager flush cadence sees the one
+      // sync-point-moving number the Python engine sees.
+
+      case kMoeEIdx:
+        // ctx.eidx = reshape(indices, (P,)).astype(uint32)
+        env[e.outs[0]] = mx::astype(
+            mx::reshape(in(0), mx::Shape{static_cast<mx::ShapeElem>(at[0])}),
+            mx::uint32);
+        break;
+
+      case kMoeTIdx:
+        // ctx.tidx = repeat(arange(T, uint32), K)
+        env[e.outs[0]] = mx::repeat(
+            mx::arange(static_cast<double>(at[0]), mx::uint32),
+            static_cast<int>(at[1]));
+        break;
+
+      case kMoeGather: {
+        // moe._emit_ext, the `env` arm. attrs [ea?, ea, ta?, ta, P];
+        // ins [value, eidx, tidx].
+        bool has_ea = at[0] != 0;
+        int ea = static_cast<int>(at[1]);
+        bool has_ta = at[2] != 0;
+        int ta = static_cast<int>(at[3]);
+        const mx::array& x0 = in(0);
+        if (!has_ea && !has_ta) {
+          env[e.outs[0]] = x0;
+          break;
+        }
+        if (has_ea && has_ta) {
+          mx::array x = mx::moveaxis(x0, ea, 0);
+          x = mx::moveaxis(x, ta < ea ? ta + 1 : ta, 1);
+          // x[eidx, tidx]: one element of the (expert, token) grid per
+          // pair, the whole trailing slice.
+          mx::Shape sizes = x.shape();
+          sizes[0] = 1;
+          sizes[1] = 1;
+          mx::array g = mx::gather(x, {in(1), in(2)}, {0, 1}, sizes);
+          mx::Shape out{static_cast<mx::ShapeElem>(at[4])};
+          for (size_t i = 2; i < x.shape().size(); i++)
+            out.push_back(x.shape()[i]);
+          env[e.outs[0]] = mx::reshape(g, out);
+          break;
+        }
+        int axis = has_ea ? ea : ta;
+        const mx::array& idx = has_ea ? in(1) : in(2);
+        env[e.outs[0]] = mx::moveaxis(mx::take(x0, idx, axis), axis, 0);
+        break;
+      }
+
+      case kMoeConcat: {
+        // moe._emit_elem's concatenate arm: pair leads may be P or 1.
+        int axis = static_cast<int>(at[0]);
+        int lead = 0;
+        for (size_t i = 0; i < e.ins.size(); i++)
+          lead = std::max(lead, in(i).shape()[0]);
+        std::vector<mx::array> parts;
+        parts.reserve(e.ins.size());
+        for (size_t i = 0; i < e.ins.size(); i++) {
+          mx::array x = in(i);
+          if (x.shape()[0] != lead) {
+            mx::Shape s = x.shape();
+            s[0] = lead;
+            x = mx::broadcast_to(x, s);
+          }
+          parts.push_back(x);
+        }
+        env[e.outs[0]] = mx::concatenate(std::move(parts), axis);
+        break;
+      }
+
+      case kMoeView: {
+        // moe._emit_view. attrs [src paired?, kind, ...]:
+        //   0 bcast    [nkeep, (kept?, dest)..., trailing]
+        //   1 perm     [order]
+        //   2 reshape  [trailing]
+        //   3 slice    [n, (start, stop, stride)...]
+        //   4 dotperm  [transpose?, perm, trailing]
+        Cursor c(at);
+        mx::array x = pair_lead(in(0), c.flag());
+        int64_t kind = c.next();
+        if (kind == 0) {
+          int64_t nkeep = c.next();
+          std::vector<int64_t> kept(static_cast<size_t>(nkeep));
+          std::vector<int64_t> dest(static_cast<size_t>(nkeep));
+          for (int64_t j = 0; j < nkeep; j++) {
+            kept[j] = c.next();
+            dest[j] = c.next();
+          }
+          mx::Shape trailing = c.shp();
+          mx::Shape view(trailing.size(), 1);
+          mx::Shape lo(x.shape().size(), 0), hi = x.shape();
+          std::vector<int> squeeze_axes;
+          for (int64_t j = 0; j < nkeep; j++) {
+            if (!kept[j]) {
+              hi[static_cast<size_t>(1 + j)] = 1;
+              squeeze_axes.push_back(static_cast<int>(1 + j));
+            } else {
+              view[static_cast<size_t>(dest[j])] = x.shape()[1 + j];
+            }
+          }
+          if (!squeeze_axes.empty())
+            x = mx::squeeze(mx::slice(x, lo, hi), squeeze_axes);
+          mx::Shape mid{x.shape()[0]};
+          for (auto d : view) mid.push_back(d);
+          mx::Shape out{x.shape()[0]};
+          for (auto d : trailing) out.push_back(d);
+          env[e.outs[0]] = mx::broadcast_to(mx::reshape(x, mid), out);
+        } else if (kind == 1) {
+          std::vector<int> order = c.vec();
+          std::vector<int> perm{0};
+          for (int i : order) perm.push_back(1 + i);
+          env[e.outs[0]] = mx::transpose(x, perm);
+        } else if (kind == 2) {
+          mx::Shape trailing = c.shp();
+          mx::Shape out{x.shape()[0]};
+          for (auto d : trailing) out.push_back(d);
+          env[e.outs[0]] = mx::reshape(x, out);
+        } else if (kind == 3) {
+          int64_t n = c.next();
+          mx::Shape lo{0}, hi{x.shape()[0]}, st{1};
+          for (int64_t j = 0; j < n; j++) {
+            lo.push_back(static_cast<mx::ShapeElem>(c.next()));
+            hi.push_back(static_cast<mx::ShapeElem>(c.next()));
+            st.push_back(static_cast<mx::ShapeElem>(c.next()));
+          }
+          env[e.outs[0]] = mx::slice(x, lo, hi, st);
+        } else if (kind == 4) {
+          bool do_transpose = c.flag();
+          std::vector<int> order = c.vec();
+          mx::Shape trailing = c.shp();
+          if (do_transpose) {
+            std::vector<int> perm{0};
+            for (int i : order) perm.push_back(1 + i);
+            x = mx::transpose(x, perm);
+          }
+          mx::Shape out{x.shape()[0]};
+          for (auto d : trailing) out.push_back(d);
+          env[e.outs[0]] = mx::reshape(x, out);
+        } else {
+          throw std::invalid_argument("tape: unknown moe view");
+        }
+        break;
+      }
+
+      case kMoeDot: {
+        // moe._emit_dot. attrs [shortcut?, src paired?, ta, packed?, E,
+        //   n_first?, group_size, bits, mode, perm?, P, M, K, N, out_dtype,
+        //   mshape, nshape]; ins [data, eidx, (tidx if shortcut),
+        //   weight | w, scales, (biases if affine), (perm if any)].
+        Cursor c(at);
+        bool shortcut = c.flag();
+        bool src_paired = c.flag();
+        int ta = static_cast<int>(c.next());
+        bool packed = c.flag();
+        int64_t E = c.next();
+        bool n_first = c.flag();
+        int64_t gs = c.next(), bits = c.next(), mode = c.next();
+        bool has_perm = c.flag();
+        int64_t P = c.next(), M = c.next(), K = c.next(), N = c.next();
+        mx::Dtype out_dt = dtype_of(c.next());
+        mx::Shape mshape = c.shp(), nshape = c.shp();
+
+        mx::array x = in(0);
+        std::optional<mx::array> lhs_idx;
+        if (shortcut) {
+          // Token-indexed and nothing else: hand gather_* the ungathered
+          // rows and let it do the indexing, instead of materializing K
+          // copies.
+          std::vector<int> perm{ta};
+          for (size_t i = 0; i < x.shape().size(); i++)
+            if (static_cast<int>(i) != ta) perm.push_back(static_cast<int>(i));
+          int rows = x.shape()[ta];
+          x = mx::reshape(mx::transpose(x, perm),
+                          mx::Shape{rows, static_cast<mx::ShapeElem>(M),
+                                    static_cast<mx::ShapeElem>(K)});
+          lhs_idx = in(2);
+        } else {
+          x = pair_lead(x, src_paired);
+          if (x.shape()[0] != static_cast<int>(P)) {
+            mx::Shape s = x.shape();
+            s[0] = static_cast<mx::ShapeElem>(P);
+            x = mx::broadcast_to(x, s);
+          }
+          x = mx::reshape(x, mx::Shape{static_cast<mx::ShapeElem>(P),
+                                       static_cast<mx::ShapeElem>(M),
+                                       static_cast<mx::ShapeElem>(K)});
+          lhs_idx = mx::arange(static_cast<double>(P), mx::uint32);
+        }
+        std::optional<mx::array> rhs_idx = in(1);
+        const size_t wbase = shortcut ? 3 : 2;
+
+        mx::array y = x;
+        if (packed) {
+          mx::array w = split_experts(in(wbase), E);
+          mx::array scales = split_experts(in(wbase + 1), E);
+          std::optional<mx::array> biases;
+          if (mode == 0) biases = split_experts(in(wbase + 2), E);
+          if (has_perm)
+            x = mx::take(x, in(e.ins.size() - 1),
+                         static_cast<int>(x.ndim()) - 1);
+          if (!is_float(x.dtype())) x = mx::astype(x, out_dt);
+          y = mx::gather_qmm(x, w, scales, biases, lhs_idx, rhs_idx,
+                             /*transpose=*/true, static_cast<int>(gs),
+                             static_cast<int>(bits), qmode(mode));
+        } else {
+          const mx::array& wv = in(wbase);
+          mx::array w3 =
+              n_first
+                  // gather_mm computes `a @ b`, so an [E, N, K] weight has
+                  // to be transposed — as a LAZY view: materializing it
+                  // would copy the whole expert set.
+                  ? mx::swapaxes(
+                        mx::reshape(wv,
+                                    mx::Shape{static_cast<mx::ShapeElem>(E),
+                                              static_cast<mx::ShapeElem>(N),
+                                              static_cast<mx::ShapeElem>(K)}),
+                        -1, -2)
+                  : mx::reshape(wv,
+                                mx::Shape{static_cast<mx::ShapeElem>(E),
+                                          static_cast<mx::ShapeElem>(K),
+                                          static_cast<mx::ShapeElem>(N)});
+          y = mx::gather_mm(x, w3, lhs_idx, rhs_idx);
+        }
+        y = mx::reshape(y, mx::Shape{static_cast<mx::ShapeElem>(P),
+                                     static_cast<mx::ShapeElem>(M),
+                                     static_cast<mx::ShapeElem>(N)});
+        if (y.dtype() != out_dt) y = mx::astype(y, out_dt);
+        mx::Shape out{static_cast<mx::ShapeElem>(P)};
+        for (auto d : mshape) out.push_back(d);
+        for (auto d : nshape) out.push_back(d);
+        env[e.outs[0]] = mx::reshape(y, out);
+        break;
+      }
+
+      case kMoeTail: {
+        // moe.emit's tail: weight the pairs, sum over K, put the token axis
+        // back. attrs [out paired?, P, T, K, sum_dtype, out_dtype,
+        // out_axis, out_shape]; ins [plan output, router weights].
+        Cursor c(at);
+        mx::array y = pair_lead(in(0), c.flag());
+        int64_t P = c.next(), T = c.next(), Kk = c.next();
+        mx::Dtype sum_dt = dtype_of(c.next());
+        mx::Dtype out_dt = dtype_of(c.next());
+        int out_axis = static_cast<int>(c.next());
+        mx::Shape want = c.shp();
+
+        mx::Shape trailing(y.shape().begin() + 1, y.shape().end());
+        if (y.shape()[0] != static_cast<int>(P)) {
+          mx::Shape s{static_cast<mx::ShapeElem>(P)};
+          for (auto d : trailing) s.push_back(d);
+          y = mx::broadcast_to(y, s);
+        }
+        mx::array w = mx::astype(
+            mx::reshape(in(1), mx::Shape{static_cast<mx::ShapeElem>(P)}),
+            y.dtype());
+        mx::Shape wshape{static_cast<mx::ShapeElem>(P)};
+        for (size_t i = 0; i < trailing.size(); i++) wshape.push_back(1);
+        y = mx::multiply(y, mx::reshape(w, wshape));
+        // The dense graph converts the products before summing them.
+        if (y.dtype() != sum_dt) y = mx::astype(y, sum_dt);
+        mx::Shape split{static_cast<mx::ShapeElem>(T),
+                        static_cast<mx::ShapeElem>(Kk)};
+        for (auto d : trailing) split.push_back(d);
+        y = mx::sum(mx::reshape(y, split), std::vector<int>{1});
+        if (out_axis) y = mx::moveaxis(y, 0, out_axis);
+        if (y.shape() != want)
+          throw std::runtime_error("tape: moe produced the wrong shape");
+        if (y.dtype() != out_dt) y = mx::astype(y, out_dt);
+        env[e.outs[0]] = y;
+        break;
+      }
+
       // --- control flow (ops/control.py) -----------------------------
       case kWhile:
         run_while(e, env, in_trace);
@@ -1707,7 +2298,8 @@ void register_tape(nb::module_& m) {
            nb::arg("results"), nb::arg("attrs"),
            nb::arg("payload").none(), nb::arg("drops"),
            nb::arg("regions") = std::vector<std::shared_ptr<Program>>(),
-           nb::arg("bytes") = 0)
+           nb::arg("bytes") = 0,
+           nb::arg("fattrs") = std::vector<double>())
       .def("set_outputs", &Program::set_outputs, nb::arg("slots"),
            nb::arg("copies") = std::vector<int>())
       .def("set_compile", &Program::set_compile, nb::arg("compile"),
@@ -1717,5 +2309,8 @@ void register_tape(nb::module_& m) {
       .def_prop_ro("compiled_dropped", &Program::compiled_dropped)
       .def_prop_ro("num_ops", &Program::num_ops)
       .def_prop_ro("num_slots", &Program::num_slots)
+      .def_prop_ro("num_args", &Program::num_args)
+      .def("op_histogram", &Program::op_histogram,
+           "opcode -> entry count, this program and its regions")
       .def_prop_ro("max_live", &Program::max_live);
 }
