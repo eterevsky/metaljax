@@ -304,8 +304,84 @@ def _native_mismatches():
     return bad
 
 
+# --- the native engine again, this time as a PIPELINED dynamic loop -------
+#
+# Stage 2 M5a moved a dynamic while's sync points on purpose: the loop now
+# builds the body and the next condition before reading the current one back,
+# blocks on that host read instead of on an eval of the carry, and submits
+# the carry with async_eval. That is a fourth ticket in this lottery, and the
+# asset that draws it has to be a real program -- the same 28-layer init scan,
+# with its condition rewritten into the form ops.control._analyze_counted does
+# NOT recognise (`bound > i` instead of `i < bound`), which is the only
+# difference between the counted path and the dynamic one.
+
+
+def _pipeline_source():
+    text = _native_source().decode()
+    old = "stablehlo.compare LT, %iterArg_14, %c_0, SIGNED"
+    new = "stablehlo.compare GT, %c_0, %iterArg_14, SIGNED"
+    assert old in text, (
+        "the init scan's loop condition is no longer the counted form this "
+        "detector rewrites; find the while's compare and update `old`")
+    return text.replace(old, new).encode()
+
+
+def _pipeline_mismatches():
+    """Pipelined-loop detector: does a dynamic loop's answer depend on when
+    its carry is evaluated?
+
+    Same question as `_native_mismatches`, asked of the layout M5a
+    introduced: the pipelined loop against the serial one it replaces, over
+    the same iterations of the same body. ops.control._WHILE_PIPELINE is the
+    single place either engine reads that decision from, so patching it here
+    moves the native loop's sync points and nothing else.
+    """
+    from metaljax import engine
+    if engine.NATIVE is None:
+        raise AssertionError(
+            "the native canary must run under METALJAX_ENGINE=native")
+
+    def once():
+        before = engine.NATIVE.stats()
+        ex = engine.compile_program(_pipeline_source(), "mlir")
+        outs = engine.execute(ex, [])
+        mx.eval(*[o.data for o in outs])
+        assert ex._native_prog is not False, (
+            "the native tape declined the init scan; this canary no longer "
+            "measures the native engine at all")
+        after = engine.NATIVE.stats()
+        want_key = ("pipelined_loops" if control._WHILE_PIPELINE
+                    else "serial_loops")
+        assert after[want_key] > before[want_key], (
+            f"the loop did not take the {want_key} path; the condition "
+            "rewrite above no longer produces a dynamic while")
+        got = _checksums(outs)
+        del outs
+        mx.clear_cache()
+        return got
+
+    saved_body = control._BODY_COMPILE
+    saved_pipe = control._WHILE_PIPELINE
+    control._BODY_COMPILE = False
+    try:
+        control._WHILE_PIPELINE = 1
+        want = once()
+        control._WHILE_PIPELINE = 0
+        got = once()
+    finally:
+        control._BODY_COMPILE = saved_body
+        control._WHILE_PIPELINE = saved_pipe
+
+    bad = []
+    for j, (a, b) in enumerate(zip(want, got)):
+        if a != b:
+            bad.append(f"pipelined output {j}: checksum {a}, {b} when the "
+                       f"same loop runs serially")
+    return bad
+
+
 _DETECTORS = {"compiled": _compiled_mismatches, "scan": _scan_mismatches,
-              "native": _native_mismatches}
+              "native": _native_mismatches, "pipeline": _pipeline_mismatches}
 
 
 # --- the shipped budgets must be clean -------------------------------------
@@ -382,7 +458,7 @@ def _probe(mode, **budgets):
     """
     env = dict(os.environ)
     env.update({k: str(v) for k, v in budgets.items()})
-    if mode == "native":
+    if mode in ("native", "pipeline"):
         # The native engine is a process-wide choice (the extension is
         # loaded at import), so the canary picks it here rather than
         # depending on how pytest itself was launched.
@@ -478,6 +554,38 @@ def test_native_byte_budget_canary_still_corrupts():
     raise AssertionError(
         f"no byte budget in {_NATIVE_CANARY_MB} corrupts the init scan on the "
         f"native engine any more (tried {tried}). " + _CANARY_HELP)
+
+
+# --- and of the pipelined dynamic loop (Stage 2 M5a) -----------------------
+#
+# Swept on this milestone with the detector above (`pipeline`), on the same
+# axes and against the same shipped budgets:
+#   kernels: 800 clean (3/3 reps), 100 clean, 50 clean
+#   bytes:   512 clean (3/3 reps), 128 WRONG (5 of 66 outputs), 64 WRONG (4)
+# Only the BYTE axis bites this layout -- which is its own small piece of
+# evidence that a pipelined loop draws a different ticket from the serial one
+# it replaces (that one corrupts at 100 and 50 kernels and is clean at 128 MB
+# only down to 256).
+_PIPELINE_CANARY_MB = (128, 64, 40, 256, 20, 8)
+
+
+def test_pipelined_loop_is_correct_at_the_shipped_budgets():
+    corrupt, rec = _probe("pipeline")
+    assert not corrupt, "\n".join(rec["detail"])
+
+
+def test_pipeline_byte_budget_canary_still_corrupts():
+    """Some byte budget must still make the pipelined loop disagree with the
+    serial one. Nothing else proves the test above can fail."""
+    tried = []
+    for mb in _PIPELINE_CANARY_MB:
+        corrupt, _ = _probe("pipeline", MLX_MAX_MB_PER_BUFFER=mb)
+        tried.append((mb, corrupt))
+        if corrupt:
+            return
+    raise AssertionError(
+        f"no byte budget in {_PIPELINE_CANARY_MB} makes the pipelined loop "
+        f"disagree with the serial one (tried {tried}). " + _CANARY_HELP)
 
 
 if __name__ == "__main__":

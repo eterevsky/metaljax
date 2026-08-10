@@ -264,6 +264,7 @@ struct Config {
   int64_t flush_sync_every = 1;               // METALJAX_EAGER_FLUSH_SYNC
   int64_t flush_clear_bytes = 2048LL << 20;   // METALJAX_FLUSH_CLEAR_MB
   int64_t loop_clear_cost = 500000;           // METALJAX_LOOP_CLEAR_COST
+  int64_t while_pipeline = 1;                 // METALJAX_WHILE_PIPELINE
   bool debug = false;                         // METALJAX_DEBUG
   bool memdbg = false;                        // METALJAX_MEMDBG
 };
@@ -281,6 +282,9 @@ struct Stats {
   int64_t compile_drops = 0;   // compiled paths abandoned after a failure
   int64_t chunk_drops = 0;     // chunked loop replays abandoned
   int64_t unrolls = 0;         // counted loops unrolled into a trace
+  int64_t pipelined_loops = 0;  // dynamic whiles that ran pipelined
+  int64_t pipelined_steps = 0;  // ...iterations they retired that way
+  int64_t serial_loops = 0;     // dynamic whiles that could not pipeline
 };
 
 Stats g_stats;
@@ -349,8 +353,8 @@ void flush_eval(const std::vector<mx::array>& arrays, bool hard) {
 // metal::malloc dies), and recovers once if the limit is hit anyway.
 int64_t g_flushed_cost = 0;
 
-void loop_flush(const std::vector<mx::array>& arrays, int64_t cost_units) {
-  g_stats.loop_flushes++;
+// The blocking half: settle `arrays`, recovering once from exhaustion.
+void loop_eval(const std::vector<mx::array>& arrays) {
   bool retry = false;
   try {
     mx::eval(arrays);
@@ -366,6 +370,15 @@ void loop_flush(const std::vector<mx::array>& arrays, int64_t cost_units) {
     mx::clear_cache();
     mx::eval(arrays);
   }
+}
+
+// The bookkeeping half: charge a sync point's work against the op-unit
+// budget and return cached buffers to the OS when it is spent. Split out
+// because a pipelined loop's blocking point is a HOST READ of the condition
+// rather than an eval of the carry -- a different array to wait on, the same
+// iteration of work to charge, and the same cadence either way.
+void loop_account(int64_t cost_units) {
+  g_stats.loop_flushes++;
   g_flushed_cost += cost_units;
   if (g_cfg.loop_clear_cost > 0 && g_flushed_cost >= g_cfg.loop_clear_cost) {
     g_flushed_cost = 0;
@@ -376,6 +389,11 @@ void loop_flush(const std::vector<mx::array>& arrays, int64_t cost_units) {
                  std::to_string(mx::get_active_memory()) + "B cache=" +
                  std::to_string(mx::get_cache_memory()) + "B");
   }
+}
+
+void loop_flush(const std::vector<mx::array>& arrays, int64_t cost_units) {
+  loop_eval(arrays);
+  loop_account(cost_units);
 }
 
 // ops.control._anchor_outputs: give constant outputs a bitwise-exact data
@@ -414,6 +432,15 @@ int64_t item_int(const mx::array& a) {
 bool item_bool(const mx::array& a) {
   mx::array v = mx::astype(a, mx::bool_);
   v.eval();
+  return v.item<bool>();
+}
+
+// A loop condition's host read. Same value as item_bool, but the wait goes
+// through the loop's recovery path: on a pipelined loop this IS the sync
+// point, so it is where Metal's buffer limit would surface.
+bool loop_item_bool(const mx::array& a) {
+  mx::array v = mx::astype(a, mx::bool_);
+  loop_eval({v});
   return v.item<bool>();
 }
 
@@ -839,6 +866,33 @@ class Program {
     nb::dict d;
     for (const auto& kv : counts) d[nb::int_(kv.first)] = kv.second;
     return d;
+  }
+
+  // Does running this program read anything back to the HOST? Every
+  // control-flow op does: a while reads its trip count or its condition, an
+  // if/case its predicate. Structure, not policy -- read off the tape itself
+  // so it cannot drift from what the tape actually holds.
+  //
+  // It is what says whether a loop body may be BUILT ahead of the condition
+  // that decides whether it runs (run_while's pipelined path). Building a
+  // graph is free and pure; a nested host read is neither -- it would
+  // evaluate real work at a carry the loop may be about to abandon, which
+  // for a nested dynamic while is not even guaranteed to terminate.
+  bool reads_host() const {
+    if (reads_host_ < 0) {
+      reads_host_ = 0;
+      for (const Entry& e : ops_) {
+        if (e.op == kWhile || e.op == kIf || e.op == kCase) {
+          reads_host_ = 1;
+          break;
+        }
+        for (const auto& r : e.regions) {
+          if (r->reads_host()) { reads_host_ = 1; break; }
+        }
+        if (reads_host_) break;
+      }
+    }
+    return reads_host_ != 0;
   }
 
   // The op-by-op walk. `in_trace` is threaded rather than stored: the same
@@ -1966,18 +2020,100 @@ class Program {
           "metaljax: a dynamic while cannot run inside a trace");
     BodyRunner runner(body, body_caps, 1);
     vals = ins;
-    for (;;) {
-      std::vector<mx::array> cargs(vals);
+    // The condition of ONE carry, as a lazy array. `cargs` is scoped to die
+    // here on purpose: it is a second handle on every carry, and a handle
+    // still alive when the next iteration's update EVALUATES is the
+    // difference between MLX writing a KV cache in place and copying the
+    // whole thing (mx::array::is_donatable is a use_count test). Holding it
+    // across the body cost 4.6 us per megabyte of cache per token.
+    auto cond_of = [&](const std::vector<mx::array>& v) {
+      std::vector<mx::array> cargs(v);
       cargs.insert(cargs.end(), cond_caps.begin(), cond_caps.end());
       std::vector<mx::array> pred = cond->interpret(cargs, false);
       if (pred.size() != 1)
         throw std::runtime_error("tape: while cond must return one value");
-      if (!item_bool(pred[0])) break;
-      vals = runner.run_one(vals);
-      // Flush the carry, not nothing: the cond only forces the values it
-      // reads, so anything else in the carry (a KV cache) would pile up as
-      // unevaluated graph across iterations.
-      loop_flush(vals, cost);
+      return pred[0];
+    };
+
+    // Can the body be BUILT before its condition is known? Building an MLX
+    // graph is pure and lazy, so a body built for an iteration that turns
+    // out not to run is simply dropped -- unless the body reads something
+    // back to the host, which would make "building" it mean RUNNING it.
+    const bool pipeline =
+        g_cfg.while_pipeline > 0 && !body->reads_host() && !cond->reads_host();
+    if (!pipeline) {
+      g_stats.serial_loops++;
+      for (;;) {
+        mx::array pred = cond_of(vals);
+        if (!item_bool(pred)) break;
+        vals = runner.run_one(vals);
+        // Flush the carry, not nothing: the cond only forces the values it
+        // reads, so anything else in the carry (a KV cache) would pile up as
+        // unevaluated graph across iterations.
+        loop_flush(vals, cost);
+      }
+      write_results(e, env, vals);
+      return;
+    }
+
+    // Pipelined dynamic loop. Two host round trips per iteration is what
+    // made LLM decode stall (M4's verdict): the old shape submitted the
+    // condition and waited, then submitted the body and waited, so the GPU
+    // was idle for both decisions. Here the body and the NEXT condition are
+    // built and submitted before the current condition is read back, so by
+    // the time the host wakes up the device is already a token ahead.
+    //
+    // The order of what happens once the condition says "keep going" is
+    // load-bearing:
+    //   1. drop this iteration's carry, so the update ops in the body it
+    //      feeds can donate their buffers (see cond_of);
+    //   2. THEN submit -- the WHOLE carry, since the condition only forces
+    //      what it reads and a KV cache would otherwise pile up as
+    //      unevaluated graph;
+    //   3. charge the iteration against the op-unit budget, exactly as the
+    //      serial path's loop_flush does.
+    // Speculation never touches the carry a loop may return: the body of
+    // iteration t is only ever SUBMITTED once t's condition has said true.
+    // The one place it is EVALUATED earlier is BodyRunner's probe after a
+    // compiled body has been rebound mid-loop -- and that is still safe,
+    // because `vals` is held across the build, which is precisely what
+    // stops MLX donating (and therefore mutating) anything in it.
+    g_stats.pipelined_loops++;
+    // The first iteration stays unpipelined. BodyRunner probes a freshly
+    // bound compiled body with a SYNCHRONOUS eval (a Metal build error
+    // raised on an async worker aborts the process), and that probe should
+    // land on an iteration the loop is known to want -- a zero-trip loop
+    // must cost exactly one condition here, as it does on the serial path.
+    {
+      mx::array first = cond_of(vals);
+      if (!loop_item_bool(first)) {
+        write_results(e, env, vals);
+        return;
+      }
+    }
+    vals = runner.run_one(vals);
+    loop_flush(vals, cost);
+    mx::array pred = cond_of(vals);
+    for (;;) {
+      // Built, not run: `next` is a lazy graph until something asks for its
+      // values, and nothing does until `pred` says this iteration happens.
+      // Pure host work, and it overlaps whatever the device is still doing
+      // for the carry and condition submitted last time round.
+      std::vector<mx::array> next = runner.run_one(vals);
+      mx::array npred = cond_of(next);
+      const bool go = loop_item_bool(pred);    // the one blocking point
+      // An evaluated condition is detached from the carry it was computed
+      // from -- but only once MLX has actually walked it, and only if the
+      // host read did not have to build a converted copy first. Dropping it
+      // outright is one move and needs neither to be true.
+      pred = npred;
+      if (!go) break;                          // `vals` is intact: see above
+      vals = std::move(next);                  // (1) release the old carry
+      std::vector<mx::array> pending(vals);
+      pending.push_back(pred);
+      mx::async_eval(pending);                 // (2) submit, do not wait
+      g_stats.pipelined_steps++;
+      loop_account(cost);                      // (3) same cadence, same clears
     }
     write_results(e, env, vals);
   }
@@ -2224,6 +2360,7 @@ class Program {
   bool compile_ = false;
   bool compile_disabled_ = false;
   bool no_chunk_ = false;
+  mutable int reads_host_ = -1;   // lazily derived, never un-derived
   int64_t max_repeat_ = 1;
   std::vector<int> anchors_;
   std::map<int, Compiled> compiled_;
@@ -2255,12 +2392,13 @@ nb::dict dtype_codes() {
 // truth per number: a second env-var reader here would be a second opinion,
 // and these are values the command-buffer lottery is pinned to.
 void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
-               int64_t flush_clear_bytes, int64_t loop_clear_cost, bool debug,
-               bool memdbg) {
+               int64_t flush_clear_bytes, int64_t loop_clear_cost,
+               int64_t while_pipeline, bool debug, bool memdbg) {
   g_cfg.eager_flush_bytes = eager_flush_bytes;
   g_cfg.flush_sync_every = flush_sync_every;
   g_cfg.flush_clear_bytes = flush_clear_bytes;
   g_cfg.loop_clear_cost = loop_clear_cost;
+  g_cfg.while_pipeline = while_pipeline;
   g_cfg.debug = debug;
   g_cfg.memdbg = memdbg;
 }
@@ -2277,6 +2415,9 @@ nb::dict stats() {
   d["compile_drops"] = g_stats.compile_drops;
   d["chunk_drops"] = g_stats.chunk_drops;
   d["unrolls"] = g_stats.unrolls;
+  d["pipelined_loops"] = g_stats.pipelined_loops;
+  d["pipelined_steps"] = g_stats.pipelined_steps;
+  d["serial_loops"] = g_stats.serial_loops;
   return d;
 }
 
@@ -2289,7 +2430,8 @@ void register_tape(nb::module_& m) {
         "MLIR element type -> dtype code; absent means unsupported");
   m.def("configure", &configure, nb::arg("eager_flush_bytes"),
         nb::arg("flush_sync_every"), nb::arg("flush_clear_bytes"),
-        nb::arg("loop_clear_cost"), nb::arg("debug"), nb::arg("memdbg"),
+        nb::arg("loop_clear_cost"), nb::arg("while_pipeline"),
+        nb::arg("debug"), nb::arg("memdbg"),
         "Copy the Python-side runtime cadences into the native engine");
   m.def("stats", &stats, "Native-engine counters (sync points, compiles)");
   nb::class_<Program>(m, "Program")

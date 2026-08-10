@@ -1514,6 +1514,7 @@ def configure(native):
         flush_sync_every=interpreter._FLUSH_SYNC_EVERY,
         flush_clear_bytes=interpreter._FLUSH_CLEAR_BYTES,
         loop_clear_cost=control._LOOP_CLEAR_COST,
+        while_pipeline=control._WHILE_PIPELINE,
         debug=interpreter._DEBUG,
         memdbg=control._MEMDBG,
     )

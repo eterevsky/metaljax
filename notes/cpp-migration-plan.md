@@ -173,6 +173,82 @@ the carry) + KV donation/in-place update on the native tape. M5b =
 msl_scan port (the texmo floor). M6 targets unchanged but their
 path runs through M5a, not dispatch removal.
 
+## M5a landed (2026-08-10): pipelined dynamic while + carry donation
+
+Both halves of M4's verdict, on the native tape. Nothing in the
+Python engine's execution changed — it stays the differential
+reference; `ops/control._WHILE_PIPELINE` is the shared knob
+(METALJAX_WHILE_PIPELINE=0 restores the old shape), read by
+`tape.configure` like every other loop cadence.
+
+**Donation (the bigger win).** The dynamic loop built its condition's
+argument vector at the top of the iteration and let it live to the
+BOTTOM — a second handle on every carry, alive while the next
+iteration's `dynamic_update_slice` evaluated. `mx::array::is_donatable`
+is a use_count test, so MLX copied the whole KV cache per token.
+Scoping that vector to the condition (`cond_of`) is the entire fix.
+Measured on a decode-shaped loop whose carry is one cache: cost per
+token was 4.6 us per megabyte of cache (a full copy at ~435 GB/s);
+it is now FLAT — 16 MB 152 us/step, 512 MB 165.
+
+**Pipelining.** The loop now builds iteration t's body and t+1's
+condition BEFORE reading t's condition back, blocks on that host read
+(the single sync point), then releases the carry, submits it with
+`async_eval`, and goes round. Two host round trips per iteration
+become one, and the graph building for the next iteration overlaps the
+device work already submitted. Deeper speculation — SUBMITTING the
+body before its condition resolves — is what would close the last
+gap, and it is mutually exclusive with donation: the pipeline would
+have to hold the carry the loop may return, which is exactly the
+handle that stops MLX writing in place. Donation is worth far more
+(a cache copy per token vs one round trip), so the pipeline
+speculates on BUILDING only.
+
+Gated on `!body->reads_host() && !cond->reads_host()` (no nested
+while/if/case): with a host read inside, "building" the body means
+running it, and a nested dynamic while need not even terminate at a
+carry the outer loop is about to abandon.
+
+Numbers (us/step, slope over two trip counts so per-execute costs
+cancel; native engine, standalone, M5 Max):
+
+| benchmark                                | main  | M5a serial | M5a  |
+|------------------------------------------|-------|-----------|------|
+| M3 decode shape (4 matmuls, no cache)    | 331.5 | 328.7     | 176.4|
+| realistic decode (qkv+attn over KV+MLP)  | 236.4 | 197.3     | 160.5|
+| cheap body, 16 MB cache                  | 339.9 | —         | 151.7|
+| cheap body, 512 MB cache                 | 2376  | 328.4     | 165.0|
+
+Projected on the model rows: rows 5/7 are dense decode whose bodies
+are one compiled replay, so the win is the per-token round trip
+(~150-170 us of the 23.3 ms/tok row 7, ~0.7%) PLUS whatever the KV
+copy was costing — the latter is the one to measure, since it scales
+with context length and the benchmark above says it was the whole
+size-dependent term. Model rows are the main agent's to run.
+
+**Mechanism worth keeping** (it explains a second finding):
+`mx::async_eval` holds handles on its root arrays until the task
+completes, so a graph built on those roots and submitted before
+anything WAITS cannot donate them. That is why the pipelined loop
+donates (its host read of the condition is the wait) and why the
+COUNTED loop's chunked replay does not: `_run_chunked` async-evals
+every chunk and blocks only every `sync_every`, so the first
+`dynamic_update_slice` of each chunk copies. Measured on the 512 MB
+cache with a counted loop: K=16 157 us/step, K=4 735, K=1 (no
+chunking) 23 — one full cache copy per chunk, and uncompiled chunks
+behave identically (165), so it is the chunk loop's shape, not
+`mx::compile`. Not fixed here: `chunkable` requires body cost <=
+`_CHUNK_MAX_COST` (1500), so a real decode body never chunks — the
+shape that loses is a CHEAP body with a huge in-place carry.
+
+Canaries: tests/test_command_buffer.py grew a fourth detector
+(`pipeline`) — the same 28-layer init scan with its condition
+rewritten into the non-counted form, pipelined vs serial. Clean at
+the shipped budgets 3/3; corrupts at 128 MB (5 of 66 outputs) and 64
+MB per buffer, clean at 100 and 50 kernels — so only the BYTE axis
+bites this layout, where the serial native detector's band is the
+other way round. The three existing detectors' bands did not move.
+
 ## Grand plan (Oleg, 2026-08-10)
 
 1) Migrate ALL non-test code to C++ (phase 2 included);

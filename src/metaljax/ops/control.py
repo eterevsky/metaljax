@@ -185,6 +185,16 @@ _DEBUG = os.environ.get("METALJAX_DEBUG", "") == "1"
 # re-mallocs of the working set). The clear-and-retry at the flush sites
 # remains the hard backstop for pathological workloads.
 _LOOP_CLEAR_COST = int(os.environ.get("METALJAX_LOOP_CLEAR_COST", "500000"))
+# Pipeline a dynamic while's iterations on the native engine (Stage 2 M5a):
+# build the next body and condition while the device is still working on the
+# current ones, so a data-dependent loop costs one host round trip per
+# iteration instead of two. 0 restores the serial shape. Parsed here rather
+# than in C++ for the same reason every other loop cadence is: this MOVES A
+# LOOP'S SYNC POINTS, which is a ticket in the MLX command-buffer lottery
+# (notes/mlx-command-buffer-split.md), and tests/test_command_buffer.py has
+# to be able to patch one place to compare layouts. The Python engine's own
+# dynamic loop is unaffected -- it stays the reference.
+_WHILE_PIPELINE = int(os.environ.get("METALJAX_WHILE_PIPELINE", "1"))
 _MEMDBG = os.environ.get("METALJAX_MEMDBG", "") == "1"
 _flushed_cost = 0
 
