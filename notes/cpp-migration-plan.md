@@ -172,3 +172,12 @@ host-side for counted segments; for dynamic conds, double-buffer
 the carry) + KV donation/in-place update on the native tape. M5b =
 msl_scan port (the texmo floor). M6 targets unchanged but their
 path runs through M5a, not dispatch removal.
+
+## Grand plan (Oleg, 2026-08-10)
+
+1) Migrate ALL non-test code to C++ (phase 2 included);
+2) correctness as close to perfect as possible;
+3) release; 4) make every model that runs on mlx-lm/torch/llama.cpp
+run on metaljax (rows 8/10/12/15 + the llama.cpp expansion);
+5) tackle performance disparities one by one.
+Steps 3/4 may swap depending on post-migration state.
