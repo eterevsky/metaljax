@@ -460,3 +460,15 @@ Steps 3/4 may swap depending on post-migration state.
 - Tests-to-engine-path migration (Interpreter-direct files) + the
   static opcode-vs-REGISTRY audit: scheduled with the M6 flip prep
   (per Oleg, 2026-08-10).
+
+## Post-migration: XLA optimization layer (Oleg, 2026-08-10)
+
+DECIDED: once the C++ migration is done, add a graph-level
+optimization stage above the tape — the missing middle layer vs
+XLA's architecture (optimized-HLO :: thunks == optimized-StableHLO ::
+tape). Two candidate routes, evaluate then: (a) XLA's HLO pass
+pipeline as a library pre-step (cleans unoptimized input StableHLO,
+enables an honest PJRT OptimizedProgram); (b) our recognizers
+graduate to StableHLO->StableHLO MLIR rewrite passes in the phase-2
+compile path, producing an inspectable optimized graph. Not before
+the migration completes.
