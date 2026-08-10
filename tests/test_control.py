@@ -48,13 +48,27 @@ def test_dynamic_while_matches_cpu():
 
 
 def test_dynamic_while_body_is_compiled():
-    from helpers import lower_bytes
-    from metaljax import Interpreter
-    from metaljax import dtypes as mdt
+    """A dynamic loop's body must be a compiled graph, not op-by-op replay.
+
+    Asked of whichever engine ran the program: the claim is the same, but
+    the two record it in their own bookkeeping — the Python engine caches
+    the compiled body on the interpreter, the native tape compiles the
+    region in C++ and counts it.
+    """
+    from helpers import execute_module, from_buffer, lower_bytes
+    from metaljax import engine
 
     x = rng.standard_normal(8).astype(np.float32)
-    interp = Interpreter(lower_bytes(_dynamic_while, x))
-    interp(mdt.to_mx(x))
+    before = None if engine.NATIVE is None else engine.NATIVE.stats()
+    ex, outs = execute_module(lower_bytes(_dynamic_while, x), (x,))
+    for o in outs:
+        from_buffer(o)          # read back: the loop runs before this returns
+    if before is not None and ex._native_prog:   # None = never asked (py)
+        after = engine.NATIVE.stats()
+        assert after["compiles"] > before["compiles"], \
+            "the body of a dynamic while was interpreted op by op"
+        return
+    interp = ex.interpreter
     assert interp._body_cache, "no while body was executed"
     assert any(compiled for _, _, compiled in interp._body_cache.values()), \
         "the body of a dynamic while was interpreted op by op"

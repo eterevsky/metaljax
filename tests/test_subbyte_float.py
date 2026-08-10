@@ -34,7 +34,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from helpers import check, run_metal
+from helpers import check, run_metal, run_metal_device
 
 F4 = jnp.float4_e2m1fn
 F6E2M3 = jnp.float6_e2m3fn
@@ -52,10 +52,12 @@ GRID = {
 
 
 def metal_pack(f, x, dtype):
-    """Run f on metal and pack the result the way the PJRT boundary does:
-    the interpreter hands back the f16 storage, engine.to_host casts it
-    to the narrow dtype."""
+    """Run f on metal and read the result the way a caller does: the engine
+    computes in the f16 storage and `engine.to_host` casts it to the narrow
+    dtype, which is what `run_metal` returns. The `astype` is therefore a
+    no-op here and is kept only so the requested dtype is asserted."""
     (got,) = run_metal(f, x)
+    assert got.dtype == np.dtype(dtype), (got.dtype, dtype)
     return got.astype(dtype)
 
 
@@ -174,7 +176,10 @@ def test_fp6_arithmetic_stays_on_grid(dtype):
               lambda v: v.astype(dtype) * v.astype(dtype),
               lambda v: jnp.negative(v.astype(dtype))):
         packed = metal_pack(f, g, dtype)
-        (storage,) = run_metal(f, g)
+        # The DEVICE storage, before to_host narrows it: the claim is that
+        # narrowing loses nothing, so the two have to be read differently or
+        # the comparison is an array against itself.
+        (storage,) = run_metal_device(f, g)
         np.testing.assert_array_equal(
             packed.astype(np.float32), storage.astype(np.float32),
             err_msg="arithmetic result left the value grid")

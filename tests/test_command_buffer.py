@@ -60,8 +60,8 @@ INIT_MODULE = os.path.join(os.path.dirname(__file__), "data",
                            "qwen3_init_scan.mlir")
 
 
-def _inputs(interp):
-    """Deterministic pseudo-random arguments for the module."""
+def _host_inputs(interp):
+    """Deterministic pseudo-random arguments for the module, on the host."""
     rng = np.random.default_rng(0)
     args = []
     with interp.context:
@@ -74,7 +74,13 @@ def _inputs(interp):
         else:
             x = (rng.standard_normal(size=shape) * 0.1).astype(np.float32)
             x = x.astype(dt)
-        args.append(mdt.to_mx(x))
+        args.append(x)
+    return args
+
+
+def _inputs(interp):
+    """The same arguments, on the device."""
+    args = [mdt.to_mx(x) for x in _host_inputs(interp)]
     mx.eval(*args)
     return args
 
@@ -99,6 +105,15 @@ def _compiled_mismatches():
 
     Three replays of one compiled graph must agree bit-for-bit with each
     other and (loosely) with op-by-op interpretation of the same module.
+
+    Interpreter-direct on purpose (as are the two Python detectors below):
+    what is under test is a SYNC-POINT LAYOUT, and each detector has to run
+    the same program under two layouts the engine would never pick on its
+    own -- three replays of one graph against op-by-op interpretation here,
+    two flush cadences over one while body in `_scan_mismatches`. The engine
+    path is not missing from this file: `_native_mismatches` and
+    `_pipeline_mismatches` below are the native engine's own layouts, driven
+    through engine.compile_program/execute.
     """
     interp = Interpreter(open(MODULE).read().encode())
     args = _inputs(interp)
@@ -193,7 +208,9 @@ def _scan_mismatches():
     """Op-by-op detector: complaints about the init scan, if any.
 
     Same ops in the same order, only evaluated at different points, so the
-    carries must be bit-exact whatever the flush cadence.
+    carries must be bit-exact whatever the flush cadence. Interpreter-direct
+    for the reason `_compiled_mismatches` gives: the two flush cadences are
+    layouts, not programs.
     """
     interp = Interpreter(open(INIT_MODULE).read().encode())
     bad = []
@@ -412,6 +429,46 @@ def test_command_buffer_budgets_are_bounded():
 
 def test_compiled_llm_step_is_correct_and_deterministic():
     bad = _compiled_mismatches()
+    assert not bad, "\n".join(bad)
+
+
+def test_llm_step_through_the_engine_matches_op_by_op():
+    """The same decode asset as an ordinary PROGRAM.
+
+    The detectors above drive the interpreter directly because they compare
+    two sync-point layouts; this one takes the module the way a caller does
+    -- engine.compile_program + execute, whatever path the engine picks for
+    it -- so the asset's ops are covered on the engine route (and, under
+    METALJAX_ENGINE=native, on the tape) as well.
+    """
+    from metaljax import engine
+    import helpers
+
+    ex = engine.compile_program(open(MODULE).read().encode(), "mlir")
+    host = _host_inputs(ex.interpreter)
+    outs = engine.execute(ex, [helpers.to_buffer(a) for a in host])
+    got = [helpers.from_buffer(o).astype(np.float64) for o in outs]
+
+    ref = Interpreter(open(MODULE).read().encode())
+    want = [mdt.to_np(o).astype(np.float64)
+            for o in ref(*[mdt.to_mx(a) for a in host])]
+
+    assert len(got) == len(want)
+    bad = []
+    for j, (g, exp) in enumerate(zip(got, want)):
+        if g.shape != exp.shape:
+            bad.append(f"output {j}: shape {g.shape} vs {exp.shape}")
+            continue
+        finite = exp[~np.isnan(exp)] if exp.size else exp
+        scale = float(np.max(np.abs(finite))) if finite.size else 0.0
+        # Same tolerance as `_compiled_mismatches`, and for the same reason:
+        # the engine may fuse where op-by-op evaluation does not.
+        tol = 2e-2 * np.abs(exp) + 1e-2 * scale + 1e-6
+        off = (np.abs(g - exp) > tol) | (np.isnan(g) != np.isnan(exp))
+        n = int(np.sum(off))
+        if n:
+            bad.append(f"engine output {j} {tuple(exp.shape)} differs from "
+                       f"op-by-op evaluation in {n} of {exp.size} elements")
     assert not bad, "\n".join(bad)
 
 

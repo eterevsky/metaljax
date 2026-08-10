@@ -127,7 +127,16 @@ def _metal():
 
 
 def _run_eager(interp, args):
-    """The bare Interpreter, which is always the op-by-op path."""
+    """The bare Interpreter, which is always the op-by-op path.
+
+    Interpreter-direct on purpose, and this whole file is: the subject is
+    the EAGER environment (last-use pruning, the sentinel environment, the
+    byte-denominated flush), which is what runs when a program is too big to
+    compile -- `engine.execute` would hand these small fixtures to
+    mx.compile and none of it would be exercised. The programs still reach
+    the engine from here: `_through_engine` runs them the ordinary way, and
+    `test_recognized_spellings_through_the_engine` covers every fixture.
+    """
     outs = interp(*[mdt.to_mx(np.asarray(a)) for a in args])
     mx.eval(*outs)
     return [mdt.to_np(o) for o in outs]
@@ -136,18 +145,9 @@ def _run_eager(interp, args):
 def _through_engine(f, args):
     """Compile+execute once through the engine, which runs the packing and
     verification prologues qmm/moe need before their plans go live."""
-    from metaljax import engine
-
-    ex = engine.compile_program(helpers.lower_bytes(f, *args), "mlir")
-    bufs = []
-    for a in jax.tree.leaves(args):
-        arr = np.asarray(a)
-        bufs.append(engine.MetalBuffer(mdt.to_mx(arr),
-                                       engine._NP_TO_ENUM[arr.dtype],
-                                       list(arr.shape)))
-    outs = engine.execute(ex, bufs)
-    mx.eval(*[o.data for o in outs])
-    return ex.interpreter, [mdt.to_np(o.data) for o in outs]
+    ex, outs = helpers.execute_module(helpers.lower_bytes(f, *args),
+                                      jax.tree.leaves(args))
+    return ex.interpreter, [helpers.from_buffer(o) for o in outs]
 
 
 def _prune_verify(on=True):
@@ -577,6 +577,47 @@ def test_the_completeness_check_has_teeth(drop):
         sdpa.emit_reads = orig
 
 
+def test_recognized_spellings_through_the_engine():
+    """Every fixture in this file, run as an ordinary program.
+
+    The tests above drive the eager environment directly because that is
+    their subject; this one takes the same programs through
+    engine.compile_program/execute -- the route a real caller takes, and the
+    only one the Stage 2 native tape sees -- so their ops are covered there
+    too, and a rewrite that is right eagerly but wrong through the engine
+    cannot hide.
+    """
+    import test_sdpa as ts
+
+    cases = []
+    if sdpa.ENABLED:
+        cases.append((attn_computed, _attn_args()))
+        cases.append((attn_causal, _attn_args()[:3]))
+        for fn, shapes in ((ts.attn_bhtd, [(B, H, T, D)] * 3),
+                           (ts.attn_gqa, [(B, H, T, D),
+                                          (B, H // 2, T, D),
+                                          (B, H // 2, T, D)])):
+            cases.append((fn, ts._arrays(shapes, jnp.float32, seed=1)))
+    tols = {}
+    if qmm.QMM_ENABLED:
+        f, args = _qmm_fixture()
+        cases.append((f, args))
+        tols[len(cases) - 1] = (2e-2, 2e-2)
+    if moe.ENABLED:
+        f, args = _moe_fixture()
+        cases.append((f, args))
+        tols[len(cases) - 1] = (2e-3, 2e-3)
+    assert cases, "every recognizer is disabled"
+
+    for i, (fn, args) in enumerate(cases):
+        _interp, got = _through_engine(fn, args)
+        with jax.default_device(_cpu()):
+            want = np.asarray(jax.jit(fn)(*args))
+        rtol, atol = tols.get(i, (2e-5, 2e-5))
+        np.testing.assert_allclose(got[0], want, rtol=rtol, atol=atol,
+                                   err_msg=getattr(fn, "__name__", str(i)))
+
+
 def test_the_sentinel_environment_is_off_by_default():
     """It puts a Python `__getitem__` on the interpreter's hottest lookup."""
     import os
@@ -597,6 +638,9 @@ def _peak_stack(n, prune, flush_mb, args, cache={}):
 
     Measured net of the baseline: this shares a process with the rest of the
     suite, so what is alive when the run starts is not zero.
+
+    Interpreter-direct for `_run_eager`'s reason: the quantity measured is
+    the EAGER path's peak, which a compiled main would not have.
     """
     def f(q, k, v):
         h = q

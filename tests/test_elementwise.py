@@ -162,8 +162,7 @@ def test_half_precision(dt):
 def test_bf16_hex_splat_constant():
     # xla-translate emits bf16 specials as hex splats (dense<0xFF80> = -inf);
     # the MLIR bindings mis-decode those as float(hex) if allowed to.
-    import mlx.core as mx
-    from metaljax.interpreter import Interpreter
+    from helpers import run_module
 
     mod = """
 module {
@@ -174,9 +173,9 @@ module {
   }
 }
 """
-    a, b = Interpreter(mod)()
-    assert np.all(np.isneginf(np.array(a.astype(mx.float32))))
-    assert float(np.array(b.astype(mx.float32))) == 1.0
+    a, b = run_module(mod)
+    assert np.all(np.isneginf(a.astype(np.float32)))
+    assert float(b.astype(np.float32)) == 1.0
 
 
 def test_emulated_dtypes_i4_f8():

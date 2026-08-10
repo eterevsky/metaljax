@@ -32,8 +32,6 @@ import jax
 import jax.numpy as jnp
 
 import helpers
-from metaljax import Interpreter
-from metaljax import dtypes as mdt
 from metaljax import sdpa
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -50,23 +48,26 @@ B, H, T, D = 2, 4, 8, 16
 
 def _matches(f, *args):
     """How many attentions the recognizer finds in `f`'s lowering."""
-    interp = Interpreter(helpers.lower_bytes(f, *args))
+    from metaljax import engine
+
+    interp = engine.compile_program(helpers.lower_bytes(f, *args),
+                                    "mlir").interpreter
     with interp.context:
         return len(sdpa.analyze(interp).matches)
 
 
 def _run(f, args, enabled):
+    """Compile and execute through the engine -- the route the native tape
+    hooks, and the one that runs the recognizer prologues."""
     old = sdpa.ENABLED
     sdpa.ENABLED = enabled
     try:
-        import mlx.core as mx
-        interp = Interpreter(helpers.lower_bytes(f, *args))
-        outs = interp(*[mdt.to_mx(np.asarray(x))
-                        for x in jax.tree.leaves(args)])
-        mx.eval(*outs)
-        with interp.context:
-            n = len(sdpa.analyze(interp).matches)
-        return [mdt.to_np(o) for o in outs], n
+        ex, outs = helpers.execute_module(helpers.lower_bytes(f, *args),
+                                          jax.tree.leaves(args))
+        got = [helpers.from_buffer(o) for o in outs]
+        with ex.interpreter.context:
+            n = len(sdpa.analyze(ex.interpreter).matches)
+        return got, n
     finally:
         sdpa.ENABLED = old
 
@@ -489,7 +490,7 @@ ASSET = os.path.join(os.path.dirname(__file__), "data",
 
 
 def _asset_inputs(interp):
-    import mlx.core as mx
+    """Deterministic host arguments for the asset, one per input aval."""
     rng = np.random.default_rng(0)
     args = []
     with interp.context:
@@ -502,8 +503,7 @@ def _asset_inputs(interp):
         else:
             x = (rng.standard_normal(size=shape) * 0.1).astype(np.float32)
             x = x.astype(dt)
-        args.append(mdt.to_mx(x))
-    mx.eval(*args)
+        args.append(x)
     return args
 
 
@@ -511,21 +511,22 @@ def _asset_inputs(interp):
 def _run_asset(enabled):
     """Cached: the two tests below need the same pair of runs, and this is
     the most expensive thing in the file (a real 8-layer decode step)."""
-    import mlx.core as mx
+    from metaljax import engine
     from metaljax.ops import control
     old = sdpa.ENABLED
     sdpa.ENABLED = enabled
     sdpa.reset_stats()
     try:
-        interp = Interpreter(open(ASSET).read().encode())
+        ex = engine.compile_program(open(ASSET).read().encode(), "mlir")
+        interp = ex.interpreter
         args = _asset_inputs(interp)
         with interp.context:
             n = len(sdpa.analyze(interp).matches)
             cost = control._block_cost(interp, interp._main_block())
-        outs = interp(*args)
-        mx.eval(*outs)
-        return ([np.asarray(mdt.to_np(o), np.float32).astype(np.float64)
-                 for o in outs], n, cost, sdpa.stats()["fused"])
+        outs = engine.execute(ex, [helpers.to_buffer(a) for a in args])
+        native = bool(ex._native_prog)
+        return ([np.asarray(helpers.from_buffer(o), np.float32).astype(np.float64)
+                 for o in outs], n, cost, sdpa.stats()["fused"], native)
     finally:
         sdpa.ENABLED = old
 
@@ -534,11 +535,18 @@ def _run_asset(enabled):
 def test_real_llm_asset_fuses_and_stays_correct():
     """maxtext's qwen3 prefill: GQA by reshaped Q, a `@_where` call mask, an
     f32 softmax island, and the deferred normalization -- all at once."""
-    got, n, cost_on, fused = _run_asset(True)
-    ref, n0, cost_off, _ = _run_asset(False)
+    got, n, cost_on, fused, native = _run_asset(True)
+    ref, n0, cost_off, _, _ = _run_asset(False)
 
     assert n == 1 and n0 == 0, f"recognized {n} attentions (off: {n0})"
-    assert fused == 8, f"expected one emit per layer call, got {fused}"
+    # The layer body is a while body called 8 times, and the two engines
+    # count `fused` at different moments: the Python engine ticks it inside
+    # `emit`, once per iteration, while the native tape emits ONCE at
+    # lowering and replays the entry (tape._count, Stage 2 M4). Same eight
+    # fused attentions either way; one site is what the tape must show.
+    want_fused = 1 if native else 8
+    assert fused == want_fused, (
+        f"expected {want_fused} fused emit(s), got {fused}")
     assert cost_on < cost_off, "the fused chain should shrink the trace cost"
 
     # Only the attention changed, so the pre-attention outputs must be
@@ -558,8 +566,8 @@ def test_real_llm_asset_first_layer_is_bit_identical():
     """Layer 0's K/V cache is computed before any attention, so the rewrite
     must not touch it -- this is what separates "accumulated rounding" from
     "the rewrite moved something it should not have"."""
-    got, _, _, _ = _run_asset(True)
-    ref, _, _, _ = _run_asset(False)
+    got, *_ = _run_asset(True)
+    ref, *_ = _run_asset(False)
     # outputs 6 and 7 are cached_prefill_key / cached_prefill_value, layer
     # major.
     for j in (6, 7):

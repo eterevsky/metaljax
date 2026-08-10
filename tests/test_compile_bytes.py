@@ -40,6 +40,14 @@ MB = 2 ** 20
 
 
 def _bytes(module_text):
+    """The estimator's answer for a module, and the interpreter it read.
+
+    Interpreter-direct throughout this section on purpose: the estimator is
+    a question about parsed IR, and none of the tests below it EXECUTE
+    anything -- so there is no engine path to take, and nothing that could
+    show up in (or be missing from) the native-tape census. The tests that
+    do run programs use `_run_program`, which goes through the engine.
+    """
     interp = Interpreter(module_text)
     with interp.context:
         return control._block_bytes(interp, interp._main_block()), interp
@@ -226,6 +234,9 @@ def test_absorbed_attention_is_not_charged():
 
 
 def _moe_program(T, E=8, K=2, H=64, I=32):
+    """(estimate, literal bytes, recognizer state) for a MoE block. Static:
+    the recognizer pass and the estimator read IR, nothing runs (see
+    `_bytes`)."""
     import test_moe as tm
 
     w = tm.make_weights(E, T, H, I, seed=T)
@@ -527,8 +538,16 @@ def _loop_args():
 
 
 def _run_loop(budget_mb):
-    """Bare interpreter (the loop paths live below the engine). Returns the
-    result, the interpreter, and the chunk sizes it actually compiled."""
+    """Bare interpreter, deliberately: BODY-level chunking is only reachable
+    when the enclosing main is not itself one compiled trace, and at the
+    budgets this test needs (0 = gate off) the engine compiles the whole
+    main -- which would leave `_body_cache` empty and make the assertions
+    below unobservable. `test_byte_budget_through_the_engine` runs the same
+    program the ordinary way, so the ops still reach engine.execute (and the
+    native tape) from this file.
+
+    Returns the result, the interpreter, and the chunk sizes it compiled.
+    """
     args = _loop_args()
     interp = Interpreter(helpers.lower_bytes(_loop, *args))
     with _budget(budget_mb):
@@ -536,6 +555,26 @@ def _run_loop(budget_mb):
         mx.eval(*outs)
     repeats = sorted({k[2] for k, v in interp._body_cache.items() if v[2]})
     return mdt.to_np(outs[0]), interp, repeats
+
+
+def test_byte_budget_through_the_engine():
+    """The same loop, executed as a real program: the budget decides how the
+    engine runs it (one traced main, a chunked body, op by op) and none of
+    the three may change the answer."""
+    args = _loop_args()
+    with jax.default_device(jax.devices("cpu")[0]):
+        want = np.asarray(jax.jit(_loop)(*args))
+
+    compiled = []
+    for budget_mb in (0, 256, 64):
+        with _budget(budget_mb):
+            ex, outs = helpers.execute_module(
+                helpers.lower_bytes(_loop, *args), jax.tree.leaves(args))
+            got = helpers.from_buffer(outs[0])
+        compiled.append(bool(ex._can_compile))
+        np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-5,
+                                   err_msg=f"budget {budget_mb} MB")
+    assert compiled == [True, False, False], compiled
 
 
 def test_byte_budget_sizes_the_chunked_replay_and_can_refuse_it():

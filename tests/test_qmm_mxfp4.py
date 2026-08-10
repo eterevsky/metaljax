@@ -877,7 +877,12 @@ def test_a_big_constant_declines_the_build_cache(monkeypatch):
 
 
 def _fingerprint_of(text):
-    """The build-cache fingerprint of the one match in a module's text."""
+    """The build-cache fingerprint of the one match in a module's text.
+
+    Interpreter-direct on purpose: this parses IR and asks the recognizer a
+    question about it. Nothing executes, so there is no engine path to take
+    (and no op here that could register as a native decline).
+    """
     from jaxlib.mlir import ir
     from metaljax import _ir
     from metaljax.interpreter import Interpreter

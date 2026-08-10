@@ -265,15 +265,14 @@ def _mgru16(xs, h0, w):
 
 
 def _plan_modes(f, *args):
-    """Run through a fresh Interpreter; return the MSL plan modes built."""
-    import mlx.core as mx
-    from helpers import lower_bytes
-    from metaljax import Interpreter
-    from metaljax import dtypes as mdt
-    interp = Interpreter(lower_bytes(f, *args))
-    outs = interp(*[mdt.to_mx(np.asarray(x)) for x in jax.tree.leaves(args)])
-    mx.eval(*outs)
-    return [p.mode for p in interp._msl_cache.values() if p is not None]
+    """Run through a fresh executable; return the MSL plan modes built."""
+    from helpers import execute_module, from_buffer, lower_bytes
+
+    ex, outs = execute_module(lower_bytes(f, *args), jax.tree.leaves(args))
+    for o in outs:
+        from_buffer(o)          # settle: plans are built as the loop runs
+    return [p.mode for p in ex.interpreter._msl_cache.values()
+            if p is not None]
 
 
 def test_coop_preferred_for_square_16wide_cell():

@@ -928,7 +928,14 @@ def test_trace_budget_restored_for_interleaved_groups():
 
 @needs_qmm
 def test_cost_model_charges_the_fused_dot():
-    """The recognized chain must not count toward the trace budget."""
+    """The recognized chain must not count toward the trace budget.
+
+    Interpreter-direct on purpose, and it is not a route around the engine:
+    nothing here EXECUTES. The two interpreters are parsed IR that
+    `_block_cost` is asked about, and one of them has its recognizer state
+    replaced by hand — which is the literal-cost baseline, not a program
+    anyone runs.
+    """
     import io
     from metaljax.interpreter import Interpreter
     from metaljax.ops import control

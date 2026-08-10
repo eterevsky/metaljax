@@ -18,7 +18,6 @@ import numpy as np
 import pytest
 
 from helpers import check
-from metaljax import Interpreter
 
 SHAPE = (2048, 2048)
 CONST_BYTES = 4 * SHAPE[0] * SHAPE[1]  # 16 MiB as f32
@@ -94,9 +93,11 @@ def test_splat_constant_costs_nothing_to_read():
       }
     }
     """
-    interp = Interpreter(src)
+    from helpers import execute_module
+
     base = _settled_active()
-    (out,) = interp()
+    _ex, (buf,) = execute_module(src)
+    out = buf.data
     mx.eval(out)
     assert out.shape == SHAPE
     assert float(out[0, 0]) == 1.5 and float(out[-1, -1]) == 1.5

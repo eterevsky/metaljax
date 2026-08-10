@@ -115,8 +115,7 @@ def test_uint8_dot_exact(K):
 def test_mixed_sign_int8_dot():
     # jax converts mixed-signedness operands to i32 before the dot, so the
     # i8 x u8 chunk (512) is only reachable from a hand-written module.
-    from metaljax.interpreter import Interpreter
-    import mlx.core as mx
+    from helpers import run_module
 
     mod = """
 module {
@@ -126,15 +125,14 @@ module {
   }
 }
 """
-    interp = Interpreter(mod)
     for a, b in (
         (np.full((3, 2048), -128, np.int8), np.full((2048, 5), 255, np.uint8)),
         (rng.integers(-128, 128, (3, 2048)).astype(np.int8),
          rng.integers(0, 256, (2048, 5)).astype(np.uint8)),
     ):
-        (out,) = interp(mx.array(a), mx.array(b))
+        (out,) = run_module(mod, (a, b))
         want = (a.astype(np.int64) @ b.astype(np.int64)).astype(np.int32)
-        np.testing.assert_array_equal(np.array(out), want)
+        np.testing.assert_array_equal(out, want)
 
 
 def test_int8_dot_batched_and_multi_contracting():
@@ -171,11 +169,9 @@ def test_mixed_precision_matmul():
 
 
 def test_plain_stablehlo_dot():
-    # stablehlo.dot never comes out of jax; feed the interpreter a module
+    # stablehlo.dot never comes out of jax; feed the engine a module
     # directly (HLO-imported benchmarks contain it).
-    from metaljax import _ir
-    from metaljax.interpreter import Interpreter
-    import mlx.core as mx
+    from helpers import run_module
 
     mod = """
 module {
@@ -185,11 +181,10 @@ module {
   }
 }
 """
-    interp = Interpreter(mod)
     a = np.random.default_rng(0).standard_normal((3, 4)).astype(np.float32)
     b = np.random.default_rng(1).standard_normal((4, 5)).astype(np.float32)
-    (out,) = interp(mx.array(a), mx.array(b))
-    np.testing.assert_allclose(np.array(out), a @ b, rtol=1e-5, atol=1e-6)
+    (out,) = run_module(mod, (a, b))
+    np.testing.assert_allclose(out, a @ b, rtol=1e-5, atol=1e-6)
 
 
 def test_lapack_qr_eigh_svd():
