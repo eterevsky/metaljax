@@ -1,0 +1,4 @@
+jax-v0.11.0/tests/core_test.py::CoreTest::test_reference_cycles
+jax-v0.11.0/tests/core_test.py::CoreTest::test_reference_cycles_jit
+jax-v0.11.0/tests/export_back_compat_test.py::CompatTest::test_custom_call_coverage
+jax-v0.11.0/tests/lax_test.py::LaxTest::testScatter1
