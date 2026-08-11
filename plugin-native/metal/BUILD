@@ -3,7 +3,7 @@
 #
 # This package holds the plugin shell (client / device / memory space / buffer
 # plumbing) and the StableHLO -> tape lowering that stands between it and the
-# shared executor runtime (@metaljax_runtime//:runtime).  The bazel helpers
+# shared executor runtime (//runtime).  The bazel helpers
 # live in //build_defs.
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
@@ -35,7 +35,7 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/strings",
         "@llvm-project//mlir:IR",
-        "@metaljax_runtime//:runtime",
+        "//runtime",
         "@mlx",
         "@xla//xla:xla_data_proto_cc",
     ],
@@ -81,7 +81,7 @@ cc_library(
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:IR",
-        "@metaljax_runtime//:runtime",
+        "//runtime",
         "@mlx",
         "@stablehlo//:stablehlo_ops",
         "@xla//xla:shape_util",
@@ -105,7 +105,7 @@ cc_library(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
-        "@metaljax_runtime//:runtime",
+        "//runtime",
         "@mlx",
         "@xla//xla:shape_util",
         "@xla//xla:util",
@@ -178,12 +178,12 @@ metaljax_cc_binary(
     linkshared = True,
     deps = [
         ":metal_c_pjrt",
-        "@metaljax_runtime//:runtime",
+        "//runtime",
     ],
 )
 
 # Phase 2 P1: the executor runtime driven from a process with no interpreter
-# in it.  Depends on @metaljax_runtime and @mlx and on nothing else -- no XLA,
+# in it.  Depends on //runtime and @mlx and on nothing else -- no XLA,
 # no plugin -- because the claim being tested is exactly that the tape stands
 # on its own.
 #
@@ -196,7 +196,7 @@ cc_test(
     srcs = ["runtime_gil_free_test.cc"],
     tags = ["local"],
     deps = [
-        "@metaljax_runtime//:runtime",
+        "//runtime",
         "@mlx",
     ],
 )

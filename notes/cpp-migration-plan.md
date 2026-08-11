@@ -919,3 +919,24 @@ fork authorized but not needed.
   the scatter/sort tail, then async execute + donation.
   Suite-vs-suite as the standing gate. (North star per Oleg: everything
   through the new stack, correctness first, performance second.)
+
+## The runtime fork (2026-08-11, per Oleg)
+
+Stage 1 is FROZEN ("essentially no longer modified; don't test it too
+much"). The shared-runtime arrangement (P1's new_local_repository over
+native/) therefore forked at 6c2bb5e: plugin-native/runtime/ holds the
+16 core TUs + program.h/msl.h as //runtime, and every pure-native
+change from P9 on lands there ONLY. native/ stays exactly as P8.5
+left it -- still building the Stage 1 nanobind extension via
+build.sh, sealed by its final battery (pytest 1258, texmo_check 106,
+the pipelining bug fixed on both sides of the fork). Backporting to
+native/ is an explicit decision that re-opens the Stage 1 battery,
+not a reflex. Standing battery from P9: execute_test + plugin
+texmo_gate + affected jax-suite files (+ tests/-on-native leg once
+added); Stage-1 legs retired.
+
+Primary objective (Oleg): jax-suite parity with Stage 1's 99.53%.
+Census ladder: P9 Accelerate+linalg registrations (867), P10 complex
+scatter + lexicographic sort (542), P11 dtypes + reduce_precision
+(192), P12 collectives+tokens (109), P13 callbacks/PJRT/donation
+(62), P14 shape-poly (17). Native at 93.15% after P8.5.
