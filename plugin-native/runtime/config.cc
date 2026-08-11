@@ -101,6 +101,11 @@ const NamedOp kOpNames[] = {
     // artifact it arrives already decomposed into the sort above. Both
     // reach the plugin, so both are here.
     {"chlo.top_k", kTopK},
+    // XLA's ApproxTopK custom call (jax.lax.approx_max_k/approx_min_k), whose
+    // contract an EXACT top-k satisfies: recall 1.0 is >= any recall_target.
+    // A pseudo-name, like the conv: the target's own name is what the plugin
+    // matches on, and the attribute layout is this tape's.
+    {"metaljax.approx_top_k", kApproxTopK},
     // StableHLO's gather/scatter go STRAIGHT to MLX's primitives (see the
     // handlers): the numpy-style indexing the Python handlers use lives in
     // MLX's python layer and has no C++ entry point, and routing through a

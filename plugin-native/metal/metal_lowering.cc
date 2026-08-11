@@ -24,6 +24,7 @@ Licensed under the Apache License, Version 2.0.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "host_lapack.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
@@ -132,6 +133,81 @@ bool IsScatterNoop(mlir::Operation* op) {
 bool IsControlOp(absl::string_view name) {
   return name == "stablehlo.while" || name == "stablehlo.if" ||
          name == "stablehlo.case";
+}
+
+// --------------------------------------------------------------------------
+// custom calls (P9)
+// --------------------------------------------------------------------------
+
+// A custom call's `backend_config`, which every target below encodes as a
+// short string (jax's `mlir.custom_call(backend_config=...)`).
+std::string BackendConfig(mlir::Operation* op) {
+  if (auto s = op->getAttrOfType<mlir::StringAttr>("backend_config"))
+    return s.getValue().str();
+  return "";
+}
+
+std::string CallTarget(mlir::Operation* op) {
+  if (auto s = op->getAttrOfType<mlir::StringAttr>("call_target_name"))
+    return s.getValue().str();
+  return "";
+}
+
+// Call target -> which factorization it runs on the HOST
+// (src/metaljax/ops/lapack.py's `TARGETS`, the entries this plugin serves).
+//
+// On platform `metal` jax emits `Qr` and
+// `ProductOfElementaryHouseholderReflectors` from its own generic QR rule --
+// that is every jnp.linalg.qr, every lstsq, and jax.nn.initializers.orthogonal
+// -- and the `metaljax_*` names from the rules
+// src/jax_plugins/metal/__init__.py registers for the primitives jax has NO
+// platform-independent lowering for (eigh, svd, eig, schur, hessenberg,
+// tridiagonal), for the two solves whose `perturb_singular` no StableHLO op
+// can carry, and for LU at a symbolic matrix dimension.
+//
+// The `lapack_*geqrf/orgqr_ffi` names are jax's CPU QR targets; they reach
+// this plugin only inside a deserialized artifact, and their result
+// conventions match our kQr/kOrgqr, so serving them is free.  The eigh/svd/
+// eig FFI targets (`lapack_ssyevd_ffi` and friends) are DELIBERATELY ABSENT:
+// their conventions differ (a trailing `info` result, iteration workspaces),
+// jax never emits them for platform `metal`, and nothing in the suite can
+// reach them -- an implementation here would be permanently untested layout
+// code whose failure mode is silently transposed results the day some jax
+// version starts emitting them.  Absent means they decline BY NAME, which is
+// the honest answer until a reachable consumer exists.
+const absl::flat_hash_map<std::string, HostLinalg>& HostTargets() {
+  static const auto* table = new absl::flat_hash_map<std::string, HostLinalg>{
+      {"stablehlo.cholesky", HostLinalg::kCholesky},
+      {"stablehlo.triangular_solve", HostLinalg::kTriangularSolve},
+      {"Qr", HostLinalg::kQr},
+      {"lapack_sgeqrf_ffi", HostLinalg::kQr},
+      {"lapack_cgeqrf_ffi", HostLinalg::kQr},
+      {"ProductOfElementaryHouseholderReflectors", HostLinalg::kOrgqr},
+      {"lapack_sorgqr_ffi", HostLinalg::kOrgqr},
+      {"lapack_cungqr_ffi", HostLinalg::kOrgqr},
+      {"metaljax_eigh", HostLinalg::kEigh},
+      {"metaljax_svd", HostLinalg::kSvd},
+      {"metaljax_eig", HostLinalg::kEig},
+      {"metaljax_lu", HostLinalg::kLu},
+      {"metaljax_schur", HostLinalg::kSchur},
+      {"metaljax_hessenberg", HostLinalg::kHessenberg},
+      {"metaljax_tridiagonal", HostLinalg::kTridiagonal},
+      {"metaljax_triangular_solve", HostLinalg::kTriangularSolve},
+      {"metaljax_tridiagonal_solve", HostLinalg::kTridiagonalSolve},
+  };
+  return *table;
+}
+
+// Whether this op computes on the host -- the question `BlockIsPure` asks, and
+// the reason `interpreter.custom_call_host_hook` exists on the Python side.
+// Structural: the two StableHLO ops whose handler is a host one, plus any
+// custom call whose target is in the table above.
+bool IsHostOp(mlir::Operation* op) {
+  const absl::string_view name = View(op->getName().getStringRef());
+  if (name == "stablehlo.cholesky" || name == "stablehlo.triangular_solve")
+    return true;
+  if (name != "stablehlo.custom_call") return false;
+  return HostTargets().contains(CallTarget(op));
 }
 
 // Reduce monoids: body op -> kind, mirroring tape.py's _REDUCE_KINDS and
@@ -1054,12 +1130,13 @@ int64_t BytesChunks(LowerContext& ctx, mlir::Block& block) {
 // with the HOST.  It is the gate on every tracing path, because a trace cannot
 // contain a host read at all.
 //
-// Two of the Python's arms cannot fire here: a `custom_call` with a host
-// handler and a token-carrying value both decline this plugin's lowering
-// outright (the op set and `CheckValue`), long before anything asks about
-// purity.  The token tests are written anyway -- a reader checks a
-// transliteration line by line, and they cost a type comparison -- while the
-// custom_call arm has nothing to call and is left out.
+// One of the Python's arms cannot fire here: a token-carrying value declines
+// this plugin's lowering outright (`CheckValue`), long before anything asks
+// about purity.  The token tests are written anyway -- a reader checks a
+// transliteration line by line, and they cost a type comparison.  The
+// custom_call arm is `custom_call_host_hook`'s, and it is live from P9 on:
+// a block holding a LAPACK target computes off the device, so it can no more
+// be traced than a while's host read can.
 bool BlockIsPure(LowerContext& ctx, mlir::Block& block) {
   auto cached = ctx.pure.find(&block);
   if (cached != ctx.pure.end()) return cached->second;
@@ -1080,11 +1157,12 @@ bool BlockIsPure(LowerContext& ctx, mlir::Block& block) {
       token_result = token_result ||
                      mlir::isa<mlir::stablehlo::TokenType>(r.getType());
     if (token_result) { pure = false; break; }
-    // interpreter._IMPURE_OPS. The two host-computed linalg ops are in the
-    // list because the Python handler runs them on the CPU through numpy;
-    // they decline here, and are listed so the two readings agree on paper.
+    // interpreter._IMPURE_OPS, plus custom_call_host_hook: the two
+    // host-computed linalg ops, the control flow that reads a predicate back,
+    // and every custom call whose target computes on the host.
     if (n == "stablehlo.while" || n == "stablehlo.if" || n == "stablehlo.case" ||
-        n == "stablehlo.triangular_solve" || n == "stablehlo.cholesky") {
+        n == "stablehlo.triangular_solve" || n == "stablehlo.cholesky" ||
+        IsHostOp(&o)) {
       if (n == "stablehlo.while" && WhileTraceable(ctx, &o))
         continue;      // statically-counted small loop: unrollable
       pure = false;
@@ -1268,6 +1346,9 @@ class Lowering {
     int64_t bytes = 0;
     std::vector<std::shared_ptr<Program>> regions;
     std::vector<DumpNode> region_dumps;
+    // P9: the handler of an entry that computes on the HOST, bound here and
+    // called by the executor -- the one place a native run leaves the tape.
+    HostFn host;
   };
 
   // One block lowered into THIS frame: the block's own arguments first, then
@@ -1341,6 +1422,14 @@ class Lowering {
   absl::Status LowerTopK(mlir::Operation* op);
   absl::Status LowerRng(mlir::Operation* op);
 
+  // P9: `stablehlo.custom_call`, and the two StableHLO ops whose handler runs
+  // off the device.  `LowerHostLinalg` binds a `HostFn` (host_lapack.h) into
+  // the entry; `LowerApproxTopK` is the one custom call that is ordinary
+  // device work.
+  absl::Status LowerCustomCall(mlir::Operation* op);
+  absl::Status LowerHostLinalg(mlir::Operation* op, HostLinalg kind);
+  absl::Status LowerApproxTopK(mlir::Operation* op);
+
   // tape.py `_generic_reduce_attrs`: a reduce body neither table recognizes,
   // lowered into a sub-Program the handler calls once per halving round.
   // Shared by stablehlo.reduce and reduce_window, whose window axis goes to
@@ -1378,10 +1467,11 @@ class Lowering {
             std::vector<int64_t> attrs, std::optional<mx::array> payload,
             int64_t bytes,
             std::vector<std::shared_ptr<Program>> regions = {},
-            std::vector<DumpNode> region_dumps = {}) {
+            std::vector<DumpNode> region_dumps = {}, HostFn host = {}) {
     entries_.push_back(Pending{op, std::move(ins), std::move(outs),
                                std::move(attrs), std::move(payload), bytes,
-                               std::move(regions), std::move(region_dumps)});
+                               std::move(regions), std::move(region_dumps),
+                               std::move(host)});
   }
 
   int64_t ResultBytes(mlir::Operation* op) {
@@ -3388,6 +3478,181 @@ absl::Status Lowering::LowerRng(mlir::Operation* op) {
   return absl::OkStatus();
 }
 
+// --------------------------------------------------------------------------
+// the host linalg family and the rest of the custom calls (P9)
+// --------------------------------------------------------------------------
+//
+// `src/metaljax/ops/control.py`'s `_custom_call`, in the same order: the two
+// sharding identities, the assertion that computes nothing, ApproxTopK, and
+// then `lapack.run_target`'s table.  A target outside all of them declines
+// NAMING ITSELF, which is the difference between a missing feature and a
+// wrong answer.
+
+absl::Status Lowering::LowerCustomCall(mlir::Operation* op) {
+  const std::string target = CallTarget(op);
+  if (target.empty()) return Decline("a custom call with no target name");
+
+  // Single-device: a sharding annotation is the identity.
+  if (target == "Sharding" || target == "annotate_device_placement") {
+    if (op->getNumResults() != op->getNumOperands())
+      return Decline(absl::StrCat("custom call ", target,
+                                  " is not an arity-preserving alias"));
+    for (unsigned i = 0; i < op->getNumResults(); i++) {
+      ASSIGN_OR_RETURN(int s, Slot(op->getOperand(i)));
+      Alias(op->getResult(i), s);
+    }
+    return absl::OkStatus();
+  }
+  if (target == "shape_assertion") {
+    if (op->getNumResults() != 0)
+      return Decline("a shape_assertion with results");
+    return absl::OkStatus();   // nothing to run: the shapes are already static
+  }
+  if (target == "ApproxTopK") return LowerApproxTopK(op);
+
+  auto it = HostTargets().find(target);
+  if (it == HostTargets().end())
+    return Decline(absl::StrCat("custom call target '", target, "'"));
+  // A call that still carries its result-shape operands has not been through
+  // jax's refine-polymorphic-shapes pass, so its result types are dynamic and
+  // there is nothing to size a host buffer from.
+  if (op->getAttr("indices_of_shape_operands"))
+    return Decline(absl::StrCat("custom call ", target,
+                                " with unrefined shape operands"));
+  return LowerHostLinalg(op, it->second);
+}
+
+// One entry whose handler runs on the host.  Everything the handler needs from
+// the IR is read HERE -- the declared result types, and the flags the op's
+// attributes or its `backend_config` carry -- so the executor's side of the
+// boundary sees arrays and nothing else.
+absl::Status Lowering::LowerHostLinalg(mlir::Operation* op, HostLinalg kind) {
+  if (op->getNumResults() == 0)
+    return Decline("a host linalg call with no results");
+  HostLinalgCall call;
+  call.kind = kind;
+  for (mlir::Value r : op->getResults()) {
+    auto t = mlir::dyn_cast<mlir::RankedTensorType>(r.getType());
+    if (!t) return Decline("a host linalg result that is not a ranked tensor");
+    std::optional<mx::Dtype> dt = MxDtypeOf(t.getElementType());
+    if (!dt.has_value()) return Decline("a host linalg result element type");
+    std::vector<int64_t> dims(t.getShape().begin(), t.getShape().end());
+    for (int64_t d : dims)
+      if (d < 0) return Decline("a host linalg result with a dynamic shape");
+    call.results.push_back(HostSpec{std::move(dims), *dt});
+  }
+
+  const std::string cfg = BackendConfig(op);
+  if (auto ch = mlir::dyn_cast<mlir::stablehlo::CholeskyOp>(op)) {
+    call.lower = ch.getLower();
+  } else if (auto ts = mlir::dyn_cast<mlir::stablehlo::TriangularSolveOp>(op)) {
+    call.left = ts.getLeftSide();
+    call.lower = ts.getLower();
+    call.unit = ts.getUnitDiagonal();
+    const mlir::stablehlo::Transpose tr = ts.getTransposeA();
+    call.conjugate = tr == mlir::stablehlo::Transpose::ADJOINT;
+    call.transpose = call.conjugate ||
+                     tr == mlir::stablehlo::Transpose::TRANSPOSE;
+  } else if (kind == HostLinalg::kTriangularSolve) {
+    // metaljax_triangular_solve's config, six characters wide: side L/R,
+    // lower l/u, transpose t/n, conjugate c/-, unit 1/0, perturb p/-
+    // (src/jax_plugins/metal/__init__.py `tri_solve_rule`).
+    if (cfg.size() != 6)
+      return Decline("metaljax_triangular_solve with a malformed config");
+    call.left = cfg[0] == 'L';
+    call.lower = cfg[1] == 'l';
+    call.transpose = cfg[2] == 't';
+    call.conjugate = cfg[3] == 'c';
+    call.unit = cfg[4] == '1';
+    call.perturb = cfg[5] == 'p';
+  } else if (kind == HostLinalg::kTridiagonalSolve) {
+    call.perturb = cfg.find('p') != std::string::npos;
+  } else if (kind == HostLinalg::kEigh || kind == HostLinalg::kTridiagonal) {
+    call.lower = cfg.find('L') != std::string::npos;
+  } else if (kind == HostLinalg::kEig) {
+    call.left_vectors = cfg.find('L') != std::string::npos;
+    call.right_vectors = cfg.find('R') != std::string::npos;
+  }
+
+  HostFn fn;
+  try {
+    fn = MakeHostLinalg(std::move(call));
+  } catch (const std::exception& e) {
+    return Decline(e.what());
+  }
+
+  std::vector<int> ins;
+  for (mlir::Value v : op->getOperands()) {
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    ins.push_back(s);
+  }
+  std::vector<int> outs;
+  for (mlir::Value r : op->getResults()) outs.push_back(Bind(r));
+  // No taint: every result is a fresh array the handler built out of host
+  // memory, so none of them can be an argument's buffer or a constant's.
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.host_call"));
+  Emit(opcode, std::move(ins), std::move(outs), {}, std::nullopt,
+       ResultBytes(op), {}, {}, std::move(fn));
+  return absl::OkStatus();
+}
+
+// XLA's ApproxTopK, answered exactly (ops/sort.py `approx_top_k`).  Operands
+// (values, indices, init_value, init_index) -- the two initial values belong
+// to the comparator-driven reduction XLA would run and have no part in a
+// sort -- and results (values, indices) along `reduction_dim`.
+absl::Status Lowering::LowerApproxTopK(mlir::Operation* op) {
+  if (op->getNumOperands() < 2 || op->getNumResults() != 2)
+    return Decline("ApproxTopK with an unexpected arity");
+  auto cfg = op->getAttrOfType<mlir::DictionaryAttr>("mhlo.backend_config");
+  if (!cfg) return Decline("ApproxTopK without an mhlo.backend_config");
+  auto k_attr = cfg.getAs<mlir::IntegerAttr>("top_k");
+  auto dim_attr = cfg.getAs<mlir::IntegerAttr>("reduction_dim");
+  if (!k_attr || !dim_attr)
+    return Decline("ApproxTopK without top_k / reduction_dim");
+  auto vt = mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType());
+  auto rt = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+  if (!vt || !rt) return Decline("ApproxTopK on an unranked tensor");
+  int64_t dim = dim_attr.getInt();
+  if (dim < 0) dim += vt.getRank();
+  if (dim < 0 || dim >= vt.getRank())
+    return Decline("ApproxTopK reduction_dim out of range");
+  int64_t k = k_attr.getInt();
+  // aggregate_to_topk = false asks for a result WIDER than backend_config's
+  // top_k (XLA returns an unsorted approximate set of that width).  Slicing to
+  // top_k would under-fill the result buffer and leave the tail uninitialised.
+  const int64_t out_n = rt.getShape()[static_cast<size_t>(dim)];
+  if (out_n > 0)
+    k = std::max(k, std::min(out_n, vt.getShape()[static_cast<size_t>(dim)]));
+
+  // Which comparator XLA was given: jax names it `top_k_gt_*` for a maximum
+  // and `top_k_lt_*` for a minimum.
+  bool is_max = false;
+  if (auto called = op->getAttrOfType<mlir::ArrayAttr>("called_computations")) {
+    std::string names;
+    for (mlir::Attribute a : called)
+      if (auto sym = mlir::dyn_cast<mlir::FlatSymbolRefAttr>(a))
+        absl::StrAppend(&names, sym.getValue().str());
+    is_max = names.find("_gt_") != std::string::npos ||
+             names.find("_ge_") != std::string::npos;
+  }
+  int64_t kind = 0;
+  if (IsComplexElement(op->getOperand(0)))
+    return Decline("ApproxTopK on complex");
+  if (IsFloatElement(op->getOperand(0))) kind = 1;
+  else if (IsBoolElement(op->getOperand(0))) kind = 2;
+
+  std::vector<int> ins;
+  for (unsigned i = 0; i < 2; i++) {
+    ASSIGN_OR_RETURN(int s, Slot(op->getOperand(i)));
+    ins.push_back(s);
+  }
+  std::vector<int> outs{Bind(op->getResult(0)), Bind(op->getResult(1))};
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.approx_top_k"));
+  Emit(opcode, std::move(ins), std::move(outs), {k, dim, kind, is_max ? 1 : 0},
+       std::nullopt, ResultBytes(op));
+  return absl::OkStatus();
+}
+
 bool Lowering::IsIdentity(absl::string_view name, mlir::Operation* op) {
   auto dims_of = [&](mlir::Value v) {
     auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
@@ -3807,6 +4072,13 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   if (name == "stablehlo.sort") return LowerSort(op);
   if (name == "chlo.top_k") return LowerTopK(op);
   if (name == "stablehlo.rng_bit_generator") return LowerRng(op);
+  // P9: the host linalg family.  Ahead of the single-result gate below,
+  // because a QR hands back two arrays and an LU three.
+  if (name == "stablehlo.custom_call") return LowerCustomCall(op);
+  if (name == "stablehlo.cholesky")
+    return LowerHostLinalg(op, HostLinalg::kCholesky);
+  if (name == "stablehlo.triangular_solve")
+    return LowerHostLinalg(op, HostLinalg::kTriangularSolve);
 
   if (op->getNumResults() != 1)
     return Decline(absl::StrCat("op ", name, " with ", op->getNumResults(),
@@ -3904,7 +4176,7 @@ absl::StatusOr<Lowering::Built> Lowering::Finish(
           e.region_dumps});
     }
     built.program->add(e.op, e.ins, e.outs, e.attrs, e.payload, drops[i],
-                       e.regions, e.bytes, {}, nullptr, {});
+                       e.regions, e.bytes, {}, nullptr, e.host);
   }
   // A region Program never needs output copies: its results are a loop's
   // carries or a branch's values, which stay inside this engine.  Only a

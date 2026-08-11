@@ -108,6 +108,7 @@ enum Op : int {
   // data / structured
   kConstant, kReduce, kArgReduce, kGenericReduce, kReduceWindow, kDotGeneral,
   kBitcastConvert, kDynamicSlice, kDynamicUpdateSlice, kSort, kTopK,
+  kApproxTopK,
   kGather, kScatter, kRng, kConv,
   // control flow (M3): each carries its regions as sub-Programs
   kWhile, kIf, kCase,

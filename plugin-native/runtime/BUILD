@@ -29,6 +29,7 @@ cc_library(
         "dtypes.cc",
         "emits.cc",
         "host.cc",
+        "host_lapack.cc",
         "msl.cc",
         "ops_conv.cc",
         "ops_elementwise.cc",
@@ -41,6 +42,7 @@ cc_library(
         "runtime.cc",
     ],
     hdrs = [
+        "host_lapack.h",
         "msl.h",
         "program.h",
     ],
@@ -50,8 +52,19 @@ cc_library(
         # noisy under XLA's warning set and neither is ours to fix.
         "-Wno-deprecated-copy",
         "-Wno-c++20-extensions",
+        # Accelerate's modern (LAPACK 3.9.1) prototypes rather than the frozen
+        # 3.2.1 legacy set; 32-bit LAPACK integers, which is the framework's
+        # default interface -- see the header comment in host_lapack.cc for why
+        # ILP64 buys nothing here.
+        "-DACCELERATE_NEW_LAPACK",
     ],
     includes = ["."],
+    # LAPACK/BLAS for the host linalg family (P9).  Framework, not a
+    # standalone library: macOS has no liblapack of its own.
+    linkopts = [
+        "-framework",
+        "Accelerate",
+    ],
     # The plugin dylib's link forces every object in (symbol-collision
     # trouble between the runtime, libmlx and XLA's static LLVM/absl must be
     # a build failure, not a phase-3 mystery), and the gil-free test's

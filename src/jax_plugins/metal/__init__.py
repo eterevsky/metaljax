@@ -80,10 +80,19 @@ def initialize():
 
 
 def _initialize_native(path: Path) -> None:
-    """Register the Stage 2 plugin. Nothing else: the metaljax_* lowerings
-    below emit custom calls that only the Stage 1 host handlers implement,
-    and registering them would make jax lower to ops this plugin cannot
-    know about."""
+    """Register the Stage 2 plugin, and the linalg lowerings it now serves.
+
+    The metaljax_* custom calls below were Stage 1's alone until P9; the
+    native plugin implements them on Accelerate's LAPACK
+    (plugin-native/runtime/host_lapack.cc), so registering them is what makes
+    eigh/svd/eig/schur/hessenberg/tridiagonal reach a backend at all -- with
+    no rule for platform `metal`, jax refuses at TRACE time, before the plugin
+    ever sees a module. What stays behind is the part this plugin has no
+    answer for yet: the callback lowerings (they stash a Python callable in
+    the Stage 1 registry, which is exactly the interpreter this plugin exists
+    to replace) and buffer donation, whose contract the plugin does not
+    implement.
+    """
     # The MLX precision default that src/metaljax/__init__.py applies for
     # the Stage 1 engine, repeated here because that module is not imported
     # on this path. MLX reads it when it initializes its Metal device --
@@ -94,9 +103,10 @@ def _initialize_native(path: Path) -> None:
     import jax._src.xla_bridge as xb
 
     xb.register_plugin("metal", priority=-1, library_path=str(path))
+    _register_linalg_lowerings(callbacks=False, donation=False)
 
 
-def _register_linalg_lowerings():
+def _register_linalg_lowerings(callbacks=True, donation=True):
     """eigh/svd/eig have no generic StableHLO lowering — jax only
     registers per-platform rules, and those reject bf16/f16 outright
     (LAPACK routine tables). Emit our own custom_calls instead, with the
@@ -203,7 +213,8 @@ def _register_linalg_lowerings():
         mlir.register_lowering(ll.eigh_p, eigh_rule, platform="metal")
         mlir.register_lowering(ll.svd_p, svd_rule, platform="metal")
         mlir.register_lowering(ll.eig_p, eig_rule, platform="metal")
-        _register_callback_lowerings(mlir)
+        if callbacks:
+            _register_callback_lowerings(mlir)
 
         # Buffer donation: jax only sets up input-output aliasing for
         # platforms in this list. With metal added, donate_argnums marks
@@ -211,7 +222,8 @@ def _register_linalg_lowerings():
         # jax.buffer_donor) and the plugin invalidates those buffers
         # after execute — the standard XLA contract. Reusing a donated
         # array afterwards raises, exactly as on cpu/cuda/tpu.
-        mlir._platforms_with_donation.append("metal")
+        if donation:
+            mlir._platforms_with_donation.append("metal")
 
         # jax.export refuses to serialize custom calls without a
         # registered stability guarantee; ours are versioned with the

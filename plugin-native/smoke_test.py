@@ -104,18 +104,26 @@ def _compile():
             jax.device_put(np.ones((1, 2, 3), np.float32))))
     print("  jit(conv_general_dilated) ->", cv.tolist())
     assert np.array_equal(cv, np.full((1, 1, 2), 6.0, np.float32)), cv
-    # An op outside the native set declines, naming itself.  The host-computed
-    # LAPACK targets are what is left (phase 2's next milestone); every other
-    # family the census used to name now lowers.
+    # ...and so does a cholesky, whose LAPACK now runs on Accelerate through a
+    # host call (P9) -- the family this checkpoint watched decline after conv.
+    ch = np.asarray(jax.jit(lambda a: jnp.linalg.cholesky(
+        a @ a.T + 4 * jnp.eye(3)))(
+            jax.device_put(np.eye(3, dtype=np.float32))))
+    print("  jit(jnp.linalg.cholesky) ->", ch.diagonal().tolist())
+    assert np.allclose(ch, np.sqrt(5.0) * np.eye(3), atol=1e-6), ch
+    # An op outside the native set declines, naming itself.  reduce_precision
+    # is the stand-in now (phase 2's P11); every family this checkpoint has
+    # named before it -- sort, convolution, the LAPACK targets -- lowers.
     try:
-        jax.jit(lambda a: jnp.linalg.cholesky(a @ a.T + 4 * jnp.eye(3)))(
-            jax.device_put(np.eye(3, dtype=np.float32)))
+        jax.jit(lambda a: jax.lax.reduce_precision(a, 5, 10))(
+            jax.device_put(np.arange(4, dtype=np.float32)))
     except Exception as e:  # noqa: BLE001 - the expected decline
         msg = str(e)
-        print("  cholesky declined:", msg.splitlines()[0][:160])
-        assert "stablehlo.cholesky" in msg, "the decline did not name the op"
+        print("  reduce_precision declined:", msg.splitlines()[0][:160])
+        assert "stablehlo.reduce_precision" in msg, \
+            "the decline did not name the op"
         return
-    raise AssertionError("cholesky unexpectedly compiled")
+    raise AssertionError("reduce_precision unexpectedly compiled")
 
 
 if FAILED:

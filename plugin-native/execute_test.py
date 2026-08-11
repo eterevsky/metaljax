@@ -53,6 +53,35 @@ def _randint(shape, seed, dtype=np.int32, lo=-5, hi=6):
                       dtype=dtype)
 
 
+# Operands for the linalg family (P9).  Built rather than drawn so the
+# conditioning is known: an eigendecomposition of a near-singular draw would
+# measure the RNG's luck rather than the factorization.
+def _spd(n, seed, dtype=np.float32):
+    a = _rand((n, n), seed).astype(np.float64)
+    return (a @ a.T + n * np.eye(n)).astype(dtype)
+
+
+def _sym(n, seed):
+    a = _rand((n, n), seed)
+    return (a + a.T).astype(np.float32)
+
+
+def _herm(n, seed):
+    a = _rand((n, n), seed) + 1j * _rand((n, n), seed + 1)
+    return (a + a.conj().T).astype(np.complex64)
+
+
+def _cspd(n, seed):
+    a = (_rand((n, n), seed) + 1j * _rand((n, n), seed + 1)).astype(
+        np.complex128)
+    return (a @ a.conj().T + n * np.eye(n)).astype(np.complex64)
+
+
+def _triangular(n, seed, lower=False):
+    a = _rand((n, n), seed) + 3 * np.eye(n, dtype=np.float32)
+    return np.asarray(np.tril(a) if lower else np.triu(a), np.float32)
+
+
 def _switch_case(i, x):
     """`lax.switch` over three branches, including two out-of-range indices.
 
@@ -1064,6 +1093,278 @@ def _cases():
         ("softmax", lambda x: jax.nn.softmax(x, axis=-1),
          [_rand((4, 9), 30)], *F32),
     ]
+
+    # ----------------------------------------------------------------------
+    # linalg (P9): the family that computes on the HOST
+    # ----------------------------------------------------------------------
+    #
+    # A factorization is not determined by its inputs the way a matmul is: an
+    # eigenvector may be negated, a singular vector rotated inside a
+    # degenerate subspace, a Q column's sign flipped, and every one of those
+    # is a correct answer.  So most rows below hand back an INVARIANT -- a
+    # reconstruction, a residual, an orthogonality product -- which is what
+    # jax's own linalg_test asserts on, and only the quantities that really
+    # are unique (a cholesky factor, the eigenvalues, the singular values)
+    # are compared elementwise.  The tolerance is the band an f32
+    # factorization earns, not the elementwise one.
+    LIN = (2e-5, 2e-5)
+
+    def adj(a):
+        return jnp.swapaxes(a, -1, -2).conj()
+
+    def qr_inv(x, mode="reduced"):
+        q, r = jnp.linalg.qr(x, mode=mode)
+        return q @ r, adj(q) @ q
+
+    def eigh_inv(x):
+        w, v = jnp.linalg.eigh(x)
+        return w, (v * w) @ v.conj().T, v.conj().T @ v
+
+    def svd_inv(x, full_matrices=True):
+        u, s, vt = jnp.linalg.svd(x, full_matrices=full_matrices)
+        k = min(x.shape[0], x.shape[1])
+        return s, (u[:, :k] * s) @ vt[:k], u.conj().T @ u
+
+    def eig_inv(x):
+        w, v = jnp.linalg.eig(x)
+        # The eigenvalues come back in LAPACK's order, which both backends
+        # get from the same routine; sorting them makes the row independent
+        # of that anyway.  The residual is the part that says the vectors go
+        # with the values.
+        order = jnp.argsort(w.real * 1e6 + w.imag)
+        return w[order], jnp.abs(x @ v - v * w).max()
+
+    tri = jax.lax.linalg.triangular_solve
+    cases += [
+        # --- cholesky: the factor is unique, so it compares elementwise ----
+        ("cholesky f32", lambda x: jnp.linalg.cholesky(x), [_spd(5, 300)],
+         *LIN),
+        ("cholesky upper",
+         lambda x: jax.scipy.linalg.cholesky(x, lower=False), [_spd(5, 301)],
+         *LIN),
+        ("cholesky c64", lambda x: jnp.linalg.cholesky(x), [_cspd(4, 302)],
+         *LIN),
+        ("cholesky batched", lambda x: jnp.linalg.cholesky(x),
+         [np.stack([_spd(3, 303), _spd(3, 304), _spd(3, 305)])], *LIN),
+        # Not positive definite: XLA fills the result with NaN rather than
+        # failing, and `_compare` demands the NaNs land in the same places.
+        ("cholesky of a singular matrix", lambda x: jnp.linalg.cholesky(x),
+         [np.zeros((3, 3), np.float32)], *LIN),
+        ("cholesky vmapped",
+         lambda x: jax.vmap(jnp.linalg.cholesky)(x),
+         [np.stack([_spd(4, 306), _spd(4, 307)])], *LIN),
+
+        # --- qr: reconstruction and orthogonality --------------------------
+        ("qr tall", qr_inv, [_rand((6, 3), 310)], *LIN),
+        ("qr wide", qr_inv, [_rand((3, 6), 311)], *LIN),
+        ("qr square", qr_inv, [_rand((4, 4), 312)], *LIN),
+        # `complete` asks for more columns of Q than there are reflectors,
+        # which is the zero-tau completion (`_householder_product`'s pad).
+        ("qr tall complete", lambda x: qr_inv(x, "complete"),
+         [_rand((6, 3), 313)], *LIN),
+        ("qr complete orthonormal",
+         lambda x: (lambda q: q.T @ q)(jnp.linalg.qr(x, mode="complete")[0]),
+         [_rand((5, 2), 314)], *LIN),
+        ("qr c64", qr_inv, [(_rand((5, 3), 315)
+                             + 1j * _rand((5, 3), 316)).astype(np.complex64)],
+         *LIN),
+        ("qr batched", lambda x: qr_inv(x)[0], [_rand((3, 5, 4), 317)], *LIN),
+        ("qr r factor",
+         lambda x: jnp.abs(jnp.linalg.qr(x)[1]), [_rand((6, 3), 318)], *LIN),
+        # jax.nn.initializers.orthogonal is a QR with a sign correction, and
+        # is how a real program reaches this pair of targets.
+        ("orthogonal initializer",
+         lambda k: (lambda q: q.T @ q)(
+             jax.nn.initializers.orthogonal()(k, (6, 3))),
+         [jax.random.key(0)], *LIN),
+
+        # --- eigh ----------------------------------------------------------
+        ("eigh symmetric", eigh_inv, [_sym(5, 320)], *LIN),
+        ("eigh upper triangle",
+         lambda x: jnp.linalg.eigvalsh(x, UPLO="U"), [_sym(5, 321)], *LIN),
+        ("eigh hermitian c64", eigh_inv, [_herm(4, 322)], *LIN),
+        ("eigh batched", lambda x: jnp.linalg.eigh(x)[0],
+         [np.stack([_sym(3, 323), _sym(3, 324)])], *LIN),
+        # Degenerate spectrum: the eigenVECTORS are only defined up to a
+        # rotation inside each repeated subspace, so nothing but the values
+        # and the invariants can be compared at all.
+        ("eigh with degenerate eigenvalues",
+         lambda x: (jnp.linalg.eigh(x)[0],
+                    (lambda w, v: (v * w) @ v.T)(*jnp.linalg.eigh(x))),
+         [np.diag([2.0, 2.0, 2.0, 5.0]).astype(np.float32)], *LIN),
+        ("eigh of the identity", lambda x: jnp.linalg.eigh(x)[0],
+         [np.eye(4, dtype=np.float32)], *LIN),
+        ("eigh grad",
+         lambda x: jax.grad(lambda z: jnp.linalg.eigvalsh(z).sum())(x),
+         [_sym(4, 325)], *LIN),
+
+        # --- svd -----------------------------------------------------------
+        ("svd values", lambda x: jnp.linalg.svd(x, compute_uv=False),
+         [_rand((6, 4), 330)], *LIN),
+        ("svd full", svd_inv, [_rand((6, 4), 331)], *LIN),
+        ("svd thin", lambda x: svd_inv(x, False), [_rand((6, 4), 332)], *LIN),
+        ("svd wide", svd_inv, [_rand((3, 7), 333)], *LIN),
+        ("svd c64", lambda x: jnp.linalg.svd(x, compute_uv=False),
+         [(_rand((5, 3), 334) + 1j * _rand((5, 3), 335)).astype(np.complex64)],
+         *LIN),
+        # Rank deficient: the trailing singular values are zero and their
+        # vectors arbitrary, so only the values and the reconstruction hold.
+        ("svd rank deficient",
+         lambda x: (jnp.linalg.svd(x, compute_uv=False),
+                    (lambda u, s, vt: (u[:, :3] * s) @ vt[:3])(
+                        *jnp.linalg.svd(x))),
+         [np.outer(np.arange(1, 6), np.arange(1, 4)).astype(np.float32)],
+         *LIN),
+        ("svd batched", lambda x: jnp.linalg.svd(x, compute_uv=False),
+         [_rand((3, 4, 5), 336)], *LIN),
+        ("pinv", lambda x: jnp.linalg.pinv(x), [_rand((6, 3), 337)], *LIN),
+        ("matrix rank", lambda x: jnp.linalg.matrix_rank(x),
+         [np.outer(np.arange(1, 6), np.arange(1, 4)).astype(np.float32)],
+         *EXACT),
+        ("2-norm and condition number",
+         lambda x: (jnp.linalg.norm(x, 2), jnp.linalg.cond(x)),
+         [_spd(4, 338)], *LIN),
+
+        # --- eig (complex results from a real operand) ---------------------
+        ("eig of a real matrix", eig_inv, [_rand((4, 4), 340)], *LIN),
+        ("eig of a complex matrix", eig_inv,
+         [(_rand((3, 3), 341) + 1j * _rand((3, 3), 342)).astype(np.complex64)],
+         *LIN),
+        # A rotation block: complex conjugate eigenvalues, which is where the
+        # real geev's packed eigenvector columns get unpacked.
+        ("eig with a conjugate pair", lambda x: jnp.sort(
+            jnp.linalg.eigvals(x).imag),
+         [np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 2.0]],
+                   np.float32)], *LIN),
+        ("eigvals batched", lambda x: jnp.sort(jnp.linalg.eigvals(x).real, -1),
+         [np.stack([_sym(3, 343), _sym(3, 344)])], *LIN),
+
+        # --- lu ------------------------------------------------------------
+        ("lu factor", lambda x: jax.scipy.linalg.lu_factor(x),
+         [_rand((4, 4), 350)], *LIN),
+        ("lu reconstruction",
+         lambda x: (lambda p, l, u: p @ l @ u)(*jax.scipy.linalg.lu(x)),
+         [_rand((5, 3), 351)], *LIN),
+        ("lu permutation", lambda x: jax.lax.linalg.lu(x)[2],
+         [_rand((4, 4), 352)], *EXACT),
+
+        # --- triangular solve: the four side/transpose combinations --------
+        ("triangular solve left upper",
+         lambda a, b: tri(a, b, left_side=True, lower=False),
+         [_triangular(4, 360), _rand((4, 3), 361)], *LIN),
+        ("triangular solve left lower",
+         lambda a, b: tri(a, b, left_side=True, lower=True),
+         [_triangular(4, 362, lower=True), _rand((4, 3), 363)], *LIN),
+        ("triangular solve right upper",
+         lambda a, b: tri(a, b, left_side=False, lower=False),
+         [_triangular(4, 364), _rand((3, 4), 365)], *LIN),
+        ("triangular solve right lower",
+         lambda a, b: tri(a, b, left_side=False, lower=True),
+         [_triangular(4, 366, lower=True), _rand((3, 4), 367)], *LIN),
+        ("triangular solve transposed",
+         lambda a, b: tri(a, b, left_side=True, lower=True,
+                          transpose_a=True),
+         [_triangular(4, 368, lower=True), _rand((4, 2), 369)], *LIN),
+        ("triangular solve unit diagonal",
+         lambda a, b: tri(a, b, left_side=True, lower=True,
+                          unit_diagonal=True),
+         [_triangular(4, 370, lower=True), _rand((4, 2), 371)], *LIN),
+        ("triangular solve adjoint c64",
+         lambda a, b: tri(a, b, left_side=True, lower=True,
+                          transpose_a=True, conjugate_a=True),
+         [np.tril(_rand((3, 3), 372) + 1j * _rand((3, 3), 373)
+                  + 3 * np.eye(3)).astype(np.complex64),
+          (_rand((3, 2), 374) + 1j * _rand((3, 2), 375)).astype(np.complex64)],
+         *LIN),
+        ("triangular solve batched",
+         lambda a, b: tri(a, b, left_side=True, lower=True),
+         [np.stack([_triangular(3, 376, lower=True),
+                    _triangular(3, 377, lower=True)]),
+          _rand((2, 3, 2), 378)], *LIN),
+        # One matrix against a batch of right-hand sides: jax's batching rule
+        # broadcasts `a`, which is the operand shape the handler has to
+        # stretch to `b`'s batch (`np.broadcast_to` in the Python handler).
+        ("triangular solve vmapped over b",
+         lambda a, b: jax.vmap(
+             lambda y: tri(a, y, left_side=True, lower=True))(b),
+         [_triangular(3, 379, lower=True), _rand((4, 3, 2), 380)], *LIN),
+        # A zero on the diagonal: XLA divides THROUGH it rather than failing,
+        # and `_compare` demands the infinities land in the same places.
+        ("triangular solve with a zero pivot",
+         lambda a, b: tri(a, b, left_side=True, lower=True),
+         [np.array([[1.0, 0.0], [2.0, 0.0]], np.float32),
+          np.array([[1.0], [1.0]], np.float32)], *LIN),
+
+        # --- the solvers built on the two above ----------------------------
+        ("linalg.solve", lambda a, b: jnp.linalg.solve(a, b),
+         [_spd(4, 390), _rand((4, 2), 391)], *LIN),
+        ("linalg.inv", lambda x: jnp.linalg.inv(x), [_spd(4, 392)], *LIN),
+        ("linalg.det", lambda x: jnp.linalg.det(x), [_spd(4, 393)],
+         1e-5, 1e-4),
+        ("linalg.slogdet", lambda x: jnp.linalg.slogdet(x), [_spd(4, 394)],
+         *LIN),
+        ("det grad", lambda x: jax.grad(jnp.linalg.det)(x), [_spd(3, 395)],
+         1e-5, 1e-4),
+        ("cho_solve", lambda a, b: jax.scipy.linalg.cho_solve(
+            jax.scipy.linalg.cho_factor(a), b),
+         [_spd(4, 396), _rand((4, 2), 397)], *LIN),
+        ("lstsq", lambda a, b: jnp.linalg.lstsq(a, b)[0],
+         [_rand((6, 3), 398), _rand((6,), 399)], *LIN),
+        ("solve grad",
+         lambda a, b: jax.grad(lambda z: jnp.linalg.solve(z, b).sum())(a),
+         [_spd(4, 400), _rand((4, 2), 401)], *LIN),
+        ("matrix_power", lambda x: jnp.linalg.matrix_power(x, -2),
+         [_spd(3, 402)], *LIN),
+
+        # --- schur / hessenberg / tridiagonal ------------------------------
+        ("schur form", lambda x: jax.scipy.linalg.schur(x)[0],
+         [_rand((4, 4), 410)], *LIN),
+        ("schur reconstruction",
+         lambda x: (lambda t, z: z @ t @ z.T)(*jax.scipy.linalg.schur(x)),
+         [_rand((4, 4), 411)], *LIN),
+        ("hessenberg", lambda x: jax.scipy.linalg.hessenberg(x),
+         [_rand((4, 4), 412)], *LIN),
+        ("tridiagonal", lambda x: jax.lax.linalg.tridiagonal(x)[1:3],
+         [_sym(4, 413)], *LIN),
+        ("tridiagonal solve",
+         lambda dl, d, du, b: jax.lax.linalg.tridiagonal_solve(dl, d, du, b),
+         [np.array([0.0, 1.0, 1.0, 1.0], np.float32),
+          np.array([4.0, 4.0, 4.0, 4.0], np.float32),
+          np.array([1.0, 1.0, 1.0, 0.0], np.float32),
+          _rand((4, 2), 414)], *LIN),
+
+        # --- ApproxTopK, answered exactly ----------------------------------
+        ("approx_max_k", lambda x: jax.lax.approx_max_k(x, 3),
+         [_rand((16,), 420)], *EXACT),
+        ("approx_min_k", lambda x: jax.lax.approx_min_k(x, 4),
+         [_rand((16,), 421)], *EXACT),
+        ("approx_max_k over rows",
+         lambda x: jax.lax.approx_max_k(x, 2, reduction_dimension=1),
+         [_rand((3, 8), 422)], *EXACT),
+        ("approx_max_k unaggregated",
+         lambda x: jax.lax.approx_max_k(x, 2, aggregate_to_topk=False),
+         [_rand((64,), 423)], *EXACT),
+
+        # --- a host op inside control flow ---------------------------------
+        # A block holding a host call is IMPURE, so neither the loop body nor
+        # the main may be traced through mx::compile; that decision is what
+        # this row exercises (a compiled trace would try to read a tracer on
+        # the host and compute on nothing).
+        ("cholesky inside a fori body",
+         lambda x: jax.lax.fori_loop(
+             0, 3, lambda i, c: jnp.linalg.cholesky(c @ c.T + 4 * jnp.eye(3)),
+             x),
+         [np.eye(3, dtype=np.float32)], *LIN),
+        ("a solve inside a scan",
+         lambda a, xs: jax.lax.scan(
+             lambda c, y: (c + jnp.linalg.solve(a, y), c.sum()),
+             jnp.zeros((3,), np.float32), xs)[0],
+         [_spd(3, 430), _rand((4, 3), 431)], *LIN),
+        ("eigh inside a cond",
+         lambda p, x: jax.lax.cond(p, lambda z: jnp.linalg.eigvalsh(z),
+                                   lambda z: jnp.diag(z), x),
+         [np.bool_(True), _sym(3, 432)], *LIN),
+    ]
     return cases
 
 
@@ -1341,6 +1642,17 @@ module @sort_nonscalar {
 """
 
 
+_UNKNOWN_CUSTOM_CALL = """
+module @unknown_custom_call {
+  func.func public @main(%x: tensor<3xf32>) -> tensor<3xf32> {
+    %r = stablehlo.custom_call @no_such_op(%x) {backend_config = ""}
+        : (tensor<3xf32>) -> tensor<3xf32>
+    return %r : tensor<3xf32>
+  }
+}
+"""
+
+
 # Programs that must DECLINE, with the op the message has to name.  A decline
 # is a feature here: the plugin refuses whole programs it cannot lower, and it
 # says which op stopped it.
@@ -1422,13 +1734,17 @@ def _declines():
         # A loop whose BODY holds an op outside the set declines the whole
         # program, naming that op -- the region is lowered by the same
         # `Lowering` as main, so its declines are main's.  (Convolution used
-        # to be the op here; it computes now, so the LAPACK targets --
-        # phase 2's next milestone -- stand in for it.)
+        # to be the op here, then the LAPACK targets; both compute now, so
+        # reduce_precision -- phase 2's P11 -- stands in.)
         ("while loop over an unlowered op",
          lambda x: jax.lax.fori_loop(
-             0, 4, lambda i, c: jnp.linalg.cholesky(
-                 c @ c.T + 4 * jnp.eye(3)), x),
-         [np.eye(3, dtype=np.float32)], "stablehlo.cholesky"),
+             0, 4, lambda i, c: jax.lax.reduce_precision(c * 1.5, 5, 10), x),
+         [np.arange(4, dtype=np.float32)], "stablehlo.reduce_precision"),
+        # A custom call whose target has no handler declines by NAME, so a
+        # program that reaches an unknown external is a missing feature and
+        # never a wrong answer.  (Written by hand: jax emits no such call.)
+        ("an unknown custom call", _UNKNOWN_CUSTOM_CALL,
+         [np.arange(3, dtype=np.float32)], "custom call target 'no_such_op'"),
     ]
 
 
@@ -1851,6 +2167,45 @@ def main():
           f"{'ok' if ok else 'FAIL: ' + (proc.stderr or proc.stdout).strip()[-90:]}")
     if not ok:
         failures.append("f64 policy")
+
+    # Half-precision linalg, which has NO CPU answer to compare with: jax's
+    # own rules reject bf16/f16 there outright (its LAPACK tables have no
+    # half-precision entry), while metaljax's lowerings accept every float
+    # dtype and the host handlers compute in f32 and cast back.  So the check
+    # is the one a reference cannot give: that it runs, and that what comes
+    # back really is a factorization of the operand it was handed.
+    for label, dt in (("bfloat16", jnp.bfloat16), ("float16", jnp.float16)):
+        try:
+            a = _spd(4, 500)
+            x = jax.device_put(jnp.asarray(a).astype(dt))
+            # The operand the factorization actually saw: the half-rounded
+            # matrix, which is what its invariants are invariants OF.
+            rounded = np.asarray(x.astype(jnp.float32), np.float64)
+            w, v = jax.jit(jnp.linalg.eigh)(x)
+            w = np.asarray(jnp.asarray(w).astype(jnp.float32), np.float64)
+            v = np.asarray(jnp.asarray(v).astype(jnp.float32), np.float64)
+            recon = np.abs((v * w) @ v.T - rounded).max() / np.abs(a).max()
+            orth = np.abs(v.T @ v - np.eye(4)).max()
+            s = np.asarray(jnp.asarray(jax.jit(
+                lambda z: jnp.linalg.svd(z, compute_uv=False))(x)
+            ).astype(jnp.float32), np.float64)
+            sval = np.abs(np.sort(s)[::-1]
+                          - np.linalg.svd(rounded, compute_uv=False)).max()
+            sval /= np.abs(a).max()
+            c = np.asarray(jnp.asarray(jax.jit(jnp.linalg.cholesky)(x)
+                                       ).astype(jnp.float32), np.float64)
+            chol = np.abs(c @ c.T - rounded).max() / np.abs(a).max()
+            # bf16 keeps 8 mantissa bits, so 1 % of the operand's norm is the
+            # band its own rounding earns; f16 is inside it comfortably.
+            worst = max(recon, orth, sval, chol)
+            ok = worst < 1e-2
+            detail = f"ok (worst invariant {worst:.1e})" if ok else \
+                f"FAIL: worst invariant {worst:.1e}"
+        except BaseException as exc:  # noqa: BLE001
+            ok, detail = False, f"FAIL: {str(exc).splitlines()[0][:90]}"
+        print(f"{label + ' linalg (no CPU rule)':<32} {'':>12}  {detail}")
+        if not ok:
+            failures.append(f"{label} linalg")
 
     try:
         ref_path.unlink()

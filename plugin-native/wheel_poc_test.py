@@ -129,19 +129,26 @@ def _compile():
             jax.device_put(np.ones((1, 2, 3), np.float32))))
     print("  jit(conv_general_dilated) ->", cv.tolist())
     assert np.array_equal(cv, np.full((1, 1, 2), 6.0, np.float32)), cv
-    # An op outside the native set still declines, and says which one.  The
-    # host-computed LAPACK targets are what is left (phase 2's next
-    # milestone); nothing else in reach of this checkpoint declines.
+    # ...and so does a cholesky (P9), whose LAPACK the wheel reaches through
+    # Accelerate -- which is what says the framework really is linked into the
+    # dylib this wheel carries.
+    ch = np.asarray(jax.jit(lambda a: jax.numpy.linalg.cholesky(
+        a @ a.T + 4 * jax.numpy.eye(3)))(
+            jax.device_put(np.eye(3, dtype=np.float32))))
+    print("  jit(jnp.linalg.cholesky) ->", ch.diagonal().tolist())
+    assert np.allclose(ch, np.sqrt(5.0) * np.eye(3), atol=1e-6), ch
+    # An op outside the native set still declines, and says which one.
+    # reduce_precision is the stand-in now (phase 2's P11).
     try:
-        jax.jit(lambda a: jax.numpy.linalg.cholesky(
-            a @ a.T + 4 * jax.numpy.eye(3)))(
-                jax.device_put(np.eye(3, dtype=np.float32)))
+        jax.jit(lambda a: jax.lax.reduce_precision(a, 5, 10))(
+            jax.device_put(np.arange(4, dtype=np.float32)))
     except Exception as e:  # noqa: BLE001 - the expected decline
         msg = str(e)
-        print("  cholesky declined:", msg.splitlines()[0][:160])
-        assert "stablehlo.cholesky" in msg, "the decline did not name the op"
+        print("  reduce_precision declined:", msg.splitlines()[0][:160])
+        assert "stablehlo.reduce_precision" in msg, \
+            "the decline did not name the op"
         return
-    raise AssertionError("cholesky unexpectedly compiled")
+    raise AssertionError("reduce_precision unexpectedly compiled")
 
 
 if FAILED:

@@ -915,8 +915,34 @@ fork authorized but not needed.
   thread` — a compiled graph traced on a pool thread and replayed after that
   thread exited with its `new_thread_unsafe_stream`. Same rate on the
   unmodified tree, 0/40 under `METALJAX_COMPILE=0`.
-* Next: LAPACK on Accelerate (the largest family left in the census), then
-  the scatter/sort tail, then async execute + donation.
+* **P9 landed** (notes/cpp-p9-linalg.md): the linalg family, **both halves**.
+  (a) The JAX-side registrations: `_initialize_native` now calls the same
+  `_register_linalg_lowerings` the trampoline calls, minus callbacks and
+  donation (P13's) — without them eigh/svd/eig/schur/hessenberg/tridiagonal
+  die at TRACE time on this platform and never reach the plugin at all, which
+  is 319 of the census's 823. (b) The execution path:
+  `plugin-native/runtime/host_lapack.cc` (1,158 lines, the fork's first new
+  file) is `src/metaljax/ops/lapack.py` on **Accelerate's LAPACK**, LP64 —
+  twelve factorizations, batched, real and complex, halves computing in f32
+  and cast back (the exceeds-CPU property survives: bf16 `eigh` runs here and
+  raises on jax-CPU). The plugin's `LowerCustomCall`/`LowerHostLinalg` bind a
+  `HostFn` into a `kHostCall` entry, `stablehlo.cholesky` and
+  `stablehlo.triangular_solve` among them, and `BlockIsPure` grew the
+  custom-call arm P5 recorded as "nothing to call" — a block holding a LAPACK
+  target is impure, so no trace can contain one. ApproxTopK rode along as a
+  DEVICE op (`kApproxTopK`, exact top-k satisfies any recall target).
+  Census slice (20 files, sequential, before/after on this tree):
+  **1,007 -> 152 failures, -855, zero regressions**, and every one of the 152
+  is a loud decline (92 complex scatter, 28 f64, 10 lexicographic sort, ...)
+  or a shared-whitelist assertion — no numeric mismatch anywhere.
+  `linalg_test` 349 -> 54, `eigh_test`/`svd_test`/`ann_test`/`random_lax_test`
+  to zero. execute_test 284 -> **357 checks** (70 linalg rows, 62 of them
+  BIT-identical to jax-CPU: both stacks call LAPACK). Gate 106/106, wheel
+  test green from a fresh venv (which is what proves `-framework Accelerate`
+  is really in the shipped dylib), dylib +0.070 %.
+* Next: the scatter/sort tail (P10, 542 tests — complex scatter is now the
+  single biggest reason left in the slice), then dtypes + reduce_precision,
+  then collectives/tokens, callbacks/PJRT/donation, shape-poly.
   Suite-vs-suite as the standing gate. (North star per Oleg: everything
   through the new stack, correctness first, performance second.)
 
@@ -939,4 +965,5 @@ Primary objective (Oleg): jax-suite parity with Stage 1's 99.53%.
 Census ladder: P9 Accelerate+linalg registrations (867), P10 complex
 scatter + lexicographic sort (542), P11 dtypes + reduce_precision
 (192), P12 collectives+tokens (109), P13 callbacks/PJRT/donation
-(62), P14 shape-poly (17). Native at 93.15% after P8.5.
+(62), P14 shape-poly (17). Native at 93.15% after P8.5;
+**P9 removed 855 of the 867** (its slice: 1,007 -> 152).

@@ -11,6 +11,7 @@
 
 #include "program.h"
 
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -158,6 +159,39 @@ bool Program::step_index(const Entry& e,
       idx = mx::slice(idx, lo, hi);
       env[e.outs[0]] = mx::take_along_axis(x, idx, -1);
       env[e.outs[1]] = mx::astype(idx, mx::int32);
+      break;
+    }
+
+    case kApproxTopK: {
+      // ops/sort.py `approx_top_k`: XLA's ApproxTopK custom call, answered
+      // EXACTLY -- recall 1.0 satisfies any recall_target. Operands
+      // (values, indices), results (values, indices) along `dim`; how many
+      // to keep is resolved at lowering (aggregate_to_topk = false asks for
+      // a WIDER result than backend_config's top_k, and under-filling it
+      // would leave uninitialised device memory in the tail).
+      // attrs [k, dim, key kind, is_max?]
+      const mx::array& vals = in(0);
+      const int dim = static_cast<int>(at[1]);
+      mx::array key = vals;
+      if (at[2] == 1) {
+        // `_sort_key`'s canonicalization, which `_top_k` does not need: -0
+        // ties with +0 and every NaN with every other NaN before the
+        // totalOrder key is taken.
+        key = mx::add(key, weak(0.0, key));
+        key = mx::where(mx::isnan(key),
+                        weak(std::numeric_limits<double>::quiet_NaN(), key),
+                        key);
+        key = total_order_key(key);
+      } else if (at[2] == 2) {
+        key = mx::astype(key, mx::uint8);
+      }
+      if (at[3] != 0) key = mx::bitwise_invert(key);
+      mx::array order = mx::argsort(mx::contiguous(key), dim);
+      mx::Shape lo(order.shape().size(), 0), hi = order.shape();
+      hi[static_cast<size_t>(dim)] = static_cast<mx::ShapeElem>(at[0]);
+      mx::array top = mx::slice(order, lo, hi);
+      env[e.outs[0]] = mx::take_along_axis(vals, top, dim);
+      env[e.outs[1]] = mx::take_along_axis(in(1), top, dim);
       break;
     }
 
