@@ -47,7 +47,7 @@ absl::StatusOr<mx::array> MetalBuffer::Settled() const {
     return absl::FailedPreconditionError("metaljax: buffer has been deleted.");
   }
   BindThread();
-  std::unique_lock<std::mutex> submission = SubmissionLock();
+  std::unique_lock<std::recursive_mutex> submission = SubmissionLock();
   // Settle the array ITSELF and build a `contiguous` only for a layout that
   // needs gathering.  Wrapping every result in a fresh `contiguous` node and
   // evaluating THAT costs a full round trip through the stream -- 20us,
@@ -60,6 +60,14 @@ absl::StatusOr<mx::array> MetalBuffer::Settled() const {
       c.data_size() != static_cast<size_t>(c.size())) {
     c = mx::contiguous(c);
     c.eval();
+    // ...and KEEP it.  A buffer whose array is a view (every `jnp.ones` is a
+    // broadcast of one element) would otherwise gather afresh on every read,
+    // which costs the gather each time and, worse, gives
+    // `unsafe_buffer_pointer` a NEW address per call -- where jax reads it as
+    // the buffer's identity and asserts on it (`testArrayCopy`, and XLA's
+    // no-alias contract generally).  The values are the same values; from
+    // PJRT's point of view this buffer always held its own dense storage.
+    array_ = c;
   }
   return c;
 }
@@ -253,8 +261,30 @@ MetalBuffer::ReleaseDeviceMemoryOwnership(
 
 absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> MetalBuffer::CopyToMemorySpace(
     xla::PjRtMemorySpace* dst_memory_space) {
-  return absl::UnimplementedError(
-      "metaljax: cross-memory-space copies are not supported yet.");
+  // Unified memory: this client has exactly ONE memory space, so there is no
+  // space to cross -- but there is still a copy to make.  jax asks for this
+  // whenever it wants a buffer that provably shares nothing with the source
+  // (`jax.device_put(x, may_alias=False)`, and the donating device_put, which
+  // deletes the source right afterwards), so a handle on the same storage
+  // would be the wrong answer, not a fast one.  `mx::copy` is the one that
+  // really allocates: `contiguous`/`astype` short-circuit on an array that is
+  // already both.
+  if (dst_memory_space != nullptr && dst_memory_space->client() != client_) {
+    return absl::UnimplementedError(
+        "metaljax: copies to another client's memory space are not "
+        "supported.");
+  }
+  ASSIGN_OR_RETURN(mx::array settled, Settled());
+  mx::array fresh = mx::copy(settled);
+  {
+    BindThread();
+    std::unique_lock<std::recursive_mutex> submission = SubmissionLock();
+    fresh.eval();   // honestly ready, like every buffer this plugin hands out
+  }
+  return std::make_unique<MetalBuffer>(
+      client_,
+      dst_memory_space != nullptr ? dst_memory_space : memory_space_, device_,
+      shape_, std::move(fresh));
 }
 
 void MetalBuffer::CopyToRemoteDevice(

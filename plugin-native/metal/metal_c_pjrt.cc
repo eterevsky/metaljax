@@ -13,6 +13,7 @@ Licensed under the Apache License, Version 2.0.
 #include <utility>
 
 #include "absl/status/status.h"
+#include "host_callback.h"
 #include "metal/metal_client.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_layouts_extension.h"
@@ -55,3 +56,17 @@ const PJRT_Api* GetMetalPjrtApi() {
 }  // namespace metaljax
 
 const PJRT_Api* GetPjrtApi() { return metaljax::GetMetalPjrtApi(); }
+
+// The second symbol this dylib exports, and the whole of P13's callback
+// bridge: jax's `debug.print` / `debug.callback` / `pure_callback` /
+// `io_callback` lower to a `metaljax_callback` custom call whose
+// `backend_config` indexes a registry of Python callables that lives where the
+// lowerings are registered (src/jax_plugins/metal/__init__.py).  That module
+// installs a ctypes callback here, so the GIL is taken by ctypes for the
+// duration of one user callback and nowhere else in this plugin.  Installed
+// before any program is compiled; a callback program lowered without one
+// declines by name (runtime/host_callback.h).
+extern "C" void metaljax_native_set_callback_trampoline(void* fn) {
+  metaljax::SetCallbackTrampoline(
+      reinterpret_cast<metaljax::CallbackTrampoline>(fn));
+}

@@ -28,6 +28,7 @@ Licensed under the Apache License, Version 2.0.
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -85,6 +86,13 @@ class MetalExecutable final : public xla::PjRtExecutable {
     return options_;
   }
 
+  // What this executable knows about its own cost.  Deliberately NOT XLA's
+  // property names: there is no cost model here and no flop count to give, so
+  // the answer is the tape's own facts (jax documents the structure as
+  // arbitrary and passes it straight through to whoever asked).
+  absl::StatusOr<absl::flat_hash_map<std::string, xla::PjRtValueType>>
+  GetCostAnalysis() const override;
+
  private:
   std::shared_ptr<const LoweredProgram> lowered_;
   xla::CompileOptions options_;
@@ -136,9 +144,11 @@ class MetalLoadedExecutable final : public xla::PjRtLoadedExecutable {
 
  private:
   // One replay: check the arguments against what the tape expects, run it,
-  // settle the outputs and wrap them.  Everything Execute* does.
+  // settle the outputs, wrap them and collect the donated inputs.  Everything
+  // Execute* does.
   absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtBuffer>>> RunOnce(
-      absl::Span<xla::PjRtBuffer* const> argument_handles) const;
+      absl::Span<xla::PjRtBuffer* const> argument_handles,
+      const xla::ExecuteOptions& options) const;
 
   xla::PjRtClient* client_;
   xla::PjRtDevice* device_;

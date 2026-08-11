@@ -25,14 +25,14 @@ void BindThread() {
   (void)bound;
 }
 
-std::unique_lock<std::mutex> SubmissionLock() {
-  static std::mutex mu;
+std::unique_lock<std::recursive_mutex> SubmissionLock() {
+  static std::recursive_mutex mu;
   static const bool concurrent = [] {
     const char* v = std::getenv("METALJAX_CONCURRENT_EXECUTE");
     return v != nullptr && std::string(v) == "1";
   }();
-  if (concurrent) return std::unique_lock<std::mutex>();
-  return std::unique_lock<std::mutex>(mu);
+  if (concurrent) return std::unique_lock<std::recursive_mutex>();
+  return std::unique_lock<std::recursive_mutex>(mu);
 }
 
 }  // namespace metaljax

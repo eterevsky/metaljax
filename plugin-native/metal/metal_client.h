@@ -166,6 +166,15 @@ class MetalClient final : public xla::PjRtClient {
       xla::PjRtMemorySpace* memory_space,
       const xla::Layout* device_layout) override;
 
+  // The layout of a shape on this backend, which is the only one it has:
+  // dense, row-major, no tiling.  jax asks for it through
+  // `jax.Array.format`/`.layout` and through its memory profiler, so leaving
+  // it Unimplemented (PjRtClient's default) turned three suite files red on
+  // an attribute read that has nothing to do with computing.
+  absl::StatusOr<xla::Layout> GetDefaultLayout(
+      xla::PrimitiveType element_type,
+      absl::Span<const int64_t> dims) override;
+
   // P0 checkpoint 4: prove that the C-API wrapper hands us a *parsed* MLIR
   // module (StableHLO, already upgraded from the VHLO portable artifact), then
   // fail cleanly.

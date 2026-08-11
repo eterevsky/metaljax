@@ -1,0 +1,12 @@
+jax-v0.11.0/tests/dtypes_test.py::TestPromotionTables::testFloatArrayCreation3
+jax-v0.11.0/tests/lax_numpy_indexing_test.py::IndexedUpdateTest::testStaticIndexing5
+jax-v0.11.0/tests/lax_numpy_test.py::LaxBackedNumpyTests::testArrayExplicitDtypes
+jax-v0.11.0/tests/lax_test.py::LaxTest::testConvGeneralDilated0D2
+jax-v0.11.0/tests/layout_test.py::LayoutTest::test_in_layouts_jit_jnp_input
+jax-v0.11.0/tests/pickle_test.py::PickleTest::testPickleX64
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_correctly_capture_default0
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_correctly_capture_default1
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_correctly_capture_default2
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_correctly_capture_default3
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_make_array0
+jax-v0.11.0/tests/x64_context_test.py::X64ContextTests::test_make_array1

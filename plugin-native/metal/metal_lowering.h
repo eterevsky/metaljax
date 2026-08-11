@@ -53,6 +53,11 @@ struct LoweredProgram {
   std::shared_ptr<Program> program;
   std::vector<ValueSpec> parameters;
   std::vector<ValueSpec> results;
+  // P13: the parameters the caller DONATES -- `tf.aliasing_output` (an input
+  // XLA may write its output into) and `jax.buffer_donor` (one it may reuse
+  // for anything).  XLA's contract is that the caller may not touch such a
+  // buffer again, and jax relies on it: the executable deletes them.
+  std::vector<int> donated_parameters;
   // Diagnostics: how many tape entries the program holds, and how many of
   // its outputs are copied out of the environment because they may alias an
   // argument or a constant the Program owns (XLA's no-alias contract).

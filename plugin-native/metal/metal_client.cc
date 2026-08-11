@@ -304,7 +304,7 @@ MetalClient::BufferFromHostBuffer(
   }
 
   BindThread();
-  std::unique_lock<std::mutex> submission = SubmissionLock();
+  std::unique_lock<std::recursive_mutex> submission = SubmissionLock();
   mx::Shape shape;
   shape.reserve(dims.size());
   int64_t total = 1;
@@ -415,6 +415,13 @@ MetalClient::CompileAndLoad(xla::MaybeOwningMlirModule module,
     return absl::InvalidArgumentError(
         "metaljax-native: CompileAndLoad received no module.");
   }
+  // The caller's `compiler_options` (jax's `lowered.compile(compiler_options=)`)
+  // are XLA debug-option overrides, and XLA validates them against the flag
+  // registry -- an unknown name or an unparseable value is the caller's error,
+  // reported by name.  This plugin runs none of them, but a backend that
+  // accepted `{"invalid_key": ...}` in silence would be lying about what it
+  // was asked to do.
+  RETURN_IF_ERROR(options.ApplyAllOptionOverrides());
   const xla::ExecutableBuildOptions& build = options.executable_build_options;
   if (build.num_replicas() != 1 || build.num_partitions() != 1) {
     return absl::UnimplementedError(absl::StrCat(
@@ -439,6 +446,13 @@ MetalClient::CompileAndLoad(xla::MaybeOwningMlirModule module,
   return std::make_unique<MetalLoadedExecutable>(
       this, devices_.front(), memory_spaces_.front(), std::move(lowered),
       std::move(options), std::move(name));
+}
+
+absl::StatusOr<xla::Layout> MetalClient::GetDefaultLayout(
+    xla::PrimitiveType element_type, absl::Span<const int64_t> dims) {
+  ASSIGN_OR_RETURN(xla::Shape shape,
+                   xla::ShapeUtil::MakeValidatedShape(element_type, dims));
+  return xla::LayoutUtil::GetDefaultLayoutForShape(shape);
 }
 
 std::unique_ptr<xla::PjRtClient> CreateMetalClient() {

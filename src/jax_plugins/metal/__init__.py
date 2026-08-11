@@ -4,6 +4,7 @@ jax discovers this via the `jax_plugins` namespace package and calls
 initialize() at backend-discovery time.
 """
 
+import ctypes
 import importlib.util
 import logging
 import os
@@ -37,6 +38,19 @@ def _library_path() -> Path | None:
     return p if p.exists() else None
 
 
+def _is_native_dylib(path: Path) -> bool:
+    """Whether this dylib is the Stage 2 plugin, asked of the file itself.
+
+    The callback-bridge symbol is the marker: the trampoline plugin does not
+    export it, and dlopening a plugin is what jax is about to do anyway.
+    """
+    try:
+        return hasattr(ctypes.CDLL(str(path)),
+                       "metaljax_native_set_callback_trampoline")
+    except OSError:
+        return False
+
+
 def _native_library_path() -> Path | None:
     """The bundled fully-native plugin, if this install carries one.
 
@@ -49,7 +63,15 @@ def _native_library_path() -> Path | None:
     env = os.environ.get("METALJAX_PLUGIN_PATH")
     if env:  # an explicit override always wins, whichever plugin it names
         p = Path(env)
-        return p if p.name == _NATIVE_DYLIB and p.exists() else None
+        if not p.exists():
+            return None
+        # Which plugin an override names is decided by the file's own
+        # exports, not only by its name: a COPY of the native dylib under
+        # another name (which is how a measurement pins a build) would
+        # otherwise register through the Stage 1 branch, pulling the Python
+        # engine into the process and leaving the callback bridge
+        # uninstalled -- a wrong measurement rather than an error.
+        return p if p.name == _NATIVE_DYLIB or _is_native_dylib(p) else None
     try:
         spec = importlib.util.find_spec("metaljax")
     except (ImportError, ValueError):
@@ -87,11 +109,13 @@ def _initialize_native(path: Path) -> None:
     (plugin-native/runtime/host_lapack.cc), so registering them is what makes
     eigh/svd/eig/schur/hessenberg/tridiagonal reach a backend at all -- with
     no rule for platform `metal`, jax refuses at TRACE time, before the plugin
-    ever sees a module. What stays behind is the part this plugin has no
-    answer for yet: the callback lowerings (they stash a Python callable in
-    the Stage 1 registry, which is exactly the interpreter this plugin exists
-    to replace) and buffer donation, whose contract the plugin does not
-    implement.
+    ever sees a module.
+
+    P13 completed the pair. The callback lowerings stash their Python callable
+    in a registry of THIS module rather than Stage 1's (which is the very
+    interpreter this plugin exists to replace), reachable from the dylib
+    through the C trampoline `_install_native_callbacks` installs; and
+    donation, whose XLA contract the plugin now implements, is on.
     """
     # The MLX precision default that src/metaljax/__init__.py applies for
     # the Stage 1 engine, repeated here because that module is not imported
@@ -103,7 +127,123 @@ def _initialize_native(path: Path) -> None:
     import jax._src.xla_bridge as xb
 
     xb.register_plugin("metal", priority=-1, library_path=str(path))
-    _register_linalg_lowerings(callbacks=False, donation=False)
+    _register_linalg_lowerings(callbacks=_install_native_callbacks(path),
+                               donation=True)
+
+
+# --------------------------------------------------------------------------
+# the native plugin's callback bridge (P13)
+# --------------------------------------------------------------------------
+#
+# jax's debug.print / debug.callback / pure_callback / io_callback lower, on
+# every backend, to something that eventually calls the user's Python. The
+# Stage 1 plugin trampolines into metaljax.engine and can simply call it; the
+# native plugin holds no interpreter, so the callable stays HERE, in the
+# registry below, and the dylib reaches it through one C function pointer.
+#
+# ctypes is what makes that safe: a CFUNCTYPE callback acquires the GIL for the
+# duration of the call and releases it after, so the GIL enters the native
+# engine only inside a user callback -- which is the same contract
+# native/bindings.cc gives the Stage 1 extension.
+_NATIVE_CALLBACKS: list = []
+# The ctypes callback object: freeing it would leave the dylib holding a
+# dangling function pointer.
+_NATIVE_TRAMPOLINE = None
+
+
+class _HostBuffer(ctypes.Structure):
+    """`MetaljaxHostBuffer` (plugin-native/runtime/host_callback.h)."""
+
+    _fields_ = [("data", ctypes.c_void_p),
+                ("dtype", ctypes.c_int32),
+                ("rank", ctypes.c_int32),
+                ("dims", ctypes.POINTER(ctypes.c_int64))]
+
+
+_TRAMPOLINE_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+    ctypes.POINTER(_HostBuffer), ctypes.c_int32, ctypes.POINTER(_HostBuffer),
+    ctypes.POINTER(ctypes.c_char), ctypes.c_int32)
+
+
+def _host_dtypes():
+    """`MetaljaxHostDtype` -> numpy, in the enum's order."""
+    import ml_dtypes
+    import numpy as np
+    return [np.bool_, np.int8, np.int16, np.int32, np.int64, np.uint8,
+            np.uint16, np.uint32, np.uint64, np.float16, ml_dtypes.bfloat16,
+            np.float32, np.complex64]
+
+
+def _install_native_callbacks(path: Path):
+    """Install the trampoline, and return the registrar the lowerings use.
+
+    Returns None when the dylib predates the bridge (or ctypes cannot open
+    it), which leaves the callback lowerings unregistered -- so jax refuses
+    debug.print at TRACE time with its own message rather than the plugin
+    failing at execute.
+    """
+    global _NATIVE_TRAMPOLINE
+    import numpy as np
+
+    try:
+        lib = ctypes.CDLL(str(path))
+        setter = lib.metaljax_native_set_callback_trampoline
+    except (OSError, AttributeError) as e:
+        logger.warning("metaljax: no callback bridge in the plugin: %s", e)
+        return None
+
+    dtypes = _host_dtypes()
+
+    def view(buf):
+        """The numpy array over one host buffer -- a VIEW, never a copy: an
+        output is written through it."""
+        dt = np.dtype(dtypes[buf.dtype])
+        shape = tuple(buf.dims[i] for i in range(buf.rank))
+        n = 1
+        for d in shape:
+            n *= d
+        if n == 0 or not buf.data:
+            return np.empty(shape, dt)
+        raw = np.ctypeslib.as_array(
+            ctypes.cast(buf.data, ctypes.POINTER(ctypes.c_ubyte)),
+            shape=(n * dt.itemsize,))
+        return raw.view(dt).reshape(shape)
+
+    def trampoline(index, nin, ins, nout, outs, error, error_len):
+        try:
+            fn = _NATIVE_CALLBACKS[index]
+            outputs = fn(*[view(ins[i]) for i in range(nin)])
+            if outputs is None:
+                outputs = []
+            if not isinstance(outputs, (list, tuple)):
+                outputs = [outputs]
+            if len(outputs) != nout:
+                raise ValueError(
+                    f"callback returned {len(outputs)} values, "
+                    f"the program declares {nout}")
+            for i in range(nout):
+                dst = view(outs[i])
+                # The declared shape and dtype win, exactly as
+                # metaljax.ops.callbacks._run_callback casts to its specs.
+                dst[...] = np.asarray(outputs[i]).reshape(dst.shape)
+            return 0
+        except BaseException as e:   # noqa: BLE001 - it becomes a PJRT error
+            msg = f"{type(e).__name__}: {e}".encode()[:max(error_len - 1, 0)]
+            ctypes.memmove(error, msg, len(msg))
+            error[len(msg)] = b"\0"
+            return 1
+
+    _NATIVE_TRAMPOLINE = _TRAMPOLINE_TYPE(trampoline)
+    setter.argtypes = [ctypes.c_void_p]
+    setter.restype = None
+    setter(ctypes.cast(_NATIVE_TRAMPOLINE, ctypes.c_void_p))
+
+    def register(fn) -> int:
+        _NATIVE_CALLBACKS.append(fn)
+        return len(_NATIVE_CALLBACKS) - 1
+
+    return register
 
 
 def _register_linalg_lowerings(callbacks=True, donation=True):
@@ -214,7 +354,10 @@ def _register_linalg_lowerings(callbacks=True, donation=True):
         mlir.register_lowering(ll.svd_p, svd_rule, platform="metal")
         mlir.register_lowering(ll.eig_p, eig_rule, platform="metal")
         if callbacks:
-            _register_callback_lowerings(mlir)
+            # True: the Stage 1 registry (metaljax.ops.callbacks). A callable:
+            # the native plugin's, installed by _install_native_callbacks.
+            _register_callback_lowerings(
+                mlir, None if callbacks is True else callbacks)
 
         # Buffer donation: jax only sets up input-output aliasing for
         # platforms in this list. With metal added, donate_argnums marks
@@ -239,17 +382,21 @@ def _register_linalg_lowerings(callbacks=True, donation=True):
         logger.warning("metaljax: linalg lowering registration failed: %s", e)
 
 
-def _register_callback_lowerings(mlir):
+def _register_callback_lowerings(mlir, register=None):
     """jax.debug.print / debug_callback / pure_callback on metal: stash
-    the Python callable in metaljax's registry and emit a
-    metaljax_callback custom call with its index (we run in-process, so
-    the interpreter can just call it)."""
+    the Python callable in a registry and emit a metaljax_callback custom
+    call with its index (we run in-process, so whoever holds the registry
+    can just call it). `register` is that registry's registrar; None means
+    Stage 1's, in metaljax.ops.callbacks."""
     from functools import partial
     from jax._src import debugging
 
     def emit_callback(ctx, args, callback, with_results=True):
-        from metaljax.ops import callbacks as cb_mod
-        idx = cb_mod.register_callback(callback)
+        if register is not None:
+            idx = register(callback)
+        else:
+            from metaljax.ops import callbacks as cb_mod
+            idx = cb_mod.register_callback(callback)
         out_types = ([mlir.aval_to_ir_type(ctx.module_context, a)
                       for a in ctx.avals_out] if with_results else [])
         op = mlir.custom_call(

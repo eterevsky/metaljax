@@ -999,9 +999,51 @@ fork authorized but not needed.
   dylib +0.032 %. The decline sentinel moved off `reduce_precision` to
   **`stablehlo.rng`** (`jax.lax.rng_uniform`), which neither engine implements
   and no phase is scheduled to.
-* Next: collectives/tokens (P12), callbacks/PJRT/donation (P13), shape-poly
-  (P14). Suite-vs-suite as the standing gate. (North star per Oleg: everything
-  through the new stack, correctness first, performance second.)
+* **P12-P14 landed** (notes/cpp-p12-14-parity.md): the parity tail, all six
+  families of the census's remainder, and THE measurement.
+  **Collectives** are `ops/collectives.py` with two guards the Python handler
+  does not have (replica-group size, and a result shape that is not the
+  operand's — aliasing is how the identity arms lower, so a shape change must
+  decline rather than hand back the wrong array). **Tokens** are the empty bool
+  array in three places (`CheckValue`, `Dims`, and main's boundary specs — the
+  buffer jax's `RuntimeTokenSet` actually passes), plus `create_token`/
+  `after_all` on the runtime's existing `kToken`. **Callbacks** are a new
+  `runtime/host_callback.{h,cc}` and the dylib's SECOND exported symbol: the
+  registry of Python callables moved out of `metaljax.ops.callbacks` into
+  `src/jax_plugins/metal/__init__.py` (the native branch), which installs a
+  ctypes callback the tape calls through a C ABI — so the GIL enters this
+  plugin inside a user callback and nowhere else, and the runtime still names
+  no Python symbol. **Donation** is jax's `_platforms_with_donation` plus the
+  plugin collecting the promise (`tf.aliasing_output` / `jax.buffer_donor` read
+  at lowering; the buffers deleted after a successful run, minus
+  `non_donatable_input_indices`). **The PJRT surface**: `unsafe_buffer_pointer`
+  became STABLE (a settled view is now kept — a broadcast gathered afresh per
+  call handed out a new address, which jax asserts on), `GetDefaultLayout`,
+  `CopyToMemorySpace` as a real copy, compile-option validation, and a cost
+  analysis of the tape's own facts. **Shape-poly** needed nothing: its four
+  remaining rows are Stage 1's four.
+  Two live defects found on the way: the submission lock had to become
+  RECURSIVE (a callback that touches a metal array re-enters the plugin on the
+  same thread — measured: the pre-fix dylib hangs), and a callback operand must
+  be settled and checked for `data_size` before its pointer crosses (the
+  short-buffer overread of CLAUDE.md item 20, in a new place).
+  Family slice (17 files): **200 -> 26 failures**, of which 24 are the shared
+  whitelist. execute_test 482 -> **493 checks**; decline_census 34 -> **35 of
+  35**; gate 106/106; `tests/`-on-native 84 -> **71** (`test_pjrt_surface`
+  10 -> 0, `test_donation` 3 -> 0; the 70 that stay are the recognizer-emit
+  families); dylib +0.027 %.
+* **THE measurement** (notes/data/p12-14-*): the whole pinned suite through the
+  native plugin, sequential, exactly as P8 ran it — **28,057 passed / 142
+  failed = 99.50 %**, against Stage 1's 28,062 / 137 = 99.51 % on this tree and
+  the 0.11.3 release artifact's 99.53 %. Shared with Stage 1: 130 (the
+  whitelist). **NATIVE-ONLY: 12** (from P8's 1,918), and every one is an
+  intentional decline by name — 9 `element type f64` (the f64 policy;
+  `x64_context` 6, `pickle` 1, `dtypes` 1, `lax_numpy` 1), 1 complex scatter
+  multiply without unique indices (P10), 1 complex 0-spatial convolution (P7),
+  1 non-default parameter layout. No numeric row, no unclassified row.
+  STAGE1-ONLY: 7 — the reference-cycle pair, `testScatter1`, and the four
+  `debug_print`-in-a-while-cond rows that were P8's live Stage 1 bug.
+  Errors (35) are identical to Stage 1's, file for file.
 
 ## The runtime fork (2026-08-11, per Oleg)
 
@@ -1028,3 +1070,12 @@ the 542** (608 -> 109), **P11 238** (its 14-file slice: 328 -> 90) --
 more than the 192 the ladder budgeted for it, because the scatter tail
 and the `<unknown>`-element-type wall shared files with rows the
 per-family counts did not separate.
+
+**MET, and the ladder is finished** (P12-P14, 2026-08-11): the whole
+pinned suite natively is **99.50%** (28,057/142) against Stage 1's
+99.51% on this tree and 99.53% at release, with **12** native-only
+failures left of P8's 1,918 -- nine of them the f64 policy and the
+other three declines this migration chose. Nothing on the census is
+unported; what is left is the f64 decision (Oleg: aspirational, last
+stage) and the recognizer-emit families in `tests/`, which are the
+performance phases'.

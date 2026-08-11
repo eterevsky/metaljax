@@ -1,0 +1,7 @@
+jax-v0.11.0/tests/core_test.py::CoreTest::test_reference_cycles
+jax-v0.11.0/tests/core_test.py::CoreTest::test_reference_cycles_jit
+jax-v0.11.0/tests/debugging_primitives_test.py::DebugPrintControlFlowTest::test_can_print_in_batched_while_cond0
+jax-v0.11.0/tests/debugging_primitives_test.py::DebugPrintControlFlowTest::test_can_print_in_batched_while_cond1
+jax-v0.11.0/tests/debugging_primitives_test.py::DebugPrintControlFlowTest::test_can_print_inside_while_loop_cond0
+jax-v0.11.0/tests/debugging_primitives_test.py::DebugPrintControlFlowTest::test_can_print_inside_while_loop_cond1
+jax-v0.11.0/tests/lax_test.py::LaxTest::testScatter1

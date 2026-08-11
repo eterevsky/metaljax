@@ -41,7 +41,14 @@ void BindThread();
 // lock.  METALJAX_CONCURRENT_EXECUTE=1 lifts it, for measuring the day an
 // MLX fix lands; a returned lock that owns nothing is that flag, not an
 // error.
-std::unique_lock<std::mutex> SubmissionLock();
+//
+// RECURSIVE, since P13: a host callback runs the USER's Python in the middle
+// of an execute that holds this lock, and that Python may perfectly well
+// touch a metal array -- a `device_put`, or another jitted call.  Same-thread
+// re-entry is not the concurrency this lock exists to prevent (it is exactly
+// what a single-threaded process does anyway, one submission after another),
+// and a plain mutex would answer it with a deadlock.
+std::unique_lock<std::recursive_mutex> SubmissionLock();
 
 }  // namespace metaljax
 

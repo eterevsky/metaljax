@@ -22,8 +22,10 @@ Licensed under the Apache License, Version 2.0.
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "host_callback.h"
 #include "host_lapack.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
@@ -177,6 +179,60 @@ bool IsControlOp(absl::string_view name) {
          name == "stablehlo.case";
 }
 
+// An ordered-effect token is not a tensor and carries no data; it crosses the
+// runtime boundary -- and lives in the executor's environment -- as the EMPTY
+// BOOL array `src/metaljax/dtypes.py::token_value` builds, which is also the
+// buffer jax's runtime hands in for a token parameter
+// (`dispatch.RuntimeTokenSet`: `np.zeros(0, np.bool_)`).  Sequencing is the
+// tape's own order, so a token is an ordinary value here and the two ops that
+// make one are ordinary entries (`kToken`, runtime/host.cc).
+constexpr int64_t kTokenShape = 0;
+
+bool IsToken(mlir::Type t) { return mlir::isa<mlir::stablehlo::TokenType>(t); }
+bool IsToken(mlir::Value v) { return IsToken(v.getType()); }
+
+// A caller-requested LAYOUT, as jax spells it on main's arguments and results
+// (`mhlo.layout_mode`, XLA's minor-to-major order: "{1,0}" is row-major at
+// rank 2, "{0,1}" is column-major).  MLX's storage is major-to-minor and
+// nothing in this plugin can lay a buffer out any other way, so anything but
+// the default is refused BY NAME.  Without this check the request is simply
+// ignored: jax notices for a parameter (it compares what the executable
+// reports against what it asked for, and asserts) but the failure names
+// neither the backend nor the reason, and a path where jax did not compare
+// would compute on row-major bytes the caller believes are transposed.
+absl::Status CheckLayoutMode(mlir::Attribute attr, size_t rank,
+                             absl::string_view what) {
+  auto s = mlir::dyn_cast_or_null<mlir::StringAttr>(attr);
+  if (!s) return absl::OkStatus();
+  const std::string mode = s.getValue().str();
+  if (mode.empty() || mode == "default" || mode == "auto")
+    return absl::OkStatus();
+  // The default order, printed: minor first, so descending.
+  std::string want = "{";
+  for (size_t i = rank; i-- > 0;)
+    absl::StrAppend(&want, i + 1 == rank ? "" : ",", i);
+  absl::StrAppend(&want, "}");
+  if (mode == want) return absl::OkStatus();
+  return Decline(absl::StrCat("a ", what, " layout of ", mode,
+                              " (metaljax is row-major: ", want, ")"));
+}
+
+// Cross-replica collectives (src/metaljax/ops/collectives.py).  This plugin
+// exposes exactly ONE device, so every replica group has size 1 and each of
+// these degenerates: a reduction over one replica is the value itself, a
+// gather concatenates one shard, a permute has nowhere to go, and the two ids
+// are zero.  That is what makes jax.pmap and shard_map programs run here.  A
+// program compiled for more than one replica cannot reach us -- jax checks the
+// device count long before lowering -- and the group-size check below is the
+// backstop that says so out loud rather than computing the wrong thing.
+bool IsCollectiveOp(absl::string_view name) {
+  return name == "stablehlo.all_reduce" || name == "stablehlo.reduce_scatter" ||
+         name == "stablehlo.all_gather" || name == "stablehlo.all_to_all" ||
+         name == "stablehlo.collective_permute" ||
+         name == "stablehlo.collective_broadcast" ||
+         name == "stablehlo.replica_id" || name == "stablehlo.partition_id";
+}
+
 // --------------------------------------------------------------------------
 // custom calls (P9)
 // --------------------------------------------------------------------------
@@ -240,6 +296,11 @@ const absl::flat_hash_map<std::string, HostLinalg>& HostTargets() {
   return *table;
 }
 
+// The custom call jax's callback lowerings emit on this platform
+// (src/jax_plugins/metal/__init__.py `_register_callback_lowerings`), whose
+// `backend_config` is the index of a Python callable in that module's registry.
+constexpr absl::string_view kCallbackTarget = "metaljax_callback";
+
 // Whether this op computes on the host -- the question `BlockIsPure` asks, and
 // the reason `interpreter.custom_call_host_hook` exists on the Python side.
 // Structural: the two StableHLO ops whose handler is a host one, plus any
@@ -249,7 +310,10 @@ bool IsHostOp(mlir::Operation* op) {
   if (name == "stablehlo.cholesky" || name == "stablehlo.triangular_solve")
     return true;
   if (name != "stablehlo.custom_call") return false;
-  return HostTargets().contains(CallTarget(op));
+  const std::string target = CallTarget(op);
+  // P13: jax's own callbacks run the USER's Python, which is as host-bound as
+  // a LAPACK call and impure besides.
+  return target == kCallbackTarget || HostTargets().contains(target);
 }
 
 // Reduce monoids: body op -> kind, mirroring tape.py's _REDUCE_KINDS and
@@ -1597,6 +1661,11 @@ class Lowering {
   absl::Status LowerCustomCall(mlir::Operation* op);
   absl::Status LowerHostLinalg(mlir::Operation* op, HostLinalg kind);
   absl::Status LowerApproxTopK(mlir::Operation* op);
+  // P13: jax's own callbacks, whose handler is the embedder's Python.
+  absl::Status LowerCallback(mlir::Operation* op);
+
+  // P12: ops/collectives.py, on the one device this plugin has.
+  absl::Status LowerCollective(mlir::Operation* op, absl::string_view name);
 
   // tape.py `_generic_reduce_attrs`: a reduce body neither table recognizes,
   // lowered into a sub-Program the handler calls once per halving round.
@@ -1717,6 +1786,7 @@ class Lowering {
 };
 
 absl::Status Lowering::CheckValue(mlir::Value v) {
+  if (IsToken(v)) return absl::OkStatus();
   auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
   if (!t) return Decline("a value that is not a ranked tensor");
   for (int64_t d : t.getShape()) {
@@ -1731,6 +1801,7 @@ absl::Status Lowering::CheckValue(mlir::Value v) {
 }
 
 absl::StatusOr<std::vector<int64_t>> Lowering::Dims(mlir::Value v) {
+  if (IsToken(v)) return std::vector<int64_t>{kTokenShape};
   auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
   if (!t) return Decline("a value that is not a ranked tensor");
   std::vector<int64_t> dims;
@@ -4075,6 +4146,7 @@ absl::Status Lowering::LowerCustomCall(mlir::Operation* op) {
     return absl::OkStatus();   // nothing to run: the shapes are already static
   }
   if (target == "ApproxTopK") return LowerApproxTopK(op);
+  if (target == kCallbackTarget) return LowerCallback(op);
 
   auto it = HostTargets().find(target);
   if (it == HostTargets().end())
@@ -4162,6 +4234,63 @@ absl::Status Lowering::LowerHostLinalg(mlir::Operation* op, HostLinalg kind) {
   return absl::OkStatus();
 }
 
+// jax's host callbacks (`src/metaljax/ops/callbacks.py::_run_callback`).  What
+// the IR carries is an INDEX into the registry the lowerings keep, and the
+// declared result types; everything else is the embedder's, on the other side
+// of the C trampoline runtime/host_callback.h defines.
+absl::Status Lowering::LowerCallback(mlir::Operation* op) {
+  int32_t index = 0;
+  if (!absl::SimpleAtoi(BackendConfig(op), &index) || index < 0)
+    return Decline("metaljax_callback without a callback index");
+  // As for the LAPACK targets: without jax's refine-polymorphic-shapes pass
+  // the result types are dynamic and there is nothing to size a buffer from.
+  if (op->getAttr("indices_of_shape_operands"))
+    return Decline("metaljax_callback with unrefined shape operands");
+
+  // The ABI carries VALUES, and an emulated element type's value lives in a
+  // wider storage dtype -- so a callback would see the storage where the
+  // Python engine hands the user `ml_dtypes`.  Declining is the honest answer
+  // (and no test in reach prints an f8).
+  auto plain = [&](mlir::Value v) -> absl::Status {
+    RETURN_IF_ERROR(CheckValue(v));
+    std::optional<std::string> el = ElementName(v);
+    if (el.has_value() && EmulatedKindOfName(*el) >= 0)
+      return Decline(absl::StrCat("metaljax_callback on ", *el));
+    if (IsToken(v)) return Decline("metaljax_callback on a token");
+    return absl::OkStatus();
+  };
+
+  std::vector<CallbackSpec> results;
+  for (mlir::Value r : op->getResults()) {
+    RETURN_IF_ERROR(plain(r));
+    ASSIGN_OR_RETURN(std::vector<int64_t> dims, Dims(r));
+    auto t = mlir::cast<mlir::RankedTensorType>(r.getType());
+    results.push_back(
+        CallbackSpec{std::move(dims), *MxDtypeOf(t.getElementType())});
+  }
+  std::vector<int> ins;
+  for (mlir::Value v : op->getOperands()) {
+    RETURN_IF_ERROR(plain(v));
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    ins.push_back(s);
+  }
+
+  HostFn fn;
+  try {
+    fn = MakeHostCallback(index, std::move(results));
+  } catch (const std::exception& e) {
+    return Decline(e.what());
+  }
+
+  std::vector<int> outs;
+  for (mlir::Value r : op->getResults()) outs.push_back(Bind(r));
+  // No taint: every result is built from host memory this call staged.
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.host_call"));
+  Emit(opcode, std::move(ins), std::move(outs), {}, std::nullopt,
+       ResultBytes(op), {}, {}, std::move(fn));
+  return absl::OkStatus();
+}
+
 // XLA's ApproxTopK, answered exactly (ops/sort.py `approx_top_k`).  Operands
 // (values, indices, init_value, init_index) -- the two initial values belong
 // to the comparator-driven reduction XLA would run and have no part in a
@@ -4218,6 +4347,79 @@ absl::Status Lowering::LowerApproxTopK(mlir::Operation* op) {
   ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.approx_top_k"));
   Emit(opcode, std::move(ins), std::move(outs), {k, dim, kind, is_max ? 1 : 0},
        std::nullopt, ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// ops/collectives.py, op for op.  Every arm is either an ALIAS (the result is
+// the operand's array, so no entry reaches the tape and the aliasing taints
+// ride along by construction) or a constant, and the two guards are what keep
+// that honest: a replica group wider than one device, and a result whose shape
+// is not the operand's -- which is what a real multi-replica gather or scatter
+// would produce, and which aliasing would answer with the wrong array rather
+// than with a decline.
+absl::Status Lowering::LowerCollective(mlir::Operation* op,
+                                       absl::string_view name) {
+  for (mlir::Value v : op->getOperands()) RETURN_IF_ERROR(CheckValue(v));
+  for (mlir::Value v : op->getResults()) RETURN_IF_ERROR(CheckValue(v));
+
+  // `replica_groups` is [num_groups, group_size]; ops/collectives.py reads the
+  // last dimension.  Absent (the two id ops, collective_permute) means one.
+  if (auto groups =
+          op->getAttrOfType<mlir::DenseIntElementsAttr>("replica_groups")) {
+    auto t = mlir::dyn_cast<mlir::RankedTensorType>(groups.getType());
+    const int64_t size =
+        (t && t.getRank() > 0) ? t.getShape()[t.getRank() - 1] : 1;
+    if (size > 1)
+      return Decline(absl::StrCat("op ", name, " with replica groups of size ",
+                                  size, " (metaljax is single-device)"));
+  }
+
+  if (name == "stablehlo.replica_id" || name == "stablehlo.partition_id") {
+    if (op->getNumResults() != 1) return Decline(absl::StrCat("op ", name));
+    auto t = mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
+    const int out = Bind(op->getResult(0));
+    const_view_.insert(out);
+    Emit(OpcodeTable().at("stablehlo.constant"), {}, {out}, {},
+         mx::zeros({}, *MxDtypeOf(t.getElementType())), ResultBytes(op));
+    return absl::OkStatus();
+  }
+
+  if (name == "stablehlo.collective_permute") {
+    // With one device the only legal pair is (0, 0); an EMPTY pair list means
+    // this replica receives nothing, which XLA fills with zeros.
+    std::vector<int64_t> pairs =
+        OptI64List(op, "source_target_pairs", std::vector<int64_t>{});
+    for (int64_t v : pairs)
+      if (v != 0)
+        return Decline(absl::StrCat("collective_permute to replica ", v,
+                                    " (metaljax is single-device)"));
+    if (op->getNumOperands() != 1 || op->getNumResults() != 1)
+      return Decline("collective_permute with an unexpected arity");
+    if (pairs.empty()) {
+      ASSIGN_OR_RETURN(std::vector<int64_t> dims, Dims(op->getResult(0)));
+      auto t = mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
+      mx::Shape shape(dims.begin(), dims.end());
+      const int out = Bind(op->getResult(0));
+      const_view_.insert(out);
+      Emit(OpcodeTable().at("stablehlo.constant"), {}, {out}, {},
+           mx::zeros(shape, *MxDtypeOf(t.getElementType())), ResultBytes(op));
+      return absl::OkStatus();
+    }
+  }
+
+  if (op->getNumResults() != op->getNumOperands())
+    return Decline(absl::StrCat("op ", name, " is not an arity-preserving "
+                                             "alias"));
+  for (unsigned i = 0; i < op->getNumResults(); i++) {
+    ASSIGN_OR_RETURN(std::vector<int64_t> in, Dims(op->getOperand(i)));
+    ASSIGN_OR_RETURN(std::vector<int64_t> out, Dims(op->getResult(i)));
+    if (in != out)
+      return Decline(absl::StrCat(
+          "op ", name,
+          " that changes shape (a replica group wider than this device)"));
+    ASSIGN_OR_RETURN(int s, Slot(op->getOperand(i)));
+    Alias(op->getResult(i), s);
+  }
   return absl::OkStatus();
 }
 
@@ -4633,6 +4835,11 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
 
   if (IsControlOp(name)) return LowerControl(op);
 
+  // P12: the collectives, ahead of the region gate -- all_reduce and
+  // reduce_scatter carry their reduction as a region, and on one device
+  // nothing in it runs.
+  if (IsCollectiveOp(name)) return LowerCollective(op, name);
+
   // tape.py `_REGION_BODY_OPS`: the four ops whose region is a BODY the
   // lowering reads (structurally, or into a sub-Program) rather than a branch
   // of control flow.
@@ -4644,6 +4851,23 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
 
   for (mlir::Value v : op->getOperands()) RETURN_IF_ERROR(CheckValue(v));
   for (mlir::Value v : op->getResults()) RETURN_IF_ERROR(CheckValue(v));
+
+  // P12: the two ops that MAKE a token.  `create_token` takes none and
+  // `after_all` joins any number into one, and both hand back the same empty
+  // array -- so the operands are read for their order alone, which the tape
+  // already has (ops/callbacks.py `_token`).
+  if (name == "stablehlo.create_token" || name == "stablehlo.after_all") {
+    if (op->getNumResults() != 1 || !IsToken(op->getResult(0)))
+      return Decline(absl::StrCat("op ", name, " with an unexpected result"));
+    ASSIGN_OR_RETURN(int opcode, Opcode(name));
+    std::vector<int> ins;
+    for (mlir::Value v : op->getOperands()) {
+      ASSIGN_OR_RETURN(int s, Slot(v));
+      ins.push_back(s);
+    }
+    Emit(opcode, std::move(ins), {Bind(op->getResult(0))}, {}, std::nullopt, 0);
+    return absl::OkStatus();
+  }
 
   if (name == "stablehlo.constant") return LowerConstant(op);
   if (name == "stablehlo.reduce") return LowerReduce(op);
@@ -4825,23 +5049,44 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
     return Decline("a main function with several blocks");
   mlir::Block& block = fn.getBody().front();
 
+  // What PJRT calls one boundary value.  A TOKEN parameter or result is the
+  // empty bool array of `kTokenShape`: that is the buffer jax's runtime hands
+  // in for an ordered effect and the one it expects back.
+  auto spec_of = [&](mlir::Value v) -> absl::StatusOr<ValueSpec> {
+    ASSIGN_OR_RETURN(std::vector<int64_t> dims, Dims(v));
+    if (IsToken(v))
+      return ValueSpec{xla::PRED, std::move(dims), mx::bool_};
+    auto t = mlir::cast<mlir::RankedTensorType>(v.getType());
+    return ValueSpec{*PrimitiveTypeOf(t.getElementType()), std::move(dims),
+                     *MxDtypeOf(t.getElementType())};
+  };
+
   LoweredProgram lowered;
   for (mlir::BlockArgument arg : block.getArguments()) {
     RETURN_IF_ERROR(CheckValue(arg));
-    ASSIGN_OR_RETURN(std::vector<int64_t> dims, Dims(arg));
-    auto t = mlir::cast<mlir::RankedTensorType>(arg.getType());
-    lowered.parameters.push_back(
-        ValueSpec{*PrimitiveTypeOf(t.getElementType()), std::move(dims),
-                  *MxDtypeOf(t.getElementType())});
+    ASSIGN_OR_RETURN(ValueSpec spec, spec_of(arg));
+    lowered.parameters.push_back(std::move(spec));
+    // Donation is declared on the argument, in the two spellings jax emits
+    // (`mlir._set_up_aliases`): an aliased output, or a plain donor.  Which
+    // output it aliases does not matter here -- this engine never writes into
+    // an input -- but the caller's promise not to touch it again does, and
+    // `RunOnce` collects on it.
+    const unsigned i = arg.getArgNumber();
+    if (fn.getArgAttr(i, "tf.aliasing_output") ||
+        fn.getArgAttr(i, "jax.buffer_donor"))
+      lowered.donated_parameters.push_back(static_cast<int>(i));
+    RETURN_IF_ERROR(CheckLayoutMode(fn.getArgAttr(i, "mhlo.layout_mode"),
+                                    lowered.parameters.back().dims.size(),
+                                    "parameter"));
   }
 
   ASSIGN_OR_RETURN(Built built, LowerBlock(block, {}));
   for (mlir::Value v : built.returned) {
-    ASSIGN_OR_RETURN(std::vector<int64_t> dims, Dims(v));
-    auto t = mlir::cast<mlir::RankedTensorType>(v.getType());
-    lowered.results.push_back(
-        ValueSpec{*PrimitiveTypeOf(t.getElementType()), std::move(dims),
-                  *MxDtypeOf(t.getElementType())});
+    ASSIGN_OR_RETURN(ValueSpec spec, spec_of(v));
+    RETURN_IF_ERROR(CheckLayoutMode(
+        fn.getResultAttr(lowered.results.size(), "mhlo.layout_mode"),
+        spec.dims.size(), "result"));
+    lowered.results.push_back(std::move(spec));
   }
 
   // Which outputs may not be handed out as they stand: one that may BE an

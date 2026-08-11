@@ -38,6 +38,15 @@ parsed StableHLO into one of its `Program`s and `Execute` replays it.
 `//metal:runtime_gil_free_test` builds a tape through the same C++ API and
 runs it on the GPU in a process with no interpreter in it.
 
+The dylib exports two symbols. `GetPjrtApi` is the plugin; the other,
+`metaljax_native_set_callback_trampoline`, is the callback bridge (P13):
+`src/jax_plugins/metal/__init__.py` keeps the registry of Python callables that
+`jax.debug.print` / `pure_callback` / `io_callback` lower to and installs a
+ctypes callback here, so the GIL enters this plugin inside a user callback and
+nowhere else. Its C ABI is `runtime/host_callback.h`. That symbol is also how
+`METALJAX_PLUGIN_PATH` tells the two plugins apart when the file has been
+copied under another name.
+
 XLA comes from the read-only `metaljax/xla` checkout via `local_repository`
 (pinned to jax 0.11.0's XLA revision); MLX comes from the venv's wheel via
 `third_party/mlx`. First build is ~7 minutes, everything after that is seconds

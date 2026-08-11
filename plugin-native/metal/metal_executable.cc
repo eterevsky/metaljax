@@ -106,7 +106,8 @@ MetalLoadedExecutable::MetalLoadedExecutable(
 
 absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtBuffer>>>
 MetalLoadedExecutable::RunOnce(
-    absl::Span<xla::PjRtBuffer* const> argument_handles) const {
+    absl::Span<xla::PjRtBuffer* const> argument_handles,
+    const xla::ExecuteOptions& options) const {
   if (deleted_) {
     return absl::FailedPreconditionError(
         "metaljax-native: the executable has been deleted.");
@@ -117,7 +118,7 @@ MetalLoadedExecutable::RunOnce(
         lowered_->parameters.size(), argument_handles.size()));
   }
   BindThread();
-  std::unique_lock<std::mutex> submission = SubmissionLock();
+  std::unique_lock<std::recursive_mutex> submission = SubmissionLock();
 
   std::vector<mx::array> inputs;
   inputs.reserve(argument_handles.size());
@@ -185,6 +186,22 @@ MetalLoadedExecutable::RunOnce(
     buffers.push_back(std::make_unique<MetalBuffer>(
         client_, memory_space_, device_, spec.shape(), outs[j]));
   }
+
+  // The donation contract (P13), collected only after a run that succeeded:
+  // an argument the module declares donated is the caller's to hand over, and
+  // XLA's rule is that they may not touch it again.  This engine never writes
+  // into an input -- the aliasing an output would need is exactly what
+  // `Lowering::Run`'s copy rule refuses -- so the buffer is simply released,
+  // which is the whole of what jax observes (a reuse raises, and the memory
+  // goes back to MLX's pool one execute earlier than the caller's own
+  // reference would have freed it).  `non_donatable_input_indices` is the
+  // caller taking the promise back for one call, and it wins.
+  for (int i : lowered_->donated_parameters) {
+    if (options.non_donatable_input_indices.contains(i)) continue;
+    if (static_cast<size_t>(i) < argument_handles.size() &&
+        argument_handles[i] != nullptr)
+      argument_handles[i]->Delete();
+  }
   return buffers;
 }
 
@@ -199,7 +216,7 @@ MetalLoadedExecutable::Execute(
         argument_handles.size()));
   }
   ASSIGN_OR_RETURN(std::vector<std::unique_ptr<xla::PjRtBuffer>> buffers,
-                   RunOnce(argument_handles[0]));
+                   RunOnce(argument_handles[0], options));
   std::vector<std::vector<std::unique_ptr<xla::PjRtBuffer>>> result;
   result.push_back(std::move(buffers));
   if (returned_futures.has_value()) {
@@ -221,7 +238,7 @@ MetalLoadedExecutable::ExecuteSharded(
         "metaljax-native: the executable is loaded on a different device.");
   }
   ASSIGN_OR_RETURN(std::vector<std::unique_ptr<xla::PjRtBuffer>> buffers,
-                   RunOnce(argument_handles));
+                   RunOnce(argument_handles, options));
   if (fill_future) returned_future = xla::Future<>(absl::OkStatus());
   return buffers;
 }
@@ -265,6 +282,28 @@ MetalExecutable::GetOutputDimensions() const {
   for (const ValueSpec& spec : lowered_->results)
     dims.push_back(xla::DimensionVector(spec.dims.begin(), spec.dims.end()));
   return std::vector<std::vector<xla::DimensionVector>>{std::move(dims)};
+}
+
+absl::StatusOr<absl::flat_hash_map<std::string, xla::PjRtValueType>>
+MetalExecutable::GetCostAnalysis() const {
+  auto bytes = [](const std::vector<ValueSpec>& specs) {
+    int64_t total = 0;
+    for (const ValueSpec& spec : specs)
+      total += spec.element_count() *
+               static_cast<int64_t>(spec.dtype.size());
+    return total;
+  };
+  // FLOAT, every one of them: the C API carries a cost property as a float and
+  // `PJRT_Executable_GetCostAnalysis` CHECKs the variant's alternative, so an
+  // int64 here aborts the process inside jaxlib rather than raising.
+  return absl::flat_hash_map<std::string, xla::PjRtValueType>{
+      {"metaljax_tape_entries", static_cast<float>(lowered_->num_entries)},
+      {"metaljax_argument_bytes",
+       static_cast<float>(bytes(lowered_->parameters))},
+      {"metaljax_result_bytes", static_cast<float>(bytes(lowered_->results))},
+      {"metaljax_output_copies", static_cast<float>(lowered_->num_copies)},
+      {"metaljax_compiled", lowered_->compiled ? 1.0f : 0.0f},
+  };
 }
 
 namespace {

@@ -101,7 +101,10 @@ class MetalBuffer final : public xla::PjRtBuffer {
   xla::PjRtMemorySpace* memory_space_;
   xla::PjRtDevice* device_;
   xla::Shape shape_;
-  std::optional<mlx::core::array> array_;
+  // Mutable because `Settled` may replace a VIEW with the dense array it
+  // gathered: the buffer's value never changes, only which storage holds it,
+  // and every path that reaches it holds the submission lock.
+  mutable std::optional<mlx::core::array> array_;
   bool deleted_ = false;
 };
 

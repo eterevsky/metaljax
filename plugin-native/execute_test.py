@@ -1996,6 +1996,60 @@ module @zero_size_constants {
 """
 
 
+# P12: the cross-replica collectives, on the one device this plugin has.  jax
+# emits them only from pmap/shard_map, which cannot be nested in the jitted
+# CASES above, so they are written out -- and the CPU backend, with the same
+# one replica, is the reference for every one of them.  `all_reduce` carries
+# its reduction as a REGION, which is what made it decline before the port:
+# with a group of one there is nothing for that region to reduce.
+_COLLECTIVES = """
+module @collectives {
+  func.func public @main(%x: tensor<4xf32>)
+      -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>,
+          tensor<ui32>, tensor<ui32>) {
+    %ar = "stablehlo.all_reduce"(%x) <{
+        replica_groups = dense<0> : tensor<1x1xi64>}> ({
+    ^bb0(%a: tensor<f32>, %b: tensor<f32>):
+      %s = stablehlo.add %a, %b : tensor<f32>
+      stablehlo.return %s : tensor<f32>
+    }) : (tensor<4xf32>) -> tensor<4xf32>
+    %ag = "stablehlo.all_gather"(%x) <{all_gather_dim = 0 : i64,
+        replica_groups = dense<0> : tensor<1x1xi64>}>
+        : (tensor<4xf32>) -> tensor<4xf32>
+    %cp = "stablehlo.collective_permute"(%x) <{
+        source_target_pairs = dense<[[0, 0]]> : tensor<1x2xi64>}>
+        : (tensor<4xf32>) -> tensor<4xf32>
+    %rs = "stablehlo.reduce_scatter"(%x) <{scatter_dimension = 0 : i64,
+        replica_groups = dense<0> : tensor<1x1xi64>}> ({
+    ^bb0(%c: tensor<f32>, %d: tensor<f32>):
+      %t = stablehlo.add %c, %d : tensor<f32>
+      stablehlo.return %t : tensor<f32>
+    }) : (tensor<4xf32>) -> tensor<4xf32>
+    %rid = stablehlo.replica_id : tensor<ui32>
+    %pid = stablehlo.partition_id : tensor<ui32>
+    return %ar, %ag, %cp, %rs, %rid, %pid
+        : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>,
+          tensor<ui32>, tensor<ui32>
+  }
+}
+"""
+
+
+# `collective_permute` with an EMPTY pair list: this replica receives nothing,
+# which XLA fills with zeros -- the one arm of the family that is not an
+# identity, and the one a single-device engine could get silently wrong.
+_COLLECTIVE_PERMUTE_EMPTY = """
+module @collective_permute_empty {
+  func.func public @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+    %r = "stablehlo.collective_permute"(%x) <{
+        source_target_pairs = dense<> : tensor<0x2xi64>}>
+        : (tensor<4xf32>) -> tensor<4xf32>
+    return %r : tensor<4xf32>
+  }
+}
+"""
+
+
 def _module_cases():
     return [
         ("while with a captured bound", _WHILE_CAPTURED_BOUND,
@@ -2020,6 +2074,10 @@ def _module_cases():
          [_randint((1, 2, 6), 192), _randint((3, 2, 3), 193)]),
         ("zero-size constants", _ZERO_SIZE_CONSTANTS,
          [np.zeros((0,), np.float32)]),
+        ("single-device collectives", _COLLECTIVES,
+         [_rand((4,), 260)]),
+        ("collective_permute with no pairs", _COLLECTIVE_PERMUTE_EMPTY,
+         [_rand((4,), 261)]),
     ]
 
 
@@ -2249,6 +2307,167 @@ def _declines():
         # never a wrong answer.  (Written by hand: jax emits no such call.)
         ("an unknown custom call", _UNKNOWN_CUSTOM_CALL,
          [np.arange(3, dtype=np.float32)], "custom call target 'no_such_op'"),
+    ]
+
+
+# --------------------------------------------------------------------------
+# the P13 surface: callbacks, ordered effects, donation, buffer identity
+# --------------------------------------------------------------------------
+#
+# None of these is a NUMBER the CPU backend could be asked for -- they are
+# contracts about what the runtime does around the numbers -- so they sit here
+# rather than in the differential cases: what a callback printed and in which
+# order, whether a donated buffer is gone, whether two buffers are the same
+# memory.  Each returns (ok, detail).
+
+
+def _p13_contracts(jax, jnp):
+    import jax.experimental   # io_callback
+
+    # `jax.debug.print` itself cannot be exercised here: its impl device_puts
+    # the operands onto a local CPU device, and this process sees the metal
+    # platform alone (which is what stops a case comparing metal against
+    # itself).  `io_callback` reaches the same `metaljax_callback` custom call
+    # by the same lowering, and recording into a list says more about ORDER
+    # than captured text would.
+    def callbacks_run_in_order():
+        """The callback trampoline, in the tape's order.
+
+        The loop body holds the callback, so the whole program is impure and
+        runs entry by entry -- which is exactly the shape that would run a
+        pipelined loop's condition twice (the Stage 1 bug P8.5 found), so the
+        count is as much the point as the values.
+        """
+        seen = []
+
+        @jax.jit
+        def f(x):
+            def body(i, c):
+                jax.experimental.io_callback(
+                    lambda a, b: seen.append((int(a), float(b))), None, i, c)
+                return c + 1.0
+            return jax.lax.fori_loop(0, 3, body, x)
+
+        out = float(np.asarray(f(jnp.float32(10.0))))
+        jax.effects_barrier()
+        want = [(0, 10.0), (1, 11.0), (2, 12.0)]
+        if seen != want:
+            return False, f"saw {seen}"
+        return (out == 13.0), f"loop returned {out}"
+
+    def ordered_effects_thread_tokens():
+        """An ORDERED callback gives main a `!stablehlo.token` parameter and
+        a token result, which is the whole of P12's token work: without them
+        the program declines on a value that is not a ranked tensor."""
+        seen = []
+
+        @jax.jit
+        def f(x):
+            jax.experimental.io_callback(
+                lambda v: seen.append(float(v)), None, x, ordered=True)
+            return x * 2
+
+        np.asarray(f(jnp.float32(3.0)))
+        out = float(np.asarray(f(jnp.float32(4.0))))
+        jax.effects_barrier()
+        if seen != [3.0, 4.0]:
+            return False, f"saw {seen}"
+        return out == 8.0, f"returned {out}"
+
+    def pure_callback_values():
+        def host(v):
+            return np.sin(v).astype(np.float32)
+
+        x = _rand((5,), 262)
+        got = np.asarray(jax.jit(lambda v: jax.pure_callback(
+            host, jax.ShapeDtypeStruct((5,), np.float32), v) + 1.0)(x))
+        want = np.sin(x) + 1.0
+        err = float(np.max(np.abs(got - want)))
+        return err < 1e-6, f"max error {err:.3e}"
+
+    def callback_error_propagates():
+        def host(v):
+            raise ValueError("deliberate")
+
+        try:
+            np.asarray(jax.jit(lambda v: jax.pure_callback(
+                host, jax.ShapeDtypeStruct((3,), np.float32), v))(
+                    jnp.arange(3, dtype=jnp.float32)))
+        except BaseException as exc:  # noqa: BLE001
+            msg = str(exc)
+            return "deliberate" in msg, f"raised {msg.splitlines()[0][:70]}"
+        return False, "no error raised"
+
+    def donation_invalidates():
+        """XLA's donation contract: a donated argument is gone afterwards, and
+        an argument that is not donated is untouched."""
+        a = jax.device_put(np.arange(3, dtype=np.float32))
+        b = jax.device_put(np.ones(3, np.float32))
+        out = jax.jit(lambda x, y: (x + y, y), donate_argnums=0)(a, b)
+        if not np.allclose(np.asarray(out[0]), np.arange(3) + 1):
+            return False, "wrong result"
+        if not a.is_deleted():
+            return False, "the donated buffer survived"
+        if b.is_deleted():
+            return False, "a buffer that was not donated was deleted"
+        try:
+            np.asarray(a)
+        except BaseException:  # noqa: BLE001 - this is the contract
+            return True, ""
+        return False, "the donated buffer is still readable"
+
+    def buffer_pointer_is_stable():
+        """`unsafe_buffer_pointer` is the buffer's IDENTITY, so it may not
+        move between calls -- jax asserts on it (`testArrayCopy`).  A value
+        held as a broadcast VIEW is the case that used to gather afresh, and
+        hand out a new address, on every read."""
+        x = jnp.ones(10, jnp.float32)          # a broadcast of one element
+        ptrs = {x.unsafe_buffer_pointer() for _ in range(3)}
+        if len(ptrs) != 1:
+            return False, f"{len(ptrs)} different addresses in 3 calls"
+        if jnp.copy(x).unsafe_buffer_pointer() in ptrs:
+            return False, "a copy shares the original's buffer"
+        return True, ""
+
+    def default_layout_is_answered():
+        x = jax.device_put(np.zeros((2, 3), np.float32))
+        fmt = x.format
+        mtm = tuple(fmt.layout.major_to_minor)
+        return mtm == (0, 1), f"major_to_minor {mtm}"
+
+    def cost_analysis_is_answered():
+        info = jax.jit(lambda v: v + 1).lower(
+            jnp.arange(3, dtype=jnp.float32)).compile().cost_analysis()
+        if info is None:
+            return False, "None"
+        return "metaljax_tape_entries" in info, f"{sorted(info)[:3]}"
+
+    def compile_options_are_validated():
+        lowered = jax.jit(lambda v: v + 1).lower(
+            jnp.arange(3, dtype=jnp.float32))
+        try:
+            lowered.compile(compiler_options={"invalid_key": "v"})
+        except BaseException as exc:  # noqa: BLE001
+            if "No such compile option" not in str(exc):
+                return False, f"raised {str(exc).splitlines()[0][:70]}"
+        else:
+            return False, "an unknown compile option was accepted"
+        # ...and a known one still compiles and runs.
+        exe = lowered.compile(
+            compiler_options={"xla_embed_ir_in_executable": True})
+        got = np.asarray(exe(jnp.arange(3, dtype=jnp.float32)))
+        return np.array_equal(got, np.arange(3) + 1), f"{got}"
+
+    return [
+        ("callbacks run in order", callbacks_run_in_order),
+        ("ordered effects thread tokens", ordered_effects_thread_tokens),
+        ("pure_callback computes", pure_callback_values),
+        ("a callback's error propagates", callback_error_propagates),
+        ("donation invalidates its input", donation_invalidates),
+        ("buffer pointers are stable", buffer_pointer_is_stable),
+        ("the default layout is answered", default_layout_is_answered),
+        ("cost analysis is answered", cost_analysis_is_answered),
+        ("compile options are validated", compile_options_are_validated),
     ]
 
 
@@ -2570,6 +2789,16 @@ def main():
     print(f"{label:<32} {'':>12}  {detail}")
     if not ok:
         failures.append(label)
+
+    for label, check in _p13_contracts(jax, jnp):
+        try:
+            ok, detail = check()
+        except BaseException as exc:  # noqa: BLE001 - report and continue
+            ok, detail = False, f"{type(exc).__name__}: " \
+                                f"{str(exc).splitlines()[0][:90]}"
+        print(f"{label:<32} {'':>12}  {'ok' if ok else f'FAIL: {detail}'}")
+        if not ok:
+            failures.append(label)
 
     # Every dtype the transfer path claims, host -> device -> host, bit exact,
     # plus a negative-stride view (whose logical first element is not its
