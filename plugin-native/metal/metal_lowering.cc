@@ -157,6 +157,247 @@ int64_t Product(const std::vector<int64_t>& xs) {
   return p;
 }
 
+// Python's `//`, which the window arithmetic below depends on: a window that
+// does not fit its padded axis gives a NEGATIVE numerator, and C++'s
+// truncation would round it towards zero and invent an output element where
+// Python's floor gives none.  (`(-1) // 2` is -1 in Python and 0 in C++;
+// after the `+ 1` and the `max(0, ...)` that is one window versus none.)
+int64_t FloorDiv(int64_t a, int64_t b) {
+  int64_t q = a / b, r = a % b;
+  if (r != 0 && ((r < 0) != (b < 0))) q--;
+  return q;
+}
+
+// Python's `-(-a // b)` on non-negative operands.
+int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+// tape.py `_opt_i64_list`: an i64 array-ish attribute, or the default when
+// the op does not carry it.  StableHLO spells the window attributes as
+// DenseI64ArrayAttr and `padding` as an elements attribute, and
+// `metaljax._ir.i64_list` reads either -- so this does too.
+std::vector<int64_t> OptI64List(mlir::Operation* op, llvm::StringRef name,
+                                std::vector<int64_t> fallback) {
+  if (auto arr = op->getAttrOfType<mlir::DenseI64ArrayAttr>(name))
+    return std::vector<int64_t>(arr.asArrayRef().begin(),
+                                arr.asArrayRef().end());
+  if (auto den = op->getAttrOfType<mlir::DenseIntElementsAttr>(name)) {
+    std::vector<int64_t> out;
+    for (const llvm::APInt& v : den.getValues<llvm::APInt>())
+      out.push_back(v.getSExtValue());
+    return out;
+  }
+  return fallback;
+}
+
+// The element-type name of a value, as src/metaljax/tape.py's `_element`
+// spells it ("i1", "ui32", "bf16", "complex<f32>").
+std::optional<std::string> ElementName(mlir::Value v) {
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+  if (!t) return std::nullopt;
+  return TapeElementName(t.getElementType());
+}
+
+// reduce_window's own materialization cap (tape.py `_WINDOW_MAX`); above it
+// the Python handler raises, so the tape declines instead of asking MLX for a
+// view with more elements than the device can hold.
+constexpr int64_t kWindowMax = 200000000;
+
+// The static half of ops/reduction.py `_extract_windows`, transliterated from
+// tape.py `_window_plan`: base dilation, then padding, then the strided window
+// view -- every shape of which follows from the attributes, so none of it
+// needs an array.  The attribute order is `read_window_plan`'s in
+// native/ops_reduce.cc, field for field.
+struct WindowPlanOut {
+  std::vector<int64_t> attrs;
+  std::vector<int64_t> out_sizes;
+  int64_t wflat = 0;
+};
+
+absl::StatusOr<WindowPlanOut> BuildWindowPlan(
+    int64_t rank, const std::vector<int64_t>& src,
+    const std::vector<int64_t>& wd, const std::vector<int64_t>& strides,
+    const std::vector<int64_t>& bdil, const std::vector<int64_t>& wdil,
+    const std::vector<std::pair<int64_t, int64_t>>& pad) {
+  WindowPlanOut out;
+  std::vector<int64_t>& attrs = out.attrs;
+  std::vector<int64_t> shape = src;
+
+  std::vector<std::pair<int64_t, int64_t>> dil;   // (axis, base dilation)
+  for (int64_t ax = 0; ax < rank; ax++)
+    if (bdil[ax] != 1) dil.push_back({ax, bdil[ax]});
+  attrs.push_back(static_cast<int64_t>(dil.size()));
+  for (const auto& [ax, b] : dil) {
+    if (b < 1) return Decline("reduce_window base dilation");
+    shape[ax] = shape[ax] * b;
+    attrs.push_back(ax);
+    attrs.push_back(b);
+    attrs.push_back(static_cast<int64_t>(shape.size()));
+    attrs.insert(attrs.end(), shape.begin(), shape.end());
+    shape[ax] = shape[ax] - (b - 1);
+    attrs.push_back(shape[ax]);
+  }
+
+  bool any_pad = false, any_neg = false;
+  for (const auto& [lo, hi] : pad) {
+    any_pad = any_pad || lo != 0 || hi != 0;
+    any_neg = any_neg || lo < 0 || hi < 0;
+  }
+  if (any_pad) {
+    // ops/reduction.py raises here: mx::pad has no negative widths, and a
+    // crop-then-window rewrite is not what the Python engine computes.
+    if (any_neg) return Decline("reduce_window negative padding");
+    attrs.push_back(1);
+    attrs.push_back(rank);
+    for (const auto& p : pad) attrs.push_back(p.first);
+    attrs.push_back(rank);
+    for (const auto& p : pad) attrs.push_back(p.second);
+    for (int64_t i = 0; i < rank; i++)
+      shape[i] += pad[i].first + pad[i].second;
+  } else {
+    attrs.push_back(0);
+    attrs.push_back(0);
+    attrs.push_back(0);
+  }
+
+  for (int64_t i = 0; i < rank; i++) {
+    const int64_t span = (wd[i] - 1) * wdil[i] + 1;
+    out.out_sizes.push_back(
+        std::max<int64_t>(0, FloorDiv(shape[i] - span, strides[i]) + 1));
+  }
+  out.wflat = Product(wd);
+  if (out.wflat * Product(out.out_sizes) > kWindowMax)
+    return Decline("reduce_window materialization too large");
+
+  std::vector<int64_t> elem(rank, 1);
+  for (int64_t i = rank - 2; i >= 0; i--) elem[i] = elem[i + 1] * shape[i + 1];
+  std::vector<int64_t> view_shape = out.out_sizes;
+  view_shape.insert(view_shape.end(), wd.begin(), wd.end());
+  std::vector<int64_t> view_strides;
+  for (int64_t i = 0; i < rank; i++) view_strides.push_back(elem[i] * strides[i]);
+  for (int64_t i = 0; i < rank; i++) view_strides.push_back(elem[i] * wdil[i]);
+  std::vector<int64_t> flat = out.out_sizes;
+  flat.push_back(out.wflat);
+  attrs.push_back(static_cast<int64_t>(view_shape.size()));
+  attrs.insert(attrs.end(), view_shape.begin(), view_shape.end());
+  attrs.push_back(static_cast<int64_t>(view_strides.size()));
+  attrs.insert(attrs.end(), view_strides.begin(), view_strides.end());
+  attrs.push_back(static_cast<int64_t>(flat.size()));
+  attrs.insert(attrs.end(), flat.begin(), flat.end());
+
+  bool empty = out.wflat == 0;
+  for (int64_t s : out.out_sizes) empty = empty || s == 0;
+  attrs.push_back(empty ? 1 : 0);
+  attrs.push_back(static_cast<int64_t>(out.out_sizes.size()));
+  attrs.insert(attrs.end(), out.out_sizes.begin(), out.out_sizes.end());
+  return out;
+}
+
+// --------------------------------------------------------------------------
+// sort comparators (src/metaljax/ops/sort.py)
+// --------------------------------------------------------------------------
+//
+// tape.py lowers only the comparator that IS a bare compare, because the
+// Python ENGINE evaluates the other shape -- a comparator that computes a KEY
+// from its argument pair -- by running the block's code on whole arrays, and
+// tape.py has no way to hand a block to that opcode.  This plugin has no
+// Python engine behind it, so the recognizer is ported instead: the key chain
+// is elementwise scalar code, and elementwise scalar code lowered into the
+// ENCLOSING frame computes the same key on the whole operand.  What the
+// Python does with an interpreter at run time, this does with tape entries at
+// compile time; `_gather_sorted` is then the kSort entry, keyed on the chain's
+// output rather than on the operand.
+
+// ops/sort.py `_arg_deps`: the transitive comparator-block-argument
+// dependencies of a value.  Values defined outside the comparator block
+// (constants XLA's parse hoisted out) are opaque leaves.
+std::vector<unsigned> ArgDeps(mlir::Value root, mlir::Block& block) {
+  llvm::DenseSet<mlir::Value> seen;
+  llvm::DenseSet<unsigned> deps;
+  std::vector<mlir::Value> stack{root};
+  while (!stack.empty()) {
+    mlir::Value v = stack.back();
+    stack.pop_back();
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+      if (arg.getOwner() == &block) deps.insert(arg.getArgNumber());
+      continue;
+    }
+    mlir::Operation* def = v.getDefiningOp();
+    if (def == nullptr || def->getBlock() != &block) continue;
+    if (!seen.insert(v).second) continue;
+    for (mlir::Value w : def->getOperands()) stack.push_back(w);
+  }
+  std::vector<unsigned> out(deps.begin(), deps.end());
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// ops/sort.py `_serialize`: the canonical form of a value's def DAG with the
+// comparator's own argument renamed, so the two sides of the compare can be
+// checked for computing the SAME function of their respective arguments.  An
+// asymmetric comparator is not a sort by a key and must not be treated as one.
+void SerializeKey(mlir::Value v, mlir::BlockArgument key, mlir::Block& block,
+                  std::string* out) {
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+    absl::StrAppend(out, arg == key ? "KEY" : "OTHER_ARG");
+    return;
+  }
+  mlir::Operation* def = v.getDefiningOp();
+  if (def == nullptr || def->getBlock() != &block) {
+    // An external leaf is identified by the value itself: the two sides
+    // referring to the SAME hoisted constant is what makes them symmetric.
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    v.printAsOperand(os, mlir::OpPrintingFlags());
+    absl::StrAppend(out, "(EXT ", os.str(), ")");
+    return;
+  }
+  absl::StrAppend(out, "(", View(def->getName().getStringRef()));
+  std::vector<std::pair<std::string, std::string>> attrs;
+  for (const mlir::NamedAttribute& na : def->getAttrs()) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    na.getValue().print(os);
+    attrs.push_back({na.getName().str(), os.str()});
+  }
+  std::sort(attrs.begin(), attrs.end());
+  for (const auto& [n, a] : attrs) absl::StrAppend(out, " ", n, "=", a);
+  for (mlir::Value w : def->getOperands()) {
+    absl::StrAppend(out, " ");
+    SerializeKey(w, key, block, out);
+  }
+  absl::StrAppend(out, ")");
+}
+
+// Which ops a key chain may be made of.  The Python recognizer accepts any op
+// with a handler and relies on the chain being elementwise; here the rule is
+// spelled out, because an op that is NOT elementwise would be lowered against
+// its rank-0 IR type and then run on a whole array -- a wrong answer rather
+// than a decline.  Every operand and result being rank-0 is checked as well:
+// together the two make "scalar block code, run on arrays" a fact rather than
+// an assumption.
+bool IsChainOp(absl::string_view name) {
+  return SimpleOps().contains(name) || name == "stablehlo.compare" ||
+         name == "stablehlo.convert" || name == "stablehlo.constant" ||
+         name == "stablehlo.shift_left" ||
+         name == "stablehlo.shift_right_logical" ||
+         name == "stablehlo.shift_right_arithmetic";
+}
+
+bool IsRank0(mlir::Value v) {
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+  return t && t.getRank() == 0;
+}
+
+// tape.py `_CUM_KINDS`: the monoid of a cumulative reduce_window, which jax
+// lowers as a full-width window with prefix (or suffix) padding.
+std::optional<int64_t> CumKind(absl::string_view body_op) {
+  if (body_op == "stablehlo.add") return 0;
+  if (body_op == "stablehlo.maximum") return 1;
+  if (body_op == "stablehlo.minimum") return 2;
+  if (body_op == "stablehlo.multiply") return 3;
+  return std::nullopt;
+}
+
 // ops/linalg.py `_exact_f32_chunk`: the contraction-dim chunk that keeps an
 // integer dot exact under an f32 matmul, or 0 when these operands cannot take
 // that path.  f32 holds every integer below 2**24 exactly, so a sum of
@@ -1085,9 +1326,31 @@ class Lowering {
       mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerReverse(mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerPopcnt(mlir::Operation* op);
+  absl::StatusOr<std::vector<int64_t>> LowerFft(mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerGather(mlir::Operation* op);
   absl::Status LowerConstant(mlir::Operation* op);
   absl::Status LowerReduce(mlir::Operation* op);
+  // The families that bind and emit themselves: each may hand back more than
+  // one array (so the single-result path cannot serve them), and
+  // reduce_window's third arm carries a sub-Program besides.
+  absl::Status LowerReduceWindow(mlir::Operation* op);
+  absl::Status LowerSort(mlir::Operation* op);
+  absl::Status LowerTopK(mlir::Operation* op);
+  absl::Status LowerRng(mlir::Operation* op);
+
+  // tape.py `_generic_reduce_attrs`: a reduce body neither table recognizes,
+  // lowered into a sub-Program the handler calls once per halving round.
+  // Shared by stablehlo.reduce and reduce_window, whose window axis goes to
+  // the same routine (`rank` is the WINDOW rank there, not the operand's).
+  struct GenericBody {
+    std::vector<int64_t> attrs;
+    std::vector<int> caps;
+    std::shared_ptr<Program> program;
+    DumpNode dump;
+  };
+  absl::StatusOr<GenericBody> LowerGenericBody(size_t n,
+                                               const std::vector<int64_t>& dims,
+                                               mlir::Block& body, int64_t rank);
   // Scatter emits itself: its drop strategy may carry a neutral VALUE, which
   // is a payload rather than an attribute (tape.py returns one too).
   absl::Status LowerScatter(mlir::Operation* op);
@@ -1159,6 +1422,24 @@ class Lowering {
   void ApplyTaint(int slot, const Taint& t) {
     if (t.cv) const_view_.insert(slot);
     if (!t.args.empty()) arg_alias_[slot] = t.args;
+  }
+
+  // tape.py's taint rule for an op with a REGION (or one of `_TAINTING_OPS`):
+  // every result inherits every operand's taints.  A body that returns one of
+  // its own arguments hands an operand's array straight back -- a degenerate
+  // combiner does exactly that -- and rng_bit_generator returns its state
+  // operand unchanged when it consumes no blocks.  Conservative on purpose:
+  // being wrong here means an output aliasing an argument across calls.
+  void TaintFromAll(const std::vector<int>& ins,
+                    const std::vector<int>& outs) {
+    Taint t;
+    for (int s : ins) {
+      auto it = arg_alias_.find(s);
+      if (it != arg_alias_.end()) t.args.insert(it->second.begin(),
+                                                it->second.end());
+      t.cv = t.cv || const_view_.count(s) > 0;
+    }
+    for (int s : outs) ApplyTaint(s, t);
   }
 
   LowerContext* ctx_;
@@ -1748,6 +2029,66 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerPopcnt(
   return std::vector<int64_t>{*ucode, view, wide ? 1 : 0, bits, code};
 }
 
+// tape.py `_lower_fft`: ops/elementwise.py `_fft`, with its two workarounds
+// intact.  Both are MLX bugs the Python handler documents -- a transform of an
+// empty input is the typed empty result rather than an MLX error, and a unit
+// LAST length on a real transform silently DROPS the transforms over the
+// remaining axes, so that case is spelled out as the identity on the DC bin
+// plus an ordinary complex transform over the leading axes.  The third
+// workaround, the barrier before an EAGER transform (MLX's FFT kernels can
+// read an input whose producing copy is still in flight), lives in the
+// handler, where the `in_trace` flag it keys on is known.
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerFft(mlir::Operation* op) {
+  auto fft = mlir::dyn_cast<mlir::stablehlo::FftOp>(op);
+  if (!fft) return Decline("stablehlo.fft in an unexpected form");
+  ASSIGN_OR_RETURN(std::vector<int64_t> in_shape, Dims(op->getOperand(0)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> out_shape, Dims(op->getResult(0)));
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
+  const int64_t rank = static_cast<int64_t>(in_shape.size());
+  std::vector<int64_t> s(fft.getFftLength().begin(), fft.getFftLength().end());
+  if (s.empty() || static_cast<int64_t>(s.size()) > rank)
+    return Decline("fft length rank");
+  std::vector<int64_t> axes;
+  for (int64_t i = rank - static_cast<int64_t>(s.size()); i < rank; i++)
+    axes.push_back(i);
+
+  bool empty = Product(in_shape) == 0;
+  for (int64_t d : s) empty = empty || d == 0;
+  if (empty) {
+    std::vector<int64_t> attrs{0, out_code,
+                               static_cast<int64_t>(out_shape.size())};
+    attrs.insert(attrs.end(), out_shape.begin(), out_shape.end());
+    return attrs;
+  }
+
+  int64_t code = 0;
+  switch (fft.getFftType()) {
+    case mlir::stablehlo::FftType::FFT: code = 0; break;
+    case mlir::stablehlo::FftType::IFFT: code = 1; break;
+    case mlir::stablehlo::FftType::RFFT: code = 2; break;
+    case mlir::stablehlo::FftType::IRFFT: code = 3; break;
+  }
+
+  if (s.back() == 1 && (code == 2 || code == 3)) {
+    // The unit-length rewrite: `1` for the real axis, the leading axes
+    // transformed (or not, when there are none).
+    std::vector<int64_t> lead_s(s.begin(), s.end() - 1);
+    std::vector<int64_t> lead_axes(axes.begin(), axes.end() - 1);
+    std::vector<int64_t> attrs{code == 3 ? 2 : 3, lead_axes.empty() ? 0 : 1,
+                               static_cast<int64_t>(lead_s.size())};
+    attrs.insert(attrs.end(), lead_s.begin(), lead_s.end());
+    attrs.push_back(static_cast<int64_t>(lead_axes.size()));
+    attrs.insert(attrs.end(), lead_axes.begin(), lead_axes.end());
+    return attrs;
+  }
+
+  std::vector<int64_t> attrs{1, code, static_cast<int64_t>(s.size())};
+  attrs.insert(attrs.end(), s.begin(), s.end());
+  attrs.push_back(static_cast<int64_t>(axes.size()));
+  attrs.insert(attrs.end(), axes.begin(), axes.end());
+  return attrs;
+}
+
 // --------------------------------------------------------------------------
 // gather / scatter (src/metaljax/tape.py `_index_plan` / `_lower_gather` /
 // `_lower_scatter`)
@@ -2313,7 +2654,485 @@ absl::Status Lowering::LowerReduce(mlir::Operation* op) {
       }
     }
   }
-  return Decline("stablehlo.reduce with a general body");
+  // _generic_reduce: any associative body, any arity.  The reduced dims move
+  // to one trailing axis and the body combines the two halves of it until one
+  // element is left, then folds the init in.  Everything the Python version
+  // derives from the arrays is static here; the BODY is the one thing that is
+  // not, so it becomes a sub-Program.
+  if (op->getNumResults() != n) return Decline("generic reduce result count");
+  ASSIGN_OR_RETURN(std::vector<int64_t> src, Dims(op->getOperand(0)));
+  ASSIGN_OR_RETURN(GenericBody gb,
+                   LowerGenericBody(n, dims, body,
+                                    static_cast<int64_t>(src.size())));
+  ins.insert(ins.end(), gb.caps.begin(), gb.caps.end());
+  std::vector<int> outs;
+  for (mlir::Value r : op->getResults()) outs.push_back(Bind(r));
+  TaintFromAll(ins, outs);
+  std::vector<DumpNode> dumps;
+  if (kDumpTape) dumps.push_back(std::move(gb.dump));
+  ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.reduce.generic"));
+  Emit(opcode, std::move(ins), std::move(outs), std::move(gb.attrs),
+       std::nullopt, ResultBytes(op), {std::move(gb.program)},
+       std::move(dumps));
+  return absl::OkStatus();
+}
+
+// tape.py `_generic_reduce_attrs`.  The body's own arguments are the 2n
+// (accumulator, element) pairs; the values it reads from enclosing scopes ride
+// as extra operands after the op's, which is where the handler looks for them.
+absl::StatusOr<Lowering::GenericBody> Lowering::LowerGenericBody(
+    size_t n, const std::vector<int64_t>& dims, mlir::Block& body,
+    int64_t rank) {
+  for (int64_t d : dims)
+    if (d < 0 || d >= rank) return Decline("reduce dimension out of range");
+  std::vector<int64_t> keep;
+  for (int64_t i = 0; i < rank; i++)
+    if (std::find(dims.begin(), dims.end(), i) == dims.end()) keep.push_back(i);
+  if (body.getNumArguments() != 2 * n) return Decline("reduce body arity");
+  ASSIGN_OR_RETURN(Region region, LowerRegion(body));
+  if (region.outputs.size() != n) return Decline("reduce body result count");
+
+  GenericBody out;
+  out.attrs.push_back(static_cast<int64_t>(n));
+  out.attrs.push_back(static_cast<int64_t>(keep.size()));
+  out.attrs.insert(out.attrs.end(), keep.begin(), keep.end());
+  out.attrs.push_back(static_cast<int64_t>(dims.size()));
+  out.attrs.insert(out.attrs.end(), dims.begin(), dims.end());
+  out.attrs.push_back(static_cast<int64_t>(region.caps.size()));
+  out.caps = std::move(region.caps);
+  out.program = std::move(region.program);
+  out.dump = std::move(region.dump);
+  return out;
+}
+
+// tape.py `_lower_reduce_window`: ops/reduction.py `_reduce_window` with its
+// three arms resolved.  The cum-op peephole (jax lowers cumsum and friends as
+// a full-width window with prefix padding), the windowed reduction over an
+// as_strided view, and -- where the body is neither a monoid nor the single
+// compare of select_and_gather_add -- the generic pairwise reduce over the
+// window axis, whose body becomes a sub-Program.
+absl::Status Lowering::LowerReduceWindow(mlir::Operation* op) {
+  auto rw = mlir::dyn_cast<mlir::stablehlo::ReduceWindowOp>(op);
+  if (!rw) return Decline("stablehlo.reduce_window in an unexpected form");
+  const size_t n = op->getNumOperands() / 2;
+  if (n * 2 != op->getNumOperands())
+    return Decline("reduce_window operand arity");
+  if (op->getNumResults() != n) return Decline("reduce_window result count");
+  ASSIGN_OR_RETURN(std::vector<int64_t> src, Dims(op->getOperand(0)));
+  const int64_t rank = static_cast<int64_t>(src.size());
+  const std::vector<int64_t> ones(static_cast<size_t>(rank), 1);
+  std::vector<int64_t> wd = OptI64List(op, "window_dimensions", ones);
+  std::vector<int64_t> strides = OptI64List(op, "window_strides", ones);
+  std::vector<int64_t> bdil = OptI64List(op, "base_dilations", ones);
+  std::vector<int64_t> wdil = OptI64List(op, "window_dilations", ones);
+  std::vector<std::pair<int64_t, int64_t>> pad(static_cast<size_t>(rank),
+                                               {0, 0});
+  if (auto pa = op->getAttrOfType<mlir::DenseIntElementsAttr>("padding")) {
+    std::vector<int64_t> flat;
+    for (const llvm::APInt& v : pa.getValues<llvm::APInt>())
+      flat.push_back(v.getSExtValue());
+    if (static_cast<int64_t>(flat.size()) != 2 * rank)
+      return Decline("reduce_window padding rank");
+    for (int64_t i = 0; i < rank; i++)
+      pad[static_cast<size_t>(i)] = {flat[2 * i], flat[2 * i + 1]};
+  }
+  if (static_cast<int64_t>(wd.size()) != rank ||
+      static_cast<int64_t>(strides.size()) != rank ||
+      static_cast<int64_t>(bdil.size()) != rank ||
+      static_cast<int64_t>(wdil.size()) != rank)
+    return Decline("reduce_window attribute rank");
+  for (int64_t s : strides)
+    if (s < 1) return Decline("reduce_window stride or dilation");
+  for (int64_t d : wdil)
+    if (d < 1) return Decline("reduce_window stride or dilation");
+  if (rw.getBody().getBlocks().size() != 1)
+    return Decline("a reduce_window with a multi-block body");
+  mlir::Block& body = rw.getBody().front();
+  std::vector<mlir::Operation*> body_ops;
+  for (mlir::Operation& o : body) body_ops.push_back(&o);
+
+  std::vector<int> ins;
+  for (mlir::Value v : op->getOperands()) {
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    ins.push_back(s);
+  }
+  auto emit = [&](std::vector<int64_t> attrs,
+                  std::vector<std::shared_ptr<Program>> regions,
+                  std::vector<DumpNode> dumps,
+                  bool taint_all) -> absl::Status {
+    std::vector<int> outs;
+    for (mlir::Value r : op->getResults()) outs.push_back(Bind(r));
+    if (taint_all) TaintFromAll(ins, outs);
+    ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.reduce_window"));
+    Emit(opcode, ins, std::move(outs), std::move(attrs), std::nullopt,
+         ResultBytes(op), std::move(regions), std::move(dumps));
+    return absl::OkStatus();
+  };
+
+  // The cumulative pattern, recognized exactly as the handler does: one axis
+  // of full width, padded on one side by width-1, everything else trivial.
+  if (n == 1 && body_ops.size() == 2) {
+    std::optional<int64_t> cum =
+        CumKind(View(body_ops[0]->getName().getStringRef()));
+    bool trivial = true;
+    for (int64_t s : strides) trivial = trivial && s == 1;
+    for (int64_t d : bdil) trivial = trivial && d == 1;
+    for (int64_t d : wdil) trivial = trivial && d == 1;
+    if (cum.has_value() && trivial) {
+      std::vector<int64_t> big;
+      for (int64_t i = 0; i < rank; i++)
+        if (wd[static_cast<size_t>(i)] > 1) big.push_back(i);
+      if (big.size() == 1) {
+        const size_t ax = static_cast<size_t>(big[0]);
+        const int64_t size = src[ax];
+        bool others = true;
+        for (int64_t i = 0; i < rank; i++) {
+          if (static_cast<size_t>(i) == ax) continue;
+          others = others && wd[static_cast<size_t>(i)] == 1 &&
+                   pad[static_cast<size_t>(i)].first == 0 &&
+                   pad[static_cast<size_t>(i)].second == 0;
+        }
+        if (others && wd[ax] == size) {
+          if (pad[ax].first == size - 1 && pad[ax].second == 0)
+            return emit({0, *cum, big[0], 0}, {}, {}, false);
+          if (pad[ax].first == 0 && pad[ax].second == size - 1)
+            return emit({0, *cum, big[0], 1}, {}, {}, false);
+        }
+      }
+    }
+  }
+
+  for (size_t i = 1; i < n; i++) {
+    ASSIGN_OR_RETURN(std::vector<int64_t> other, Dims(op->getOperand(i)));
+    if (other != src) return Decline("reduce_window inputs of different shapes");
+  }
+  ASSIGN_OR_RETURN(WindowPlanOut plan,
+                   BuildWindowPlan(rank, src, wd, strides, bdil, wdil, pad));
+  std::vector<int64_t> attrs{1, static_cast<int64_t>(n)};
+  attrs.insert(attrs.end(), plan.attrs.begin(), plan.attrs.end());
+
+  if (n >= 2) {
+    // select_and_gather_add: one compare on the first pair plus selects picks
+    // a single window element for every output.
+    std::vector<mlir::stablehlo::CompareOp> cmps;
+    size_t nsel = 0;
+    for (mlir::Operation* o : body_ops) {
+      if (auto c = mlir::dyn_cast<mlir::stablehlo::CompareOp>(o))
+        cmps.push_back(c);
+      if (o->getName().getStringRef() == "stablehlo.select") nsel++;
+    }
+    if (cmps.size() == 1 && nsel >= n) {
+      const auto d = cmps[0].getComparisonDirection();
+      const bool is_max = d == mlir::stablehlo::ComparisonDirection::GE ||
+                          d == mlir::stablehlo::ComparisonDirection::GT;
+      attrs.push_back(1);
+      attrs.push_back(is_max ? 1 : 0);
+      return emit(std::move(attrs), {}, {}, false);
+    }
+  } else if (body_ops.size() == 2) {
+    std::optional<int64_t> kind =
+        ReduceKind(View(body_ops[0]->getName().getStringRef()),
+                   IsBoolElement(op->getOperand(0)));
+    if (kind.has_value()) {
+      attrs.push_back(0);
+      attrs.push_back(*kind);
+      return emit(std::move(attrs), {}, {}, false);
+    }
+  }
+
+  // Everything else folds the window axis with the body itself.  What that
+  // reduce sees is the extracted window VIEW, so its rank is the output rank
+  // plus the one flattened window axis, and the reduced dim is that axis.
+  const int64_t wrank = static_cast<int64_t>(plan.out_sizes.size()) + 1;
+  ASSIGN_OR_RETURN(
+      GenericBody gb,
+      LowerGenericBody(n, {static_cast<int64_t>(plan.out_sizes.size())}, body,
+                       wrank));
+  attrs.push_back(2);
+  attrs.insert(attrs.end(), gb.attrs.begin(), gb.attrs.end());
+  ins.insert(ins.end(), gb.caps.begin(), gb.caps.end());
+  std::vector<DumpNode> dumps;
+  if (kDumpTape) dumps.push_back(std::move(gb.dump));
+  return emit(std::move(attrs), {std::move(gb.program)}, std::move(dumps),
+              true);
+}
+
+// ops/sort.py `_sort`, the arm whose comparator ends in a compare -- which is
+// every sort jax emits except the two lexicographic select trees.  Two shapes
+// reach here and both are handled: the comparator's two sides ARE the (lhs,
+// rhs) block-argument pair (an integer sort, and the `sort(values, iota)` a
+// top_k decomposes to), in which case the sort key is an operand and the entry
+// is exactly tape.py's; or the sides compute the same KEY function of their
+// argument (jax's float canonicalization: -0 -> +0, NaN -> canonical qNaN,
+// then a TOTALORDER compare), in which case that chain is lowered into THIS
+// frame -- it is scalar elementwise code, so it computes the key of the whole
+// operand -- and the entry keys on its output.
+absl::Status Lowering::LowerSort(mlir::Operation* op) {
+  auto sort = mlir::dyn_cast<mlir::stablehlo::SortOp>(op);
+  if (!sort) return Decline("stablehlo.sort in an unexpected form");
+  const int64_t dim = sort.getDimension();
+  if (sort.getComparator().getBlocks().size() != 1)
+    return Decline("a sort with a multi-block comparator");
+  mlir::Block& block = sort.getComparator().front();
+  std::vector<mlir::Operation*> body;
+  for (mlir::Operation& o : block) body.push_back(&o);
+  if (body.empty()) return Decline("a sort with an empty comparator");
+  mlir::Operation* ret = body.back();
+  if (ret->getName().getStringRef() != "stablehlo.return" ||
+      ret->getNumOperands() != 1)
+    return Decline("sort: comparator must return one value");
+  mlir::Value cmp_val = ret->getOperand(0);
+  mlir::Operation* cmp = cmp_val.getDefiningOp();
+  if (cmp == nullptr || cmp->getBlock() != &block)
+    return Decline("sort: comparator returns an argument");
+  auto cmp_op = mlir::dyn_cast<mlir::stablehlo::CompareOp>(cmp);
+  if (!cmp_op) {
+    // The two lexicographic select trees.  Both mean a DIFFERENT execution
+    // shape -- successive stable argsorts threaded through a permutation, and
+    // for complex a (re, im) key packed into one u64 -- which the sort entry
+    // cannot express: it computes one argsort and gathers with it, and there
+    // is no opcode that gathers by a permutation the tape computed.  Named
+    // rather than approximated (see notes/cpp-p6-tail.md).
+    const std::vector<unsigned> deps = ArgDeps(cmp_val, block);
+    std::vector<unsigned> keys;
+    for (unsigned d : deps)
+      if (keys.empty() || keys.back() != d / 2) keys.push_back(d / 2);
+    if (keys.size() == 1 && keys[0] < op->getNumOperands() &&
+        IsComplexElement(op->getOperand(keys[0])))
+      return Decline("sort: complex lexicographic comparator");
+    return Decline(
+        absl::StrCat("sort: comparator ends in ",
+                     View(cmp->getName().getStringRef()), ", not compare"));
+  }
+  const auto d = cmp_op.getComparisonDirection();
+  const bool gt = d == mlir::stablehlo::ComparisonDirection::GT;
+  if (!gt && d != mlir::stablehlo::ComparisonDirection::LT)
+    return Decline("sort: non-strict compare");
+  if (block.getNumArguments() != 2 * op->getNumOperands() ||
+      op->getNumResults() != op->getNumOperands())
+    return Decline("sort arity");
+
+  mlir::Value lhs = cmp->getOperand(0), rhs = cmp->getOperand(1);
+  const std::vector<unsigned> ldeps = ArgDeps(lhs, block);
+  const std::vector<unsigned> rdeps = ArgDeps(rhs, block);
+  if (ldeps.size() != 1 || rdeps.size() != 1)
+    return Decline("sort: comparator mixes operands");
+  const unsigned li = ldeps[0], ri = rdeps[0];
+  if (ri != li + 1 || li % 2 != 0)
+    return Decline("sort comparator args are not an (lhs, rhs) pair");
+  const size_t k = static_cast<size_t>(li / 2);
+  // Both sides must compute the same key function of their own argument.
+  std::string lkey, rkey;
+  SerializeKey(lhs, block.getArgument(li), block, &lkey);
+  SerializeKey(rhs, block.getArgument(ri), block, &rkey);
+  if (lkey != rkey) return Decline("sort: asymmetric comparator");
+
+  std::vector<int> ins;
+  for (mlir::Value v : op->getOperands()) {
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    ins.push_back(s);
+  }
+
+  // The key: an operand when the comparator compares the pair directly, and
+  // otherwise the chain's output, lowered here as ordinary entries.
+  int64_t key_index = static_cast<int64_t>(k);
+  mlir::Value key_value = op->getOperand(k);
+  if (!mlir::isa<mlir::BlockArgument>(lhs)) {
+    // Every argument pair stands for its operand array, exactly as the Python
+    // seeds its evaluation environment.
+    for (unsigned j = 0; j * 2 < block.getNumArguments(); j++) {
+      if (j >= op->getNumOperands()) break;
+      ASSIGN_OR_RETURN(int s, Slot(op->getOperand(j)));
+      Alias(block.getArgument(2 * j), s);
+      if (2 * j + 1 < block.getNumArguments())
+        Alias(block.getArgument(2 * j + 1), s);
+    }
+    // The cone of ops the key depends on, in block order.
+    llvm::DenseSet<mlir::Operation*> cone;
+    std::vector<mlir::Value> stack{lhs};
+    while (!stack.empty()) {
+      mlir::Value v = stack.back();
+      stack.pop_back();
+      mlir::Operation* def = v.getDefiningOp();
+      if (def == nullptr || def->getBlock() != &block) continue;
+      if (!cone.insert(def).second) continue;
+      for (mlir::Value w : def->getOperands()) stack.push_back(w);
+    }
+    const int64_t chain_bytes = ValueBytes(op->getOperand(k));
+    for (mlir::Operation* o : body) {
+      if (!cone.contains(o)) continue;
+      const absl::string_view name = View(o->getName().getStringRef());
+      if (!IsChainOp(name))
+        return Decline(absl::StrCat("sort: comparator op ", name));
+      for (mlir::Value v : o->getOperands())
+        if (!IsRank0(v)) return Decline("sort: comparator op is not scalar");
+      for (mlir::Value v : o->getResults())
+        if (!IsRank0(v)) return Decline("sort: comparator op is not scalar");
+      const size_t before = entries_.size();
+      RETURN_IF_ERROR(LowerOp(o));
+      // The IR says rank 0; what the entry materializes is a whole operand.
+      // The flush cadence meters device bytes, so it is told the truth.
+      if (name != "stablehlo.constant")
+        for (size_t i = before; i < entries_.size(); i++)
+          entries_[i].bytes = chain_bytes;
+    }
+    ASSIGN_OR_RETURN(int key_slot, Slot(lhs));
+    key_index = static_cast<int64_t>(ins.size());
+    key_value = lhs;
+    ins.push_back(key_slot);
+  }
+
+  // `_sort_key`'s complex arm packs canonicalized (re, im) order keys into one
+  // u64.  Not a `kind` this opcode carries -- and taking the integer arm would
+  // sort by raw complex values -- so it declines.
+  if (IsComplexElement(key_value)) return Decline("sort on complex");
+  int64_t kind = 0;
+  if (IsFloatElement(key_value)) kind = 1;
+  else if (IsBoolElement(key_value)) kind = 2;
+
+  std::vector<int> outs;
+  for (mlir::Value r : op->getResults()) outs.push_back(Bind(r));
+  ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.sort"));
+  Emit(opcode, std::move(ins), std::move(outs),
+       {dim, gt ? 1 : 0, key_index, kind}, std::nullopt, ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// tape.py `_lower_top_k`: ops/sort.py `_top_k`.  chlo.top_k survives a direct
+// jax lowering; through a portable artifact it arrives already decomposed into
+// the sort above, so both forms are lowered.
+absl::Status Lowering::LowerTopK(mlir::Operation* op) {
+  auto k_attr = op->getAttrOfType<mlir::IntegerAttr>("k");
+  if (!k_attr) return Decline("chlo.top_k without a k");
+  if (op->getNumOperands() != 1)
+    return Decline("chlo.top_k operand arity");
+  if (op->getNumResults() != 2)
+    return Decline("top_k does not return (values, indices)");
+  if (IsComplexElement(op->getOperand(0))) return Decline("top_k on complex");
+  int64_t kind = 0;
+  if (IsFloatElement(op->getOperand(0))) kind = 1;
+  else if (IsBoolElement(op->getOperand(0))) kind = 2;
+  ASSIGN_OR_RETURN(int slot, Slot(op->getOperand(0)));
+  std::vector<int> outs{Bind(op->getResult(0)), Bind(op->getResult(1))};
+  ASSIGN_OR_RETURN(int opcode, Opcode("chlo.top_k"));
+  Emit(opcode, {slot}, std::move(outs), {k_attr.getInt(), kind}, std::nullopt,
+       ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// tape.py `_lower_rng`: ops/rng.py `_rng_bit_generator`, whose whole schedule
+// is static.  How many philox blocks are consumed, where a threefry output
+// shape splits in half, which halves are sliced back down, whether the state
+// arrives as four u32 words or two u64 ones -- all of it follows from the
+// result type and the state's type, so it is resolved here and the C++ handler
+// is the arithmetic only.  Bit-exactness against the Python engine (and so
+// against XLA) is the whole point of the family, so nothing here rounds a
+// shape differently: every expression below is copied from the handler.
+absl::Status Lowering::LowerRng(mlir::Operation* op) {
+  auto rng = mlir::dyn_cast<mlir::stablehlo::RngBitGeneratorOp>(op);
+  if (!rng) return Decline("stablehlo.rng_bit_generator in an unexpected form");
+  if (op->getNumResults() != 2)
+    return Decline("rng_bit_generator result count");
+  const bool threefry =
+      rng.getRngAlgorithm() == mlir::stablehlo::RngAlgorithm::THREE_FRY;
+
+  std::optional<std::string> st_el = ElementName(op->getOperand(0));
+  ASSIGN_OR_RETURN(std::vector<int64_t> st_shape, Dims(op->getOperand(0)));
+  int64_t state_u32;
+  if (st_el == "ui32" && st_shape == std::vector<int64_t>{4}) {
+    state_u32 = 1;
+  } else if (st_el == "ui64" && st_shape == std::vector<int64_t>{2}) {
+    state_u32 = 0;
+  } else {
+    return Decline(absl::StrCat("rng_bit_generator state ",
+                                st_el.has_value() ? *st_el : "<unknown>"));
+  }
+
+  std::optional<std::string> out_el = ElementName(op->getResult(1));
+  ASSIGN_OR_RETURN(std::vector<int64_t> out_shape, Dims(op->getResult(1)));
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(1)));
+  int64_t width = 0;
+  if (out_el == "ui8" || out_el == "i8") width = 8;
+  else if (out_el == "ui16" || out_el == "i16") width = 16;
+  else if (out_el == "ui32" || out_el == "i32") width = 32;
+  else if (out_el == "ui64" || out_el == "i64") width = 64;
+  else
+    return Decline(absl::StrCat("rng_bit_generator output ",
+                                out_el.has_value() ? *out_el : "<unknown>"));
+  std::optional<int> unsigned_code =
+      CodeForName(width == 8 ? "ui8"
+                             : (width == 16 ? "ui16"
+                                            : (width == 32 ? "ui32" : "ui64")));
+  if (!unsigned_code.has_value())
+    return Decline("rng_bit_generator unsigned dtype");
+
+  const int64_t n = Product(out_shape);
+  std::vector<int64_t> attrs{threefry ? 1 : 0, state_u32, out_code,
+                             *unsigned_code,
+                             static_cast<int64_t>(out_shape.size())};
+  attrs.insert(attrs.end(), out_shape.begin(), out_shape.end());
+
+  if (threefry) {
+    if (width > 32) return Decline("rng_bit_generator THREE_FRY 64-bit");
+    // `_threefry_bits`: one block per half-element pair, the output shape
+    // split at the first even dim (else the largest).
+    std::vector<int64_t> dims = out_shape;
+    const int64_t scalar = out_shape.empty() ? 1 : 0;
+    if (dims.empty()) dims.push_back(1);
+    int64_t split = -1;
+    for (size_t i = 0; i < dims.size(); i++) {
+      if (dims[i] % 2 == 0) { split = static_cast<int64_t>(i); break; }
+    }
+    if (split < 0) {
+      split = 0;   // python's `max(range(n), key=dims.__getitem__)`: FIRST max
+      for (size_t i = 1; i < dims.size(); i++)
+        if (dims[i] > dims[static_cast<size_t>(split)])
+          split = static_cast<int64_t>(i);
+    }
+    std::vector<int64_t> half = dims;
+    half[static_cast<size_t>(split)] = CeilDiv(dims[static_cast<size_t>(split)],
+                                               2);
+    const int64_t n_half = Product(half);
+    std::vector<int64_t> h(half.begin(), half.begin() + split + 1);
+    h.push_back(1);
+    h.insert(h.end(), half.begin() + split + 1, half.end());
+    std::vector<int64_t> rounded = dims;
+    rounded[static_cast<size_t>(split)] = half[static_cast<size_t>(split)] * 2;
+    const int64_t needs_slice =
+        rounded[static_cast<size_t>(split)] != dims[static_cast<size_t>(split)]
+            ? 1
+            : 0;
+    attrs.push_back(n_half);
+    attrs.push_back(split);
+    attrs.push_back(scalar);
+    attrs.push_back(needs_slice);
+    attrs.push_back(static_cast<int64_t>(h.size()));
+    attrs.insert(attrs.end(), h.begin(), h.end());
+    attrs.push_back(static_cast<int64_t>(rounded.size()));
+    attrs.insert(attrs.end(), rounded.begin(), rounded.end());
+    attrs.push_back(static_cast<int64_t>(dims.size()));
+    attrs.insert(attrs.end(), dims.begin(), dims.end());
+  } else {
+    const int64_t num_u32 = width == 64 ? n * 2 : n;
+    attrs.push_back(n);
+    attrs.push_back(width);
+    attrs.push_back(num_u32);
+    attrs.push_back(CeilDiv(num_u32, 4));
+  }
+
+  std::vector<int> ins;
+  for (mlir::Value v : op->getOperands()) {
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    ins.push_back(s);
+  }
+  std::vector<int> outs{Bind(op->getResult(0)), Bind(op->getResult(1))};
+  // tape.py `_TAINTING_OPS`: with an empty output XLA consumes no blocks, and
+  // the handler hands the STATE operand's own array back.
+  TaintFromAll(ins, outs);
+  ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.rng_bit_generator"));
+  Emit(opcode, std::move(ins), std::move(outs), std::move(attrs), std::nullopt,
+       ResultBytes(op));
+  return absl::OkStatus();
 }
 
 bool Lowering::IsIdentity(absl::string_view name, mlir::Operation* op) {
@@ -2712,8 +3531,12 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
 
   if (IsControlOp(name)) return LowerControl(op);
 
+  // tape.py `_REGION_BODY_OPS`: the four ops whose region is a BODY the
+  // lowering reads (structurally, or into a sub-Program) rather than a branch
+  // of control flow.
   if (!op->getRegions().empty() && name != "stablehlo.reduce" &&
-      name != "stablehlo.scatter")
+      name != "stablehlo.scatter" && name != "stablehlo.sort" &&
+      name != "stablehlo.reduce_window")
     return Decline(absl::StrCat("op ", name, " (it carries a region)"));
 
   for (mlir::Value v : op->getOperands()) RETURN_IF_ERROR(CheckValue(v));
@@ -2725,6 +3548,12 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   // rather than an attribute, and a variadic scatter must decline as one
   // instead of as "an op with two results".
   if (name == "stablehlo.scatter") return LowerScatter(op);
+  // tape.py `_MULTI_RESULT_OPS`: the rest of the handlers that decide for
+  // themselves how many arrays they hand back.
+  if (name == "stablehlo.reduce_window") return LowerReduceWindow(op);
+  if (name == "stablehlo.sort") return LowerSort(op);
+  if (name == "chlo.top_k") return LowerTopK(op);
+  if (name == "stablehlo.rng_bit_generator") return LowerRng(op);
 
   if (op->getNumResults() != 1)
     return Decline(absl::StrCat("op ", name, " with ", op->getNumResults(),
@@ -2766,6 +3595,8 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   } else if (name == "stablehlo.popcnt" ||
              name == "stablehlo.count_leading_zeros") {
     ASSIGN_OR_RETURN(attrs, LowerPopcnt(op));
+  } else if (name == "stablehlo.fft") {
+    ASSIGN_OR_RETURN(attrs, LowerFft(op));
   } else if (name == "stablehlo.gather") {
     ASSIGN_OR_RETURN(attrs, LowerGather(op));
   } else if (SimpleOps().contains(name)) {

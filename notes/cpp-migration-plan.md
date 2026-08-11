@@ -814,7 +814,36 @@ fork authorized but not needed.
   open: MLX does not fuse the FIRST compiled executable in a process (a few
   ULP on transcendental chains; four warm-ups tried, none moves it; Stage 1
   does not show it).
-* Next: sort/top_k, then reduce_window / convolution / fft, then msl_scan
-  (now the whole texmo gap), then async execute + donation.
-  Suite-vs-suite as the standing gate. (North star per Oleg: everything
+* **P6 landed** (notes/cpp-p6-tail.md): the decline tail whose executors already
+  existed — `sort`/`chlo.top_k`, `rng_bit_generator` (Philox + ThreeFry, bit-exact
+  vs CPU on every output width), `reduce_window` (cum peephole, monoid,
+  select_and_gather_add, generic bodies, base/window dilation, zero-size guards)
+  and `fft` (all four kinds plus both MLX rewrites), with `stablehlo.reduce`'s
+  general-body arm riding along on the same sub-Program mechanism. `sort` needed
+  more than a transliteration: `tape.py` lowers only the bare-compare comparator,
+  and jax's FLOAT sort computes a key (-0 -> +0, NaN -> qNaN, TOTALORDER), so
+  `ops/sort.py`'s recognizer was ported — dep analysis, the structural symmetry
+  check, and the key chain lowered into the ENCLOSING frame as ordinary entries
+  (scalar elementwise code computing the key of the whole operand), with the sort
+  entry keyed on its output. Guards: an allowlist plus an all-rank-0 check, so a
+  non-elementwise chain declines instead of being run against its rank-0 IR type.
+  Census 25 -> **31 of 35**; execute_test 156 -> **228 checks**; cross-check
+  **146 lines over 19 probes byte-identical** (the four float-sort probes have no
+  Stage 1 tape — `tape.py` declines them, which is the point); gate 106/106 x2;
+  pytest 1258; dylib +0.033 %.
+  **The mission's premise failed on one family and it is worth repeating here:
+  `convolution` is NOT a lowering gap.** There is no `kConv` opcode in
+  `native/program.h` at all — `src/metaljax/ops/conv.py` has never been
+  transliterated (M5c's census says "never in the op set"), so porting it is
+  executor work with the full P1 battery behind it, not lowering work. It is now
+  the last op between this plugin and jax's dense-model surface, and it is off
+  texmo's path (the gate is 106/106 with `mid11`'s `conv.4` included).
+  Still declining and named: the two lexicographic sort comparators (a different
+  execution shape — a permutation threaded through successive stable argsorts —
+  which would need a `take_along_axis` entry), `select_and_scatter`, negative
+  reduce_window padding (Stage 1 raises too), LAPACK, and `debug_print` (a
+  JAX-side registration gap: no lowering rule for platform `metal`).
+* Next: convolution (an opcode + `ops_conv.cc` in `native/`), LAPACK on
+  Accelerate, then msl_scan (still the whole texmo gap), then async execute +
+  donation. Suite-vs-suite as the standing gate. (North star per Oleg: everything
   through the new stack, correctness first, performance second.)

@@ -541,6 +541,265 @@ def _cases():
          lambda k: jax.random.normal(jax.random.wrap_key_data(k), (4, 4)),
          [np.array([0, 7], np.uint32)], *F32),
 
+        # --- P6: sort / top_k -------------------------------------------
+        # jax lowers a float sort as a comparator that computes a KEY (-0 ->
+        # +0, NaN -> canonical qNaN, then a TOTALORDER compare) and an integer
+        # sort as a bare compare on the argument pair.  Both shapes are here,
+        # and the values below are chosen so a wrong tie rule is visible: a
+        # signed zero pair, repeated keys, and NaNs, which total order puts
+        # last.
+        ("sort f32", lambda x: jnp.sort(x, -1), [_rand((3, 5), 60)], *EXACT),
+        ("sort f32 with ties, signed zeros and NaNs",
+         lambda x: jnp.sort(x, -1),
+         [np.array([[1.0, -0.0, 0.0, np.nan, -1.0, 1.0, np.inf, -np.inf]],
+                   f)], *EXACT),
+        ("sort i32", lambda x: jnp.sort(x, -1),
+         [np.array([[5, -1, 5, 0, -7]], np.int32)], *EXACT),
+        ("sort u8", lambda x: jnp.sort(x, -1),
+         [np.array([[200, 1, 200, 0, 255]], np.uint8)], *EXACT),
+        ("sort bool", lambda x: jnp.sort(x, -1),
+         [np.array([[True, False, True, False]])], *EXACT),
+        ("sort f16", lambda x: jnp.sort(x, -1),
+         [np.arange(8, dtype=np.float16).reshape(2, 4) / 4 - 1], *EXACT),
+        ("sort bf16", lambda x: jnp.sort(x, -1),
+         [(np.arange(8, dtype=np.float32).reshape(2, 4) / 4 - 1).astype(
+             jnp.bfloat16)], *EXACT),
+        # A non-last axis arrives as transpose -> sort -> transpose, so the
+        # sort's input is a strided VIEW -- the shape MLX 0.32's argsort reads
+        # wrong elements from, which is why the handler materializes first.
+        ("sort along axis 0", lambda x: jnp.sort(x, 0),
+         [_rand((4, 3), 61)], *EXACT),
+        ("sort a rank-3 array along the middle axis",
+         lambda x: jnp.sort(x, 1), [_rand((2, 5, 3), 62)], *EXACT),
+        ("argsort f32", lambda x: jnp.argsort(x, -1),
+         [_rand((3, 5), 63)], *EXACT),
+        ("argsort along axis 0", lambda x: jnp.argsort(x, 0),
+         [_rand((4, 3), 64)], *EXACT),
+        # Stability: every key is equal, so a stable sort must return the
+        # identity permutation.  An unstable one is free to return anything,
+        # which is exactly what this catches.
+        ("argsort stability (all keys equal)", lambda x: jnp.argsort(x, -1),
+         [np.zeros((2, 9), f)], *EXACT),
+        ("argsort stability (repeated keys)", lambda x: jnp.argsort(x, -1),
+         [np.array([[2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 0.0]], f)], *EXACT),
+        # -0 and +0 are numerically equal, so a values-only sort cannot see
+        # whether the comparator's canonicalization ran.  argsort can: without
+        # it total order puts every -0 BELOW every +0, and the indices move.
+        # Same for NaNs, which must all tie with each other.
+        ("argsort over signed zeros and NaNs", lambda x: jnp.argsort(x, -1),
+         [np.array([[0.0, -0.0, 0.0, -0.0, np.nan, -1.0, np.nan]], f)],
+         *EXACT),
+        ("sort_key_val", lambda k, v: jax.lax.sort_key_val(k, v),
+         [np.array([[3.0, 1.0, 2.0]], f),
+          np.array([[10, 20, 30]], np.int32)], *EXACT),
+        ("median (a sort under a slice)", lambda x: jnp.median(x, -1),
+         [_rand((3, 7), 65)], *F32),
+        ("percentile", lambda x: jnp.percentile(x, 40.0, axis=-1),
+         [_rand((3, 7), 66)], *F32),
+        ("partition", lambda x: jnp.partition(x, 2, axis=-1),
+         [_rand((2, 8), 67)], *EXACT),
+        ("top_k", lambda x: jax.lax.top_k(x, 3), [_rand((2, 16), 68)], *EXACT),
+        ("top_k with ties", lambda x: jax.lax.top_k(x, 4),
+         [np.array([[1.0, 1.0, 1.0, 0.0, 2.0, 2.0]], f)], *EXACT),
+        ("top_k on integers", lambda x: jax.lax.top_k(x, 2),
+         [np.array([[3, -1, 3, 7]], np.int32)], *EXACT),
+        # lax.top_k is last-axis only; a top-k over another axis is a moveaxis
+        # around it, which is the non-contiguous case again -- and the one
+        # that was a silent-wrongness bug in 0.4.x.
+        ("top_k over the leading axis",
+         lambda x: jax.lax.top_k(jnp.moveaxis(x, 0, -1), 2),
+         [_rand((5, 3), 69)], *EXACT),
+        ("sort inside a scan body",
+         lambda c, xs: jax.lax.scan(
+             lambda a, r: (a + jnp.sort(r, -1)[0], None), c, xs)[0],
+         [np.float32(0.0), _rand((4, 6), 70)], *F32),
+
+        # --- P6: rng_bit_generator --------------------------------------
+        # The bits must match the CPU backend EXACTLY, for both algorithms:
+        # this family exists to be bit-compatible with XLA, and a tolerance
+        # here would hide the only thing worth testing.  `_canonical` widens
+        # unsigned words to int64, so EXACT really is a word-for-word compare.
+        ("rng philox u32",
+         lambda k: jax.lax.rng_bit_generator(
+             k, (8,), dtype=jnp.uint32,
+             algorithm=jax.lax.RandomAlgorithm.RNG_PHILOX),
+         [np.array([1, 2, 3, 4], np.uint32)], *EXACT),
+        ("rng philox u32 (odd count)",
+         lambda k: jax.lax.rng_bit_generator(
+             k, (7,), dtype=jnp.uint32,
+             algorithm=jax.lax.RandomAlgorithm.RNG_PHILOX),
+         [np.array([1, 2, 3, 4], np.uint32)], *EXACT),
+        ("rng philox u8/u16 (narrow truncation)",
+         lambda k: (*jax.lax.rng_bit_generator(
+                        k, (9,), dtype=jnp.uint8,
+                        algorithm=jax.lax.RandomAlgorithm.RNG_PHILOX),
+                    *jax.lax.rng_bit_generator(
+                        k, (9,), dtype=jnp.uint16,
+                        algorithm=jax.lax.RandomAlgorithm.RNG_PHILOX)),
+         [np.array([1, 2, 3, 4], np.uint32)], *EXACT),
+        ("rng philox rank-3",
+         lambda k: jax.lax.rng_bit_generator(
+             k, (2, 3, 4), dtype=jnp.uint32,
+             algorithm=jax.lax.RandomAlgorithm.RNG_PHILOX),
+         [np.array([9, 9, 9, 9], np.uint32)], *EXACT),
+        ("rng threefry u32",
+         lambda k: jax.lax.rng_bit_generator(
+             k, (8,), dtype=jnp.uint32,
+             algorithm=jax.lax.RandomAlgorithm.RNG_THREE_FRY),
+         [np.array([1, 2, 3, 4], np.uint32)], *EXACT),
+        # The half-split: an odd extent rounds up and slices back, and a shape
+        # with no even dim splits at the LARGEST one instead of the first.
+        ("rng threefry u32 (odd count)",
+         lambda k: jax.lax.rng_bit_generator(
+             k, (7,), dtype=jnp.uint32,
+             algorithm=jax.lax.RandomAlgorithm.RNG_THREE_FRY),
+         [np.array([1, 2, 3, 4], np.uint32)], *EXACT),
+        ("rng threefry (3, 5): no even dim",
+         lambda k: jax.lax.rng_bit_generator(
+             k, (3, 5), dtype=jnp.uint32,
+             algorithm=jax.lax.RandomAlgorithm.RNG_THREE_FRY),
+         [np.array([1, 2, 3, 4], np.uint32)], *EXACT),
+        ("rng threefry (2, 3, 4)",
+         lambda k: jax.lax.rng_bit_generator(
+             k, (2, 3, 4), dtype=jnp.uint32,
+             algorithm=jax.lax.RandomAlgorithm.RNG_THREE_FRY),
+         [np.array([5, 6, 7, 8], np.uint32)], *EXACT),
+        ("rng threefry narrow outputs",
+         lambda k: (*jax.lax.rng_bit_generator(
+                        k, (9,), dtype=jnp.uint8,
+                        algorithm=jax.lax.RandomAlgorithm.RNG_THREE_FRY),
+                    *jax.lax.rng_bit_generator(
+                        k, (9,), dtype=jnp.uint16,
+                        algorithm=jax.lax.RandomAlgorithm.RNG_THREE_FRY)),
+         [np.array([1, 2, 3, 4], np.uint32)], *EXACT),
+        ("rng threefry scalar output",
+         lambda k: jax.lax.rng_bit_generator(
+             k, (), dtype=jnp.uint32,
+             algorithm=jax.lax.RandomAlgorithm.RNG_THREE_FRY),
+         [np.array([1, 2, 3, 4], np.uint32)], *EXACT),
+        ("rng default algorithm",
+         lambda k: jax.lax.rng_bit_generator(k, (6,), dtype=jnp.uint32),
+         [np.array([4, 3, 2, 1], np.uint32)], *EXACT),
+        # An empty output consumes no blocks, so the state comes back
+        # unchanged -- and the handler hands the operand's own array back,
+        # which is what the entry's taint rule is there for.
+        ("rng empty output returns the state",
+         lambda k: jax.lax.rng_bit_generator(k, (0,), dtype=jnp.uint32),
+         [np.array([1, 2, 3, 4], np.uint32)], *EXACT),
+        ("rng state advances across calls",
+         lambda k: (lambda s1, b1: (
+             *jax.lax.rng_bit_generator(s1, (5,), dtype=jnp.uint32), b1))(
+                 *jax.lax.rng_bit_generator(k, (5,), dtype=jnp.uint32)),
+         [np.array([1, 2, 3, 4], np.uint32)], *EXACT),
+        # The consumer that matters: one wrong word is visible everywhere.
+        ("rbg uniform",
+         lambda k: jax.random.uniform(
+             jax.random.wrap_key_data(k, impl="rbg"), (16,)),
+         [np.asarray(jax.random.key_data(jax.random.key(42, impl="rbg")))],
+         *EXACT),
+        ("rbg normal",
+         lambda k: jax.random.normal(
+             jax.random.wrap_key_data(k, impl="rbg"), (4, 4)),
+         [np.asarray(jax.random.key_data(jax.random.key(7, impl="rbg")))],
+         *F32),
+
+        # --- P6: reduce_window ------------------------------------------
+        # The cumulative peephole first: jax lowers cumsum and friends as a
+        # full-width window with prefix (or suffix) padding, which the
+        # lowering turns back into one MLX cum-op.
+        ("cumsum", lambda x: jnp.cumsum(x, 0), [_rand((8, 3), 71)], *F32),
+        ("cumsum on the last axis", lambda x: jnp.cumsum(x, -1),
+         [_rand((3, 8), 72)], *F32),
+        ("cumprod/cummax/cummin",
+         lambda x: (jnp.cumprod(x, 0), jax.lax.cummax(x, 0),
+                    jax.lax.cummin(x, 0)),
+         [np.linspace(0.5, 2.0, 12, dtype=f).reshape(4, 3)], *F32),
+        ("reverse cumsum", lambda x: jax.lax.cumsum(x, 0, reverse=True),
+         [_rand((6, 2), 73)], *F32),
+        ("max pooling", lambda x: jax.lax.reduce_window(
+            x, -np.inf, jax.lax.max, (1, 2), (1, 2), "VALID"),
+         [_rand((2, 8), 74)], *EXACT),
+        ("sum pooling with SAME padding", lambda x: jax.lax.reduce_window(
+            x, 0.0, jax.lax.add, (3, 3), (2, 2), "SAME"),
+         [_rand((5, 7), 75)], *F32),
+        ("min pooling, explicit padding", lambda x: jax.lax.reduce_window(
+            x, np.inf, jax.lax.min, (3,), (1,), [(1, 2)]),
+         [_rand((6,), 76)], *EXACT),
+        ("window dilation", lambda x: jax.lax.reduce_window(
+            x, -np.inf, jax.lax.max, (2,), (1,), [(0, 0)],
+            base_dilation=(1,), window_dilation=(3,)),
+         [_rand((9,), 77)], *EXACT),
+        ("base dilation", lambda x: jax.lax.reduce_window(
+            x, 0.0, jax.lax.add, (2,), (1,), [(0, 0)],
+            base_dilation=(2,), window_dilation=(1,)),
+         [_rand((5,), 78)], *F32),
+        ("base and window dilation together", lambda x: jax.lax.reduce_window(
+            x, 0.0, jax.lax.add, (2, 2), (1, 1), [(1, 1), (0, 0)],
+            base_dilation=(2, 1), window_dilation=(1, 2)),
+         [_rand((4, 5), 79)], *F32),
+        # A window wider than its (padded) axis produces NO output elements:
+        # the zero-size guard, which returns the init broadcast to an empty
+        # shape rather than asking MLX for a view of nothing.
+        ("a window wider than the axis (zero-size output)",
+         lambda x: jax.lax.reduce_window(
+             x, 0.0, jax.lax.add, (9,), (1,), "VALID"),
+         [_rand((4,), 80)], *EXACT),
+        ("bool reduce_window (any/all)",
+         lambda x: (jax.lax.reduce_window(x, False, jax.lax.bitwise_or,
+                                          (2,), (1,), "VALID"),
+                    jax.lax.reduce_window(x, True, jax.lax.bitwise_and,
+                                          (2,), (1,), "VALID")),
+         [np.array([True, False, True, True, False])], *EXACT),
+        ("integer max pooling", lambda x: jax.lax.reduce_window(
+            x, np.int32(-2 ** 31), jax.lax.max, (2,), (2,), "VALID"),
+         [np.array([3, -1, 4, -1, 5, 9], np.int32)], *EXACT),
+        # The jvp of a max window is select_and_gather_add: one compare over
+        # the window picks a single element and every output reads it there.
+        ("jvp of a max pool (select_and_gather_add)",
+         lambda x, t: tuple(jax.jvp(
+             lambda v: jax.lax.reduce_window(
+                 v, -np.inf, jax.lax.max, (2,), (2,), "VALID"),
+             (x,), (t,))),
+         [_rand((8,), 81), _rand((8,), 82)], *EXACT),
+        ("reduce_window in a scan body",
+         lambda xs: jax.lax.scan(
+             lambda c, r: (c + jax.lax.reduce_window(
+                 r, 0.0, jax.lax.add, (2,), (2,), "VALID"), None),
+             np.zeros((3,), f), xs)[0],
+         [_rand((4, 6), 83)], *F32),
+
+        # --- P6: fft ----------------------------------------------------
+        ("fft", lambda x: jnp.fft.fft(x), [_rand((8,), 84)], *F32),
+        ("ifft", lambda x: jnp.fft.ifft(x + 0j), [_rand((8,), 85)], *F32),
+        ("fft of an odd length", lambda x: jnp.fft.fft(x),
+         [_rand((7,), 86)], *F32),
+        ("rfft / irfft round trip",
+         lambda x: (jnp.fft.rfft(x), jnp.fft.irfft(jnp.fft.rfft(x))),
+         [_rand((16,), 87)], *F32),
+        ("rfft of an odd length", lambda x: jnp.fft.rfft(x),
+         [_rand((9,), 88)], *F32),
+        ("fft2 over the trailing axes", lambda x: jnp.fft.fft2(x),
+         [_rand((3, 4, 4), 89)], *F32),
+        ("rfft2", lambda x: jnp.fft.rfft2(x), [_rand((4, 6), 90)], *F32),
+        # The unit-length rewrite: MLX drops the transforms over the leading
+        # axes when the real axis has length 1, so that case is spelled out as
+        # the identity on the DC bin plus a complex transform of the rest.
+        ("rfft with a unit last length", lambda x: jnp.fft.rfft(x, n=1),
+         [_rand((5,), 91)], *F32),
+        ("rfft2 with a unit last length",
+         lambda x: jnp.fft.rfft2(x, s=(4, 1)), [_rand((4, 6), 92)], *F32),
+        ("irfft with a unit last length",
+         lambda x: jnp.fft.irfft(x, n=1),
+         [(_rand((5,), 93) + 1j * _rand((5,), 94)).astype(np.complex64)],
+         *F32),
+        ("fft of a complex input",
+         lambda x: (jnp.fft.fft(x), jnp.fft.ifft(x)),
+         [(_rand((8,), 95) + 1j * _rand((8,), 96)).astype(np.complex64)],
+         *F32),
+        ("fft inside an elementwise chain",
+         lambda x: jnp.abs(jnp.fft.fft(x * 2.0)) + 1.0,
+         [_rand((16,), 97)], *F32),
+
         # a realistic little block: the shapes a model's forward pass has
         ("dense + norm + gelu",
          lambda x, w, b: jax.nn.gelu(
@@ -607,10 +866,81 @@ module @if_branches {
 """
 
 
+# The 64-bit philox arm pairs two u32 words per element, and the state may
+# arrive as four u32 words or two u64 ones -- the other axis the handler
+# branches on.  jax refuses a u64 output without x64 and never emits the u64
+# state form, so both are written out here.  The u64 state is BUILT inside the
+# module from a u32 argument, because a u64 host buffer cannot cross
+# `device_put` without x64 either.
+_RNG_PHILOX_U64 = """
+module @rng_philox_u64 {
+  func.func public @main(%w: tensor<4xui32>)
+      -> (tensor<4xui32>, tensor<5xui64>) {
+    %p = stablehlo.reshape %w : (tensor<4xui32>) -> tensor<2x2xui32>
+    %s = stablehlo.bitcast_convert %p
+        : (tensor<2x2xui32>) -> tensor<2xui64>
+    %state, %out = stablehlo.rng_bit_generator %s, algorithm = PHILOX
+        : (tensor<2xui64>) -> (tensor<2xui64>, tensor<5xui64>)
+    %q = stablehlo.bitcast_convert %state
+        : (tensor<2xui64>) -> tensor<2x2xui32>
+    %r = stablehlo.reshape %q : (tensor<2x2xui32>) -> tensor<4xui32>
+    return %r, %out : tensor<4xui32>, tensor<5xui64>
+  }
+}
+"""
+
+# (A u32 STATE with a u64 output has no case: XLA's own CPU backend fails to
+# compile that combination -- "Binary op shift-right-logical with different
+# element types: u32[] and u64[]" out of its rng expander -- so there is no
+# reference to compare against.  The lowering covers it; nothing here can
+# prove it does.)
+
+# A reduce_window whose body is neither a monoid nor select_and_gather_add:
+# the window axis is folded by the BODY itself, pairwise, which makes the body
+# a sub-Program the entry carries.  jax's own lowerings only ever emit the
+# monoid forms, so this encoding has no other coverage.
+_REDUCE_WINDOW_GENERIC = """
+module @reduce_window_generic {
+  func.func public @main(%x: tensor<6xi32>) -> tensor<3xi32> {
+    %init = stablehlo.constant dense<0> : tensor<i32>
+    %r = "stablehlo.reduce_window"(%x, %init) <{
+        window_dimensions = array<i64: 2>,
+        window_strides = array<i64: 2>}> ({
+      ^bb0(%a: tensor<i32>, %b: tensor<i32>):
+        %o = stablehlo.or %a, %b : tensor<i32>
+        stablehlo.return %o : tensor<i32>
+    }) : (tensor<6xi32>, tensor<i32>) -> tensor<3xi32>
+    return %r : tensor<3xi32>
+  }
+}
+"""
+
+# The same, variadic: two inputs folded by one body, which is the arity the
+# generic path exists for.  (`stablehlo.reduce` with a general body takes the
+# same route, so this covers both.)
+_REDUCE_GENERIC_BODY = """
+module @reduce_generic_body {
+  func.func public @main(%x: tensor<2x4xi32>) -> tensor<2xi32> {
+    %init = stablehlo.constant dense<-1> : tensor<i32>
+    %r = stablehlo.reduce(%x init: %init) applies stablehlo.and
+        across dimensions = [1] : (tensor<2x4xi32>, tensor<i32>)
+        -> tensor<2xi32>
+    return %r : tensor<2xi32>
+  }
+}
+"""
+
+
 def _module_cases():
     return [
         ("while with a captured bound", _WHILE_CAPTURED_BOUND,
          [np.float32(1.5), np.int32(6)]),
+        ("rng philox 64-bit output (u64 state)", _RNG_PHILOX_U64,
+         [np.array([1, 2, 3, 4], np.uint32)]),
+        ("reduce_window with a general body", _REDUCE_WINDOW_GENERIC,
+         [np.array([1, 2, 4, 8, 16, 32], np.int32)]),
+        ("reduce with a general body", _REDUCE_GENERIC_BODY,
+         [np.array([[7, 3, 5, 6], [15, 14, 12, 8]], np.int32)]),
         ("stablehlo.if (true)", _IF_BRANCHES,
          [np.bool_(True), np.arange(4, dtype=np.float32)]),
         ("stablehlo.if (false)", _IF_BRANCHES,
@@ -633,6 +963,50 @@ def _run_module(text, args):
     return [np.asarray(o) for o in outs]
 
 
+# The two sort comparators jax's own lowerings cannot produce, both of which
+# must decline: one where the sides compute DIFFERENT functions of their
+# arguments (so there is no key array at all), and one whose chain leaves
+# scalar elementwise code (so running it on the whole operand would compute
+# something else entirely).
+_SORT_ASYMMETRIC = """
+module @sort_asymmetric {
+  func.func public @main(%x: tensor<3xf32>) -> tensor<3xf32> {
+    %one = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+    %r = "stablehlo.sort"(%x) <{dimension = 0 : i64, is_stable = true}> ({
+    ^bb0(%a: tensor<f32>, %b: tensor<f32>):
+      %s = stablehlo.add %a, %one : tensor<f32>
+      %p = stablehlo.compare LT, %s, %b, FLOAT
+          : (tensor<f32>, tensor<f32>) -> tensor<i1>
+      stablehlo.return %p : tensor<i1>
+    }) : (tensor<3xf32>) -> tensor<3xf32>
+    return %r : tensor<3xf32>
+  }
+}
+"""
+
+_SORT_NONSCALAR = """
+module @sort_nonscalar {
+  func.func public @main(%x: tensor<1x3xf32>) -> tensor<1x3xf32> {
+    %r = "stablehlo.sort"(%x) <{dimension = 1 : i64, is_stable = true}> ({
+    ^bb0(%a: tensor<f32>, %b: tensor<f32>):
+      %ab = stablehlo.broadcast_in_dim %a, dims = []
+          : (tensor<f32>) -> tensor<2xf32>
+      %bb = stablehlo.broadcast_in_dim %b, dims = []
+          : (tensor<f32>) -> tensor<2xf32>
+      %as = stablehlo.reduce(%ab init: %a) applies stablehlo.maximum
+          across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
+      %bs = stablehlo.reduce(%bb init: %b) applies stablehlo.maximum
+          across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
+      %p = stablehlo.compare LT, %as, %bs, FLOAT
+          : (tensor<f32>, tensor<f32>) -> tensor<i1>
+      stablehlo.return %p : tensor<i1>
+    }) : (tensor<1x3xf32>) -> tensor<1x3xf32>
+    return %r : tensor<1x3xf32>
+  }
+}
+"""
+
+
 # Programs that must DECLINE, with the op the message has to name.  A decline
 # is a feature here: the plugin refuses whole programs it cannot lower, and it
 # says which op stopped it.
@@ -641,10 +1015,49 @@ def _declines():
     import jax.numpy as jnp
 
     return [
-        ("sort", lambda x: jnp.sort(x), [np.array([3.0, 1.0, 2.0], np.float32)],
-         "stablehlo.sort"),
-        ("cumsum (a reduce_window)", lambda x: jnp.cumsum(x),
-         [np.arange(4, dtype=np.float32)], "stablehlo.reduce_window"),
+        # P6 left three sort shapes behind, each for a reason the entry cannot
+        # paper over.  A lexicographic comparator (jnp.lexsort, and every
+        # jnp.unique over rows) is a DIFFERENT execution shape: successive
+        # stable argsorts threaded through a permutation, where the sort entry
+        # computes one argsort and gathers with it.
+        ("lexsort", lambda a, b: jnp.lexsort((a, b)),
+         [np.array([1.0, 0.0, 1.0], np.float32),
+          np.array([2.0, 2.0, 1.0], np.float32)],
+         "sort: comparator ends in"),
+        # ...and a complex key packs canonicalized (re, im) order keys into
+        # one u64, which is not a `kind` the entry carries.
+        ("sort on complex", lambda x: jnp.sort(x),
+         [np.array([1 + 2j, 1 - 1j, 0 + 0j], np.complex64)],
+         "sort: complex lexicographic comparator"),
+        # convolution has no opcode in the executor at all -- unlike every
+        # other family in P6, this one is not "the lowering is missing".
+        ("convolution",
+         lambda x, k: jax.lax.conv_general_dilated(
+             x, k, (1,), "SAME", dimension_numbers=("NCH", "OIH", "NCH")),
+         [np.zeros((1, 2, 8), np.float32), np.zeros((3, 2, 3), np.float32)],
+         "stablehlo.convolution"),
+        # An ASYMMETRIC comparator is not a sort by a key: the two sides
+        # compute different functions of their arguments, so no single key
+        # array orders the operand the way the comparator does.  It must
+        # decline, and this is the case where getting it wrong would be
+        # SILENT -- the sort would run, on the left side's key.
+        ("sort with an asymmetric comparator", _SORT_ASYMMETRIC,
+         [np.array([3.0, 1.0, 2.0], np.float32)],
+         "sort: asymmetric comparator"),
+        # ...and one whose key chain holds an op that is not elementwise
+        # scalar code: running THAT on the whole operand is what the rank-0
+        # check exists to refuse.
+        ("sort with a non-scalar key chain", _SORT_NONSCALAR,
+         [np.array([[3.0, 1.0, 2.0]], np.float32)],
+         "sort: comparator op"),
+        # mx::pad has no negative widths, and the Python handler raises on one
+        # too -- so a cropping window declines on both engines rather than
+        # being rewritten into a slice the reference never computed.
+        ("reduce_window with negative padding",
+         lambda x: jax.lax.reduce_window(
+             x, 0.0, jax.lax.add, (2,), (1,), [(-1, 0)]),
+         [np.arange(6, dtype=np.float32)],
+         "reduce_window negative padding"),
         # A scatter whose update computation is neither an assignment nor a
         # combiner (jax's scatter_apply): running it means evaluating block
         # code on the gathered current values, which this opcode's plan does
@@ -667,8 +1080,10 @@ def _declines():
         # `Lowering` as main, so its declines are main's.
         ("while loop over an unlowered op",
          lambda x: jax.lax.fori_loop(
-             0, 4, lambda i, c: jnp.sort(c) + 1.0, x),
-         [np.arange(4, dtype=np.float32)], "stablehlo.sort"),
+             0, 4, lambda i, c: jax.lax.conv_general_dilated(
+                 c, c, (1,), "SAME",
+                 dimension_numbers=("NCH", "OIH", "NCH")) + 1.0, x),
+         [np.zeros((1, 1, 4), np.float32)], "stablehlo.convolution"),
     ]
 
 
@@ -935,7 +1350,12 @@ def main():
     print("-" * 62)
     for name, fn, args, op in _declines():
         try:
-            jax.jit(fn)(*args)
+            # A str stands for a hand-written module: some declines are
+            # encodings jax's own lowerings cannot produce.
+            if isinstance(fn, str):
+                _run_module(fn, args)
+            else:
+                jax.jit(fn)(*args)
         except BaseException as exc:  # noqa: BLE001
             msg = str(exc)
             if "UNIMPLEMENTED" in msg and op in msg:

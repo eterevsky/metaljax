@@ -96,15 +96,20 @@ def _compile():
     zero = np.asarray(2 * jnp.array([1, 2, 3]))
     print("  2 * jnp.array([1, 2, 3]) ->", zero.tolist())
     assert np.array_equal(zero, np.array([2, 4, 6], np.int32)), zero
-    # An op outside the native set declines, naming itself.
+    # An op outside the native set declines, naming itself.  Convolution is
+    # the one left with no opcode in the executor at all (P6); every other
+    # family the census used to name now lowers.
     try:
-        jax.jit(jnp.sort)(jax.device_put(np.array([3.0, 1.0, 2.0], np.float32)))
+        jax.jit(lambda a, k: jax.lax.conv_general_dilated(
+            a, k, (1,), "SAME", dimension_numbers=("NCH", "OIH", "NCH")))(
+                jax.device_put(np.ones((1, 2, 8), np.float32)),
+                jax.device_put(np.ones((3, 2, 3), np.float32)))
     except Exception as e:  # noqa: BLE001 - the expected decline
         msg = str(e)
-        print("  sort declined:", msg.splitlines()[0][:160])
-        assert "stablehlo.sort" in msg, "the decline did not name the op"
+        print("  convolution declined:", msg.splitlines()[0][:160])
+        assert "stablehlo.convolution" in msg, "the decline did not name the op"
         return
-    raise AssertionError("jnp.sort unexpectedly compiled")
+    raise AssertionError("convolution unexpectedly compiled")
 
 
 if FAILED:
