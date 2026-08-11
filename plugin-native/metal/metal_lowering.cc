@@ -212,6 +212,63 @@ const bool kDumpModule = [] {
   return v != nullptr && std::string(v) == "1";
 }();
 
+const bool kDebug = [] {
+  const char* v = std::getenv("METALJAX_DEBUG");
+  return v != nullptr && std::string(v) == "1";
+}();
+
+// One integer knob, on metal_client.cc's contract: Python's `int(...)` raises
+// on garbage, a lowering cannot usefully raise out of a compile, so garbage
+// keeps the documented default and says so under METALJAX_DEBUG.
+int64_t EnvInt(const char* name, int64_t fallback) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || *v == '\0') return fallback;
+  char* end = nullptr;
+  const long long parsed = std::strtoll(v, &end, 10);
+  if (end == v || *end != '\0') {
+    if (kDebug)
+      std::fprintf(stderr, "[metaljax-native] ignoring %s=%s (not an integer)\n",
+                   name, v);
+    return fallback;
+  }
+  return static_cast<int64_t>(parsed);
+}
+
+// The `X != "0"` form of every metaljax on/off switch.
+bool EnvOn(const char* name) {
+  const char* v = std::getenv(name);
+  return v == nullptr || std::string(v) != "0";
+}
+
+// --------------------------------------------------------------------------
+// the compile decisions' budgets (src/metaljax/ops/control.py)
+// --------------------------------------------------------------------------
+//
+// Each default and the measurement behind it belong to the Python module that
+// owns the variable; nothing here is a preference.  In one line each:
+//
+//  * `kCompileEnabled` -- METALJAX_COMPILE=0 is the global off switch, and it
+//    must reproduce the all-eager plugin exactly (interpreter.COMPILE_ENABLED).
+//  * `kTraceBudget` -- ops one mx::compile trace may hold, counted loops
+//    unrolled.  MLX retains every intermediate of a trace, so an oversized one
+//    exhausts Metal's ~500k live-buffer limit.
+//  * `kBodyCompile` -- METALJAX_BODY_COMPILE=0 keeps everything compiled
+//    EXCEPT while bodies (the targeted mitigation for the command-buffer
+//    corruption, which bites REPLAYED bodies).
+//  * `kChunkMax` / `kChunkMaxCost` -- how many iterations one chunked replay
+//    may unroll, and the body size past which chunking stops paying.
+//  * `kCompileBytes` -- bytes one trace may materialize.  The op budget bounds
+//    the live-buffer COUNT and says nothing about their SIZE; a jitted
+//    parameter init is 365 ops and 15 GB of traffic.  0 disables the gate.
+const bool kCompileEnabled = EnvOn("METALJAX_COMPILE");
+const int64_t kTraceBudget = EnvInt("METALJAX_TRACE_BUDGET", 20000);
+const bool kBodyCompile = EnvOn("METALJAX_BODY_COMPILE");
+const int64_t kChunkMax = EnvInt("METALJAX_CHUNK_MAX", 16);
+const int64_t kChunkMaxCost = EnvInt("METALJAX_CHUNK_MAX_COST", 1500);
+const int64_t kCompileBytesMb = EnvInt("METALJAX_COMPILE_BYTES_MB", 65536);
+const int64_t kCompileBytes =
+    std::max<int64_t>(kCompileBytesMb, 0) * (int64_t{1} << 20);
+
 std::string OpcodeName(int code) {
   for (const std::pair<std::string, int>& kv : opcodes())
     if (kv.second == code) return kv.first;
@@ -250,13 +307,23 @@ struct Counted {
 };
 
 // Everything shared by the frames of ONE lowering: the module (symbol lookup
-// for inlined callees) and the two analysis caches.
+// for inlined callees) and the analysis caches.  Each one is the Interpreter
+// cache named beside it, and each is keyed by BLOCK for the same reason: the
+// same block is walked once per enclosing analysis, and whole-model bodies are
+// large.
 struct LowerContext {
   mlir::ModuleOp module;
   absl::flat_hash_map<mlir::Block*, int64_t> cost;   // interp._cost_cache
   // interp._counted_cache, keyed by the COND block exactly as the Python one
   // is (no two while ops can share one).
   absl::flat_hash_map<mlir::Block*, std::optional<Counted>> counted;
+  absl::flat_hash_map<mlir::Block*, int64_t> bytes;    // interp._bytes_cache
+  absl::flat_hash_map<mlir::Block*, bool> pure;        // interp._pure_cache
+  // interp._traceable_cache, keyed by the loop's BODY block as the Python is.
+  absl::flat_hash_map<mlir::Block*, bool> traceable;
+  // interp._bytes_gated: blocks the byte gate has already reported. A RECORD,
+  // not an authority -- the decision depends on how many copies are asked for.
+  absl::flat_hash_set<mlir::Block*> gated;
 };
 
 // interpreter.free_values: the SSA values used inside `block` but defined
@@ -597,6 +664,289 @@ int64_t FlushPeriod(int64_t cost) {
 }
 
 // --------------------------------------------------------------------------
+// the compile decisions (P5): the byte estimate, purity, the anchors
+// --------------------------------------------------------------------------
+//
+// `cost` above bounds how many OPS a trace may hold; these bound how much
+// MEMORY it holds and whether it may be traced at all.  Every one of them is
+// the Python function named beside it, walked in the same order, because a
+// disagreement is not a wrong answer but something worse: the two engines
+// would put a loop's sync points in different places, and where those fall is
+// a ticket in MLX 0.32's command-buffer lottery
+// (notes/mlx-command-buffer-split.md).  That is also why the decisions are
+// worth having at all -- a 1024-step EAGER loop is exposed to that bug where
+// the compiled one is not (notes/cpp-p4-gather-scatter.md).
+
+int64_t BlockBytes(LowerContext& ctx, mlir::Block& block);
+bool BlockIsPure(LowerContext& ctx, mlir::Block& block);
+bool WhileTraceable(LowerContext& ctx, mlir::Operation* op);
+
+// interpreter.op_bytes: the device bytes one operation materializes, which is
+// its declared result size with one correction -- a SPLAT constant carries ONE
+// value however big its type says it is (`dense<1.0> : tensor<151936x1024xf32>`
+// is four bytes of IR), and `LowerConstant` broadcasts it from a one-element
+// buffer rather than materializing the shape.  Charging such a constant its
+// nominal size is not conservatism, it is an invented gigabyte: jax lowers a
+// single `random.normal` with 23 full-shape splat coefficients.
+//
+// Everything else is charged its declared result size.  The views MLX produces
+// without copying and the chains mx::compile fuses are deliberately NOT
+// modelled -- see ops/control.py `_block_bytes` on why an over-estimate is the
+// right direction for a memory gate.
+int64_t OpBytes(mlir::Operation* op) {
+  int64_t total = 0;
+  for (mlir::Value r : op->getResults()) total += ValueBytes(r);
+  if (total == 0) return 0;
+  auto cst = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(op);
+  if (!cst) return total;
+  auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue());
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+  if (!dense || !t || !dense.isSplat()) return total;
+  std::optional<mx::Dtype> dt = MxDtypeOf(t.getElementType());
+  if (!dt.has_value()) return total;
+  return static_cast<int64_t>(dt->size());
+}
+
+// ops/control.py `_block_bytes`: the device bytes this block materializes when
+// it is TRACED.  Deliberately the same walk as `BlockCost` -- loops unrolled
+// (pessimistic trip 1024 when the bound is not static), callees recursed into,
+// every branch of an if/case charged because which one runs is data.
+//
+// A program's own pass-through outputs are NOT here; they belong to
+// `ProgramBytes`, which is what a whole-program decision uses.
+int64_t BlockBytes(LowerContext& ctx, mlir::Block& block) {
+  auto cached = ctx.bytes.find(&block);
+  if (cached != ctx.bytes.end()) return cached->second;
+  ctx.bytes[&block] = 0;   // break cycles defensively, as the Python does
+  int64_t total = 0;
+  for (mlir::Operation& o : block) {
+    total += OpBytes(&o);
+    const llvm::StringRef n = o.getName().getStringRef();
+    if (n == "stablehlo.while") {
+      std::optional<Counted> c = AnalyzeCounted(ctx, &o);
+      int64_t trip = 1024;
+      if (c.has_value() && c->kind == Counted::kStatic) {
+        std::optional<int64_t> start = StaticStart(&o, c->k);
+        if (start.has_value()) trip = std::max<int64_t>(c->n - *start, 1);
+      }
+      if (o.getNumRegions() >= 2 && !o.getRegion(1).empty())
+        total += trip * BlockBytes(ctx, o.getRegion(1).front());
+    } else if (n == "func.call" || n == "stablehlo.composite") {
+      auto sym = o.getAttrOfType<mlir::FlatSymbolRefAttr>(
+          n == "func.call" ? "callee" : "decomposition");
+      if (sym) {
+        auto fn = ctx.module.lookupSymbol<mlir::func::FuncOp>(sym.getValue());
+        if (fn && !fn.getBody().empty())
+          total += BlockBytes(ctx, fn.getBody().front());
+      }
+    } else {
+      for (mlir::Region& r : o.getRegions())
+        for (mlir::Block& b : r.getBlocks()) total += BlockBytes(ctx, b);
+    }
+  }
+  ctx.bytes[&block] = total;
+  return total;
+}
+
+// ops/control.py `_passthrough_bytes`: the bytes of results no operation in the
+// block produces.  A program whose output IS one of its inputs still
+// materializes that output -- XLA's no-alias contract makes it a copy -- and
+// the op walk cannot see it, because there is no op.  Counted once per RETURNED
+// POSITION, not per distinct value: two outputs may not share a buffer either.
+//
+// Whole programs only, never inside `BlockBytes`' recursion: a loop body
+// returns its carries, most of them arguments passed through untouched, and
+// charging those per iteration would move the chunk sizing.
+int64_t PassthroughBytes(mlir::Block& block) {
+  if (block.getNumArguments() == 0) return 0;
+  llvm::DenseSet<mlir::Value> args;
+  for (mlir::BlockArgument a : block.getArguments()) args.insert(a);
+  int64_t total = 0;
+  for (mlir::Operation& o : block) {
+    if (!o.getName().getStringRef().ends_with(".return") || o.getNumResults())
+      continue;
+    for (mlir::Value v : o.getOperands())
+      if (args.contains(v)) total += ValueBytes(v);
+  }
+  return total;
+}
+
+int64_t ProgramBytes(LowerContext& ctx, mlir::Block& block) {
+  return BlockBytes(ctx, block) + PassthroughBytes(block);
+}
+
+// ops/control.py `_bytes_ok`: whether tracing `mult` copies of this block fits
+// the byte budget.  Every compile decision asks it -- the whole-main compile
+// (mult 1, whole), a compiled while body (mult repeat) and unrolling a counted
+// loop into an enclosing trace (mult trip) -- and all of them multiply the SAME
+// per-block estimate, which is what keeps them coherent.
+bool BytesOk(LowerContext& ctx, mlir::Block& block, int64_t mult,
+             absl::string_view what, bool whole = false) {
+  if (kCompileBytes <= 0) return true;
+  const int64_t per = whole ? ProgramBytes(ctx, block) : BlockBytes(ctx, block);
+  const int64_t nb = mult * per;
+  if (nb <= kCompileBytes) return true;
+  if (kDebug && ctx.gated.insert(&block).second) {
+    std::fprintf(stderr,
+                 "[metaljax-native] compile bytes gate: %s would trace %.0f MB "
+                 "(x%lld) > %lld MB (METALJAX_COMPILE_BYTES_MB); running "
+                 "eagerly\n",
+                 std::string(what).c_str(),
+                 static_cast<double>(nb) / static_cast<double>(1 << 20),
+                 static_cast<long long>(mult),
+                 static_cast<long long>(kCompileBytesMb));
+  }
+  return false;
+}
+
+// ops/control.py `_bytes_chunks`: how many copies of this block one trace may
+// hold.  Never less than 1 -- the single-step case is gated by `BytesOk` where
+// the body compile is decided, which says NO when one iteration alone is over
+// budget.
+int64_t BytesChunks(LowerContext& ctx, mlir::Block& block) {
+  if (kCompileBytes <= 0) return int64_t{1} << 30;
+  return std::max<int64_t>(
+      1, kCompileBytes / std::max<int64_t>(BlockBytes(ctx, block), 1));
+}
+
+// interpreter.block_is_pure: true when executing the block never synchronizes
+// with the HOST.  It is the gate on every tracing path, because a trace cannot
+// contain a host read at all.
+//
+// Two of the Python's arms cannot fire here: a `custom_call` with a host
+// handler and a token-carrying value both decline this plugin's lowering
+// outright (the op set and `CheckValue`), long before anything asks about
+// purity.  The token tests are written anyway -- a reader checks a
+// transliteration line by line, and they cost a type comparison -- while the
+// custom_call arm has nothing to call and is left out.
+bool BlockIsPure(LowerContext& ctx, mlir::Block& block) {
+  auto cached = ctx.pure.find(&block);
+  if (cached != ctx.pure.end()) return cached->second;
+  for (mlir::BlockArgument a : block.getArguments()) {
+    // Token-carrying code sequences host-visible effects: keep it off every
+    // tracing path. Such programs sync with the host anyway.
+    if (mlir::isa<mlir::stablehlo::TokenType>(a.getType())) {
+      ctx.pure[&block] = false;
+      return false;
+    }
+  }
+  ctx.pure[&block] = true;   // optimistic; no recursion in jax IR
+  bool pure = true;
+  for (mlir::Operation& o : block) {
+    const llvm::StringRef n = o.getName().getStringRef();
+    bool token_result = false;
+    for (mlir::Value r : o.getResults())
+      token_result = token_result ||
+                     mlir::isa<mlir::stablehlo::TokenType>(r.getType());
+    if (token_result) { pure = false; break; }
+    // interpreter._IMPURE_OPS. The two host-computed linalg ops are in the
+    // list because the Python handler runs them on the CPU through numpy;
+    // they decline here, and are listed so the two readings agree on paper.
+    if (n == "stablehlo.while" || n == "stablehlo.if" || n == "stablehlo.case" ||
+        n == "stablehlo.triangular_solve" || n == "stablehlo.cholesky") {
+      if (n == "stablehlo.while" && WhileTraceable(ctx, &o))
+        continue;      // statically-counted small loop: unrollable
+      pure = false;
+      break;
+    }
+    if (n == "func.call" || n == "stablehlo.composite") {
+      auto sym = o.getAttrOfType<mlir::FlatSymbolRefAttr>(
+          n == "func.call" ? "callee" : "decomposition");
+      if (sym) {
+        auto fn = ctx.module.lookupSymbol<mlir::func::FuncOp>(sym.getValue());
+        if (fn && !fn.getBody().empty() &&
+            !BlockIsPure(ctx, fn.getBody().front())) {
+          pure = false;
+          break;
+        }
+      }
+    }
+    bool stop = false;
+    for (mlir::Region& r : o.getRegions()) {
+      for (mlir::Block& b : r.getBlocks()) {
+        if (!BlockIsPure(ctx, b)) { pure = false; stop = true; break; }
+      }
+      if (stop) break;
+    }
+    if (stop) break;
+  }
+  ctx.pure[&block] = pure;
+  return pure;
+}
+
+// ops/control.py `_while_traceable`: whether this loop can be unrolled INSIDE
+// an enclosing mx::compile trace -- statically counted, pure body, and small
+// enough for both budgets.  It is what lets the purity analysis see through a
+// small counted loop, so a main holding one is still compiled whole.
+//
+// (`_msl_plan_for`'s early yes has no analogue: this plugin generates no
+// kernels, which is the neutral answer the Python gives with METALJAX_MSL=0.)
+bool WhileTraceable(LowerContext& ctx, mlir::Operation* op) {
+  if (op->getNumRegions() < 2 || op->getRegion(1).empty()) return false;
+  mlir::Block& body = op->getRegion(1).front();
+  auto cached = ctx.traceable.find(&body);
+  if (cached != ctx.traceable.end()) return cached->second;
+  ctx.traceable[&body] = false;   // break recursion
+  bool ok = false;
+  std::optional<Counted> c = AnalyzeCounted(ctx, op);
+  if (c.has_value() && c->kind == Counted::kStatic) {
+    std::optional<int64_t> start = StaticStart(op, c->k);
+    if (start.has_value()) {
+      const int64_t trip = std::max<int64_t>(c->n - *start, 0);
+      // The byte gate is asked LAST, so a gate that fires means "everything
+      // else said compile" -- which is what makes its debug line mean
+      // something.
+      ok = trip * BlockCost(ctx, body) <= kTraceBudget &&
+           BlockIsPure(ctx, body) &&
+           BytesOk(ctx, body, trip, "unroll-in-trace");
+    }
+  }
+  ctx.traceable[&body] = ok;
+  return ok;
+}
+
+// ops/control.py `_underived_outputs`: the terminator operands with NO data
+// path from any block argument or capture.  When traced, such outputs are baked
+// by MLX's compiler into a constants table KEYED BY VALUE -- two equal-valued
+// constant outputs collide and the compiled call dies with unordered_map::at
+// (repro: mx.compile(lambda x: (x+1, mx.array(.9), mx.array(.9)))).  The
+// executor anchors exactly these positions (native/compile.cc).
+std::vector<int> UnderivedOutputs(mlir::Block& block,
+                                  const std::vector<mlir::Value>& free) {
+  std::vector<mlir::Operation*> ops;
+  for (mlir::Operation& o : block) ops.push_back(&o);
+  if (ops.empty()) return {};
+  llvm::DenseSet<mlir::Value> derived;
+  for (mlir::BlockArgument a : block.getArguments()) derived.insert(a);
+  for (mlir::Value v : free) derived.insert(v);
+  for (size_t i = 0; i + 1 < ops.size(); i++) {
+    mlir::Operation* o = ops[i];
+    bool dep = false;
+    for (mlir::Value v : o->getOperands()) dep = dep || derived.contains(v);
+    if (!dep) {
+      for (mlir::Region& r : o->getRegions()) {
+        for (mlir::Block& b : r.getBlocks()) {
+          for (mlir::Value v : FreeValues(b)) {
+            if (derived.contains(v)) { dep = true; break; }
+          }
+          if (dep) break;
+        }
+        if (dep) break;
+      }
+    }
+    if (dep)
+      for (mlir::Value r : o->getResults()) derived.insert(r);
+  }
+  std::vector<int> out;
+  mlir::Operation* term = ops.back();
+  for (unsigned i = 0; i < term->getNumOperands(); i++) {
+    if (!derived.contains(term->getOperand(i)))
+      out.push_back(static_cast<int>(i));
+  }
+  return out;
+}
+
+// --------------------------------------------------------------------------
 // the lowering
 // --------------------------------------------------------------------------
 
@@ -628,6 +978,12 @@ struct DumpNode {
   std::vector<int> outputs;
   std::vector<int> copies;
   int slots = 0;
+  // The compile decision, when there is one to record: a `set_compile` call on
+  // this Program. Printed on a line of its own so a tape that compiles nothing
+  // still diffs byte for byte against P3/P4's recorded dumps.
+  bool compile = false;
+  std::vector<int> anchors;
+  int64_t max_repeat = 0;
 };
 
 void RenderDump(const DumpNode& node, const std::string& indent,
@@ -650,6 +1006,10 @@ void RenderDump(const DumpNode& node, const std::string& indent,
   }
   absl::StrAppend(out, indent, "[tape] outputs ", join(node.outputs),
                   " copies ", join(node.copies), " slots ", node.slots, "\n");
+  if (node.compile) {
+    absl::StrAppend(out, indent, "[tape] compile anchors ", join(node.anchors),
+                    " max_repeat ", node.max_repeat, "\n");
+  }
 }
 
 class Lowering {
@@ -2107,13 +2467,48 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
 
   const int64_t cost = BlockCost(*ctx_, body_block);
   const int64_t period = FlushPeriod(cost);
-  // P3 runs everything interpreted: `chunkable` and `body_compile_max` are
-  // the compile decisions, which are Stage 1's analysis (purity, the trace
-  // budget, the byte budget) and move with the recognizers rather than being
-  // re-derived here.  Zero is what the Python lowering itself writes with
-  // METALJAX_COMPILE=0, and it is the reason `kmax` -- read only when
-  // `chunkable` -- is a dead 1 rather than a computed chunk size.
-  const int64_t chunkable = 0, kmax = 1, body_compile_max = 0;
+
+  // The compile decisions (tape.py `_while`, P5).  Two budgets, solved for the
+  // two things the executor is allowed to do with a body: replay K iterations
+  // as ONE compiled chunk (`chunkable` / `kmax`), and compile the single-step
+  // body at all (`body_compile_max`, which is `_body_fn`'s gates -- purity, the
+  // op budget, the byte budget -- solved for `repeat`).
+  const bool pure = BlockIsPure(*ctx_, body_block);
+  const int64_t by_cost = kTraceBudget / std::max<int64_t>(cost, 1);
+  // `BytesChunks` never returns less than 1: its callers ask "how many
+  // iterations may one trace hold", and the single-step case is gated
+  // separately below, which says NO when one iteration alone is over budget.
+  // Solving that gate for `repeat` is this division, and it must NOT be
+  // rounded up to 1 -- a compiled body holds every intermediate of an
+  // iteration instead of flushing inside it (measured on the byte-gated
+  // random.normal init: 1.19 GB peak eager, 2.38 GB compiled).
+  const int64_t by_bytes =
+      kCompileBytes <= 0
+          ? by_cost
+          : kCompileBytes /
+                std::max<int64_t>(BlockBytes(*ctx_, body_block), 1);
+  // `interp._no_chunk` / `interp._no_body_compile` have no term here: they are
+  // what the PYTHON engine remembers about a body whose chunk or compiled call
+  // failed at run time, and the executor keeps the same memory itself
+  // (`Program::set_no_chunk`, `Program::drop_compiled`).  Empty at lowering on
+  // both engines, which is what a tape diff compares.
+  const int64_t chunkable =
+      (kCompileEnabled && cost <= kChunkMaxCost && pure) ? 1 : 0;
+  const int64_t kmax = std::max<int64_t>(
+      1, std::min<int64_t>({by_cost, kChunkMax,
+                            BytesChunks(*ctx_, body_block)}));
+  int64_t body_compile_max = 0;
+  if (kCompileEnabled && kBodyCompile && pure)
+    body_compile_max = std::max<int64_t>(0, std::min(by_cost, by_bytes));
+  if (body_compile_max > 0) {
+    std::vector<int> anchors = UnderivedOutputs(body_block, body.free);
+    if (kDumpTape) {
+      body.dump.compile = true;
+      body.dump.anchors = anchors;
+      body.dump.max_repeat = body_compile_max;
+    }
+    body.program->set_compile(true, std::move(anchors), body_compile_max);
+  }
 
   std::vector<int64_t> attrs{ncarry,
                              static_cast<int64_t>(cond.caps.size()),
@@ -2516,6 +2911,40 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
   }
   lowered.num_copies = static_cast<int64_t>(copies.size());
   built.program->set_outputs(built.outputs, copies);
+
+  // Whether the WHOLE tape traces through mx::compile (engine.py
+  // `MetalExecutable.runner`, P5).  Two independent budgets: `cost` bounds how
+  // many ops one trace may hold, and so the Metal live-buffer count; the byte
+  // gate bounds how much those buffers HOLD, which op count says nothing about
+  // -- a jitted parameter init is 365 ops and 15 GB of traffic.  Over either,
+  // the program runs op by op, where last-use pruning and the byte-denominated
+  // eager flush bound it and the compiled path does not.
+  const int64_t cost = BlockCost(*ctx_, block);
+  const bool pure = BlockIsPure(*ctx_, block);
+  const bool compile_main =
+      kCompileEnabled && pure && cost <= kTraceBudget &&
+      BytesOk(*ctx_, block, 1, "main", /*whole=*/true);
+  lowered.compiled = compile_main;
+  if (compile_main) {
+    // A main block has no captures, so `free` is empty: an output with no data
+    // path from an ARGUMENT is what MLX would bake by value.
+    std::vector<int> anchors = UnderivedOutputs(block, {});
+    if (kDumpTape) {
+      built.dump.compile = true;
+      built.dump.anchors = anchors;
+      built.dump.max_repeat = 1;
+    }
+    built.program->set_compile(true, std::move(anchors), /*max_repeat=*/1);
+  }
+  if (kDebug) {
+    std::fprintf(stderr,
+                 "[metaljax-native] main: pure=%d cost=%lld bytes=%.1fMB "
+                 "compile=%d\n",
+                 static_cast<int>(pure), static_cast<long long>(cost),
+                 static_cast<double>(ProgramBytes(*ctx_, block)) /
+                     static_cast<double>(1 << 20),
+                 static_cast<int>(compile_main));
+  }
   if (kDumpTape) {
     built.dump.copies = copies;
     std::string text;

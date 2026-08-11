@@ -58,6 +58,9 @@ struct LoweredProgram {
   // argument or a constant the Program owns (XLA's no-alias contract).
   int64_t num_entries = 0;
   int64_t num_copies = 0;
+  // Whether the whole tape is traced through mx::compile (the P5 decision;
+  // while BODIES carry theirs in the entry's attrs instead).
+  bool compiled = false;
 };
 
 absl::StatusOr<LoweredProgram> LowerModule(mlir::ModuleOp module);

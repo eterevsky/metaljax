@@ -795,7 +795,26 @@ fork authorized but not needed.
   for long loops, not only performance. Also: XLA's parse rewrites the module
   before CompileAndLoad (chlo legalized, constants CSE'd and hoisted out of
   regions), so tape diffs now start from METALJAX_DUMP_MODULE=1.
-* Next: the compile decisions (see above), then sort/top_k, then
-  reduce_window / convolution / fft, then async execute + donation.
+* **P5 landed** (notes/cpp-p5-compile.md): the compile decisions. `set_compile`
+  on main and on while bodies, and the three fields P3 wrote as zeros
+  (`chunkable`/`kmax`/`body_compile_max`), computed by transliterations of
+  `interpreter.block_is_pure` / `op_bytes` and `ops/control`'s
+  `_block_bytes` / `_passthrough_bytes` / `_bytes_ok` / `_bytes_chunks` /
+  `_while_traceable` / `_underived_outputs`, under the same six environment
+  budgets. This was CORRECTNESS, as P4 predicted: `db18-b4l1024` went from
+  FAIL 3.1e+01 / ok~ 1.3e-02 / FAIL 5.4e-03 to `ok` at 1.9-4.3e-05 on five
+  standalone runs, `synth-matlstm-b` likewise, and six full gate runs are
+  106/106 with zero FAIL. `METALJAX_COMPILE=0` puts the flicker back, which is
+  the control. The tape cross-check is byte-identical over 11 probes / 259
+  lines with compile ON — including the `kmax` field that differed in P3 and
+  P4. Perf, recorded not gated (one 8-step gate chunk, ms): the decisions are
+  worth 1.7-3.5x over the eager plugin, and the native path now sits within
+  1-3 % of the Stage 1 engine with `METALJAX_MSL=0` on every row measured —
+  the whole remaining gap to Stage 1's default is msl_scan. One finding left
+  open: MLX does not fuse the FIRST compiled executable in a process (a few
+  ULP on transcendental chains; four warm-ups tried, none moves it; Stage 1
+  does not show it).
+* Next: sort/top_k, then reduce_window / convolution / fft, then msl_scan
+  (now the whole texmo gap), then async execute + donation.
   Suite-vs-suite as the standing gate. (North star per Oleg: everything
   through the new stack, correctness first, performance second.)

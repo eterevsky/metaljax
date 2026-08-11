@@ -48,6 +48,9 @@ Status, measurements, gotchas and the route decision:
 [`../notes/cpp-p1-runtime.md`](../notes/cpp-p1-runtime.md) for the runtime and
 [`../notes/cpp-p2-lowering.md`](../notes/cpp-p2-lowering.md) for the lowering
 and the executable — which ops lower, which decline, and why — then
-[`../notes/cpp-p3-control.md`](../notes/cpp-p3-control.md) for control flow and
+[`../notes/cpp-p3-control.md`](../notes/cpp-p3-control.md) for control flow,
 [`../notes/cpp-p4-gather-scatter.md`](../notes/cpp-p4-gather-scatter.md) for
-gather/scatter, the RNG and the gate.
+gather/scatter, the RNG and the gate, and
+[`../notes/cpp-p5-compile.md`](../notes/cpp-p5-compile.md) for the compile
+decisions — which programs and loop bodies are traced through `mx::compile`,
+and why that turned out to be correctness rather than tuning.

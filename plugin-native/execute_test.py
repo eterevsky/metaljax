@@ -331,6 +331,32 @@ def _cases():
         ("long counted loop (10k iterations)",
          lambda x: jax.lax.fori_loop(0, 10000, lambda i, c: c + 1.0, x),
          [np.float32(0.0)], *EXACT),
+        # The CHUNKED replay (P5).  With the compile decisions on, a counted
+        # loop whose body is pure and cheap enough replays kmax iterations per
+        # compiled graph (native/control.cc `run_chunked`) instead of one --
+        # a different sync-point layout, a different set of MLX kernels, and
+        # the arm nothing exercised while `chunkable` was hard-wired to 0.
+        # 512 steps of a matmul body: cost puts kmax at the 16 ceiling, so
+        # this really does run 32 chunks and their remainder.
+        ("chunked replay (512 x matmul body)",
+         lambda h0, w, xs: jax.lax.scan(
+             lambda h, x: (jnp.tanh(h @ w * 0.5 + x), None), h0, xs)[0],
+         [_rand((4, 8), 52), _rand((8, 8), 53), _rand((512, 4, 8), 54)], *DOT),
+        # A counted loop small enough to UNROLL into the enclosing trace
+        # (ops/control._while_traceable): the whole main compiles, the loop
+        # among it, so nothing here reaches run_while's eager arm at all.
+        ("counted loop unrolled into a compiled main",
+         lambda x: jax.lax.fori_loop(0, 6, lambda i, c: jnp.sin(c) + 0.25, x),
+         [_rand((16,), 55)], *F32),
+        # The same decision, one size up: 200 iterations still fit the OP
+        # budget, so the lowering calls the body traceable and compiles main
+        # around it -- and the executor then refuses to unroll more than 64
+        # into one trace and hands the program back to the eager path
+        # (`run_recovering`).  Both engines take that route; what this row
+        # checks is that the answer survives it.
+        ("counted loop past the unroll ceiling",
+         lambda x: jax.lax.fori_loop(0, 200, lambda i, c: c + 1.0, x),
+         [np.float32(0.0)], *EXACT),
 
         # gather (P4).  StableHLO's gather goes straight to mx::gather, whose
         # index arrays, clamps, window sizes and offset_dims transpose are all
@@ -736,6 +762,28 @@ def write_reference(path):
     np.savez(path, **saved)
 
 
+def write_eager_arm(path):
+    """Run every case through the PLUGIN with the compile decisions off.
+
+    The caller's environment already holds METALJAX_COMPILE=0, which the dylib
+    reads once at load: `chunkable`, `body_compile_max` and the whole-main
+    `set_compile` all go to zero, which is the all-eager plugin P3 and P4
+    measured.  The parent compares these answers with its own compiled ones --
+    see the "eager vs compiled" section for what that comparison demands.
+    """
+    import jax
+
+    saved = {}
+    for i, (name, fn, args, _rtol, _atol) in enumerate(_cases()):
+        outs = _flatten(jax.jit(fn)(*args))
+        saved[f"n{i}"] = np.asarray(len(outs))
+        for j, out in enumerate(outs):
+            kind, arr = _canonical(out)
+            saved[f"k{i}_{j}"] = np.asarray(kind)
+            saved[f"v{i}_{j}"] = arr
+    np.savez(path, **saved)
+
+
 def read_module_reference(path, index):
     data = np.load(path)
     n = int(data[f"mn{index}"])
@@ -760,6 +808,11 @@ def read_reference(path, index):
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--reference":
         write_reference(sys.argv[2])
+        return 0
+    if len(sys.argv) > 2 and sys.argv[1] == "--eager-arm":
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        write_eager_arm(sys.argv[2])
         return 0
 
     os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
@@ -790,11 +843,13 @@ def main():
     import jax.numpy as jnp  # noqa: E402
 
     failures = []
+    compiled_arm = {}
     print(f"\n{'case':<32} {'max error':>12}  result")
     print("-" * 62)
     for i, (name, fn, args, rtol, atol) in enumerate(_cases()):
         try:
             got = _flatten(jax.jit(fn)(*args))
+            compiled_arm[i] = [_canonical(g) for g in got]
             want = read_reference(ref_path, i)
             ok, detail = _compare(name, got, want, rtol, atol)
         except BaseException as exc:  # noqa: BLE001 - report and continue
@@ -805,6 +860,60 @@ def main():
         else:
             print(f"{name:<32} {'-':>12}  FAIL: {detail}")
             failures.append(name)
+
+    # The compile decisions change which MLX KERNELS run -- mx::compile fuses
+    # elementwise chains -- and where a loop's sync points fall.  The child
+    # runs the same cases through the same dylib with METALJAX_COMPILE=0, the
+    # all-eager plugin of P3/P4, and every case must still land inside its own
+    # CPU tolerance.  Most are bit-identical; the ones that are not are named,
+    # because a fused kernel evaluating a transcendental differently is a fact
+    # about MLX worth seeing rather than a threshold to hide.
+    print("\neager vs compiled (METALJAX_COMPILE=0 in a child)")
+    print("-" * 62)
+    eager_path = ref_path.with_name(ref_path.name.replace("reference", "eager"))
+    eager_child = dict(os.environ)
+    eager_child["METALJAX_COMPILE"] = "0"
+    eager_proc = subprocess.run(
+        [sys.executable, str(pathlib.Path(__file__).resolve()), "--eager-arm",
+         str(eager_path)],
+        env=eager_child, capture_output=True, text=True)
+    if eager_proc.returncode != 0:
+        sys.stderr.write(eager_proc.stdout + eager_proc.stderr)
+        print(f"{'the eager arm':<32} {'-':>12}  FAIL: the child failed")
+        failures.append("eager arm")
+    else:
+        eager = np.load(eager_path)
+        inexact, bad = [], []
+        for i, (name, _fn, _args, rtol, atol) in enumerate(_cases()):
+            if i not in compiled_arm:
+                continue
+            got = compiled_arm[i]
+            want = [(str(eager[f"k{i}_{j}"]), eager[f"v{i}_{j}"])
+                    for j in range(int(eager[f"n{i}"]))]
+            identical = len(got) == len(want) and all(
+                gk == wk and ga.shape == wa.shape and
+                (np.array_equal(ga, wa) or
+                 (gk in "fc" and
+                  np.array_equal(np.isnan(ga), np.isnan(wa)) and
+                  np.array_equal(ga[~np.isnan(ga)], wa[~np.isnan(wa)])))
+                for (gk, ga), (wk, wa) in zip(got, want))
+            if identical:
+                continue
+            ok, detail = _compare(name, [ga for _k, ga in got], want,
+                                  rtol, atol)
+            inexact.append(f"{name} ({detail:.1e})" if ok else name)
+            if not ok:
+                bad.append(f"{name}: {detail}")
+        n = len(compiled_arm)
+        label = f"{n - len(inexact)} of {n} bit-identical"
+        if bad:
+            print(f"{label:<32} {'-':>12}  FAIL: {'; '.join(bad[:3])}")
+            failures.append("eager vs compiled")
+        else:
+            print(f"{label:<32} {'':>12}  ok"
+                  + (f" (within tolerance: {', '.join(inexact)})"
+                     if inexact else ""))
+        eager_path.unlink(missing_ok=True)
 
     print("\nhand-written StableHLO (the same text through both clients)")
     print("-" * 62)

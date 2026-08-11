@@ -64,7 +64,8 @@ const bool kDebug = [] {
 std::string StatsDelta(const Stats& before, const Stats& after) {
   return absl::StrFormat(
       "flushes=%d(+clear %d) loop_flushes=%d(+clear %d) limit_retries=%d "
-      "serial_loops=%d pipelined_loops=%d pipelined_steps=%d",
+      "serial_loops=%d pipelined_loops=%d pipelined_steps=%d "
+      "compiles=%d compiled_calls=%d unrolls=%d drops=%d/%d",
       after.flushes - before.flushes,
       after.cache_clears - before.cache_clears,
       after.loop_flushes - before.loop_flushes,
@@ -72,7 +73,16 @@ std::string StatsDelta(const Stats& before, const Stats& after) {
       after.limit_retries - before.limit_retries,
       after.serial_loops - before.serial_loops,
       after.pipelined_loops - before.pipelined_loops,
-      after.pipelined_steps - before.pipelined_steps);
+      after.pipelined_steps - before.pipelined_steps,
+      // P5: the compiled path is otherwise invisible in a process with no
+      // interpreter -- `compiles` counts traces BUILT, `compiled_calls`
+      // replays (main, a while body, one chunk), and `drops` the two ways a
+      // compiled path retires (compile_drops / chunk_drops).
+      after.compiles - before.compiles,
+      after.compiled_calls - before.compiled_calls,
+      after.unrolls - before.unrolls,
+      after.compile_drops - before.compile_drops,
+      after.chunk_drops - before.chunk_drops);
 }
 
 }  // namespace
