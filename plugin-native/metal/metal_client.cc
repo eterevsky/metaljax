@@ -24,6 +24,7 @@ Licensed under the Apache License, Version 2.0.
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "llvm/ADT/APFloat.h"
 #include "metal/metal_buffer.h"
 #include "metal/metal_dtypes.h"
 #include "metal/metal_executable.h"
@@ -360,6 +361,44 @@ MetalClient::BufferFromHostBuffer(
     float* to = reinterpret_cast<float*>(stage);
     const int64_t scalars = total * wire->lanes;
     for (int64_t i = 0; i < scalars; i++) to[i] = static_cast<float>(from[i]);
+  }
+  if (wire->emulated >= 0) {
+    // An emulated grid: the wire byte is the type's own encoding and the
+    // device holds the VALUE in a wider dtype, so this is a decode and not a
+    // copy.  Written straight into the storage the device will read (never
+    // staged through a wider float and cast on the GPU: that would be a
+    // kernel per transfer, and for float16 storage it would round twice).
+    const int kind = wire->emulated;
+    const size_t item = wire->device.size();
+    char* out = static_cast<char*>(std::malloc(
+        static_cast<size_t>(total) * item));
+    if (out == nullptr) {
+      std::free(stage);
+      return absl::ResourceExhaustedError("metaljax: could not stage a "
+                                          "sub-byte host buffer");
+    }
+    const auto* codes = reinterpret_cast<const uint8_t*>(stage);
+    for (int64_t i = 0; i < total; i++) {
+      const float v = EmulatedDecode(kind, codes[i]);
+      if (wire->device == mx::int8) {
+        reinterpret_cast<int8_t*>(out)[i] = static_cast<int8_t>(v);
+      } else if (wire->device == mx::uint8) {
+        reinterpret_cast<uint8_t*>(out)[i] = static_cast<uint8_t>(v);
+      } else if (wire->device == mx::float32) {
+        reinterpret_cast<float*>(out)[i] = v;
+      } else {
+        // float16 storage: every grid value is exact in it, and APFloat is
+        // what says so bit for bit.
+        llvm::APFloat h(v);
+        bool lost = false;
+        h.convert(llvm::APFloat::IEEEhalf(),
+                  llvm::APFloat::rmNearestTiesToEven, &lost);
+        reinterpret_cast<uint16_t*>(out)[i] =
+            static_cast<uint16_t>(h.bitcastToAPInt().getZExtValue());
+      }
+    }
+    std::free(stage);
+    stage = out;
   }
   return wrap(mx::array(static_cast<void*>(stage), shape, wire->device,
                         [](void* p) { std::free(p); }));

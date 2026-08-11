@@ -17,6 +17,8 @@ Licensed under the Apache License, Version 2.0.
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
 #include "metal/metal_dtypes.h"
 #include "metal/metal_stream.h"
 #include "mlx/mlx.h"
@@ -96,6 +98,42 @@ xla::Future<> MetalBuffer::ToLiteral(xla::MutableLiteralBase* literal) {
         xla::PrimitiveType_Name(shape_.element_type()))));
   }
   const size_t dst_size = literal->size_bytes();
+  if (wire->emulated >= 0) {
+    // An emulated grid: the device holds VALUES in a wider dtype, so the wire
+    // byte has to be re-encoded per element.  Rounding is RNE and overflow is
+    // the format's own rule (an infinity, a NaN, or saturation), which is what
+    // llvm::APFloat implements and what ml_dtypes -- the reference the CPU
+    // backend's answers come from -- implements too.
+    absl::StatusOr<mx::array> settled = Settled();
+    if (!settled.ok()) return xla::Future<>(settled.status());
+    const int64_t n = settled->size();
+    if (dst_size != static_cast<size_t>(n)) {
+      return xla::Future<>(absl::InvalidArgumentError(absl::StrFormat(
+          "metaljax: literal wants %d bytes, the buffer holds %d elements",
+          dst_size, n)));
+    }
+    auto* out = static_cast<uint8_t*>(literal->untyped_data());
+    const mx::Dtype dt = settled->dtype();
+    for (int64_t i = 0; i < n; i++) {
+      float v;
+      if (dt == mx::int8) {
+        v = static_cast<float>(settled->data<int8_t>()[i]);
+      } else if (dt == mx::uint8) {
+        v = static_cast<float>(settled->data<uint8_t>()[i]);
+      } else if (dt == mx::float32) {
+        v = settled->data<float>()[i];
+      } else {
+        llvm::APFloat h(llvm::APFloat::IEEEhalf(),
+                        llvm::APInt(16, settled->data<uint16_t>()[i]));
+        bool lost = false;
+        h.convert(llvm::APFloat::IEEEsingle(),
+                  llvm::APFloat::rmNearestTiesToEven, &lost);
+        v = h.convertToFloat();
+      }
+      out[i] = EmulatedEncode(wire->emulated, v);
+    }
+    return xla::Future<>(absl::OkStatus());
+  }
   if (!wire->widen) {
     absl::StatusOr<size_t> copied =
         CopyOut(literal->untyped_data(), dst_size, /*src_offset=*/0);
@@ -148,12 +186,13 @@ xla::Future<> MetalBuffer::CopyRawToHost(void* dst, int64_t offset,
         absl::InvalidArgumentError("metaljax: negative offset/size."));
   }
   std::optional<WireType> wire = WireTypeOf(shape_.element_type());
-  if (wire.has_value() && wire->widen) {
-    // A raw copy of a widened buffer would hand out the f32 storage under an
-    // f64 shape.  ToLiteral is the path that widens; this one declines.
+  if (wire.has_value() && (wire->widen || wire->emulated >= 0)) {
+    // A raw copy would hand out the STORAGE under the wire's shape: f32 under
+    // an f64 one, or a float16 grid value under a one-byte f8 one.  ToLiteral
+    // is the path that converts; this one declines.
     return xla::Future<>(absl::UnimplementedError(
-        "metaljax: raw host copies of f64/c128 buffers are not supported "
-        "(their device storage is f32/c64)."));
+        "metaljax: raw host copies of f64/c128 or emulated sub-byte buffers "
+        "are not supported (their device storage is not the wire's bits)."));
   }
   absl::StatusOr<size_t> copied = CopyOut(
       dst, static_cast<size_t>(transfer_size), static_cast<size_t>(offset));

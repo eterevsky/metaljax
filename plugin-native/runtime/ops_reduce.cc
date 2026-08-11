@@ -309,6 +309,134 @@ bool Program::step_reduce(const Entry& e,
       break;
     }
 
+    case kSelectAndScatter: {
+      // ops/reduction.py `_select_and_scatter`: max/min-pool backward. Each
+      // source element is routed to the position its select chose inside the
+      // window, and the routed values are combined there.
+      //
+      // The combine is a scatter over indices that OVERLAP whenever the
+      // windows do, so on the GPU its result is order-nondeterministic in
+      // the last bits (like jax-CUDA's, and like every scatter-add this
+      // engine runs); the tests that cover it compare with a tolerance
+      // rather than pinning bytes.
+      Cursor c(at);
+      const int64_t rank = c.next();
+      std::vector<int> wd = c.vec();
+      std::vector<int> strides = c.vec();
+      std::vector<int> lo = c.vec(), hi = c.vec();
+      const bool is_max = c.flag();
+      const int64_t comb = c.next();   // 0 add, 1 or, 2 and
+      const mx::array& operand = in(0);
+      const mx::Dtype dt = operand.dtype();
+      bool padded = false;
+      for (int64_t i = 0; i < rank; i++)
+        padded = padded || lo[static_cast<size_t>(i)] != 0 ||
+                 hi[static_cast<size_t>(i)] != 0;
+
+      mx::array x = operand;
+      if (padded) {
+        // The select's identity: a window position that is pure padding must
+        // never win, so the pad is -inf for a maximum and +inf for a minimum
+        // (False / True on bool, where or/and are the same two extremes).
+        mx::array fill =
+            is_bool(dt)
+                ? mx::array(!is_max, dt)
+                : mx::array(is_max ? -std::numeric_limits<float>::infinity()
+                                   : std::numeric_limits<float>::infinity(),
+                            dt);
+        std::vector<int> ax(static_cast<size_t>(rank));
+        for (size_t i = 0; i < ax.size(); i++) ax[i] = static_cast<int>(i);
+        x = mx::pad(x, ax, mx::Shape(lo.begin(), lo.end()),
+                    mx::Shape(hi.begin(), hi.end()), fill, "constant");
+      }
+      x = mx::contiguous(x);   // as_strided needs row-contiguous storage
+      std::vector<int64_t> elem_strides(static_cast<size_t>(rank));
+      int64_t acc = 1;
+      for (int64_t i = rank - 1; i >= 0; i--) {
+        elem_strides[static_cast<size_t>(i)] = acc;
+        acc *= x.shape()[static_cast<size_t>(i)];
+      }
+      const int64_t total = acc;
+      mx::Shape out_sizes;
+      mx::Shape view_shape;
+      mx::Strides view_strides;
+      int64_t wflat = 1;
+      for (int64_t i = 0; i < rank; i++) {
+        const size_t k = static_cast<size_t>(i);
+        out_sizes.push_back(static_cast<mx::ShapeElem>(std::max<int64_t>(
+            0, (x.shape()[k] - wd[k]) / strides[k] + 1)));
+        wflat *= wd[k];
+      }
+      view_shape = out_sizes;
+      for (int64_t i = 0; i < rank; i++)
+        view_shape.push_back(static_cast<mx::ShapeElem>(wd[
+            static_cast<size_t>(i)]));
+      for (int64_t i = 0; i < rank; i++)
+        view_strides.push_back(elem_strides[static_cast<size_t>(i)] *
+                               strides[static_cast<size_t>(i)]);
+      for (int64_t i = 0; i < rank; i++)
+        view_strides.push_back(elem_strides[static_cast<size_t>(i)]);
+      mx::Shape flat_shape = out_sizes;
+      flat_shape.push_back(static_cast<mx::ShapeElem>(wflat));
+      mx::array win = mx::contiguous(mx::reshape(
+          mx::as_strided(x, view_shape, view_strides, 0), flat_shape));
+      const int last = static_cast<int>(win.ndim()) - 1;
+      // First hit wins, which is what XLA's in-order GE/LE select does.
+      mx::array arg = is_max ? mx::argmax(win, last) : mx::argmin(win, last);
+
+      // The winner's absolute flat position in the padded array.
+      mx::array flat = mx::zeros(out_sizes, mx::int64);
+      mx::array rem = mx::astype(arg, mx::int64);
+      auto i64 = [](int64_t v) { return mx::array(v, mx::int64); };
+      for (int64_t i = rank - 1; i >= 0; i--) {
+        const size_t k = static_cast<size_t>(i);
+        mx::array off = mx::remainder(rem, i64(wd[k]));
+        rem = mx::floor_divide(rem, i64(wd[k]));
+        mx::Shape view(static_cast<size_t>(rank), 1);
+        view[k] = out_sizes[k];
+        mx::array pos = mx::reshape(
+            mx::multiply(mx::arange(static_cast<double>(out_sizes[k]),
+                                    mx::int64),
+                         i64(strides[k])),
+            view);
+        flat = mx::add(flat, mx::multiply(mx::add(pos, off),
+                                          i64(elem_strides[k])));
+      }
+
+      mx::array src = mx::reshape(mx::astype(in(1), dt), mx::Shape{-1});
+      mx::array idx = mx::reshape(flat, mx::Shape{-1});
+      mx::array upd = mx::reshape(src, mx::Shape{src.shape()[0], 1});
+      // or == elementwise maximum, and == minimum (jax emits `or` for PRED
+      // pooling gradients), so the identity is the combiner's own.
+      const mx::Shape flat_total{static_cast<mx::ShapeElem>(total)};
+      mx::array base = comb == 2 ? mx::ones(flat_total, dt)
+                                 : mx::zeros(flat_total, dt);
+      std::vector<mx::array> idxs{idx};
+      std::vector<int> sax{0};
+      base = comb == 0   ? mx::scatter_add(base, idxs, upd, sax)
+             : comb == 1 ? mx::scatter_max(base, idxs, upd, sax)
+                         : mx::scatter_min(base, idxs, upd, sax);
+      base = mx::reshape(base, x.shape());
+      if (padded) {
+        mx::Shape start(static_cast<size_t>(rank), 0), stop = x.shape();
+        for (int64_t i = 0; i < rank; i++) {
+          const size_t k = static_cast<size_t>(i);
+          start[k] = lo[k];
+          stop[k] = lo[k] + operand.shape()[k];
+        }
+        base = mx::slice(base, start, stop);
+      }
+      mx::array init = mx::astype(in(2), dt);
+      env[e.outs[0]] =
+          comb == 0
+              ? mx::add(base, init)
+              : (comb == 1 ? (is_bool(dt) ? mx::logical_or(base, init)
+                                          : mx::maximum(base, init))
+                           : (is_bool(dt) ? mx::logical_and(base, init)
+                                          : mx::minimum(base, init)));
+      break;
+    }
+
     default:
       return false;
   }

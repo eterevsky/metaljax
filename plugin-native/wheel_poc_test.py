@@ -138,17 +138,17 @@ def _compile():
     print("  jit(jnp.linalg.cholesky) ->", ch.diagonal().tolist())
     assert np.allclose(ch, np.sqrt(5.0) * np.eye(3), atol=1e-6), ch
     # An op outside the native set still declines, and says which one.
-    # reduce_precision is the stand-in now (phase 2's P11).
+    # `stablehlo.rng` is the stand-in now (phase 2's P11 gave reduce_precision
+    # an executor); neither engine implements XLA's non-deterministic RNG.
     try:
-        jax.jit(lambda a: jax.lax.reduce_precision(a, 5, 10))(
-            jax.device_put(np.arange(4, dtype=np.float32)))
+        jax.jit(lambda a, b: jax.lax.rng_uniform(a, b, (4,)))(
+            jax.device_put(np.float32(0.0)), jax.device_put(np.float32(1.0)))
     except Exception as e:  # noqa: BLE001 - the expected decline
         msg = str(e)
-        print("  reduce_precision declined:", msg.splitlines()[0][:160])
-        assert "stablehlo.reduce_precision" in msg, \
-            "the decline did not name the op"
+        print("  rng_uniform declined:", msg.splitlines()[0][:160])
+        assert "stablehlo.rng" in msg, "the decline did not name the op"
         return
-    raise AssertionError("reduce_precision unexpectedly compiled")
+    raise AssertionError("rng_uniform unexpectedly compiled")
 
 
 if FAILED:

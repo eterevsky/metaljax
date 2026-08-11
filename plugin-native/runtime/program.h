@@ -97,7 +97,7 @@ enum Op : int {
   // selection
   kCompare, kSelect, kClamp,
   // dtype
-  kConvert,
+  kConvert, kReducePrecision,
   // complex64 (ops/elementwise.py _real / _imag / _complex / _fft)
   kReal, kImag, kMakeComplex, kFft,
   // bit counting (SWAR, ops/elementwise.py)
@@ -109,7 +109,7 @@ enum Op : int {
   kConstant, kReduce, kArgReduce, kGenericReduce, kReduceWindow, kDotGeneral,
   kBitcastConvert, kDynamicSlice, kDynamicUpdateSlice, kSort, kLexSort, kTopK,
   kApproxTopK,
-  kGather, kScatter, kRng, kConv,
+  kGather, kScatter, kSelectAndScatter, kRng, kConv,
   // control flow (M3): each carries its regions as sub-Programs
   kWhile, kIf, kCase,
   // recognizer emits (M4): a REWRITTEN program's roots. These are not
@@ -138,6 +138,18 @@ enum Op : int {
 // the two engines' result BITS equal.
 
 mx::Dtype dtype_of(int64_t code);
+
+// The emulated grids (dtypes.py `EMULATED`): i4/ui4 and the f8/f6/f4 formats,
+// whose values live EXACTLY in a wider storage dtype (`dtype_of` returns that
+// storage, so every handler that builds a result of the declared type gets it
+// right without knowing the grid exists). What the grid is needed for is
+// two things and only two: rounding a value onto the grid, and knowing that
+// the code names one at all. The LOGICAL bit width bitcast_convert reads and
+// the host transfer's encode/decode are the tape BUILDER's, and live there;
+// nothing in a replay needs either.
+bool is_emulated(int64_t code);
+mx::array quantize_emulated(const mx::array& x, int64_t code);
+
 bool is_bool(const mx::Dtype& d);
 bool is_float(const mx::Dtype& d);
 bool is_complex(const mx::Dtype& d);
@@ -245,7 +257,11 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //
 //   unary / binary / select / clamp   (none)
 //   kCompare            [direction]            0=EQ 1=NE 2=LT 3=LE 4=GT 5=GE
-//   kConvert            [dtype]
+//   kConvert            [dtype, complex->real?]
+//   kReducePrecision    [arm, exponent_bits, mantissa_bits]
+//                       arm: 0 identity, 1 via bf16, 2 via f16, 3 general
+//                       (the general arm's f16/bf16 operands compute in f32
+//                       and cast back, which is where `orig` comes from)
 //   kReshape            [rank, shape...]
 //   kTranspose          [rank, perm...]
 //   kBroadcastInDim     [transpose?, in_rank, perm...,
@@ -283,9 +299,25 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //                        strategy 2: pad position, pad width, extent]
 //                       method: 0 set 1 add 2 mul 3 max 4 min 5 sub
 //                               6 complex multiply, as gather-multiply-set
+//                               7 an APPLY body under `unique_indices`,
+//                                 likewise: gather the current values, run
+//                                 region 0 on (old, update), set
+//                               8 the same body with NO promise: one update
+//                                 at a time, in row-major update order
 //                       strategy: the OOB-drop rule — 0 none, 1 neutral
 //                       value, 2 dummy pad. Second, ahead of everything
 //                       variable-length, so it can be read at a glance.
+//                       methods 7 and 8 append [ncaps] right after [updates
+//                       shape]
+//                       and ahead of the strategy's own extras, which is
+//                       where the handler's cursor is when it needs it; its
+//                       captures are the trailing `ins`, after the three
+//                       scatter operands.
+//   kSelectAndScatter   [rank, window dims..., strides..., pad lo/hi pairs...,
+//                        is_max, comb]   comb: 0 add 1 or 2 and
+//                       (the select is a compare, the scatter an add/or/and:
+//                        both bodies are read structurally at lowering, as
+//                        ops/reduction.py reads them)
 //   <index plan>        n, then n quads (kind, a, b, operand axis):
 //                       kind 0 = index-vector component `a`, clamped to
 //                       [0, b]; kind 1 = an iota of length `a` at batch
@@ -332,6 +364,15 @@ struct Entry {
   // the integer vector would be a bit-pattern encoding nobody could read.
   std::vector<double> fattrs;
   std::optional<mx::array> payload;  // kConstant only
+  // An emulated dtype code whose grid every result of this entry is rounded
+  // onto, or -1. Applied by `Program::step`, once, AFTER the family handler
+  // has written its results -- deliberately not inside the handlers. The
+  // Python engine spends this rule at three sites (the unary wrapper, the
+  // binary wrapper and `_convert`, ops/elementwise.py `_regrid` and
+  // `_maybe_wrap4`), and a per-site flag here would be a rule a new handler
+  // can forget: forgetting it is a WRONG ANSWER, not a decline, since the
+  // storage dtype is legal either way. One site cannot be forgotten.
+  int64_t regrid = -1;
   std::vector<int> drops;            // slots whose last use is this op
   std::vector<std::shared_ptr<Program>> regions;  // control flow only
   int64_t bytes = 0;  // estimated result bytes, for the eager flush cadence
@@ -401,7 +442,7 @@ class Program {
            std::vector<int> drops,
            std::vector<std::shared_ptr<Program>> regions, int64_t bytes,
            std::vector<double> fattrs, std::shared_ptr<MslPlan> msl,
-           HostFn host);
+           HostFn host, int64_t regrid = -1);
 
   // `copies` are output POSITIONS whose array may not be handed out as it
   // is: it could be one of the program's own constants (which the Program

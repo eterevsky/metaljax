@@ -111,19 +111,21 @@ def _compile():
             jax.device_put(np.eye(3, dtype=np.float32))))
     print("  jit(jnp.linalg.cholesky) ->", ch.diagonal().tolist())
     assert np.allclose(ch, np.sqrt(5.0) * np.eye(3), atol=1e-6), ch
-    # An op outside the native set declines, naming itself.  reduce_precision
-    # is the stand-in now (phase 2's P11); every family this checkpoint has
-    # named before it -- sort, convolution, the LAPACK targets -- lowers.
+    # An op outside the native set declines, naming itself.  `stablehlo.rng`
+    # (XLA's non-deterministic RNG, which `jax.lax.rng_uniform` emits) is the
+    # stand-in now: every family this checkpoint has named before it -- sort,
+    # convolution, the LAPACK targets, reduce_precision -- lowers, and this
+    # one is implemented by NEITHER engine, so it is not a phase away from
+    # being retired the way its predecessors were.
     try:
-        jax.jit(lambda a: jax.lax.reduce_precision(a, 5, 10))(
-            jax.device_put(np.arange(4, dtype=np.float32)))
+        jax.jit(lambda a, b: jax.lax.rng_uniform(a, b, (4,)))(
+            jax.device_put(np.float32(0.0)), jax.device_put(np.float32(1.0)))
     except Exception as e:  # noqa: BLE001 - the expected decline
         msg = str(e)
-        print("  reduce_precision declined:", msg.splitlines()[0][:160])
-        assert "stablehlo.reduce_precision" in msg, \
-            "the decline did not name the op"
+        print("  rng_uniform declined:", msg.splitlines()[0][:160])
+        assert "stablehlo.rng" in msg, "the decline did not name the op"
         return
-    raise AssertionError("reduce_precision unexpectedly compiled")
+    raise AssertionError("rng_uniform unexpectedly compiled")
 
 
 if FAILED:

@@ -100,6 +100,48 @@ const absl::flat_hash_set<std::string>& SimpleOps() {
   return *set;
 }
 
+// ops/elementwise.py `_regrid` and `_maybe_wrap4`, as one question about the
+// op's NAME.  The Python engine spends its regrid at exactly three sites --
+// the `_UNARY` wrapper, the `_BINARY` wrapper and `_convert` -- and this is
+// that rule, with the two arms the Python keeps separate:
+//
+//  * a CONVERT onto any emulated type quantizes: that is what makes the
+//    value land on the grid in the first place;
+//  * an arithmetic result is re-gridded only on the OCP FP4/FP6 formats,
+//    whose grids are coarse enough (16 or 64 points) that keeping full f16
+//    precision between ops diverges from XLA after a single operation -- on
+//    f4E2M1FN, 4 + 4 is 6, not 8 -- and, for i4/ui4, only on the three ops
+//    XLA's 4-bit wrap is visible through.  The float8 family deliberately
+//    stays unrounded between ops, exactly as it has since the emulation
+//    landed in Stage 1; the tests are measured against that engine.
+bool IsUnaryRegridOp(absl::string_view name) {
+  return name == "stablehlo.abs" || name == "stablehlo.cbrt" ||
+         name == "stablehlo.ceil" || name == "stablehlo.cosine" ||
+         name == "stablehlo.erf" || name == "stablehlo.erf_inv" ||
+         name == "stablehlo.exponential" ||
+         name == "stablehlo.exponential_minus_one" ||
+         name == "stablehlo.floor" || name == "stablehlo.is_finite" ||
+         name == "stablehlo.log" || name == "stablehlo.log_plus_one" ||
+         name == "stablehlo.logistic" || name == "stablehlo.negate" ||
+         name == "stablehlo.round_nearest_afz" ||
+         name == "stablehlo.round_nearest_even" || name == "stablehlo.rsqrt" ||
+         name == "stablehlo.sign" || name == "stablehlo.sine" ||
+         name == "stablehlo.sqrt" || name == "stablehlo.tan" ||
+         name == "stablehlo.tanh";
+}
+
+bool IsBinaryRegridOp(absl::string_view name) {
+  return name == "stablehlo.add" || name == "stablehlo.atan2" ||
+         name == "stablehlo.divide" || name == "stablehlo.maximum" ||
+         name == "stablehlo.minimum" || name == "stablehlo.multiply" ||
+         name == "stablehlo.power" || name == "stablehlo.remainder" ||
+         name == "stablehlo.subtract" || name == "stablehlo.and" ||
+         name == "stablehlo.or" || name == "stablehlo.xor" ||
+         name == "stablehlo.shift_left" ||
+         name == "stablehlo.shift_right_logical" ||
+         name == "stablehlo.shift_right_arithmetic";
+}
+
 // Ops whose result may be a VIEW of an operand's storage rather than new
 // storage (tape.py `_VIEW_OPS`, minus the ones this phase does not lower).
 // Used only to keep a constant's buffer out of an output position.
@@ -271,6 +313,35 @@ std::optional<std::string> ElementName(mlir::Value v) {
   auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
   if (!t) return std::nullopt;
   return TapeElementName(t.getElementType());
+}
+
+// The grid an op's single result must be rounded onto, or -1 (the rule above,
+// resolved against this op's own result type).  Read once, in `LowerOp`, and
+// carried on the entry -- the executor spends it in ONE place, so a handler
+// that produces a value on a grid can never forget to round it.
+int64_t RegridOf(mlir::Operation* op, absl::string_view name) {
+  if (op->getNumResults() != 1) return -1;
+  std::optional<std::string> el = ElementName(op->getResult(0));
+  if (!el.has_value() || EmulatedKindOfName(*el) < 0) return -1;
+  std::optional<int> code = TapeDtypeCode(
+      mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType())
+          .getElementType());
+  if (!code.has_value()) return -1;
+  if (name == "stablehlo.convert") return *code;
+  // A bitcast_convert onto i4/ui4 hands back raw NIBBLES, and turning those
+  // into the storage values IS `quantize_emulated` (ops/shape.py's
+  // `_from_nibbles` calls exactly that) -- so it rides the same field.
+  if (name == "stablehlo.bitcast_convert" && (*el == "i4" || *el == "ui4"))
+    return *code;
+  const bool arith = IsUnaryRegridOp(name) || IsBinaryRegridOp(name);
+  if (!arith) return -1;
+  if (*el == "f4E2M1FN" || *el == "f6E2M3FN" || *el == "f6E3M2FN")
+    return *code;
+  if ((*el == "i4" || *el == "ui4") &&
+      (name == "stablehlo.add" || name == "stablehlo.multiply" ||
+       name == "stablehlo.subtract"))
+    return *code;
+  return -1;
 }
 
 // reduce_window's own materialization cap (tape.py `_WINDOW_MAX`); above it
@@ -1436,6 +1507,10 @@ class Lowering {
     // P9: the handler of an entry that computes on the HOST, bound here and
     // called by the executor -- the one place a native run leaves the tape.
     HostFn host;
+    // P11: the emulated grid every result of this entry is rounded onto, or
+    // -1.  Set by `RegridOf` from the RESULT's element type, so a handler
+    // never has to know that its result may live on a grid.
+    int64_t regrid = -1;
   };
 
   // One block lowered into THIS frame: the block's own arguments first, then
@@ -1472,11 +1547,15 @@ class Lowering {
 
   // Splice a single-block callee's ops into this tape (tape.py `_inline`).
   absl::Status Inline(mlir::Operation* op, llvm::StringRef callee_attr);
+  absl::Status InlineBlock(mlir::Block& block, const std::vector<int>& args,
+                           mlir::ResultRange results);
 
   // Per-op lowerings, each returning the attribute vector the matching C++
   // handler decodes.  Named after tape.py's `_lower_*`, and in its order.
   absl::StatusOr<std::vector<int64_t>> LowerCompare(mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerConvert(mlir::Operation* op);
+  absl::StatusOr<std::vector<int64_t>> LowerReducePrecision(
+      mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerReshape(mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerTranspose(mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerBroadcastInDim(
@@ -1490,6 +1569,8 @@ class Lowering {
   absl::StatusOr<std::vector<int64_t>> LowerDynamicUpdateSlice(
       mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerShift(mlir::Operation* op);
+  absl::StatusOr<std::vector<int64_t>> LowerSelectAndScatter(
+      mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerBitcastConvert(
       mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerReverse(mlir::Operation* op);
@@ -1554,11 +1635,12 @@ class Lowering {
             std::vector<int64_t> attrs, std::optional<mx::array> payload,
             int64_t bytes,
             std::vector<std::shared_ptr<Program>> regions = {},
-            std::vector<DumpNode> region_dumps = {}, HostFn host = {}) {
+            std::vector<DumpNode> region_dumps = {}, HostFn host = {},
+            int64_t regrid = -1) {
     entries_.push_back(Pending{op, std::move(ins), std::move(outs),
                                std::move(attrs), std::move(payload), bytes,
                                std::move(regions), std::move(region_dumps),
-                               std::move(host)});
+                               std::move(host), regrid});
   }
 
   int64_t ResultBytes(mlir::Operation* op) {
@@ -1748,6 +1830,32 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerConvert(
   const bool real_part = IsComplexElement(op->getOperand(0)) &&
                          !IsComplexElement(op->getResult(0));
   return std::vector<int64_t>{code, real_part ? 1 : 0};
+}
+
+// ops/elementwise.py `_reduce_precision`, with its four arms resolved: which
+// one runs is a question about the two attributes and the operand's storage
+// dtype, all of which are in the IR.  A shape the Python handler raises on
+// (an exponent or mantissa width outside the ranges below) declines here, so
+// the two engines refuse the same programs.
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerReducePrecision(
+    mlir::Operation* op) {
+  auto rp = mlir::dyn_cast<mlir::stablehlo::ReducePrecisionOp>(op);
+  if (!rp) return Decline("stablehlo.reduce_precision in an unexpected form");
+  const int64_t exp = rp.getExponentBits(), man = rp.getMantissaBits();
+  std::optional<std::string> el = ElementName(op->getOperand(0));
+  if (!el.has_value()) return Decline("reduce_precision element type");
+  // f16 and bf16 operands compute in f32 and cast back, which is what makes
+  // the general arm's bit arithmetic legal for them; anything else is not a
+  // float this backend rounds.
+  if (*el != "f32" && *el != "f16" && *el != "bf16")
+    return Decline(absl::StrCat("reduce_precision on ", *el));
+  if (exp >= 8 && man >= 23) return std::vector<int64_t>{0, exp, man};
+  if (exp == 8 && man == 7) return std::vector<int64_t>{1, exp, man};
+  if (exp == 5 && man == 10) return std::vector<int64_t>{2, exp, man};
+  if (man < 0 || man >= 23 || exp < 1 || exp > 8)
+    return Decline(absl::StrFormat("reduce_precision e%dm%d on %s", exp, man,
+                                   *el));
+  return std::vector<int64_t>{3, exp, man};
 }
 
 absl::StatusOr<std::vector<int64_t>> Lowering::LowerReshape(
@@ -2148,10 +2256,142 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerBitcastConvert(
   std::optional<mx::Dtype> dst = MxDtypeOf(dst_t.getElementType());
   if (!src.has_value() || !dst.has_value())
     return Decline("bitcast_convert element type");
-  int64_t kind = 0;
-  if (dst->size() < src->size()) kind = 1;
-  else if (dst->size() > src->size()) kind = 2;
-  return std::vector<int64_t>{code, kind};
+  // A bitcast reads BITS, so the storage has to BE the logical bit pattern.
+  // i4/ui4 are the one emulated pair this can reconstruct (whole nibbles);
+  // the f8/f6/f4 grids hold VALUES in a wider float, so their bit patterns
+  // simply do not exist on this device (ops/shape.py raises the same way).
+  int64_t ib = 8 * static_cast<int64_t>(src->size());
+  int64_t ob = 8 * static_cast<int64_t>(dst->size());
+  // `CheckValue` has already run on both, so both names exist.
+  const std::string in_name = *ElementName(op->getOperand(0));
+  const std::string out_name = *ElementName(op->getResult(0));
+  for (const std::string* n : {&in_name, &out_name}) {
+    const int kind = EmulatedKindOfName(*n);
+    if (kind < 0) continue;
+    if (*n != "i4" && *n != "ui4")
+      return Decline(absl::StrCat("bitcast_convert on ", *n,
+                                  ": metaljax stores it in a wider dtype, so "
+                                  "its bit pattern is unavailable"));
+    (n == &in_name ? ib : ob) = EmulatedBits(kind);
+  }
+  if (ib != 4 && ob != 4) {
+    int64_t kind = 0;
+    if (dst->size() < src->size()) kind = 1;
+    else if (dst->size() > src->size()) kind = 2;
+    return std::vector<int64_t>{code, kind};
+  }
+  // A 4-bit end. XLA packs two values per byte along the minor-most
+  // dimension, low nibble first, and a width-changing bitcast adds (or
+  // removes) exactly that trailing ratio dim -- so a row-major flatten makes
+  // the packed byte stream contiguous and the whole thing is one linear
+  // reinterpretation. The result element type does the un-packing arithmetic
+  // through the entry's `regrid` (`_from_nibbles` IS `quantize_emulated`).
+  ASSIGN_OR_RETURN(std::vector<int64_t> out_shape, Dims(op->getResult(0)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> in_shape, Dims(op->getOperand(0)));
+  int64_t kind;
+  if (Product(in_shape) == 0) kind = 6;         // zeros of the result type
+  else if (ib == 4 && ob == 4) kind = 3;        // reinterpret in place
+  else if (ib == 4) kind = 4;                   // pack pairs into bytes
+  else kind = 5;                                // unpack each byte
+  std::vector<int64_t> attrs{code, kind,
+                             static_cast<int64_t>(out_shape.size())};
+  attrs.insert(attrs.end(), out_shape.begin(), out_shape.end());
+  return attrs;
+}
+
+// ops/reduction.py `_select_and_scatter`: max/min-pool backward.  Both regions
+// are read STRUCTURALLY -- a compare, then an add/or/and -- exactly as the
+// Python handler reads them, so the entry carries no sub-Program and a body
+// outside those two shapes declines naming what it found.
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerSelectAndScatter(
+    mlir::Operation* op) {
+  auto ss = mlir::dyn_cast<mlir::stablehlo::SelectAndScatterOp>(op);
+  if (!ss) return Decline("stablehlo.select_and_scatter in an unexpected form");
+  if (op->getNumOperands() != 3 || op->getNumResults() != 1)
+    return Decline("select_and_scatter arity");
+  ASSIGN_OR_RETURN(std::vector<int64_t> src, Dims(op->getOperand(0)));
+  const int64_t rank = static_cast<int64_t>(src.size());
+  const std::vector<int64_t> ones(static_cast<size_t>(rank), 1);
+  std::vector<int64_t> wd = OptI64List(op, "window_dimensions", ones);
+  std::vector<int64_t> strides = OptI64List(op, "window_strides", ones);
+  std::vector<int64_t> lo(static_cast<size_t>(rank), 0);
+  std::vector<int64_t> hi(static_cast<size_t>(rank), 0);
+  if (auto pa = op->getAttrOfType<mlir::DenseIntElementsAttr>("padding")) {
+    std::vector<int64_t> flat;
+    for (const llvm::APInt& v : pa.getValues<llvm::APInt>())
+      flat.push_back(v.getSExtValue());
+    if (static_cast<int64_t>(flat.size()) != 2 * rank)
+      return Decline("select_and_scatter padding rank");
+    for (int64_t i = 0; i < rank; i++) {
+      lo[static_cast<size_t>(i)] = flat[2 * i];
+      hi[static_cast<size_t>(i)] = flat[2 * i + 1];
+    }
+  }
+  if (static_cast<int64_t>(wd.size()) != rank ||
+      static_cast<int64_t>(strides.size()) != rank)
+    return Decline("select_and_scatter attribute rank");
+  for (int64_t i = 0; i < rank; i++) {
+    if (wd[static_cast<size_t>(i)] < 1 || strides[static_cast<size_t>(i)] < 1)
+      return Decline("select_and_scatter window or stride");
+    // mx::pad has no negative widths, and the Python handler passes the
+    // padding to it unchecked, so a cropping window declines on both.
+    if (lo[static_cast<size_t>(i)] < 0 || hi[static_cast<size_t>(i)] < 0)
+      return Decline("select_and_scatter negative padding");
+  }
+
+  auto ops_of = [](mlir::Region& r, std::vector<mlir::Operation*>* out) {
+    if (r.getBlocks().size() != 1) return false;
+    for (mlir::Operation& o : r.front()) out->push_back(&o);
+    return true;
+  };
+  std::vector<mlir::Operation*> sel, sct;
+  if (!ops_of(ss.getSelect(), &sel) || !ops_of(ss.getScatter(), &sct))
+    return Decline("a select_and_scatter with a multi-block region");
+  const absl::string_view comb_name =
+      sct.size() == 2 ? View(sct[0]->getName().getStringRef()) : "";
+  int64_t comb;
+  if (comb_name == "stablehlo.add") comb = 0;
+  else if (comb_name == "stablehlo.or") comb = 1;
+  else if (comb_name == "stablehlo.and") comb = 2;
+  else comb = -1;
+  auto cmp = sel.size() == 2
+                 ? mlir::dyn_cast<mlir::stablehlo::CompareOp>(sel[0])
+                 : nullptr;
+  if (!cmp || comb < 0) {
+    std::string got;
+    for (mlir::Operation* o : sel) absl::StrAppend(&got, " ", View(
+        o->getName().getStringRef()));
+    absl::StrAppend(&got, " /");
+    for (mlir::Operation* o : sct) absl::StrAppend(&got, " ", View(
+        o->getName().getStringRef()));
+    return Decline(absl::StrCat("select_and_scatter bodies", got));
+  }
+  const auto dir = cmp.getComparisonDirection();
+  bool is_max;
+  if (dir == mlir::stablehlo::ComparisonDirection::GE ||
+      dir == mlir::stablehlo::ComparisonDirection::GT) {
+    is_max = true;
+  } else if (dir == mlir::stablehlo::ComparisonDirection::LE ||
+             dir == mlir::stablehlo::ComparisonDirection::LT) {
+    is_max = false;
+  } else {
+    return Decline(absl::StrCat(
+        "select_and_scatter compare ",
+        mlir::stablehlo::stringifyComparisonDirection(dir).str()));
+  }
+
+  auto push = [](std::vector<int64_t>* out, const std::vector<int64_t>& v) {
+    out->push_back(static_cast<int64_t>(v.size()));
+    out->insert(out->end(), v.begin(), v.end());
+  };
+  std::vector<int64_t> attrs{rank};
+  push(&attrs, wd);
+  push(&attrs, strides);
+  push(&attrs, lo);
+  push(&attrs, hi);
+  attrs.push_back(is_max ? 1 : 0);
+  attrs.push_back(comb);
+  return attrs;
 }
 
 // tape.py `_lower_reverse`: one descending take per reversed dim.  A dim of
@@ -2814,12 +3054,65 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
   const Combiner combiner = ScatterCombiner(op);
   std::optional<int64_t> method = MethodCode(combiner);
   if (!method.has_value()) {
-    if (combiner == Combiner::kApply) return Decline("scatter combiner apply");
-    if (combiner == Combiner::kNonUpdate)
+    if (combiner == Combiner::kApply) {
+      // jax's `scatter_apply` / `.at[i].apply(f)`: the body is elementwise
+      // code over (current value, update), and running it on the GATHERED
+      // values and SETTING the result equals the scatter only while no two
+      // updates land on the same slot.  ops/gather.py takes that arm under
+      // the op's `unique_indices` and otherwise applies the updates ONE AT A
+      // TIME in row-major order -- because a computed body need be neither
+      // associative nor idempotent, so a duplicate index really does mean
+      // f(f(x)).  Both arms are here, chosen by the same flag, and the
+      // sequential one carries the same cap: it costs a constant number of
+      // MLX ops per update, which is only sane for the small op-semantics
+      // shapes it shows up in.  (jax emits `unique_indices = false` for every
+      // `.at[].apply()`, so the sequential arm is the one that runs.)
+      method = sc.getUniqueIndices() ? int64_t{7} : int64_t{8};
+    } else if (combiner == Combiner::kNonUpdate) {
       return Decline("scatter body: scatter body returns non-update value");
-    return Decline("scatter body: not implemented");
+    } else {
+      return Decline("scatter body: not implemented");
+    }
   }
   int64_t method_code = *method;
+
+  // A RANK-0 operand: there is no axis to index, the coordinate vector is
+  // empty (`tensor<0xi32>`) and the single update lands on the whole array.
+  // XLA's OOB rule has nothing to test and MLX's primitives want at least one
+  // index array, so the whole op degenerates to its combiner -- which is what
+  // ops/gather.py computes too, by way of an empty index tuple.  jax reaches
+  // this through `jax.experimental.sparse` on a 0-d array, where the
+  // reduction over the updates has already happened before the scatter.
+  if (op_shape.empty()) {
+    if (!d.getScatterDimsToOperandDims().empty() ||
+        !d.getInputBatchingDims().empty() ||
+        !d.getUpdateWindowDims().empty() || !upd_shape.empty())
+      return Decline("scatter on a rank-0 operand with several updates");
+    ASSIGN_OR_RETURN(int operand, Slot(op->getOperand(0)));
+    ASSIGN_OR_RETURN(int update, Slot(op->getOperand(2)));
+    if (method_code == 7 || method_code == 8) {
+      // One update onto a rank-0 operand IS the body, applied to the two
+      // values -- so the block is spliced into this frame, the way a
+      // `func.call` is.  Its ops are rank-0 and elementwise, and both arms of
+      // the apply reduce to this when there is a single slot to write.
+      return InlineBlock(sc.getUpdateComputation().front(), {operand, update},
+                         op->getResults());
+    }
+    if (combiner == Combiner::kSet) {
+      Alias(op->getResult(0), update);
+      return absl::OkStatus();
+    }
+    static const char* kNames[] = {"", "stablehlo.add", "stablehlo.multiply",
+                                   "stablehlo.maximum", "stablehlo.minimum",
+                                   "stablehlo.subtract"};
+    ASSIGN_OR_RETURN(int opcode, Opcode(kNames[method_code]));
+    std::vector<int> ins{operand, update};
+    std::vector<int> outs{Bind(op->getResult(0))};
+    Emit(opcode, std::move(ins), std::move(outs), {}, std::nullopt,
+         ResultBytes(op));
+    return absl::OkStatus();
+  }
+
   if (complex_parts && method_code == 2) {
     // MULTIPLY is the one combiner ops/gather.py rewrites rather than
     // splitting: `method = "apply"`, which gathers the current values,
@@ -2832,7 +3125,10 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
       return Decline("complex scatter multiply without unique indices");
     method_code = 6;
   } else if (complex_parts && method_code != 0 && method_code != 1 &&
-             method_code != 5) {
+             method_code != 5 && method_code != 7 && method_code != 8) {
+    // An APPLY body is componentwise by construction -- it bottoms out in a
+    // SET, which is -- so it needs no arm of its own, exactly as
+    // ops/gather.py's complex branch lets `"apply"` through.
     return Decline(absl::StrCat("complex scatter ", CombinerName(combiner)));
   }
 
@@ -2899,14 +3195,18 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
   std::optional<mx::array> payload;
   int64_t strategy = 0;
   std::vector<int64_t> extra;
-  if (!smap.empty()) {
+  // The sequential apply handles its own drops (a dropped update leaves the
+  // slot alone, which is what a per-update `where` says and what neither
+  // global strategy can express once the body has run), so it takes neither.
+  if (!smap.empty() && method_code != 8) {
     int64_t op_numel = 1, upd_numel = 1;
     for (int64_t s : op_shape) op_numel *= s;
     for (int64_t s : upd_shape) upd_numel *= s;
-    // The rewritten complex multiply WRITES rather than combines, so it takes
-    // the drop rule a set takes: neutralizing an update cannot express "leave
-    // the slot alone" for an assignment.
-    if (combiner == Combiner::kSet || method_code == 6 ||
+    // The rewritten complex multiply and the vectorized apply body both WRITE
+    // rather than combine, so they take the drop rule a set takes:
+    // neutralizing an update cannot express "leave the slot alone" for an
+    // assignment.
+    if (combiner == Combiner::kSet || method_code == 6 || method_code == 7 ||
         op_numel < upd_numel) {
       strategy = 2;
       // Pad the LOWEST indexed axis, which is the one the Python handler pads
@@ -2959,17 +3259,45 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
   attrs.insert(attrs.end(), uperm.begin(), uperm.end());
   attrs.push_back(static_cast<int64_t>(ushape.size()));
   attrs.insert(attrs.end(), ushape.begin(), ushape.end());
-  attrs.insert(attrs.end(), extra.begin(), extra.end());
 
-  ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.scatter"));
   std::vector<int> ins;
   for (mlir::Value v : op->getOperands()) {
     ASSIGN_OR_RETURN(int s, Slot(v));
     ins.push_back(s);
   }
+  // The apply body is a sub-Program over (current value, update), whose
+  // captures ride as extra operands after the scatter's three -- the same
+  // arrangement a generic reduce body uses.  `ncaps` sits here, between the
+  // updates shape and the strategy's extras, because that is where the
+  // handler's cursor is when it needs it.
+  std::vector<std::shared_ptr<Program>> regions;
+  std::vector<DumpNode> dumps;
+  if (method_code == 8 && Product(plan.batch_shape) > 1024) {
+    // ops/gather.py's own cap: the sequential arm costs a constant number of
+    // MLX ops PER UPDATE, which is only sane for the small op-semantics
+    // shapes this pattern shows up in.
+    return Decline(absl::StrFormat(
+        "scatter computed-body with duplicates: %d updates",
+        Product(plan.batch_shape)));
+  }
+  if (method_code == 7 || method_code == 8) {
+    mlir::Block& body = sc.getUpdateComputation().front();
+    if (body.getNumArguments() != 2) return Decline("scatter body arity");
+    ASSIGN_OR_RETURN(Region region, LowerRegion(body));
+    if (region.outputs.size() != 1)
+      return Decline("scatter body result count");
+    attrs.push_back(static_cast<int64_t>(region.caps.size()));
+    ins.insert(ins.end(), region.caps.begin(), region.caps.end());
+    regions.push_back(std::move(region.program));
+    if (kDumpTape) dumps.push_back(std::move(region.dump));
+  }
+  attrs.insert(attrs.end(), extra.begin(), extra.end());
+
+  ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.scatter"));
   std::vector<int> outs{Bind(op->getResult(0))};
   Emit(opcode, std::move(ins), std::move(outs), std::move(attrs),
-       std::move(payload), ResultBytes(op));
+       std::move(payload), ResultBytes(op), std::move(regions),
+       std::move(dumps));
   return absl::OkStatus();
 }
 
@@ -2995,7 +3323,63 @@ absl::Status Lowering::LowerConstant(mlir::Operation* op) {
 
   mx::array value = mx::zeros(shape, dt);
   int64_t rank0_buffer = 0;
-  if (numel == 0) {
+  const int emulated =
+      EmulatedKindOfName(*TapeElementName(type.getElementType()));
+  if (emulated >= 0 && numel > 0) {
+    // An emulated grid: the raw data is the TYPE's encoding (bit-packed, for
+    // the sub-byte widths) and the device wants the VALUE in a wider storage
+    // dtype, so the typed iterator is the only honest reader -- as it is for
+    // i1, and for the same reason.  The one-value splat is kept: a constant
+    // that broadcasts costs one element of device memory whatever its shape.
+    const bool splat = numel > 1 && dense.isSplat();
+    const int64_t n = splat ? 1 : numel;
+    std::vector<char> bytes(static_cast<size_t>(n) * item, 0);
+    auto store = [&](int64_t i, double v) {
+      if (dt == mx::int8) {
+        reinterpret_cast<int8_t*>(bytes.data())[i] = static_cast<int8_t>(v);
+      } else if (dt == mx::uint8) {
+        reinterpret_cast<uint8_t*>(bytes.data())[i] = static_cast<uint8_t>(v);
+      } else if (dt == mx::float32) {
+        reinterpret_cast<float*>(bytes.data())[i] = static_cast<float>(v);
+      } else {
+        llvm::APFloat h(static_cast<float>(v));
+        bool lost = false;
+        h.convert(llvm::APFloat::IEEEhalf(),
+                  llvm::APFloat::rmNearestTiesToEven, &lost);
+        reinterpret_cast<uint16_t*>(bytes.data())[i] =
+            static_cast<uint16_t>(h.bitcastToAPInt().getZExtValue());
+      }
+    };
+    if (dt == mx::int8 || dt == mx::uint8) {
+      int64_t i = 0;
+      for (const llvm::APInt& v : dense.getValues<llvm::APInt>()) {
+        if (i >= n) break;
+        store(i++, dt == mx::int8 ? static_cast<double>(v.getSExtValue())
+                                  : static_cast<double>(v.getZExtValue()));
+      }
+      if (i != n) return Decline("an i4 constant of the wrong length");
+    } else {
+      int64_t i = 0;
+      for (const llvm::APFloat& v : dense.getValues<llvm::APFloat>()) {
+        if (i >= n) break;
+        llvm::APFloat w = v;
+        bool lost = false;
+        w.convert(llvm::APFloat::IEEEsingle(),
+                  llvm::APFloat::rmNearestTiesToEven, &lost);
+        store(i++, w.convertToFloat());
+      }
+      if (i != n) return Decline("a sub-byte float constant of the wrong "
+                                 "length");
+    }
+    if (splat) {
+      const mx::Shape unit(shape.size(), 1);
+      value = mx::broadcast_to(
+          mx::reshape(OwnedArray(bytes.data(), item, mx::Shape{1}, dt), unit),
+          shape);
+    } else {
+      value = OwnedArray(bytes.data(), bytes.size(), shape, dt);
+    }
+  } else if (numel == 0) {
     // A zero-size constant still carries a value in the IR, and MLIR stores
     // it as a SPLAT with one raw element (`dense<1.0> : tensor<0xf32>`, which
     // is what chlo's decompositions emit when the operand is empty), so the
@@ -4162,6 +4546,24 @@ absl::Status Lowering::Inline(mlir::Operation* op, llvm::StringRef attr) {
   }
 
   calls_.push_back(name);
+  absl::Status status = InlineBlock(block, {}, op->getResults());
+  calls_.pop_back();
+  return status;
+}
+
+// The body of `Inline`, and the whole of a degenerate scatter's: lower a
+// block's operations into THIS frame, over arrays the caller names.  `args`
+// binds the block's arguments (empty when the caller has already aliased
+// them, as `Inline` does through the call's operands).
+absl::Status Lowering::InlineBlock(mlir::Block& block,
+                                   const std::vector<int>& args,
+                                   mlir::ResultRange results) {
+  if (!args.empty()) {
+    if (block.getNumArguments() != args.size())
+      return Decline("an inlined block whose arity does not match");
+    for (size_t i = 0; i < args.size(); i++)
+      Alias(block.getArgument(static_cast<unsigned>(i)), args[i]);
+  }
   std::vector<mlir::Value> returned;
   bool terminated = false;
   for (mlir::Operation& inner : block) {
@@ -4173,14 +4575,12 @@ absl::Status Lowering::Inline(mlir::Operation* op, llvm::StringRef attr) {
     }
     RETURN_IF_ERROR(LowerOp(&inner));
   }
-  calls_.pop_back();
-  if (!terminated)
-    return Decline(absl::StrCat("callee @", name, " has no terminator"));
-  if (returned.size() != op->getNumResults())
-    return Decline(absl::StrCat("callee @", name, " result count mismatch"));
-  for (unsigned i = 0; i < op->getNumResults(); i++) {
+  if (!terminated) return Decline("an inlined block with no terminator");
+  if (returned.size() != results.size())
+    return Decline("an inlined block whose result count does not match");
+  for (size_t i = 0; i < results.size(); i++) {
     ASSIGN_OR_RETURN(int s, Slot(returned[i]));
-    Alias(op->getResult(i), s);
+    Alias(results[static_cast<unsigned>(i)], s);
   }
   return absl::OkStatus();
 }
@@ -4238,7 +4638,8 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   // of control flow.
   if (!op->getRegions().empty() && name != "stablehlo.reduce" &&
       name != "stablehlo.scatter" && name != "stablehlo.sort" &&
-      name != "stablehlo.reduce_window")
+      name != "stablehlo.reduce_window" &&
+      name != "stablehlo.select_and_scatter")
     return Decline(absl::StrCat("op ", name, " (it carries a region)"));
 
   for (mlir::Value v : op->getOperands()) RETURN_IF_ERROR(CheckValue(v));
@@ -4273,6 +4674,8 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
     ASSIGN_OR_RETURN(attrs, LowerCompare(op));
   } else if (name == "stablehlo.convert") {
     ASSIGN_OR_RETURN(attrs, LowerConvert(op));
+  } else if (name == "stablehlo.reduce_precision") {
+    ASSIGN_OR_RETURN(attrs, LowerReducePrecision(op));
   } else if (name == "stablehlo.reshape") {
     ASSIGN_OR_RETURN(attrs, LowerReshape(op));
   } else if (name == "stablehlo.transpose") {
@@ -4306,6 +4709,8 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
     ASSIGN_OR_RETURN(attrs, LowerPopcnt(op));
   } else if (name == "stablehlo.fft") {
     ASSIGN_OR_RETURN(attrs, LowerFft(op));
+  } else if (name == "stablehlo.select_and_scatter") {
+    ASSIGN_OR_RETURN(attrs, LowerSelectAndScatter(op));
   } else if (name == "stablehlo.gather") {
     ASSIGN_OR_RETURN(attrs, LowerGather(op));
   } else if (name == "stablehlo.convolution") {
@@ -4330,7 +4735,7 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   std::vector<int> outs{Bind(op->getResult(0))};
   TaintResults(op, name, ins, outs);
   Emit(opcode, std::move(ins), outs, std::move(attrs), std::nullopt,
-       ResultBytes(op));
+       ResultBytes(op), {}, {}, {}, RegridOf(op, name));
   return absl::OkStatus();
 }
 
@@ -4360,7 +4765,7 @@ absl::StatusOr<Lowering::Built> Lowering::Finish(
           e.region_dumps});
     }
     built.program->add(e.op, e.ins, e.outs, e.attrs, e.payload, drops[i],
-                       e.regions, e.bytes, {}, nullptr, e.host);
+                       e.regions, e.bytes, {}, nullptr, e.host, e.regrid);
   }
   // A region Program never needs output copies: its results are a loop's
   // carries or a branch's values, which stay inside this engine.  Only a

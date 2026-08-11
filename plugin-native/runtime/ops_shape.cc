@@ -150,23 +150,68 @@ bool Program::step_shape(const Entry& e,
       break;
 
     case kBitcastConvert: {
-      // ops/shape.py _bitcast_convert, byte-multiple arm only: MLX's
-      // storage IS the XLA layout there, so the whole op is a view. The
-      // 4-bit forms cannot reach this handler -- i4/ui4 are not in the
-      // dtype table, and every other emulated type is declined for the
-      // same reason (their bit patterns do not exist on the device).
+      // ops/shape.py _bitcast_convert. The byte-multiple arms are a view:
+      // MLX's storage IS the XLA layout there. A 4-bit end is not -- an
+      // i4/ui4 value lives in a whole byte here and XLA packs two per byte
+      // along the minor-most dimension, low nibble first -- so a row-major
+      // flatten makes the packed stream contiguous and the pack or unpack
+      // is one linear reinterpretation. Every emulated type OTHER than
+      // i4/ui4 is declined at lowering: a value stored in a wider float has
+      // no bit pattern on this device to read.
       mx::Dtype dt = dtype_of(at[0]);
       if (at[1] == 0) {
         env[e.outs[0]] = mx::view(in(0), dt);
-      } else if (at[1] == 1) {
+        break;
+      }
+      if (at[1] == 1) {
         // Narrowing: the result gains a trailing dim of the size ratio,
         // and mx::view rescales the LAST axis -- so split a fresh unit
         // axis (which also makes a rank-0 input legal).
         env[e.outs[0]] = mx::view(mx::expand_dims(in(0), -1), dt);
-      } else {
+        break;
+      }
+      if (at[1] == 2) {
         // Widening: the input's trailing ratio-sized dim collapses.
         env[e.outs[0]] = mx::squeeze(mx::view(in(0), dt), -1);
+        break;
       }
+      mx::Shape out_shape = shape(at, 3, at[2]);
+      if (at[1] == 6) {   // nothing to reinterpret
+        env[e.outs[0]] = mx::zeros(out_shape, dt);
+        break;
+      }
+      auto u8 = [](int64_t v) { return mx::array(v, mx::uint8); };
+      auto flat = [](const mx::array& a) {
+        return mx::reshape(a, mx::Shape{-1});
+      };
+      if (at[1] == 3) {
+        // i4 <-> ui4: reinterpret the nibble in place. The entry's regrid
+        // turns the nibbles into the result type's storage values.
+        env[e.outs[0]] = mx::reshape(
+            mx::bitwise_and(mx::astype(flat(in(0)), mx::uint8), u8(0x0F)),
+            out_shape);
+        break;
+      }
+      if (at[1] == 4) {
+        // Pack pairs into bytes, low nibble first, then read the byte
+        // stream as the (byte-multiple) result type.
+        mx::array n =
+            mx::bitwise_and(mx::astype(flat(in(0)), mx::uint8), u8(0x0F));
+        const mx::Shape stop{n.shape()[0]};
+        mx::array lo = mx::slice(n, mx::Shape{0}, stop, mx::Shape{2});
+        mx::array hi = mx::slice(n, mx::Shape{1}, stop, mx::Shape{2});
+        env[e.outs[0]] = mx::reshape(
+            mx::view(mx::bitwise_or(lo, mx::left_shift(hi, u8(4))), dt),
+            out_shape);
+        break;
+      }
+      // Unpack each byte into (low, high). Again the regrid does the last
+      // step, from nibbles to the result type's storage values.
+      mx::array b = flat(mx::view(mx::reshape(in(0), mx::Shape{-1, 1}),
+                                  mx::uint8));
+      mx::array lo = mx::bitwise_and(b, u8(0x0F));
+      mx::array hi = mx::right_shift(b, u8(4));
+      env[e.outs[0]] = mx::reshape(flat(mx::stack({lo, hi}, -1)), out_shape);
       break;
     }
 

@@ -60,7 +60,7 @@ void Program::add(int op, std::vector<int> ins, std::vector<int> outs,
                   std::vector<int> drops,
                   std::vector<std::shared_ptr<Program>> regions, int64_t bytes,
                   std::vector<double> fattrs, std::shared_ptr<MslPlan> msl,
-                  HostFn host) {
+                  HostFn host, int64_t regrid) {
   for (int s : ins) check_slot(s);
   for (int s : outs) check_slot(s);
   for (int s : drops) check_slot(s);
@@ -68,9 +68,11 @@ void Program::add(int op, std::vector<int> ins, std::vector<int> outs,
     throw std::invalid_argument("tape: msl plan without an msl entry");
   if ((op == kHostCall) != static_cast<bool>(host))
     throw std::invalid_argument("tape: host callable without a host entry");
+  if (regrid >= 0 && !is_emulated(regrid))
+    throw std::invalid_argument("tape: regrid onto a non-emulated dtype");
   ops_.push_back(Entry{op, std::move(ins), std::move(outs),
                        std::move(attrs), std::move(fattrs),
-                       std::move(payload), std::move(drops),
+                       std::move(payload), regrid, std::move(drops),
                        std::move(regions), bytes, std::move(msl),
                        std::move(host)});
 }
@@ -235,6 +237,16 @@ void Program::step(const Entry& e, std::vector<std::optional<mx::array>>& env,
         step_control(e, env, in_trace) || step_rng(e, env, in_trace) ||
         step_conv(e, env, in_trace) || step_host(e, env, in_trace)))
     throw std::invalid_argument("tape: unknown opcode");
+
+  // The emulated grids, in ONE place (see Entry::regrid). An entry whose
+  // result type is i4/ui4 or one of the OCP FP4/FP6 grids -- and the convert
+  // onto any emulated type -- rounds here, after the handler that computed
+  // in the wide storage dtype.
+  if (e.regrid >= 0) {
+    for (int s : e.outs) {
+      if (env[s]) env[s] = quantize_emulated(*env[s], e.regrid);
+    }
+  }
 
   for (int s : e.drops) env[s].reset();
 }

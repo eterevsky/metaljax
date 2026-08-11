@@ -10,16 +10,25 @@
 
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace metaljax {
 
 namespace {
 
-// Keyed by the MLIR element type as printed, so tape.py can gate straight
-// off the IR: an element type absent from this table (complex, f64, and the
-// whole emulated i4/f8/f6/f4 family, whose device storage is a WIDER dtype
-// holding values rather than bits) declines the program.
+// Keyed by the MLIR element type as printed, so a tape builder can gate
+// straight off the IR: an element type absent from this table (f64 above
+// all) declines the program.
+//
+// The EMULATED entries at the end are the one place where the code's dtype
+// is not the type's own bits: dtypes.py stores an i4 in an int8, an f8 in a
+// float16 and E8M0's exponent range in a float32, holding the VALUE rather
+// than the encoding. `dtype_of` therefore answers with the storage, which is
+// what every handler wants, and the one question that needs the logical
+// type ask `is_emulated` / `quantize_emulated` instead.  (The LOGICAL bit
+// width a bitcast reads, and the wire encoding a host transfer needs, are the
+// tape BUILDER's business and live there -- a replay needs neither.)
 
 struct NamedDtype { const char* name; mx::Dtype dtype; };
 
@@ -33,8 +42,68 @@ const NamedDtype kDtypes[] = {
     // arithmetic, and every handler whose Python counterpart branches on
     // complex64 branches on it below.
     {"complex<f32>", mx::complex64},
+    // The emulated grids, in dtypes.py `EMULATED` order. Appended, never
+    // interleaved: the codes are handed to a tape builder by name at run
+    // time (`dtype_codes`), so their VALUES bind nothing, but keeping the
+    // real types' codes stable keeps a dumped tape comparable across builds.
+    {"f8E4M3FN", mx::float16},      {"f8E5M2", mx::float16},
+    {"f8E4M3", mx::float16},        {"f8E3M4", mx::float16},
+    {"f8E8M0FNU", mx::float32},     {"f8E4M3B11FNUZ", mx::float16},
+    {"f8E5M2FNUZ", mx::float16},    {"f8E4M3FNUZ", mx::float16},
+    {"f6E2M3FN", mx::float16},      {"f6E3M2FN", mx::float16},
+    {"f4E2M1FN", mx::float16},      {"i4", mx::int8},
+    {"ui4", mx::uint8},
 };
 constexpr int kNumDtypes = sizeof(kDtypes) / sizeof(kDtypes[0]);
+
+// The first emulated code. Everything below it is a real MLX dtype.
+constexpr int kFirstEmulated = 13;
+
+// What rounding a value onto one of those grids needs (dtypes.py
+// `quantize_emulated`, `NO_NAN_EMULATED`, `_HAS_INF`, and ml_dtypes' finfo,
+// whose numbers are all exact powers of two or exact halves and are written
+// out here rather than recomputed).
+enum Kind { kFloatGrid = 0, kInt4, kUint4, kE8M0 };
+// What a magnitude past the grid's largest finite value becomes.
+enum Over { kOverNaN = 0, kOverInf, kOverSaturate };
+
+struct Emulated {
+  Kind kind;
+  int nmant;      // mantissa bits of the grid
+  double tiny;    // smallest normal
+  double maxval;  // largest finite magnitude
+  Over over;
+  double minexp, maxexp;   // E8M0 only
+};
+
+const Emulated kEmulated[] = {
+    // f8E4M3FN: only the all-ones pattern is NaN, so overflow has one to go
+    // to; the FNUZ formats likewise.
+    {kFloatGrid, 3, 0x1p-6, 448.0, kOverNaN, 0, 0},        // f8E4M3FN
+    {kFloatGrid, 2, 0x1p-14, 57344.0, kOverInf, 0, 0},     // f8E5M2
+    {kFloatGrid, 3, 0x1p-6, 240.0, kOverInf, 0, 0},        // f8E4M3
+    {kFloatGrid, 4, 0x1p-2, 15.5, kOverInf, 0, 0},         // f8E3M4
+    {kE8M0, 0, 0, 0, kOverNaN, -127, 128},                 // f8E8M0FNU
+    {kFloatGrid, 3, 0x1p-10, 30.0, kOverNaN, 0, 0},        // f8E4M3B11FNUZ
+    {kFloatGrid, 2, 0x1p-15, 57344.0, kOverNaN, 0, 0},     // f8E5M2FNUZ
+    {kFloatGrid, 3, 0x1p-7, 240.0, kOverNaN, 0, 0},        // f8E4M3FNUZ
+    // The OCP microscaling formats have neither inf nor NaN: every bit
+    // pattern is a finite value, so XLA's convert saturates.
+    {kFloatGrid, 3, 0x1p0, 7.5, kOverSaturate, 0, 0},      // f6E2M3FN
+    {kFloatGrid, 2, 0x1p-2, 28.0, kOverSaturate, 0, 0},    // f6E3M2FN
+    {kFloatGrid, 1, 0x1p0, 6.0, kOverSaturate, 0, 0},      // f4E2M1FN
+    {kInt4, 0, 0, 0, kOverNaN, 0, 0},                      // i4
+    {kUint4, 0, 0, 0, kOverNaN, 0, 0},                     // ui4
+};
+static_assert(sizeof(kEmulated) / sizeof(kEmulated[0]) ==
+                  kNumDtypes - kFirstEmulated,
+              "one grid per emulated dtype");
+
+const Emulated& grid(int64_t code) {
+  if (code < kFirstEmulated || code >= kNumDtypes)
+    throw std::invalid_argument("tape: not an emulated dtype code");
+  return kEmulated[code - kFirstEmulated];
+}
 
 }  // namespace
 
@@ -42,6 +111,96 @@ mx::Dtype dtype_of(int64_t code) {
   if (code < 0 || code >= kNumDtypes)
     throw std::invalid_argument("tape: bad dtype code");
   return kDtypes[code].dtype;
+}
+
+bool is_emulated(int64_t code) {
+  return code >= kFirstEmulated && code < kNumDtypes;
+}
+
+// dtypes.quantize_emulated: round values onto an emulated dtype's grid, in
+// its wide storage. A transliteration, MLX call for MLX call, because this
+// is the arithmetic the values themselves are made of -- the Python engine's
+// answers are what the jax suite's expectations were measured against.
+mx::array quantize_emulated(const mx::array& x, int64_t code) {
+  const Emulated& g = grid(code);
+  const mx::Dtype storage = dtype_of(code);
+  if (g.kind == kInt4) {
+    // 4-bit wrap, sign-extended: ((v + 8) mod 16) - 8. `mx::remainder` is
+    // Python's `%` (the sign follows the divisor), which is what makes this
+    // right for negatives.
+    mx::array v = mx::astype(x, mx::int32);
+    v = mx::subtract(
+        mx::remainder(mx::add(v, mx::array(8, mx::int32)),
+                      mx::array(16, mx::int32)),
+        mx::array(8, mx::int32));
+    return mx::astype(v, storage);
+  }
+  if (g.kind == kUint4) {
+    return mx::astype(mx::remainder(mx::astype(x, mx::int32),
+                                    mx::array(16, mx::int32)),
+                      storage);
+  }
+  if (g.kind == kE8M0) {
+    // Exponent-only log-scale format: the nearest power of two. The floor at
+    // f32's smallest subnormal keeps log2 off -inf for a zero input.
+    mx::array f = mx::maximum(mx::astype(x, mx::float32),
+                              mx::array(1e-45f, mx::float32));
+    mx::array e = mx::round(mx::log2(f));
+    e = mx::clip(e, mx::array(static_cast<float>(g.minexp), mx::float32),
+                 mx::array(static_cast<float>(g.maxexp), mx::float32));
+    return mx::power(mx::array(2.0f, mx::float32), e);
+  }
+
+  const int man = g.nmant;
+  mx::array f = mx::astype(x, mx::float32);
+  mx::array isnan = mx::isnan(f);
+  // RNE mantissa rounding in f32 bit-space.
+  auto u32 = [](int64_t v) { return mx::array(v, mx::uint32); };
+  mx::array u = mx::view(f, mx::uint32);
+  const int shift = 23 - man;
+  mx::array half = u32((int64_t{1} << (shift - 1)) - 1);
+  mx::array lsb = mx::bitwise_and(mx::right_shift(u, u32(shift)), u32(1));
+  u = mx::bitwise_and(mx::add(mx::add(u, half), lsb),
+                      u32(~((int64_t{1} << shift) - 1) & 0xFFFFFFFF));
+  mx::array rounded = mx::view(u, mx::float32);
+  // Subnormal range: a uniform grid of spacing tiny * 2^-man. Round onto it
+  // by borrowing f32's own rounding -- adding 1.5 * 2^23 * step puts the
+  // value where f32's ulp IS step, so the addition rounds it onto the grid
+  // and the subtraction is exact. Done on the MAGNITUDE so that -0 (and
+  // anything rounding to zero from below) keeps its sign.
+  const double step = g.tiny / static_cast<double>(int64_t{1} << man);
+  mx::array shifter = mx::array(
+      static_cast<float>(step * static_cast<double>(int64_t{1} << 23) * 1.5),
+      mx::float32);
+  mx::array neg = mx::not_equal(mx::right_shift(mx::view(f, mx::uint32),
+                                                u32(31)),
+                                u32(0));
+  mx::array sub_mag = mx::subtract(mx::add(mx::abs(f), shifter), shifter);
+  mx::array sub = mx::where(neg, mx::negative(sub_mag), sub_mag);
+  mx::array q = mx::where(
+      mx::less(mx::abs(f), mx::array(static_cast<float>(g.tiny), mx::float32)),
+      sub, rounded);
+  // Overflow, by what the format can encode: an infinity where it has one,
+  // NaN where it keeps a NaN but no infinity (the FN/FNUZ float8s, matching
+  // XLA's convert -- ml_dtypes saturates, the CPU backend does not), and the
+  // largest finite value for the OCP FP4/FP6 formats, which have neither.
+  mx::array mx_max = mx::array(static_cast<float>(g.maxval), mx::float32);
+  mx::array over = mx::greater(mx::abs(q), mx_max);
+  mx::array big =
+      g.over == kOverInf
+          ? mx::array(std::numeric_limits<float>::infinity(), mx::float32)
+          : (g.over == kOverSaturate
+                 ? mx_max
+                 : mx::array(std::numeric_limits<float>::quiet_NaN(),
+                             mx::float32));
+  q = mx::where(over, mx::where(neg, mx::negative(big), big), q);
+  // NaN passes through the storage dtype. For the no-NaN formats that is
+  // still what XLA produces once the value reaches the host: their cast maps
+  // NaN to a zero, which is what the host transfer does. (Do NOT substitute
+  // a literal -0 here -- MLX bakes scalar constants into its fused kernels
+  // and the sign of a zero does not survive that.)
+  q = mx::where(isnan, f, q);
+  return mx::astype(q, storage);
 }
 
 bool is_bool(const mx::Dtype& d) { return d == mx::bool_; }

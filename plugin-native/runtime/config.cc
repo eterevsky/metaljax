@@ -15,9 +15,11 @@ Stats g_stats;
 std::function<void()> g_gc_hook;
 
 // StableHLO name -> opcode. Several names may share an opcode (chlo.erf is
-// stablehlo.erf's handler verbatim); the emulated-dtype regrid the Python
-// unary/binary wrappers apply is deliberately absent, because every element
-// type that could trigger it is declined in tape.py.
+// stablehlo.erf's handler verbatim). The emulated-dtype regrid the Python
+// unary/binary wrappers apply is not here either: it is not an opcode but a
+// per-entry field (`Entry::regrid`), so that the ONE site that spends it is
+// `Program::step` rather than every handler that might produce a value on a
+// grid.
 struct NamedOp { const char* name; int op; };
 
 const NamedOp kOpNames[] = {
@@ -66,6 +68,7 @@ const NamedOp kOpNames[] = {
     {"stablehlo.select", kSelect},
     {"stablehlo.clamp", kClamp},
     {"stablehlo.convert", kConvert},
+    {"stablehlo.reduce_precision", kReducePrecision},
     {"stablehlo.real", kReal},
     {"stablehlo.imag", kImag},
     {"stablehlo.complex", kMakeComplex},
@@ -120,6 +123,11 @@ const NamedOp kOpNames[] = {
     // semantics the primitives already have.
     {"stablehlo.gather", kGather},
     {"stablehlo.scatter", kScatter},
+    // ops/reduction.py `_select_and_scatter`: max/min-pool backward. Its two
+    // regions are read STRUCTURALLY at lowering (a compare, then an
+    // add/or/and), like the scatter combiner and unlike a generic reduce
+    // body, so the entry carries no sub-Program.
+    {"stablehlo.select_and_scatter", kSelectAndScatter},
     {"stablehlo.rng_bit_generator", kRng},
     // ops/conv.py, ported for phase 2 (P7) — under a PSEUDO-NAME, and that
     // is load-bearing. A tape builder with no `_lower_*` of its own emits an

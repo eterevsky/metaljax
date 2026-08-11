@@ -5,6 +5,9 @@ Licensed under the Apache License, Version 2.0.
 
 #include "metal/metal_dtypes.h"
 
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -12,6 +15,8 @@ Licensed under the Apache License, Version 2.0.
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/str_cat.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Types.h"
 #include "mlx/mlx.h"
@@ -22,7 +27,137 @@ namespace metaljax {
 
 namespace mx = mlx::core;
 
+namespace {
+
+// The emulated element types, in src/metaljax/dtypes.py `EMULATED` order --
+// which is also the order of the runtime's own grid table, though nothing
+// depends on that: both sides key by NAME.  `sem` is nullptr for the two
+// integer grids, whose encoding is the low nibble and needs no float
+// machinery.
+struct EmulatedWire {
+  const char* name;
+  xla::PrimitiveType wire;
+  int bits;
+  const llvm::fltSemantics& (*sem)();
+  bool integer;   // i4 / ui4
+  bool is_signed;
+};
+
+const EmulatedWire kEmulated[] = {
+    {"f8E4M3FN", xla::F8E4M3FN, 8, &llvm::APFloat::Float8E4M3FN, false, false},
+    {"f8E5M2", xla::F8E5M2, 8, &llvm::APFloat::Float8E5M2, false, false},
+    {"f8E4M3", xla::F8E4M3, 8, &llvm::APFloat::Float8E4M3, false, false},
+    {"f8E3M4", xla::F8E3M4, 8, &llvm::APFloat::Float8E3M4, false, false},
+    {"f8E8M0FNU", xla::F8E8M0FNU, 8, &llvm::APFloat::Float8E8M0FNU, false,
+     false},
+    {"f8E4M3B11FNUZ", xla::F8E4M3B11FNUZ, 8, &llvm::APFloat::Float8E4M3B11FNUZ,
+     false, false},
+    {"f8E5M2FNUZ", xla::F8E5M2FNUZ, 8, &llvm::APFloat::Float8E5M2FNUZ, false,
+     false},
+    {"f8E4M3FNUZ", xla::F8E4M3FNUZ, 8, &llvm::APFloat::Float8E4M3FNUZ, false,
+     false},
+    {"f6E2M3FN", xla::F6E2M3FN, 6, &llvm::APFloat::Float6E2M3FN, false, false},
+    {"f6E3M2FN", xla::F6E3M2FN, 6, &llvm::APFloat::Float6E3M2FN, false, false},
+    {"f4E2M1FN", xla::F4E2M1FN, 4, &llvm::APFloat::Float4E2M1FN, false, false},
+    {"i4", xla::S4, 4, nullptr, true, true},
+    {"ui4", xla::U4, 4, nullptr, true, false},
+};
+constexpr int kNumEmulated = sizeof(kEmulated) / sizeof(kEmulated[0]);
+
+}  // namespace
+
+int EmulatedKindOfName(const std::string& name) {
+  for (int i = 0; i < kNumEmulated; i++)
+    if (name == kEmulated[i].name) return i;
+  return -1;
+}
+
+int EmulatedKindOfPrimitive(xla::PrimitiveType type) {
+  for (int i = 0; i < kNumEmulated; i++)
+    if (kEmulated[i].wire == type) return i;
+  return -1;
+}
+
+int EmulatedBits(int kind) {
+  if (kind < 0 || kind >= kNumEmulated) return 0;
+  return kEmulated[kind].bits;
+}
+
+float EmulatedDecode(int kind, uint8_t code) {
+  const EmulatedWire& w = kEmulated[kind];
+  const uint8_t masked =
+      w.bits >= 8 ? code : static_cast<uint8_t>(code & ((1u << w.bits) - 1));
+  if (w.integer) {
+    if (!w.is_signed) return static_cast<float>(masked);
+    // Two's complement in the low nibble: 0x8..0xF are -8..-1.
+    return static_cast<float>(masked >= 8 ? static_cast<int>(masked) - 16
+                                          : static_cast<int>(masked));
+  }
+  if (w.wire == xla::F8E8M0FNU) {
+    // Exponent only, unsigned, no zero: code c is 2^(c-127) and 0xFF is the
+    // single NaN.  APFloat carries the semantics but converting THROUGH it
+    // returns an infinity for the NaN code, so the format is spelled out --
+    // it is two lines and ml_dtypes, which is what the CPU backend's answers
+    // come from, says exactly this.
+    if (masked == 0xFF) return std::numeric_limits<float>::quiet_NaN();
+    return std::ldexp(1.0f, static_cast<int>(masked) - 127);
+  }
+  llvm::APFloat v(w.sem(), llvm::APInt(w.bits, masked));
+  bool lost = false;
+  v.convert(llvm::APFloat::IEEEsingle(), llvm::APFloat::rmNearestTiesToEven,
+            &lost);
+  return v.convertToFloat();
+}
+
+uint8_t EmulatedEncode(int kind, float value) {
+  const EmulatedWire& w = kEmulated[kind];
+  if (w.integer) {
+    // 4-bit wrap, which is what the device-side grid already applied; doing
+    // it again here is what keeps a value that never met the grid (a host
+    // buffer built from a wider numpy array) honest.
+    const int v = static_cast<int>(std::llrint(static_cast<double>(value)));
+    return static_cast<uint8_t>(static_cast<unsigned>(v) & 0x0Fu);
+  }
+  if (w.wire == xla::F8E8M0FNU) {
+    // Anything that is not a positive power of two in [2^-127, 2^127] --
+    // zero, a negative, an infinity, a NaN, an exponent out of range -- is
+    // the NaN code.  ml_dtypes' rule, measured.
+    if (!(value > 0) || std::isinf(value)) return 0xFF;
+    const int e = static_cast<int>(std::nearbyint(std::log2(
+        static_cast<double>(value))));
+    if (e < -127 || e > 127) return 0xFF;
+    return static_cast<uint8_t>(e + 127);
+  }
+  llvm::APFloat v(value);
+  bool lost = false;
+  if (std::isnan(value) &&
+      w.sem().nonFiniteBehavior == llvm::fltNonfiniteBehavior::FiniteOnly) {
+    // The OCP FP4/FP6 formats have no NaN to convert to, and ml_dtypes maps
+    // one to a ZERO whose sign is the OPPOSITE of the NaN's (measured: +NaN
+    // becomes -0, -NaN becomes +0).  Reproduced rather than reasoned about:
+    // the CPU backend's answers come from that cast, and APFloat -- which
+    // has no rule to follow here -- returns +0 for both.
+    const bool neg = std::signbit(value);
+    return neg ? 0u : static_cast<uint8_t>(1u << (w.bits - 1));
+  }
+  v.convert(w.sem(), llvm::APFloat::rmNearestTiesToEven, &lost);
+  const llvm::APInt bits = v.bitcastToAPInt();
+  return static_cast<uint8_t>(bits.getZExtValue() &
+                              ((w.bits >= 8) ? 0xFFu : ((1u << w.bits) - 1)));
+}
+
 std::optional<WireType> WireTypeOf(xla::PrimitiveType type) {
+  // The emulated grids first: one wire byte per element (XLA's default layout
+  // gives a sub-byte type a whole byte -- `primitive_util::ByteWidth` rounds
+  // up and nothing sets `element_size_in_bits` here), decoded to a value in
+  // the wider storage the device holds.
+  if (int kind = EmulatedKindOfPrimitive(type); kind >= 0) {
+    const mx::Dtype device =
+        kEmulated[kind].integer
+            ? (kEmulated[kind].is_signed ? mx::int8 : mx::uint8)
+            : (type == xla::F8E8M0FNU ? mx::float32 : mx::float16);
+    return WireType{device, 1, false, 1, kind};
+  }
   switch (type) {
     case xla::PRED: return WireType{mx::bool_, 1, false, 1};
     case xla::S8:   return WireType{mx::int8, 1, false, 1};
@@ -54,9 +189,27 @@ std::optional<std::string> TapeElementName(mlir::Type type) {
     const unsigned w = it.getWidth();
     if (it.isSigned()) return std::nullopt;
     if (w == 1) return std::string("i1");
-    if (w != 8 && w != 16 && w != 32 && w != 64) return std::nullopt;
+    if (w != 4 && w != 8 && w != 16 && w != 32 && w != 64) return std::nullopt;
     return absl::StrCat(it.isUnsigned() ? "ui" : "i", w);
   }
+  // The emulated float grids, spelled out one by one for the reason this
+  // whole function is spelled out: a type nobody has thought about must fall
+  // out as nullopt rather than match by accident.
+  if (mlir::isa<mlir::Float8E4M3FNType>(type)) return std::string("f8E4M3FN");
+  if (mlir::isa<mlir::Float8E5M2Type>(type)) return std::string("f8E5M2");
+  if (mlir::isa<mlir::Float8E4M3Type>(type)) return std::string("f8E4M3");
+  if (mlir::isa<mlir::Float8E3M4Type>(type)) return std::string("f8E3M4");
+  if (mlir::isa<mlir::Float8E8M0FNUType>(type))
+    return std::string("f8E8M0FNU");
+  if (mlir::isa<mlir::Float8E4M3B11FNUZType>(type))
+    return std::string("f8E4M3B11FNUZ");
+  if (mlir::isa<mlir::Float8E5M2FNUZType>(type))
+    return std::string("f8E5M2FNUZ");
+  if (mlir::isa<mlir::Float8E4M3FNUZType>(type))
+    return std::string("f8E4M3FNUZ");
+  if (mlir::isa<mlir::Float6E2M3FNType>(type)) return std::string("f6E2M3FN");
+  if (mlir::isa<mlir::Float6E3M2FNType>(type)) return std::string("f6E3M2FN");
+  if (mlir::isa<mlir::Float4E2M1FNType>(type)) return std::string("f4E2M1FN");
   if (mlir::isa<mlir::Float16Type>(type)) return std::string("f16");
   if (mlir::isa<mlir::BFloat16Type>(type)) return std::string("bf16");
   if (mlir::isa<mlir::Float32Type>(type)) return std::string("f32");
@@ -107,6 +260,7 @@ std::optional<xla::PrimitiveType> PrimitiveTypeOf(mlir::Type type) {
   if (n == "f64") return xla::F64;
   if (n == "bf16") return xla::BF16;
   if (n == "complex<f32>") return xla::C64;
+  if (int kind = EmulatedKindOfName(n); kind >= 0) return kEmulated[kind].wire;
   return std::nullopt;
 }
 

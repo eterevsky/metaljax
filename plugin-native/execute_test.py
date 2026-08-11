@@ -28,6 +28,7 @@ import pathlib
 import subprocess
 import sys
 
+import ml_dtypes
 import numpy as np
 
 _HERE = pathlib.Path(__file__).resolve().parent
@@ -1535,8 +1536,272 @@ def _cases():
          lambda p, x: jax.lax.cond(p, lambda z: jnp.linalg.eigvalsh(z),
                                    lambda z: jnp.diag(z), x),
          [np.bool_(True), _sym(3, 432)], *LIN),
+
+        # ------------------------------------------------------------------
+        # P11: the emulated grids, reduce_precision, and the scatter tail
+        # ------------------------------------------------------------------
+        #
+        # The emulated element types (src/metaljax/dtypes.py `EMULATED`) hold
+        # their VALUES in a wider storage dtype, so three things have to agree
+        # with the CPU backend and are tested separately: the wire DECODE (a
+        # host buffer of every canonical code, read as f32), the wire ENCODE
+        # (an f32 array converted onto the grid and read back), and the
+        # ROUND TRIP through both.  The round trip is exhaustive -- every bit
+        # pattern the format has -- which is the only way to know that a NaN
+        # or subnormal encoding nobody thought about survives.
+        *_subbyte_cases(),
+        # Arithmetic on a grid: the OCP FP4/FP6 formats re-round after every
+        # operation (4 + 4 is 6 on f4E2M1FN, not 8) and i4/ui4 wrap to four
+        # bits, which is what the entry's `regrid` field is for.  The float8
+        # family deliberately does NOT re-round between ops, exactly as the
+        # Python engine has not since the emulation landed.
+        ("f4E2M1FN add re-grids", lambda a: a + a,
+         [np.array([1.0, 2.0, 4.0, 3.0], ml_dtypes.float4_e2m1fn)], 0, 0),
+        ("f4E2M1FN multiply re-grids", lambda a: a * a,
+         [np.array([1.0, 2.0, 4.0, 3.0], ml_dtypes.float4_e2m1fn)], 0, 0),
+        # The FP6 pair has no arithmetic row: XLA:CPU cannot compile an
+        # `arith.subf` on one at all, so there would be no reference.  Their
+        # grid is covered by the round-trip and encode rows above, and the
+        # rounding they share with f4E2M1FN is one code path.
+        ("f4E2M1FN subtract re-grids", lambda a: a - a[::-1],
+         [np.array([1.0, 2.0, 4.0, 0.5], ml_dtypes.float4_e2m1fn)], 0, 0),
+        ("f4E2M1FN maximum does not re-grid anything new",
+         lambda a: jnp.maximum(a, a[::-1]),
+         [np.array([1.0, 2.0, 4.0, 0.5], ml_dtypes.float4_e2m1fn)], 0, 0),
+        ("i4 arithmetic wraps to four bits",
+         lambda a: (a + a, a * a, a - a[::-1], jnp.maximum(a, a[::-1])),
+         [np.array([-8, -1, 3, 7], ml_dtypes.int4)], 0, 0),
+        ("ui4 arithmetic wraps to four bits",
+         lambda a: (a + a, a * a),
+         [np.array([0, 5, 9, 15], ml_dtypes.uint4)], 0, 0),
+        ("f8E4M3FN arithmetic keeps its wide storage",
+         lambda a: (a + a, a * a, (a + a).astype(jnp.float32)),
+         [np.array([1.0, 2.0, 3.5, -0.5], ml_dtypes.float8_e4m3fn)], 0, 0),
+        # The shape ops carry an emulated value without touching it, and a
+        # constant of one arrives as the TYPE's encoding in the IR (bit-packed
+        # for the sub-byte widths), which only the typed iterator can read.
+        ("emulated values through the shape ops",
+         lambda a: (a.reshape(2, 2).T, jnp.concatenate([a, a]),
+                    jnp.where(jnp.arange(4) > 1, a, a[::-1]),
+                    a > jnp.array(1.0, ml_dtypes.float8_e4m3fn)),
+         [np.array([1.0, 2.0, 3.5, -0.5], ml_dtypes.float8_e4m3fn)], 0, 0),
+        ("an f8E4M3FN constant, dense and splat",
+         lambda a: (a + jnp.array([1.0, 0.5, 2.0, -1.0],
+                                  ml_dtypes.float8_e4m3fn),
+                    a * jnp.full((4,), 2.0, ml_dtypes.float8_e4m3fn)),
+         [np.array([1.0, 2.0, 3.5, -0.5], ml_dtypes.float8_e4m3fn)], 0, 0),
+        ("an i4 constant and a gather of one",
+         lambda a, i: (a + jnp.array([1, 2, 3, 4], ml_dtypes.int4), a[i]),
+         [np.array([-8, -1, 3, 7], ml_dtypes.int4),
+          np.array([3, 0, 1], np.int32)], 0, 0),
+        # bitcast_convert with a 4-bit end: XLA packs two nibbles per byte
+        # along the minor-most dimension, low nibble first.
+        ("i4 <-> ui4 bitcast reinterprets the nibble",
+         lambda a: jax.lax.bitcast_convert_type(a, ml_dtypes.uint4),
+         [np.array([-8, -1, 3, 7], ml_dtypes.int4)], 0, 0),
+        ("i4 -> i8 bitcast packs pairs",
+         lambda a: jax.lax.bitcast_convert_type(a.reshape(2, 2), jnp.int8),
+         [np.array([-8, -1, 3, 7], ml_dtypes.int4)], 0, 0),
+        ("i8 -> i4 bitcast unpacks bytes",
+         lambda a: jax.lax.bitcast_convert_type(a, ml_dtypes.int4),
+         [np.array([0x12, -0x7F, 0, -1], np.int8)], 0, 0),
+        ("a zero-size 4-bit bitcast",
+         lambda a: jax.lax.bitcast_convert_type(a, jnp.int8),
+         [np.zeros((0, 2), ml_dtypes.int4)], 0, 0),
+        ("converts between the grids and the real types",
+         lambda a: (a.astype(jnp.float32), a.astype(jnp.int8),
+                    a.astype(ml_dtypes.uint4)),
+         [np.array([-8, -1, 3, 7], ml_dtypes.int4)], 0, 0),
+
+        # reduce_precision: the four arms (identity, the bf16 and f16 grids,
+        # and the general any-e/m rounding) over the three float storages.
+        *[(f"reduce_precision e{e}m{m} on {nm}",
+           (lambda v, e=e, m=m: jax.lax.reduce_precision(v, e, m)),
+           [(np.arange(-8, 8, dtype=np.float32) * 0.3).astype(dt)], 0, 0)
+          for e, m in [(8, 23), (8, 7), (5, 10), (5, 2), (4, 3), (3, 4),
+                       (1, 0), (8, 0), (2, 5)]
+          for nm, dt in [("f32", np.float32), ("f16", np.float16),
+                         ("bf16", ml_dtypes.bfloat16)]],
+        ("reduce_precision at the specials",
+         lambda v: jax.lax.reduce_precision(v, 5, 2),
+         [np.array([np.nan, np.inf, -np.inf, 0.0, -0.0, 1e30, -1e-30,
+                    65504.0], np.float32)], 0, 0),
+        ("reduce_precision inside a counted loop",
+         lambda x: jax.lax.fori_loop(
+             0, 4, lambda i, c: jax.lax.reduce_precision(c * 1.5, 5, 10), x),
+         [np.arange(4, dtype=np.float32)], 1e-6, 1e-6),
+
+        # The scatter tail.  A computed body with no uniqueness promise is
+        # applied ONE UPDATE AT A TIME, in row-major order, because a body
+        # need be neither associative nor idempotent -- `_dup` below is the
+        # row that says so (index 1 is written twice, and sin(sin(x)) is not
+        # sin(x)).
+        ("scatter_apply over distinct indices",
+         lambda x, i: x.at[i].apply(jnp.sin),
+         [np.arange(8, dtype=np.float32), np.array([0, 3, 5], np.int32)],
+         1e-6, 1e-6),
+        ("scatter_apply over DUPLICATE indices",
+         lambda x, i: x.at[i].apply(jnp.sin),
+         [np.arange(8, dtype=np.float32), np.array([1, 1, 5], np.int32)],
+         1e-6, 1e-6),
+        ("scatter_apply with an out-of-bounds index",
+         lambda x, i: x.at[i].apply(jnp.sin),
+         [np.arange(8, dtype=np.float32), np.array([0, 9, 5], np.int32)],
+         1e-6, 1e-6),
+        ("scatter_apply over rows",
+         lambda x, i: x.at[i, :].apply(jnp.exp),
+         [np.arange(12, dtype=np.float32).reshape(4, 3),
+          np.array([0, 2], np.int32)], 1e-5, 1e-5),
+        ("scatter_apply on integers",
+         lambda x, i: x.at[i].apply(lambda z: z * 3),
+         [np.arange(6, dtype=np.int32), np.array([1, 4], np.int32)], 0, 0),
+        ("scatter_apply under vmap",
+         jax.vmap(lambda x, i: x.at[i].apply(jnp.sin)),
+         [np.arange(12, dtype=np.float32).reshape(3, 4),
+          np.array([[0], [2], [3]], np.int32)], 1e-6, 1e-6),
+        ("scatter_apply on a rank-0 operand",
+         lambda x: x.at[()].apply(jnp.sin), [np.float32(2.0)], 1e-6, 1e-6),
+        ("scatter_apply on complex",
+         lambda x, i: x.at[i].apply(lambda z: z * z),
+         [np.array([1 + 1j, 2 - 2j, 0j, 3j], np.complex64),
+          np.array([0, 2], np.int32)], 1e-6, 1e-6),
+        # A rank-0 operand with an empty coordinate vector: the scatter IS its
+        # combiner.  jax reaches it through `jax.experimental.sparse` on a
+        # 0-d array, whose updates are reduced before the scatter.
+        ("a rank-0 scatter's combiner",
+         lambda a, u: (a.at[()].set(u), a.at[()].add(u), a.at[()].max(u),
+                       a.at[()].min(u), a.at[()].multiply(u)),
+         [np.float32(3.0), np.float32(9.0)], 0, 0),
+        ("a 0-d BCOO densifies through a rank-0 scatter",
+         lambda d: _bcoo_0d(d),
+         [np.array([1.0, 2.0, 4.0], np.float32)], 1e-6, 1e-6),
+
+        # select_and_scatter: max/min-pool backward.  Its scatter-add lands on
+        # overlapping windows, so the GPU's answer is order-nondeterministic
+        # in the last bits -- these rows carry a tolerance rather than pinning
+        # bytes, which is the disposition this family shipped with.
+        ("max-pool backward (select_and_scatter)",
+         jax.grad(lambda v: jnp.sum(jax.lax.reduce_window(
+             v, -jnp.inf, jax.lax.max, (1, 2, 2), (1, 1, 1), "VALID") ** 2)),
+         [np.arange(24, dtype=np.float32).reshape(2, 3, 4) * 0.7],
+         1e-6, 1e-6),
+        ("min-pool backward, strided and padded",
+         jax.grad(lambda v: jnp.sum(jax.lax.reduce_window(
+             v, jnp.inf, jax.lax.min, (1, 2, 2), (1, 2, 2), "SAME") ** 2)),
+         [np.arange(24, dtype=np.float32).reshape(2, 3, 4) * 0.7],
+         1e-6, 1e-6),
+        ("max-pool backward with SAME padding",
+         jax.grad(lambda v: jnp.sum(jax.lax.reduce_window(
+             v, -jnp.inf, jax.lax.max, (1, 3, 3), (1, 2, 2), "SAME") ** 2)),
+         [np.arange(24, dtype=np.float32).reshape(2, 3, 4) * 0.7],
+         1e-6, 1e-6),
+        ("select_and_scatter_add directly",
+         lambda o, s: _sas_add(s, o, jax.lax.ge_p, (2, 2, 2), (1, 1, 1),
+                               [(0, 0), (0, 0), (0, 0)]),
+         [np.arange(24, dtype=np.float32).reshape(2, 3, 4) * 0.7,
+          np.arange(6, dtype=np.float32).reshape(1, 2, 3) + 1.0], 1e-6, 1e-6),
+        ("select_and_scatter_add with LE and padding",
+         lambda o, s: _sas_add(s, o, jax.lax.le_p, (2, 2, 2), (1, 2, 2),
+                               [(0, 0), (1, 1), (1, 1)]),
+         [np.arange(24, dtype=np.float32).reshape(2, 3, 4) * 0.7,
+          np.arange(6, dtype=np.float32).reshape(1, 2, 3) + 1.0],
+         1e-6, 1e-6),
+        ("select_and_scatter_add under vmap",
+         jax.vmap(lambda o, s: _sas_add(s, o, jax.lax.ge_p, (2, 2), (1, 1),
+                                        [(0, 0), (0, 0)])),
+         [np.arange(24, dtype=np.float32).reshape(2, 3, 4) * 0.7,
+          np.arange(12, dtype=np.float32).reshape(2, 2, 3)], 1e-6, 1e-6),
     ]
     return cases
+
+
+def _sas_add(source, operand, select_prim, window_dimensions, window_strides,
+             padding):
+    """`stablehlo.select_and_scatter` without going through a pooling
+    gradient.  jax has no public wrapper (only the primitive), and this is
+    the entry point its own `lax_vmap_test` uses."""
+    from jax._src.lax import windowed_reductions
+
+    return windowed_reductions._select_and_scatter_add(
+        source, operand, select_prim, window_dimensions, window_strides,
+        padding)
+
+
+def _bcoo_0d(data):
+    """`jax.experimental.sparse` on a 0-d array, which is where a rank-0
+    scatter comes from in the wild: the updates are reduced first, and what
+    reaches the scatter is one value at an EMPTY coordinate vector."""
+    import jax.numpy as jnp
+    from jax.experimental import sparse
+
+    return sparse.BCOO((data, jnp.zeros((3, 0), jnp.int32)),
+                       shape=()).todense()
+
+
+def _subbyte_cases():
+    """One decode / encode / round-trip triple per emulated element type.
+
+    The round trip walks every bit pattern the format has, so a NaN or
+    subnormal encoding nobody thought about is covered by construction; the
+    decode reads the same codes as f32, and the encode converts an f32 array
+    (including the specials) onto the grid.  `_canonical` widens both sides to
+    f64, so a NaN's PAYLOAD is not compared -- it survives neither engine's
+    float16 storage, and the CPU backend is the only one that keeps it.
+    """
+    import jax.numpy as jnp
+
+    grids = [
+        ("f8E4M3FN", ml_dtypes.float8_e4m3fn, 8),
+        ("f8E5M2", ml_dtypes.float8_e5m2, 8),
+        ("f8E4M3", ml_dtypes.float8_e4m3, 8),
+        ("f8E3M4", ml_dtypes.float8_e3m4, 8),
+        ("f8E8M0FNU", ml_dtypes.float8_e8m0fnu, 8),
+        ("f8E4M3B11FNUZ", ml_dtypes.float8_e4m3b11fnuz, 8),
+        ("f8E5M2FNUZ", ml_dtypes.float8_e5m2fnuz, 8),
+        ("f8E4M3FNUZ", ml_dtypes.float8_e4m3fnuz, 8),
+        ("f6E2M3FN", ml_dtypes.float6_e2m3fn, 6),
+        ("f6E3M2FN", ml_dtypes.float6_e3m2fn, 6),
+        ("f4E2M1FN", ml_dtypes.float4_e2m1fn, 4),
+        ("i4", ml_dtypes.int4, 4),
+        ("ui4", ml_dtypes.uint4, 4),
+    ]
+    # The specials the encode has to place: a zero of each sign, values on and
+    # off the grid, both overflows and a NaN.  Which of an infinity, a NaN or
+    # a saturation each format produces is its own rule.
+    src = np.array([0.0, -0.0, 1.0, -1.0, 0.5, 3.7, -2.25, 1e5, -1e5,
+                    np.nan, np.inf, -np.inf, 1e-8], np.float32)
+    # ...minus the OVERFLOWS, for the two families where this engine and
+    # XLA:CPU knowingly disagree about them.  Neither is a defect of this
+    # milestone; both are Stage 1's answers, unchanged:
+    #   * FP6 -- XLA:CPU maps an overflow to a ZERO where ml_dtypes (the
+    #     reference for these formats, CLAUDE.md item 20: "XLA:CPU's fp6 is
+    #     itself broken") saturates to the largest finite value, which is
+    #     what both metaljax engines produce;
+    #   * i4/ui4 -- XLA saturates a float->4-bit convert where the emulation
+    #     WRAPS (`((v + 8) mod 16) - 8`, dtypes.py `quantize_emulated`), so
+    #     1e5 is 7 there and 0 here.
+    # Everything in range, both signed zeros and the NaN are still compared.
+    in_range = np.array([0.0, -0.0, 1.0, -1.0, 0.5, 3.7, -2.25, np.nan],
+                        np.float32)
+    # ui4 has no negatives either, and they are the same disagreement: XLA
+    # clamps them to 0, the emulation's `v mod 16` wraps -1 to 15.
+    unsigned = np.array([0.0, -0.0, 1.0, 0.5, 3.7, 12.0, np.nan], np.float32)
+    out = []
+    for name, dt, bits in grids:
+        codes = np.arange(1 << bits, dtype=np.uint8).view(np.dtype(dt))
+        out.append((f"{name}: every code round-trips through the device",
+                    lambda a: a, [codes], 0, 0))
+        # XLA:CPU cannot compile an FP6 convert at all (it crashes inside its
+        # own fusion compiler), so those two have no decode reference; the
+        # round trip above still covers them, since it needs no convert.
+        if bits != 6:
+            out.append((f"{name}: every code decodes",
+                        lambda a: a.astype(jnp.float32), [codes], 0, 0))
+        s = (unsigned if name == "ui4"
+             else src if bits == 8 and name != "i4" else in_range)
+        out.append((f"{name}: an f32 array encodes onto the grid",
+                    (lambda a, dt=dt: a.astype(dt)), [s], 0, 0))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1939,15 +2204,6 @@ def _declines():
              x, 0.0, jax.lax.add, (2,), (1,), [(-1, 0)]),
          [np.arange(6, dtype=np.float32)],
          "reduce_window negative padding"),
-        # A scatter whose update computation is neither an assignment nor a
-        # combiner (jax's scatter_apply): running it means evaluating block
-        # code on the gathered current values, which this opcode's plan does
-        # not carry.  It declines rather than guessing, exactly as tape.py
-        # does.
-        ("scatter with a computed body",
-         lambda x, i: x.at[i].apply(jnp.sin),
-         [np.arange(4, dtype=np.float32), np.array([0, 2], np.int32)],
-         "scatter combiner apply"),
         # A complex scatter runs as two real ones (P10), which is exact only
         # while the combiner is componentwise.  MULTIPLY is not, and the
         # rewrite that answers it (gather, multiply, set) is equal to the
@@ -1963,12 +2219,31 @@ def _declines():
         # A loop whose BODY holds an op outside the set declines the whole
         # program, naming that op -- the region is lowered by the same
         # `Lowering` as main, so its declines are main's.  (Convolution used
-        # to be the op here, then the LAPACK targets; both compute now, so
-        # reduce_precision -- phase 2's P11 -- stands in.)
+        # to be the op here, then the LAPACK targets, then reduce_precision;
+        # all three compute now, so `stablehlo.rng` -- XLA's
+        # non-deterministic RNG, which NEITHER engine implements -- stands
+        # in.)
         ("while loop over an unlowered op",
          lambda x: jax.lax.fori_loop(
-             0, 4, lambda i, c: jax.lax.reduce_precision(c * 1.5, 5, 10), x),
-         [np.arange(4, dtype=np.float32)], "stablehlo.reduce_precision"),
+             0, 4, lambda i, c: c + jax.lax.rng_uniform(
+                 np.float32(0.0), np.float32(1.0), (4,)), x),
+         [np.arange(4, dtype=np.float32)], "stablehlo.rng"),
+        # A scatter whose computed body has no uniqueness promise runs one
+        # update at a time, which is only affordable for the small shapes the
+        # pattern shows up in: past ops/gather.py's own cap the program
+        # declines rather than emitting thousands of entries' worth of work.
+        ("scatter with a computed body over too many updates",
+         lambda x, i: x.at[i].apply(jnp.sin),
+         [np.arange(4096, dtype=np.float32),
+          np.arange(2048, dtype=np.int32)],
+         "scatter computed-body with duplicates"),
+        # A bitcast whose end is an emulated FLOAT grid: those hold values in
+        # a wider dtype, so the bits the op wants to read do not exist on the
+        # device.  i4/ui4 are the exception (whole nibbles) and lower.
+        ("bitcast_convert on an emulated float grid",
+         lambda x: jax.lax.bitcast_convert_type(x, jnp.uint8),
+         [np.array([1.0, 2.0], ml_dtypes.float8_e4m3fn)],
+         "bitcast_convert on f8E4M3FN"),
         # A custom call whose target has no handler declines by NAME, so a
         # program that reaches an unknown external is a missing feature and
         # never a wrong answer.  (Written by hand: jax emits no such call.)

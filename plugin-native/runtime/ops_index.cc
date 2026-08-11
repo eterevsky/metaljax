@@ -316,6 +316,87 @@ bool Program::step_index(const Entry& e,
         // dropped update's product is garbage that the redirect discards.
         upd = mx::multiply(mx::gather(in(0), idxs, axes, sshape), upd);
         method = 0;
+      } else if (method == 7) {
+        // An APPLY body (jax's scatter_apply, and every `.at[i].apply(f)`):
+        // the region is elementwise code over (current value, update), and
+        // running it on the GATHERED values and SETTING the result equals
+        // the scatter only while no two updates land on the same slot --
+        // which is why the lowering takes this arm only under the op's own
+        // `unique_indices`. Same read as the complex multiply above: before
+        // any dummy pad, over the same clamped indices.
+        const int64_t ncaps = c.next();
+        std::vector<mx::array> args{mx::gather(in(0), idxs, axes, sshape),
+                                    upd};
+        for (int64_t k = 0; k < ncaps; k++)
+          args.push_back(in(static_cast<size_t>(3 + k)));
+        if (e.regions.size() != 1)
+          throw std::runtime_error("tape: scatter apply without a body");
+        std::vector<mx::array> res = e.regions[0]->call(args, in_trace);
+        if (res.size() != 1)
+          throw std::runtime_error("tape: scatter apply body result count");
+        upd = mx::astype(res[0], in(0).dtype());
+        method = 0;
+      } else if (method == 8) {
+        // The same body with NO uniqueness promise: XLA applies the updates
+        // sequentially, and a computed body need be neither associative nor
+        // idempotent, so two updates on one slot really do mean f(f(x)).
+        // One update at a time, in row-major update order -- ops/gather.py's
+        // arm, with its cap enforced at lowering. A dropped update leaves the
+        // slot alone, which is why this arm takes no drop strategy: the
+        // `where` below is per update, where a mask over the whole update
+        // array could not say it once the body has run.
+        const int64_t ncaps = c.next();
+        if (e.regions.size() != 1)
+          throw std::runtime_error("tape: scatter apply without a body");
+        std::vector<mx::array> caps;
+        for (int64_t k = 0; k < ncaps; k++)
+          caps.push_back(in(static_cast<size_t>(3 + k)));
+        int64_t nb = 1;
+        for (mx::ShapeElem d : bshape) nb *= d;
+        std::vector<mx::array> fidx;
+        fidx.reserve(idxs.size());
+        for (const mx::array& a : idxs)
+          fidx.push_back(mx::reshape(a, mx::Shape{-1}));
+        mx::Shape uflat{static_cast<mx::ShapeElem>(nb)};
+        for (mx::ShapeElem d : sshape) uflat.push_back(d);
+        mx::array uf = mx::reshape(upd, uflat);
+        std::optional<mx::array> of;
+        if (oob) of = mx::reshape(*oob, mx::Shape{-1});
+        auto at_i = [](const mx::array& a, int64_t i) {
+          return mx::reshape(mx::slice(a, mx::Shape{static_cast<mx::ShapeElem>(i)},
+                                       mx::Shape{static_cast<mx::ShapeElem>(i + 1)}),
+                             mx::Shape{});
+        };
+        // MLX has no complex scatter kernels, so a complex write goes by
+        // parts here as it does everywhere else in this handler.
+        auto put = [&](const mx::array& base, const std::vector<mx::array>& ix,
+                       const mx::array& v) {
+          if (!is_complex(base.dtype())) return mx::scatter(base, ix, v, axes);
+          return make_complex(
+              mx::scatter(mx::real(base), ix, mx::real(v), axes),
+              mx::scatter(mx::imag(base), ix, mx::imag(v), axes));
+        };
+        mx::array out = in(0);
+        for (int64_t i = 0; i < nb; i++) {
+          std::vector<mx::array> one;
+          one.reserve(fidx.size());
+          for (const mx::array& a : fidx) one.push_back(at_i(a, i));
+          mx::array old = mx::gather(out, one, axes, sshape);
+          mx::Shape lo(uflat.size(), 0), hi = uflat;
+          lo[0] = static_cast<mx::ShapeElem>(i);
+          hi[0] = static_cast<mx::ShapeElem>(i + 1);
+          mx::array ui = mx::reshape(mx::slice(uf, lo, hi), sshape);
+          std::vector<mx::array> args{old, ui};
+          args.insert(args.end(), caps.begin(), caps.end());
+          std::vector<mx::array> res = e.regions[0]->call(args, in_trace);
+          if (res.size() != 1)
+            throw std::runtime_error("tape: scatter apply body result count");
+          mx::array nv = mx::astype(res[0], out.dtype());
+          if (of) nv = mx::where(at_i(*of, i), old, nv);
+          out = put(out, one, nv);
+        }
+        env[e.outs[0]] = out;
+        break;
       }
       std::optional<mx::array> mask;
       if (strategy == 1) {

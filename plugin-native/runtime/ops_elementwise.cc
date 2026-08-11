@@ -8,6 +8,7 @@
 
 #include "program.h"
 
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -390,13 +391,79 @@ bool Program::step_elementwise(const Entry& e,
       env[e.outs[0]] = mx::minimum(mx::maximum(in(1), in(0)), in(2));
       break;
 
-    case kConvert:
+    case kConvert: {
       // _convert. XLA's complex -> real convert keeps the REAL part,
       // which mx::astype would not do on its own; whether that arm runs
       // is a question about two element types, so tape.py answered it.
-      env[e.outs[0]] = mx::astype(at[1] ? mx::real(in(0)) : in(0),
-                                  dtype_of(at[0]));
+      const mx::array x = at[1] ? mx::real(in(0)) : in(0);
+      // A convert onto an EMULATED grid is the entry's `regrid` and nothing
+      // else: `quantize_emulated` reads the operand's own value and ends in
+      // the storage dtype itself. Casting to the storage first would round
+      // TWICE -- f32 -> f16 -> f8E4M3FN is not f32 -> f8E4M3FN -- and would
+      // put a saturating float->int cast in front of the 4-bit wrap.
+      env[e.outs[0]] = is_emulated(at[0]) ? x : mx::astype(x, dtype_of(at[0]));
       break;
+    }
+
+    case kReducePrecision: {
+      // _reduce_precision. Which arm runs is a question about the operand's
+      // dtype and the two attributes, all static, so the lowering answered
+      // it; what is left is the arithmetic.
+      const mx::array& x = in(0);
+      if (at[0] == 0) {           // e >= 8 and m >= 23: nothing to lose
+        env[e.outs[0]] = x;
+        break;
+      }
+      if (at[0] == 1 || at[0] == 2) {   // exactly bf16's or f16's grid
+        env[e.outs[0]] = mx::astype(
+            mx::astype(x, at[0] == 1 ? mx::bfloat16 : mx::float16), x.dtype());
+        break;
+      }
+      const mx::Dtype orig = x.dtype();
+      mx::array f = orig == mx::float32 ? x : mx::astype(x, mx::float32);
+      const int64_t exp = at[1], man = at[2];
+      auto u32 = [](int64_t v) { return mx::array(v, mx::uint32); };
+      mx::array isnan = mx::isnan(f);
+      mx::array u = mx::view(f, mx::uint32);
+      if (man < 23) {
+        // Round the f32 mantissa to `man` bits, to nearest-even.
+        const int64_t shift = 23 - man;
+        mx::array half = u32((int64_t{1} << (shift - 1)) - 1);
+        mx::array lsb = mx::bitwise_and(mx::right_shift(u, u32(shift)), u32(1));
+        u = mx::bitwise_and(mx::add(mx::add(u, half), lsb),
+                            u32(~((int64_t{1} << shift) - 1) & 0xFFFFFFFF));
+      }
+      mx::array r = mx::view(u, mx::float32);
+      if (exp < 8) {
+        // ...then clamp to an `exp`-bit exponent range: overflow to an
+        // infinity, underflow to a zero. XLA's reduce_precision has no
+        // subnormals, so there is nothing between the two. (exp == 1 is
+        // degenerate but well defined -- bias 0 makes every finite value
+        // either overflow or underflow, which this already produces.)
+        mx::array biased = mx::astype(
+            mx::bitwise_and(mx::right_shift(u, u32(23)), u32(0xFF)),
+            mx::int32);
+        const int64_t max_e = (int64_t{1} << (exp - 1)) - 1;
+        const int64_t min_e = 2 - (int64_t{1} << (exp - 1));
+        mx::array sign =
+            mx::where(mx::less(r, mx::array(0.0f, mx::float32)),
+                      mx::array(-1.0f, mx::float32),
+                      mx::array(1.0f, mx::float32));
+        mx::array over = mx::greater(biased, mx::array(127 + max_e, mx::int32));
+        mx::array under = mx::less(biased, mx::array(127 + min_e, mx::int32));
+        r = mx::where(over,
+                      mx::multiply(sign,
+                                   mx::array(std::numeric_limits<float>::
+                                                 infinity(),
+                                             mx::float32)),
+                      r);
+        r = mx::where(under,
+                      mx::multiply(sign, mx::array(0.0f, mx::float32)), r);
+      }
+      r = mx::where(isnan, f, r);
+      env[e.outs[0]] = mx::astype(r, orig);
+      break;
+    }
 
     // --- complex64 (ops/elementwise.py) ---
     case kReal: env[e.outs[0]] = mx::real(in(0)); break;

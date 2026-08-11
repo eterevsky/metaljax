@@ -966,9 +966,41 @@ fork authorized but not needed.
   every remainder a loud decline or a known non-P10 row. execute_test 357 ->
   **384 checks**; gate 106/106; decline_census 32 -> **34 of 35**; dylib
   +0.011 %.
-* Next: dtypes + reduce_precision,
-  then collectives/tokens, callbacks/PJRT/donation, shape-poly.
-  Suite-vs-suite as the standing gate. (North star per Oleg: everything
+* **P11 landed** (notes/cpp-p11-dtypes.md): the emulated grids,
+  `reduce_precision` and the scatter tail. (a) `src/metaljax/dtypes.py`'s
+  thirteen EMULATED element types (i4/ui4 and the f8/f6/f4 grids), whose values
+  live in a WIDER storage dtype — the invariant M5c declined the family over.
+  The per-site regrid it feared is one field, `Entry::regrid`, spent by
+  `Program::step` in ONE place after the family handler has written its
+  results, so no handler rounds and none can forget to; the lowering's
+  `RegridOf` is the Python engine's three sites (`_regrid`, `_maybe_wrap4`,
+  `_convert`) asked once, of the op's name and its result type. The host
+  transfer is a per-element CONVERSION (one wire byte per element, the type's
+  own encoding) through `llvm::APFloat`, with `f8E8M0FNU` and the OCP FP4/FP6
+  NaN spelled out where APFloat and ml_dtypes disagree; the gate is every
+  canonical bit pattern of every format, device_put and read back. **The bug
+  worth remembering: a convert must NOT cast to the storage dtype before
+  re-gridding** — `f32 -> f16 -> f8E4M3FN` is not `f32 -> f8E4M3FN`, and for
+  the integer grids it puts a saturating float->int cast in front of a 4-bit
+  wrap (`float32(1e5).astype(int4)` came back -1 where the Python engine says
+  0). (b) `reduce_precision`'s four arms, resolved at lowering. (c) The
+  scatter tail: the apply body in BOTH of `ops/gather.py`'s executions — the
+  one-shot arm under `unique_indices` and the sequential arm without it, which
+  is the one that runs, since jax emits `unique_indices = false` for every
+  `.at[].apply()` (so the honest gate is the Python handler's 1024-update cap,
+  not a decline on the missing promise); `select_and_scatter`, with a
+  tolerance rather than a byte pin, since its scatter-add over overlapping
+  windows is order-nondeterministic; and the rank-0 scatter, which degenerates
+  to its combiner. Census slice (14 files): **328 -> 90 failures, −238, zero
+  regressions**, every remainder a loud decline, a P12/P13 family or a
+  whitelist assertion — no numeric mismatch anywhere. `tests/`-on-native
+  90 -> **84** (`test_subbyte_float` 6 -> 0, the only file that moved).
+  execute_test 384 -> **482 checks**; gate 106/106; decline_census 34 of 35;
+  dylib +0.032 %. The decline sentinel moved off `reduce_precision` to
+  **`stablehlo.rng`** (`jax.lax.rng_uniform`), which neither engine implements
+  and no phase is scheduled to.
+* Next: collectives/tokens (P12), callbacks/PJRT/donation (P13), shape-poly
+  (P14). Suite-vs-suite as the standing gate. (North star per Oleg: everything
   through the new stack, correctness first, performance second.)
 
 ## The runtime fork (2026-08-11, per Oleg)
@@ -991,4 +1023,8 @@ Census ladder: P9 Accelerate+linalg registrations (867), P10 complex
 scatter + lexicographic sort (542), P11 dtypes + reduce_precision
 (192), P12 collectives+tokens (109), P13 callbacks/PJRT/donation
 (62), P14 shape-poly (17). Native at 93.15% after P8.5;
-**P9 removed 855 of the 867** (its slice: 1,007 -> 152).
+**P9 removed 855 of the 867** (its slice: 1,007 -> 152), **P10 499 of
+the 542** (608 -> 109), **P11 238** (its 14-file slice: 328 -> 90) --
+more than the 192 the ladder budgeted for it, because the scatter tail
+and the `<unknown>`-element-type wall shared files with rows the
+per-family counts did not separate.
