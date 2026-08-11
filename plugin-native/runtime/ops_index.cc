@@ -83,6 +83,53 @@ void read_index_plan(Cursor& c, const mx::array& starts, bool split, int ivd,
   }
 }
 
+// ops/sort.py `_sort_key` and `_gather_sorted`'s key arms, as the `kind` a
+// sort entry carries. The lowering picks the kind from the operand's element
+// type and from WHICH arm of the recognizer produced the key:
+//
+//   0  integer -- already ordered, nothing to do
+//   1  float, totalOrder key (`_gather_sorted`: jax's comparator did the
+//      canonicalization itself, inside the key chain this frame evaluated)
+//   2  bool, widened to uint8
+//   3  complex, the (re, im) pair of canonicalized totalOrder keys packed
+//      into one u64 -- which is what orders complex lexicographically
+//   4  float, CANONICALIZED then totalOrder (`_sort_key`: the lexicographic
+//      arm reads the raw operand, so -0 must tie with +0 and every NaN with
+//      every other NaN here rather than in the comparator)
+//
+// The tie in 3 and 4 is not cosmetic: a -0 real part that splits a group
+// would let the imaginary parts decide an order XLA does not have, and
+// jnp.unique compares neighbours of a lexsort to count its uniques.
+mx::array canon_float(const mx::array& x) {
+  mx::array c = mx::add(x, weak(0.0, x));   // -0 + +0 == +0
+  return mx::where(mx::isnan(c),
+                   weak(std::numeric_limits<double>::quiet_NaN(), c), c);
+}
+
+mx::array sort_key(const mx::array& x, int64_t kind) {
+  switch (kind) {
+    case 1: return total_order_key(x);
+    case 2: return mx::astype(x, mx::uint8);
+    case 3: {
+      mx::array re = mx::astype(total_order_key(canon_float(mx::real(x))),
+                                mx::uint64);
+      mx::array im = mx::astype(total_order_key(canon_float(mx::imag(x))),
+                                mx::uint64);
+      return mx::bitwise_or(
+          mx::left_shift(re, mx::array(uint64_t{32}, mx::uint64)), im);
+    }
+    case 4: return total_order_key(canon_float(x));
+    default: return x;
+  }
+}
+
+// ops/sort.py `_argsort`: mx::argsort reads the WRONG elements from a
+// non-contiguous input (MLX 0.32), and jax lowers a non-last-axis sort as
+// transpose -> sort -> transpose, so the operand is routinely a strided view.
+mx::array stable_argsort(const mx::array& key, int axis) {
+  return mx::argsort(mx::contiguous(key), axis);
+}
+
 // ops/gather.py's `.at[...]` methods, as the primitives they bottom out in.
 // MLX has no scatter_subtract; its ArrayAt.subtract is add-of-negated, and
 // a - b == a + (-b) for every IEEE bit pattern, so this is exact.
@@ -121,24 +168,46 @@ bool Program::step_index(const Entry& e,
       // GT — and it is what a plain jnp.sort/argsort emits too. A
       // comparator that computes a key first is declined in tape.py,
       // where the structural recognizer lives.
-      // attrs [dim, descending?, key operand, key kind]
-      //   key kind: 0 integer (already ordered), 1 float totalOrder,
-      //             2 bool (widened to uint8, as the Python handler does)
+      // attrs [dim, descending?, key operand, key kind] (kinds beside
+      // `sort_key` above)
       int dim = static_cast<int>(at[0]);
       bool descending = at[1] != 0;
-      mx::array key = in(static_cast<size_t>(at[2]));
-      if (at[3] == 1) {
-        key = total_order_key(key);
-      } else if (at[3] == 2) {
-        key = mx::astype(key, mx::uint8);
-      }
+      mx::array key = sort_key(in(static_cast<size_t>(at[2])), at[3]);
       // Bitwise NOT reverses the order for signed and unsigned alike.
       if (descending) key = mx::bitwise_invert(key);
-      // mx::argsort reads the WRONG elements from a non-contiguous input
-      // (MLX 0.32), and a non-last-axis sort arrives as a strided view.
-      mx::array idx = mx::argsort(mx::contiguous(key), dim);
+      mx::array idx = stable_argsort(key, dim);
       for (size_t i = 0; i < e.outs.size(); i++)
         env[e.outs[i]] = mx::take_along_axis(in(i), idx, dim);
+      break;
+    }
+
+    case kLexSort: {
+      // ops/sort.py `_lex_sorted`: a stable ASCENDING lexicographic sort by
+      // the first `nkeys` operands, as successive stable argsorts from the
+      // LAST key to the first, each one threaded through the permutation the
+      // previous ones built. Stability is what makes that equal a single
+      // lexicographic pass, and mx::argsort is stable (is_stable = true is
+      // the only form jax emits).
+      //
+      // The comparator that means this is a select TREE over several key
+      // pairs, which the lowering recognizes structurally; the tree itself is
+      // never evaluated, so every canonicalization it would have applied is
+      // in `sort_key` instead.
+      // attrs [dim, nkeys, kind per key...]
+      int dim = static_cast<int>(at[0]);
+      const int64_t nkeys = at[1];
+      if (nkeys < 1 || nkeys > static_cast<int64_t>(e.ins.size()))
+        throw std::invalid_argument("tape: lex sort key count");
+      std::optional<mx::array> perm;
+      for (int64_t j = nkeys - 1; j >= 0; j--) {
+        mx::array key = sort_key(in(static_cast<size_t>(j)),
+                                 at[2 + static_cast<size_t>(j)]);
+        if (perm) key = mx::take_along_axis(key, *perm, dim);
+        mx::array idx = stable_argsort(key, dim);
+        perm = perm ? mx::take_along_axis(*perm, idx, dim) : idx;
+      }
+      for (size_t i = 0; i < e.outs.size(); i++)
+        env[e.outs[i]] = mx::take_along_axis(in(i), *perm, dim);
       break;
     }
 
@@ -146,14 +215,8 @@ bool Program::step_index(const Entry& e,
       // ops/sort.py _top_k: a stable DESCENDING argsort of the last axis,
       // cut to k. attrs [k, key kind] (kinds as kSort's).
       const mx::array& x = in(0);
-      mx::array key = x;
-      if (at[1] == 1) {
-        key = total_order_key(key);
-      } else if (at[1] == 2) {
-        key = mx::astype(key, mx::uint8);
-      }
       mx::array idx =
-          mx::argsort(mx::contiguous(mx::bitwise_invert(key)), -1);
+          stable_argsort(mx::bitwise_invert(sort_key(x, at[1])), -1);
       mx::Shape lo(idx.shape().size(), 0), hi = idx.shape();
       hi.back() = static_cast<mx::ShapeElem>(at[0]);
       idx = mx::slice(idx, lo, hi);
@@ -169,24 +232,15 @@ bool Program::step_index(const Entry& e,
       // to keep is resolved at lowering (aggregate_to_topk = false asks for
       // a WIDER result than backend_config's top_k, and under-filling it
       // would leave uninitialised device memory in the tail).
-      // attrs [k, dim, key kind, is_max?]
+      // attrs [k, dim, key kind, is_max?]. The kind is the CANONICALIZING
+      // one for floats (`_sort_key`, which `_top_k` does not need): -0 ties
+      // with +0 and every NaN with every other NaN before the totalOrder key
+      // is taken.
       const mx::array& vals = in(0);
       const int dim = static_cast<int>(at[1]);
-      mx::array key = vals;
-      if (at[2] == 1) {
-        // `_sort_key`'s canonicalization, which `_top_k` does not need: -0
-        // ties with +0 and every NaN with every other NaN before the
-        // totalOrder key is taken.
-        key = mx::add(key, weak(0.0, key));
-        key = mx::where(mx::isnan(key),
-                        weak(std::numeric_limits<double>::quiet_NaN(), key),
-                        key);
-        key = total_order_key(key);
-      } else if (at[2] == 2) {
-        key = mx::astype(key, mx::uint8);
-      }
+      mx::array key = sort_key(vals, at[2]);
       if (at[3] != 0) key = mx::bitwise_invert(key);
-      mx::array order = mx::argsort(mx::contiguous(key), dim);
+      mx::array order = stable_argsort(key, dim);
       mx::Shape lo(order.shape().size(), 0), hi = order.shape();
       hi[static_cast<size_t>(dim)] = static_cast<mx::ShapeElem>(at[0]);
       mx::array top = mx::slice(order, lo, hi);
@@ -247,45 +301,77 @@ bool Program::step_index(const Entry& e,
       // the op maps no index components at all, which is also the only
       // way `strategy` comes out 0.
       read_index_plan(c, in(1), split, ivd, bshape, idxs, axes, &oob);
-      c.shp();  // the update slice shape, already folded into the reshape
+      mx::Shape sshape = c.shp();  // the update slice, per operand dim
       std::vector<int> uperm = c.vec();
       mx::array upd = in(2);
       if (!is_identity_perm(uperm)) upd = mx::transpose(upd, uperm);
       upd = mx::astype(mx::reshape(upd, c.shp()), in(0).dtype());
+      if (method == 6) {
+        // A complex MULTIPLY, which is not componentwise: ops/gather.py
+        // rewrites it into the apply path -- gather the current values,
+        // combine, and SET the result -- and the lowering only takes this
+        // arm when the op declares its indices unique, which is what makes
+        // one write per slot the same as the combiner. The gather reads the
+        // operand BEFORE any dummy pad, over the same clamped indices, so a
+        // dropped update's product is garbage that the redirect discards.
+        upd = mx::multiply(mx::gather(in(0), idxs, axes, sshape), upd);
+        method = 0;
+      }
+      std::optional<mx::array> mask;
       if (strategy == 1) {
         // Neutral value: a dropped update becomes the combiner's
         // identity, so applying it is a no-op. Order- and duplicate-safe,
         // and it touches the UPDATES rather than the operand.
         if (!oob || !e.payload)
           throw std::runtime_error("tape: scatter neutral without a mask");
-        upd = mx::where(mx::reshape(*oob, c.shp()), *e.payload, upd);
-      } else if (strategy == 2) {
-        // Dummy pad: one indexed axis grows by a window's worth of rows
-        // and dropped updates are redirected there, then the pad is cut
-        // off. Required for "set", where neutralizing an update would
-        // race a genuine duplicate write at the clamped slot (a
-        // fill_value == size index clamps onto the last real slot, which
-        // is a systematic collision, not a rare one).
+        mask = mx::reshape(*oob, c.shp());
+      }
+      // Dummy pad: one indexed axis grows by a window's worth of rows
+      // and dropped updates are redirected there, then the pad is cut
+      // off. Required for "set", where neutralizing an update would
+      // race a genuine duplicate write at the clamped slot (a
+      // fill_value == size index clamps onto the last real slot, which
+      // is a systematic collision, not a rare one). The redirection is
+      // an index question, so it is done once, whatever the operand's
+      // dtype makes of the write below.
+      size_t pos = 0;
+      int pad = 0, extent = 0, axis = 0;
+      if (strategy == 2) {
         if (!oob)
           throw std::runtime_error("tape: scatter pad without a mask");
-        size_t pos = static_cast<size_t>(c.next());
-        int pad = static_cast<int>(c.next());
-        int extent = static_cast<int>(c.next());
+        pos = static_cast<size_t>(c.next());
+        pad = static_cast<int>(c.next());
+        extent = static_cast<int>(c.next());
         if (pos >= idxs.size())
           throw std::invalid_argument("tape: scatter pad position");
-        int axis = axes[pos];
-        mx::Shape padshape = in(0).shape();
+        axis = axes[pos];
+        idxs[pos] = mx::where(*oob, mx::array(extent, mx::int32), idxs[pos]);
+      }
+      // One write, over an operand and updates of a dtype MLX can scatter.
+      auto write = [&](const mx::array& base, mx::array u) -> mx::array {
+        if (mask) u = mx::where(*mask, *e.payload, u);
+        if (strategy != 2) return scatter_by(method, base, idxs, u, axes);
+        mx::Shape padshape = base.shape();
         padshape[static_cast<size_t>(axis)] = pad;
         mx::array ext = mx::concatenate(
-            {in(0), mx::zeros(padshape, in(0).dtype())}, axis);
-        idxs[pos] = mx::where(*oob, mx::array(extent, mx::int32), idxs[pos]);
-        mx::array full = scatter_by(method, ext, idxs, upd, axes);
+            {base, mx::zeros(padshape, base.dtype())}, axis);
+        mx::array full = scatter_by(method, ext, idxs, u, axes);
         mx::Shape lo(full.ndim(), 0), hi = full.shape();
         hi[static_cast<size_t>(axis)] = extent;
-        env[e.outs[0]] = mx::slice(full, lo, hi);
-        break;
+        return mx::slice(full, lo, hi);
+      };
+      if (is_complex(in(0).dtype())) {
+        // MLX has no complex scatter kernels: write the two PARTS and
+        // recombine, which ops/gather.py does by recursing on
+        // `mx.real`/`mx.imag`. Exact for the componentwise combiners, and
+        // the lowering declines the rest. The neutral in `payload` is the
+        // part's (f32), for the same reason.
+        env[e.outs[0]] =
+            make_complex(write(mx::real(in(0)), mx::real(upd)),
+                         write(mx::imag(in(0)), mx::imag(upd)));
+      } else {
+        env[e.outs[0]] = write(in(0), upd);
       }
-      env[e.outs[0]] = scatter_by(method, in(0), idxs, upd, axes);
       break;
     }
 

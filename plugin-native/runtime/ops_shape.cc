@@ -132,10 +132,21 @@ bool Program::step_shape(const Entry& e,
     }
 
     case kConstant:
-      // Decoded once, in Python, by the same battle-tested path the
-      // eager engine uses (splat broadcast, bf16 text/hex forms, the
-      // rank-0 literal rule); it crosses at lowering and never again.
-      env[e.outs[0]] = *e.payload;
+      // Decoded once, at lowering, by the same rules the eager engine
+      // applies (splat broadcast, the raw dense blob, the rank-0 literal
+      // rule); the value crosses once and never again.
+      //
+      // attrs[0] is that rule's other half. MLX bakes a rank-0 constant
+      // into generated Metal source as a `%.7g` literal, which costs an
+      // f32 its last ULP, so the lowering left the ones that lose it as a
+      // ONE-ELEMENT buffer for this reshape to hand out at rank 0. The
+      // reshape belongs HERE and not at lowering because `eval` DETACHES
+      // a reshape node into a leaf -- a rank-0 leaf is bakeable again, so
+      // a payload reshaped once would go back to being a literal for
+      // every trace built after the first eager pass over this entry.
+      env[e.outs[0]] = at.empty() || at[0] == 0
+                           ? *e.payload
+                           : mx::reshape(*e.payload, mx::Shape{});
       break;
 
     case kBitcastConvert: {

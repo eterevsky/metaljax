@@ -53,6 +53,11 @@ def _randint(shape, seed, dtype=np.int32, lo=-5, hi=6):
                       dtype=dtype)
 
 
+def _crand(shape, seed):
+    return (_rand(shape, seed) + 1j * _rand(shape, seed + 1000)).astype(
+        np.complex64)
+
+
 # Operands for the linalg family (P9).  Built rather than drawn so the
 # conditioning is known: an eigendecomposition of a near-singular draw would
 # measure the RNG's luck rather than the factorization.
@@ -1085,6 +1090,172 @@ def _cases():
          lambda x: jax.scipy.special.polygamma(2, x),
          [np.array([0.5, 1.5, 2.5, 3.5], f)], *F32),
 
+        # --- P10: the compiled-constant precision rule -------------------
+        # mx::compile inlines a RANK-0 constant into generated Metal source
+        # as a %.7g decimal literal, one digit short of float32's round trip,
+        # so two thirds of constants come back a ULP off (CLAUDE.md item 20,
+        # and tests/test_elementwise.py's two regression tests, which are
+        # these rows).  The lowering hands the ones that do not round-trip to
+        # a one-element buffer instead.  Rank-0 operands in a CHAIN: a lone
+        # binary op passes the scalar as a kernel argument and a constant
+        # that feeds a broadcast rides in memory anyway, so only a fused
+        # multi-op kernel bakes the literal.
+        ("rank-0 f32 constants through a fused chain",
+         lambda x: jnp.stack([jnp.float32(c) * x * x for c in
+                              (np.pi, np.pi / 2, 1 / 3, 12345.6789, 0.7,
+                               8.5e-9, 1e-7, 2.0, 0.1, 0.5)]),
+         [np.float32(0.995)], *EXACT),
+        # An ill-conditioned consumer is what makes one ULP visible:
+        # tan(pi/2 - pi*q) is scipy.stats.cauchy.isf, whose condition number
+        # is ~64 at the ends of that test's clipped range (the census row
+        # `scipy_stats_test::testCauchyIsf1` is exactly this expression).
+        ("an ill-conditioned constant expression",
+         lambda x: jnp.tan(jnp.float32(np.pi / 2) - jnp.float32(np.pi) * x),
+         [np.array([0.995, 0.005, 0.99, 0.01, 0.75], f)], 2e-6, 0.0),
+        # The rule is only for the constants that LOSE something: 0.5 and 2.0
+        # round-trip through seven digits and stay literals, and the answer
+        # must be the same either way.
+        ("rank-0 constants that do round-trip",
+         lambda x: jnp.stack([jnp.float32(c) * x * x for c in
+                              (0.5, 2.0, 0.25, 1.0, 100.0)]),
+         [np.float32(1.0000001)], *EXACT),
+
+        # --- P10: complex scatter (by parts) -----------------------------
+        # MLX has no complex scatter kernels, so the entry writes the real
+        # and imaginary parts separately and recombines them -- which is
+        # exact for the componentwise combiners and nothing else (the
+        # lowering declines multiply, and complex has no order for max/min).
+        ("complex scatter set", lambda x, i, u: x.at[i].set(u),
+         [_crand((6, 4), 300), np.array([0, 5, 2], np.int32),
+          _crand((3, 4), 301)], *EXACT),
+        # Indices are UNIQUE in the arithmetic rows on purpose: two updates
+        # summed into one slot is order-nondeterministic on this GPU (as it
+        # is on jax-CUDA), so a duplicate would measure the scheduler.
+        ("complex scatter add", lambda x, i, u: x.at[i].add(u),
+         [_crand((6, 4), 302), np.array([1, 4, 3], np.int32),
+          _crand((3, 4), 303)], *EXACT),
+        ("complex scatter subtract", lambda x, i, u: x.at[i].add(-u),
+         [_crand((6, 4), 304), np.array([4, 0, 2], np.int32),
+          _crand((3, 4), 305)], *EXACT),
+        # XLA DROPS an update whose window does not fit, and the two drop
+        # strategies (neutral value, dummy pad) must both survive the split
+        # into parts -- the pad grows each part, the neutral is the PART's
+        # (0.0f, not a complex zero).
+        ("complex scatter set, out of bounds", lambda x, i, u: x.at[i].set(u),
+         [_crand((6, 4), 306), np.array([-1, 4, 99], np.int32),
+          _crand((3, 4), 307)], *EXACT),
+        ("complex scatter add, out of bounds", lambda x, i, u: x.at[i].add(u),
+         [_crand((6, 4), 308), np.array([-3, 2, 7], np.int32),
+          _crand((3, 4), 309)], *EXACT),
+        # Signed zeros and NaN payloads: adding the parts must not go
+        # through a complex multiply anywhere, and a dropped update must not
+        # perturb the sign of a zero it lands on.
+        ("complex scatter over signed zeros and NaNs",
+         lambda x, i, u: x.at[i].set(u),
+         [np.array([-0.0 + 0j, 0.0 - 0.0j, np.nan + 1j], np.complex64),
+          np.array([0, 7], np.int32),
+          np.array([-0.0 - 0.0j, 1 + np.nan * 1j], np.complex64)], *EXACT),
+        # A single element (an inserted window dim), a partial window, and a
+        # vmapped scatter (batching dims) -- the index-plan shapes P4 built.
+        ("complex scatter into one column",
+         lambda x, i, u: x.at[i, 1].set(u),
+         [_crand((6, 4), 310), np.array([0, 3], np.int32),
+          _crand((2,), 311)], *EXACT),
+        # MULTIPLY is the combiner the decomposition cannot split, so it is
+        # rewritten (gather the current values, multiply, set) under the op's
+        # own `unique_indices` -- ops/gather.py's apply path, with the promise
+        # checked rather than assumed.  Not EXACT: one complex multiply on
+        # this GPU contracts to an FMA where the CPU's does not (~7e-8),
+        # which is the same arithmetic the Python engine runs.
+        ("complex scatter multiply (unique indices)",
+         lambda x, i, u: x.at[i].multiply(u, unique_indices=True),
+         [_crand((6, 4), 322), np.array([0, 5, 2], np.int32),
+          _crand((3, 4), 323)], *F32),
+        # ...and its dropped updates: the rewrite WRITES, so it takes the
+        # dummy-pad drop rule a set takes, and the product of a clamped
+        # gather never reaches the operand.  No NEGATIVE index here -- jax
+        # wraps those before the scatter, which would make two updates land
+        # on one slot and break the uniqueness the arm was given.
+        ("complex scatter multiply, out of bounds",
+         lambda x, i, u: x.at[i].multiply(u, unique_indices=True),
+         [_crand((6, 4), 324), np.array([7, 5, 99], np.int32),
+          _crand((3, 4), 325)], *F32),
+        ("complex scatter over a partial window",
+         lambda x, i, u: x.at[i, 0:2].set(u),
+         [_crand((6, 4), 320), np.array([0, 3], np.int32),
+          _crand((2, 2), 321)], *EXACT),
+        ("complex scatter, vmapped",
+         lambda x, u: jax.vmap(lambda r, w: r.at[1].add(w))(x, u),
+         [_crand((3, 4), 312), _crand((3,), 313)], *EXACT),
+        ("complex scatter inside a scan body",
+         lambda c, xs: jax.lax.scan(
+             lambda a, r: (a.at[jnp.array([0, 2])].add(r[:2]), None),
+             c, xs)[0],
+         [_crand((4,), 314), _crand((3, 4), 315)], *EXACT),
+
+        # --- P10: lexicographic and complex sort -------------------------
+        # A comparator that is a select TREE rather than one compare means
+        # the other execution shape: successive stable argsorts threaded
+        # through a permutation, from the last key to the first.  jnp.lexsort
+        # is the plain form; jnp.unique over rows and every sparse index
+        # canonicalization are the ones the suite is full of.
+        ("lexsort, two keys",
+         lambda a, b: jnp.lexsort((b, a)),
+         [np.array([3, 1, 2, 1, 3, 1], np.int32),
+          np.array([1.0, 2.0, -0.0, 0.0, np.nan, -1.0], f)], *EXACT),
+        ("lexsort, three keys",
+         lambda a, b, c: jnp.lexsort((c, b, a)),
+         [np.array([3, 1, 2, 1, 3, 1], np.int32),
+          np.array([1.0, 2.0, -0.0, 0.0, np.nan, -1.0], f),
+          np.array([5, 4, 3, 2, 1, 0], np.int32)], *EXACT),
+        # lax.sort with num_keys > 1 returns EVERY operand permuted by the
+        # keys, which is where a permutation applied to the wrong operand
+        # would show.
+        ("lax.sort with two keys and a payload",
+         lambda a, b, c: jax.lax.sort((a, b, c), num_keys=2),
+         [np.array([3, 1, 2, 1, 3, 1], np.int32),
+          np.array([1.0, 2.0, -0.0, 0.0, np.nan, -1.0], f),
+          np.array([5, 4, 3, 2, 1, 0], np.int32)], *EXACT),
+        # Stability is what makes successive argsorts equal one
+        # lexicographic pass: with every secondary key equal, the primary
+        # key's ties must keep their input order.
+        ("lexsort stability (ties in every key)",
+         lambda a, b: jnp.lexsort((b, a)),
+         [np.zeros(7, np.int32), np.zeros(7, f)], *EXACT),
+        ("lexsort over a leading axis",
+         lambda a, b: jnp.lexsort((b, a), axis=0),
+         [_randint((4, 3), 316, np.int32, 0, 2), _rand((4, 3), 317)], *EXACT),
+        # The complex comparator is a tree too, over ONE operand pair: the
+        # key is the (re, im) pair of canonicalized totalOrder keys packed
+        # into a u64.  -0 must tie with +0 and every NaN with every other
+        # NaN, or a real part splits a group the imaginary parts then order.
+        ("sort complex", lambda x: jnp.sort(x),
+         [np.array([3 + 1j, 1 - 2j, 2 + 0j, 1 + 1j], np.complex64)], *EXACT),
+        ("argsort complex over signed zeros and NaNs",
+         lambda x: jnp.argsort(x),
+         [np.array([1 + 1j, 1 - 1j, np.nan * 1j, -0.0 + 0j, 0.0 - 0.0j,
+                    2 + 3j, -0.0 + 1j], np.complex64)], *EXACT),
+        ("sort complex along the leading axis", lambda x: jnp.sort(x, axis=0),
+         [_crand((4, 3), 318)], *EXACT),
+        ("unique over complex with NaN and -0 ties",
+         lambda x: jnp.unique(x, size=6, fill_value=0),
+         [np.array([1 + 1j, 1 - 1j, np.nan * 1j, -0.0 + 0j, 0.0 - 0.0j,
+                    2 + 3j], np.complex64)], *EXACT),
+        # jnp.unique over ROWS lexsorts the transposed rows and compares
+        # neighbours, so an unsorted tie shows up as an extra "unique".
+        ("unique rows (a lexsort under a diff)",
+         lambda x: jnp.unique(x, axis=0, size=3, fill_value=0),
+         [np.array([[1, 2], [1, 1], [1, 2], [0, 9]], np.int32)], *EXACT),
+        ("lexsort with a complex key",
+         lambda z, a: jnp.lexsort((a, z)),
+         [np.array([1 + 1j, 1 - 1j, 1 + 1j, 0 + 0j], np.complex64),
+          np.array([3, 2, 1, 0], np.int32)], *EXACT),
+        ("lexsort inside a scan body",
+         lambda c, xs: jax.lax.scan(
+             lambda a, r: (a + jnp.lexsort((r, a.astype(jnp.int32)))[0],
+                           None), c, xs)[0],
+         [np.zeros(4, np.int32), _rand((3, 4), 319)], *EXACT),
+
         # a realistic little block: the shapes a model's forward pass has
         ("dense + norm + gelu",
          lambda x, w, b: jax.nn.gelu(
@@ -1642,6 +1813,60 @@ module @sort_nonscalar {
 """
 
 
+# Two comparator TREES outside the vocabulary P10's recognizer reads (jax
+# emits neither: its multi-key comparator is `or(lt k0, and(eq k0, lt k1))`
+# and every direction in it is LT or EQ).  The first is that comparator with
+# the decisions turned around -- a descending lexicographic sort, which the
+# ascending execution shape would answer wrongly and silently.
+_SORT_TREE_DESCENDING = """
+module @sort_tree_descending {
+  func.func public @main(%a: tensor<3xi32>, %b: tensor<3xf32>)
+      -> (tensor<3xi32>, tensor<3xf32>) {
+    %r:2 = "stablehlo.sort"(%a, %b) <{dimension = 0 : i64, is_stable = true}> ({
+    ^bb0(%a0: tensor<i32>, %a1: tensor<i32>, %b0: tensor<f32>,
+         %b1: tensor<f32>):
+      %gt = stablehlo.compare GT, %a0, %a1, SIGNED
+          : (tensor<i32>, tensor<i32>) -> tensor<i1>
+      %eq = stablehlo.compare EQ, %a0, %a1, SIGNED
+          : (tensor<i32>, tensor<i32>) -> tensor<i1>
+      %lt = stablehlo.compare LT, %b0, %b1, FLOAT
+          : (tensor<f32>, tensor<f32>) -> tensor<i1>
+      %and = stablehlo.and %eq, %lt : tensor<i1>
+      %or = stablehlo.or %gt, %and : tensor<i1>
+      stablehlo.return %or : tensor<i1>
+    }) : (tensor<3xi32>, tensor<3xf32>) -> (tensor<3xi32>, tensor<3xf32>)
+    return %r#0, %r#1 : tensor<3xi32>, tensor<3xf32>
+  }
+}
+"""
+
+# ...and the second computes with a key rather than deciding on the operands,
+# so the sort it means is not "by operand 0, then operand 1" at all.
+_SORT_TREE_ARITHMETIC = """
+module @sort_tree_arithmetic {
+  func.func public @main(%a: tensor<3xi32>, %b: tensor<3xf32>)
+      -> (tensor<3xi32>, tensor<3xf32>) {
+    %one = stablehlo.constant dense<1> : tensor<i32>
+    %r:2 = "stablehlo.sort"(%a, %b) <{dimension = 0 : i64, is_stable = true}> ({
+    ^bb0(%a0: tensor<i32>, %a1: tensor<i32>, %b0: tensor<f32>,
+         %b1: tensor<f32>):
+      %s = stablehlo.add %a0, %one : tensor<i32>
+      %lt = stablehlo.compare LT, %s, %a1, SIGNED
+          : (tensor<i32>, tensor<i32>) -> tensor<i1>
+      %eq = stablehlo.compare EQ, %a0, %a1, SIGNED
+          : (tensor<i32>, tensor<i32>) -> tensor<i1>
+      %flt = stablehlo.compare LT, %b0, %b1, FLOAT
+          : (tensor<f32>, tensor<f32>) -> tensor<i1>
+      %and = stablehlo.and %eq, %flt : tensor<i1>
+      %or = stablehlo.or %lt, %and : tensor<i1>
+      stablehlo.return %or : tensor<i1>
+    }) : (tensor<3xi32>, tensor<3xf32>) -> (tensor<3xi32>, tensor<3xf32>)
+    return %r#0, %r#1 : tensor<3xi32>, tensor<3xf32>
+  }
+}
+"""
+
+
 _UNKNOWN_CUSTOM_CALL = """
 module @unknown_custom_call {
   func.func public @main(%x: tensor<3xf32>) -> tensor<3xf32> {
@@ -1661,20 +1886,20 @@ def _declines():
     import jax.numpy as jnp
 
     return [
-        # P6 left three sort shapes behind, each for a reason the entry cannot
-        # paper over.  A lexicographic comparator (jnp.lexsort, and every
-        # jnp.unique over rows) is a DIFFERENT execution shape: successive
-        # stable argsorts threaded through a permutation, where the sort entry
-        # computes one argsort and gathers with it.
-        ("lexsort", lambda a, b: jnp.lexsort((a, b)),
-         [np.array([1.0, 0.0, 1.0], np.float32),
-          np.array([2.0, 2.0, 1.0], np.float32)],
-         "sort: comparator ends in"),
-        # ...and a complex key packs canonicalized (re, im) order keys into
-        # one u64, which is not a `kind` the entry carries.
-        ("sort on complex", lambda x: jnp.sort(x),
-         [np.array([1 + 2j, 1 - 1j, 0 + 0j], np.complex64)],
-         "sort: complex lexicographic comparator"),
+        # P10 gave the two select-tree comparators their execution shapes, and
+        # what stays declined is a tree that is not one of them.  The
+        # lexicographic reading is INFERRED from which operand pairs the tree
+        # decides on -- it is never evaluated -- so its vocabulary is checked:
+        # a GT anywhere means the tree orders the other way somewhere, and
+        # running it ascending would be silently wrong rather than loud.
+        ("a descending lexicographic comparator", _SORT_TREE_DESCENDING,
+         [np.array([3, 1, 2], np.int32), np.array([1.0, 2.0, 3.0], np.float32)],
+         "sort: comparator tree compares GT"),
+        # ...and an arithmetic op inside the tree is not a decision at all:
+        # the keys it would sort by are not the operands.
+        ("a comparator tree holding arithmetic", _SORT_TREE_ARITHMETIC,
+         [np.array([3, 1, 2], np.int32), np.array([1.0, 2.0, 3.0], np.float32)],
+         "sort: comparator tree holds stablehlo.add"),
         # P7 gave convolution an executor, and two of its corners stay
         # declined.  A MIXED window reversal is one: MLX's flip is
         # all-or-nothing and so is the Python handler, so one axis reversed
@@ -1723,14 +1948,18 @@ def _declines():
          lambda x, i: x.at[i].apply(jnp.sin),
          [np.arange(4, dtype=np.float32), np.array([0, 2], np.int32)],
          "scatter combiner apply"),
-        # MLX has no complex scatter kernels at all; the Python handler
-        # scatters the two parts, which is a different composition from the
-        # single primitive this entry calls.
-        ("scatter on complex", lambda x, i, u: x.at[i].set(u),
+        # A complex scatter runs as two real ones (P10), which is exact only
+        # while the combiner is componentwise.  MULTIPLY is not, and the
+        # rewrite that answers it (gather, multiply, set) is equal to the
+        # combiner only when no two updates land on the same slot -- so
+        # without the op's `unique_indices` it declines, where ops/gather.py
+        # assumes the promise and runs.
+        ("complex scatter multiply with no uniqueness promise",
+         lambda x, i, u: x.at[i].multiply(u),
          [np.array([1 + 1j, 2 - 2j, 0j], np.complex64),
           np.array([0, 2], np.int32),
           np.array([5 + 0j, 6 + 1j], np.complex64)],
-         "scatter on complex"),
+         "complex scatter multiply without unique indices"),
         # A loop whose BODY holds an op outside the set declines the whole
         # program, naming that op -- the region is lowered by the same
         # `Lowering` as main, so its declines are main's.  (Convolution used

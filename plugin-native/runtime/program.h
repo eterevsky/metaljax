@@ -107,7 +107,7 @@ enum Op : int {
   kReverse,
   // data / structured
   kConstant, kReduce, kArgReduce, kGenericReduce, kReduceWindow, kDotGeneral,
-  kBitcastConvert, kDynamicSlice, kDynamicUpdateSlice, kSort, kTopK,
+  kBitcastConvert, kDynamicSlice, kDynamicUpdateSlice, kSort, kLexSort, kTopK,
   kApproxTopK,
   kGather, kScatter, kRng, kConv,
   // control flow (M3): each carries its regions as sub-Programs
@@ -253,7 +253,10 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //   kSlice              [rank, start..., stop..., strides...]
 //   kConcatenate        [axis]
 //   kIota               [dim, ramp_dtype, dtype, rank, shape...]
-//   kConstant           (none — the value rides in `payload`)
+//   kConstant           (none, or [rank0_buffer]) — the value rides in
+//                       `payload`; the flag says it is a one-element buffer
+//                       standing in for a rank-0 f32 MLX would otherwise
+//                       bake into Metal source as a lossy %.7g literal
 //   kReduce             [kind, ndims, dims...]  kind: 0 sum 1 prod 2 max
 //                                               3 min 4 any 5 all
 //   kArgReduce          [is_max, dim]           two results: (value, index)
@@ -279,6 +282,7 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //                                    `payload`)
 //                        strategy 2: pad position, pad width, extent]
 //                       method: 0 set 1 add 2 mul 3 max 4 min 5 sub
+//                               6 complex multiply, as gather-multiply-set
 //                       strategy: the OOB-drop rule — 0 none, 1 neutral
 //                       value, 2 dummy pad. Second, ahead of everything
 //                       variable-length, so it can be read at a glance.

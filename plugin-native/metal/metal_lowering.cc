@@ -407,6 +407,59 @@ std::vector<unsigned> ArgDeps(mlir::Value root, mlir::Block& block) {
   return out;
 }
 
+// The ops of `block` a value is computed from, in the block's own order.
+std::vector<mlir::Operation*> Cone(mlir::Value root, mlir::Block& block) {
+  llvm::DenseSet<mlir::Operation*> members;
+  std::vector<mlir::Value> stack{root};
+  while (!stack.empty()) {
+    mlir::Value v = stack.back();
+    stack.pop_back();
+    mlir::Operation* def = v.getDefiningOp();
+    if (def == nullptr || def->getBlock() != &block) continue;
+    if (!members.insert(def).second) continue;
+    for (mlir::Value w : def->getOperands()) stack.push_back(w);
+  }
+  std::vector<mlir::Operation*> out;
+  for (mlir::Operation& o : block)
+    if (members.contains(&o)) out.push_back(&o);
+  return out;
+}
+
+// The vocabulary of the two lexicographic comparators (`LowerSort`'s select
+// trees): a boolean decision tree over compares of the key pairs, plus the
+// float canonicalization and the complex part reads its compares are fed.
+//
+// ops/sort.py checks none of this -- it reads the tree's argument
+// DEPENDENCIES and trusts the shape, because jax emits exactly two.  The
+// check exists because the arm's whole execution is inferred rather than
+// evaluated: an ascending lexicographic sort is what a tree of LT/EQ/NE
+// decisions means, and a tree holding a GT would be silently mis-ordered
+// rather than declined.  Anything outside the vocabulary is a decline, which
+// is loud.
+absl::Status SortTreeOpStatus(mlir::Operation* op) {
+  const absl::string_view name = View(op->getName().getStringRef());
+  if (auto cmp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(op)) {
+    const auto d = cmp.getComparisonDirection();
+    if (d == mlir::stablehlo::ComparisonDirection::LT ||
+        d == mlir::stablehlo::ComparisonDirection::EQ ||
+        d == mlir::stablehlo::ComparisonDirection::NE)
+      return absl::OkStatus();
+    // The ascending reading is the whole inference: a tree holding a GT (or
+    // a GE, or an LE) decides the other way somewhere, and running it as an
+    // ascending lexicographic sort would be silently wrong.
+    return absl::InvalidArgumentError(absl::StrCat(
+        "sort: comparator tree compares ",
+        mlir::stablehlo::stringifyComparisonDirection(d).str()));
+  }
+  if (name == "stablehlo.select" || name == "stablehlo.and" ||
+      name == "stablehlo.or" || name == "stablehlo.not" ||
+      name == "stablehlo.xor" || name == "stablehlo.real" ||
+      name == "stablehlo.imag" || name == "stablehlo.constant")
+    return absl::OkStatus();
+  return absl::InvalidArgumentError(
+      absl::StrCat("sort: comparator tree holds ", name));
+}
+
 // ops/sort.py `_serialize`: the canonical form of a value's def DAG with the
 // comparator's own argument renamed, so the two sides of the compare can be
 // checked for computing the SAME function of their respective arguments.  An
@@ -590,6 +643,26 @@ std::string OpcodeName(int code) {
   for (const std::pair<std::string, int>& kv : opcodes())
     if (kv.second == code) return kv.first;
   return absl::StrCat("op", code);
+}
+
+// ops/elementwise.py `_roundtrips_as_literal`: whether MLX can bake `v` into
+// generated Metal source without loss.  mx::compile inlines RANK-0 constants
+// as decimal literals printed with 7 significant digits, one short of
+// float32's round-trip requirement of 9 -- measured over 4000 random f32
+// constants, 2675 came back from a fused kernel 1 ULP away from the correctly
+// rounded product, and `float32("%.7g" % c)` predicted the compiled result in
+// 4000/4000 cases.  One ULP is normally invisible until an ill-conditioned
+// consumer magnifies it: `tan(pi/2 - pi*q)` (scipy.stats.cauchy.isf) reaches
+// 4.7e-3 relative error near the pole against 2.3e-7 for the same graph run
+// eagerly.
+//
+// The comparison is the Python's, in DOUBLE: a decimal that parses back to a
+// different double but rounds to the same float would in fact survive the
+// Metal compiler's own parse, so this errs towards the buffer.
+bool RoundTripsAsLiteral(float v) {
+  char text[64];
+  std::snprintf(text, sizeof(text), "%.7g", static_cast<double>(v));
+  return std::strtod(text, nullptr) == static_cast<double>(v);
 }
 
 // An mx::array owning a fresh copy of `bytes` host bytes.  MLX frees it.
@@ -835,7 +908,21 @@ std::optional<Counted> AnalyzeCounted(LowerContext& ctx, mlir::Operation* op) {
 enum class Combiner { kSet, kAdd, kMultiply, kMaximum, kMinimum, kSubtract,
                       kApply, kNonUpdate, kBad };
 
-// The tape's method code, in the order native/ops_index.cc switches on
+// ops/gather.py `_scatter_combiner`'s own words, for a decline message.
+absl::string_view CombinerName(Combiner c) {
+  switch (c) {
+    case Combiner::kSet: return "set";
+    case Combiner::kAdd: return "add";
+    case Combiner::kMultiply: return "multiply";
+    case Combiner::kMaximum: return "maximum";
+    case Combiner::kMinimum: return "minimum";
+    case Combiner::kSubtract: return "subtract";
+    case Combiner::kApply: return "apply";
+    default: return "unknown";
+  }
+}
+
+// The tape's method code, in the order runtime/ops_index.cc switches on
 // (tape.py `_SCATTER_METHODS`).  Nothing else is a method.
 std::optional<int64_t> MethodCode(Combiner c) {
   switch (c) {
@@ -2709,12 +2796,13 @@ std::optional<mx::array> CombinerNeutral(int64_t method, mx::Dtype dt) {
 absl::Status Lowering::LowerScatter(mlir::Operation* op) {
   if (op->getNumOperands() != 3 || op->getNumResults() != 1)
     return Decline("variadic scatter");
-  if (IsComplexElement(op->getOperand(0))) {
-    // MLX has no complex GPU scatter kernels at all: the Python handler
-    // scatters the two parts separately and recombines them, which is a
-    // different composition from the single primitive this entry calls.
-    return Decline("scatter on complex");
-  }
+  // MLX has no complex GPU scatter kernels at all, so the entry scatters the
+  // REAL and IMAGINARY parts separately and recombines them, exactly as
+  // ops/gather.py `_scatter` does by recursing on `mx.real`/`mx.imag`. Sound
+  // only for a componentwise combiner -- set, add and subtract are; multiply
+  // is not (the Python handler sends it to the apply path, which this plugin
+  // declines), and there is no order on complex for max/min.
+  const bool complex_parts = IsComplexElement(op->getOperand(0));
   ASSIGN_OR_RETURN(std::vector<int64_t> op_shape, Dims(op->getOperand(0)));
   ASSIGN_OR_RETURN(std::vector<int64_t> idx_shape, Dims(op->getOperand(1)));
   ASSIGN_OR_RETURN(std::vector<int64_t> upd_shape, Dims(op->getOperand(2)));
@@ -2730,6 +2818,22 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
     if (combiner == Combiner::kNonUpdate)
       return Decline("scatter body: scatter body returns non-update value");
     return Decline("scatter body: not implemented");
+  }
+  int64_t method_code = *method;
+  if (complex_parts && method_code == 2) {
+    // MULTIPLY is the one combiner ops/gather.py rewrites rather than
+    // splitting: `method = "apply"`, which gathers the current values,
+    // combines them with the updates and SETS the result -- and that equals
+    // the combiner only while no two updates land on the same slot.  The
+    // Python handler assumes it; here it is checked, because jax's own
+    // `unique_indices` says so on the op (scatter_apply and the static
+    // indexing forms set it; a plain `.at[i].multiply(u)` does not).
+    if (!sc.getUniqueIndices())
+      return Decline("complex scatter multiply without unique indices");
+    method_code = 6;
+  } else if (complex_parts && method_code != 0 && method_code != 1 &&
+             method_code != 5) {
+    return Decline(absl::StrCat("complex scatter ", CombinerName(combiner)));
   }
 
   absl::flat_hash_set<int64_t> inserted(d.getInsertedWindowDims().begin(),
@@ -2799,7 +2903,11 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
     int64_t op_numel = 1, upd_numel = 1;
     for (int64_t s : op_shape) op_numel *= s;
     for (int64_t s : upd_shape) upd_numel *= s;
-    if (combiner == Combiner::kSet || op_numel < upd_numel) {
+    // The rewritten complex multiply WRITES rather than combines, so it takes
+    // the drop rule a set takes: neutralizing an update cannot express "leave
+    // the slot alone" for an assignment.
+    if (combiner == Combiner::kSet || method_code == 6 ||
+        op_numel < upd_numel) {
       strategy = 2;
       // Pad the LOWEST indexed axis, which is the one the Python handler pads
       // (it transposes that dim to the front and concatenates there).  Any of
@@ -2818,7 +2926,12 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
       std::optional<mx::Dtype> dt =
           t ? MxDtypeOf(t.getElementType()) : std::nullopt;
       if (!dt.has_value()) return Decline("scatter neutral: element type");
-      payload = CombinerNeutral(*method, *dt);
+      // A complex scatter neutralizes each PART, so its neutral is the
+      // part's -- which is what the Python handler computes too, since its
+      // recursion reaches `_combiner_neutral` with `mx.real(operand)`'s
+      // dtype rather than the complex one.
+      if (complex_parts) dt = mx::float32;
+      payload = CombinerNeutral(method_code, *dt);
       if (!payload.has_value())
         return Decline("scatter neutral: no neutral for this combiner");
       // The mask broadcasts against the updates: one axis per batch dim, then
@@ -2834,7 +2947,7 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
   // `strategy` rides second, ahead of everything variable-length, so a reader
   // (the C++ handler, a test) can see which drop rule this scatter took
   // without walking the whole vector.
-  std::vector<int64_t> attrs{*method, strategy,
+  std::vector<int64_t> attrs{method_code, strategy,
                              static_cast<int64_t>(plan.batch_shape.size())};
   attrs.insert(attrs.end(), plan.batch_shape.begin(), plan.batch_shape.end());
   attrs.push_back(plan.split ? 1 : 0);
@@ -2881,6 +2994,7 @@ absl::Status Lowering::LowerConstant(mlir::Operation* op) {
   const size_t item = dt.size();
 
   mx::array value = mx::zeros(shape, dt);
+  int64_t rank0_buffer = 0;
   if (numel == 0) {
     // A zero-size constant still carries a value in the IR, and MLIR stores
     // it as a SPLAT with one raw element (`dense<1.0> : tensor<0xf32>`, which
@@ -2923,12 +3037,29 @@ absl::Status Lowering::LowerConstant(mlir::Operation* op) {
           "elements of %d)",
           raw.size(), numel, item));
     value = OwnedArray(raw.data(), raw.size(), shape, dt);
+    if (shape.empty() && dt == mx::float32) {
+      // The rank-0 literal rule (`RoundTripsAsLiteral`): only rank-0
+      // constants are inlined, and only f32 loses anything -- 7 significant
+      // digits round-trip every f16 and bf16 value there is (11 and 8
+      // mantissa bits), which is also why the Python handler's `kind == "f"`
+      // test can leave bf16 out and stay correct.  What does not round-trip
+      // rides in a ONE-ELEMENT buffer, reshaped to rank 0 by the entry.
+      float v;
+      std::memcpy(&v, raw.data(), sizeof(v));
+      if (!RoundTripsAsLiteral(v)) {
+        value = OwnedArray(raw.data(), raw.size(), mx::Shape{1}, dt);
+        rank0_buffer = 1;
+      }
+    }
   }
 
   const int op_code = OpcodeTable().at("stablehlo.constant");
   const int out = Bind(op->getResult(0));
   const_view_.insert(out);
-  Emit(op_code, {}, {out}, {}, std::move(value), ResultBytes(op));
+  std::vector<int64_t> attrs;
+  if (rank0_buffer) attrs.push_back(rank0_buffer);
+  Emit(op_code, {}, {out}, std::move(attrs), std::move(value),
+       ResultBytes(op));
   return absl::OkStatus();
 }
 
@@ -3230,19 +3361,70 @@ absl::Status Lowering::LowerSort(mlir::Operation* op) {
     return Decline("sort: comparator returns an argument");
   auto cmp_op = mlir::dyn_cast<mlir::stablehlo::CompareOp>(cmp);
   if (!cmp_op) {
-    // The two lexicographic select trees.  Both mean a DIFFERENT execution
-    // shape -- successive stable argsorts threaded through a permutation, and
-    // for complex a (re, im) key packed into one u64 -- which the sort entry
-    // cannot express: it computes one argsort and gathers with it, and there
-    // is no opcode that gathers by a permutation the tape computed.  Named
-    // rather than approximated (see notes/cpp-p6-tail.md).
+    // The two lexicographic select trees, recognized STRUCTURALLY -- the tree
+    // is never evaluated, only read for which operand pairs it decides on,
+    // exactly as ops/sort.py reads its argument dependencies.  Both are
+    // ascending, and both mean an execution the one-argsort entry cannot
+    // express: the multi-key sort threads a permutation through successive
+    // stable argsorts (`kLexSort`), and the complex sort keys on the packed
+    // (re, im) pair the comparator would have compared componentwise.
+    if (block.getNumArguments() != 2 * op->getNumOperands() ||
+        op->getNumResults() != op->getNumOperands())
+      return Decline("sort arity");
     const std::vector<unsigned> deps = ArgDeps(cmp_val, block);
     std::vector<unsigned> keys;
     for (unsigned d : deps)
       if (keys.empty() || keys.back() != d / 2) keys.push_back(d / 2);
+    for (mlir::Operation* o : Cone(cmp_val, block)) {
+      const absl::Status ok = SortTreeOpStatus(o);
+      if (!ok.ok()) return Decline(ok.message());
+    }
+    std::vector<int> ins;
+    for (mlir::Value v : op->getOperands()) {
+      ASSIGN_OR_RETURN(int s, Slot(v));
+      ins.push_back(s);
+    }
+    auto bind_results = [&] {
+      std::vector<int> outs;
+      for (mlir::Value r : op->getResults()) outs.push_back(Bind(r));
+      return outs;
+    };
+
     if (keys.size() == 1 && keys[0] < op->getNumOperands() &&
-        IsComplexElement(op->getOperand(keys[0])))
-      return Decline("sort: complex lexicographic comparator");
+        IsComplexElement(op->getOperand(keys[0]))) {
+      // `_gather_sorted(ins, ins[k], descending=False, dim)`: ONE argsort,
+      // over `_sort_key`'s complex arm (kind 3).
+      ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.sort"));
+      Emit(opcode, std::move(ins), bind_results(),
+           {dim, 0, static_cast<int64_t>(keys[0]), 3}, std::nullopt,
+           ResultBytes(op));
+      return absl::OkStatus();
+    }
+    // `_lex_sorted(ins, num_keys, dim)`.  The keys are the FIRST operands, in
+    // order -- a tree that decides on any other set is not the shape jax
+    // emits and is declined.  One key and not complex declines too, which is
+    // ops/sort.py's behaviour (its `ks.pop()` empties the set before the
+    // lexicographic test reads it) and is unreachable from jax: a single-key
+    // sort gets a bare compare, not a tree.
+    bool leading = keys.size() > 1 && keys.size() <= op->getNumOperands();
+    for (size_t i = 0; i < keys.size() && leading; i++)
+      if (keys[i] != i) leading = false;
+    if (leading) {
+      std::vector<int64_t> attrs{dim, static_cast<int64_t>(keys.size())};
+      for (size_t i = 0; i < keys.size(); i++) {
+        // `_sort_key`, per key: the lexicographic arm reads the RAW operand,
+        // so the canonicalization the tree holds happens in the handler.
+        mlir::Value k = op->getOperand(i);
+        attrs.push_back(IsComplexElement(k)  ? 3
+                        : IsFloatElement(k)  ? 4
+                        : IsBoolElement(k)   ? 2
+                                             : 0);
+      }
+      ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.lex_sort"));
+      Emit(opcode, std::move(ins), bind_results(), std::move(attrs),
+           std::nullopt, ResultBytes(op));
+      return absl::OkStatus();
+    }
     return Decline(
         absl::StrCat("sort: comparator ends in ",
                      View(cmp->getName().getStringRef()), ", not compare"));
@@ -3638,7 +3820,9 @@ absl::Status Lowering::LowerApproxTopK(mlir::Operation* op) {
   int64_t kind = 0;
   if (IsComplexElement(op->getOperand(0)))
     return Decline("ApproxTopK on complex");
-  if (IsFloatElement(op->getOperand(0))) kind = 1;
+  // ops/sort.py `approx_top_k` keys through `_sort_key`, not through the bare
+  // totalOrder key `_top_k` uses -- so the canonicalizing float kind (4).
+  if (IsFloatElement(op->getOperand(0))) kind = 4;
   else if (IsBoolElement(op->getOperand(0))) kind = 2;
 
   std::vector<int> ins;

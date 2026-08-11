@@ -940,8 +940,33 @@ fork authorized but not needed.
   BIT-identical to jax-CPU: both stacks call LAPACK). Gate 106/106, wheel
   test green from a fresh venv (which is what proves `-framework Accelerate`
   is really in the shipped dylib), dylib +0.070 %.
-* Next: the scatter/sort tail (P10, 542 tests — complex scatter is now the
-  single biggest reason left in the slice), then dtypes + reduce_precision,
+* **P10 landed** (notes/cpp-p10-scatter-sort.md): the scatter/sort tail, plus a
+  live correctness defect the plugin had re-exposed. (a) `mx::compile` bakes a
+  RANK-0 constant into generated Metal source as a `%.7g` literal, which costs
+  an f32 its last ULP (CLAUDE.md item 20); Stage 1's rule — round-trip test at
+  decode, one-element buffer for what fails it — is ported, with the reshape
+  moved into the ENTRY, because `eval` detaches a reshape into a leaf and a
+  rank-0 leaf is bakeable again. It cleared both `tests/test_elementwise.py`
+  regression tests and P8's last numeric census row (`testCauchyIsf1`). P5's
+  "first compiled executable is unfused" finding is NOT this and did not move
+  (two probes fail to reproduce it on this tree; the `execute_test`
+  eager-vs-compiled 4.8e-07 is unchanged by the fix, and that program's two
+  paths are bit-identical standalone). **New finding, not acted on**: MLX's
+  `is_scalar` is a SIZE-1 test, so every SPLAT constant is baked the same way,
+  on both engines — the fix is the same shape but costs a kernel argument per
+  lossy constant, which is Metal's 31-buffer limit, so it waits for Oleg.
+  (b) Complex scatter by parts (set/add/subtract componentwise; multiply as
+  gather-multiply-set, gated on the op's own `unique_indices` where the Python
+  handler assumes it; max/min and a broken promise decline). (c) The two
+  lexicographic comparators: `kLexSort` (successive stable argsorts through a
+  permutation) and the complex key packed as (re, im) totalOrder halves, both
+  recognized structurally with a vocabulary guard the Python does not have —
+  a tree holding a GT declines rather than sorting the wrong way silently.
+  Census slice (18 files): **608 -> 109 failures, −499, zero regressions**,
+  every remainder a loud decline or a known non-P10 row. execute_test 357 ->
+  **384 checks**; gate 106/106; decline_census 32 -> **34 of 35**; dylib
+  +0.011 %.
+* Next: dtypes + reduce_precision,
   then collectives/tokens, callbacks/PJRT/donation, shape-poly.
   Suite-vs-suite as the standing gate. (North star per Oleg: everything
   through the new stack, correctness first, performance second.)

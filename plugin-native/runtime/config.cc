@@ -97,6 +97,13 @@ const NamedOp kOpNames[] = {
     {"stablehlo.dynamic_slice", kDynamicSlice},
     {"stablehlo.dynamic_update_slice", kDynamicUpdateSlice},
     {"stablehlo.sort", kSort},
+    // ops/sort.py `_lex_sorted`: the LEXICOGRAPHIC sort, whose comparator is
+    // a select tree over several key pairs rather than one compare. A
+    // different execution shape (successive stable argsorts threaded through
+    // a permutation), so a different opcode -- and a pseudo-name, like the
+    // conv, because src/metaljax/tape.py has no lowering for it and must
+    // keep declining the shape to the Python engine.
+    {"metaljax.lex_sort", kLexSort},
     // chlo.top_k survives a direct jax lowering; through a portable
     // artifact it arrives already decomposed into the sort above. Both
     // reach the plugin, so both are here.
