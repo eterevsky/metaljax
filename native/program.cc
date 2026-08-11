@@ -152,7 +152,13 @@ bool Program::reads_host() const {
   if (reads_host_ < 0) {
     reads_host_ = 0;
     for (const Entry& e : ops_) {
-      if (e.op == kWhile || e.op == kIf || e.op == kCase) {
+      // Control flow reads a predicate or a trip count; a host call reads
+      // its operands so a handler off the device can see them, and its
+      // effect (a print, a callback) has already happened by the time the
+      // entry returns. Both make "building" this program mean RUNNING it,
+      // which is the property run_while's pipelined path needs.
+      if (e.op == kWhile || e.op == kIf || e.op == kCase ||
+          e.op == kHostCall) {
         reads_host_ = 1;
         break;
       }
@@ -249,7 +255,27 @@ std::vector<mx::array> Program::run_recovering(
     bool resource_limit = false;
     std::exception_ptr err;
     try {
-      return call(inputs, false);
+      std::vector<mx::array> outs = call(inputs, false);
+      // A compiled call only BUILDS the graph: MLX generates the fused
+      // Metal kernels at EVAL, which is where it says "Too many
+      // inputs/outputs fused" for a trace whose arguments exhaust the
+      // buffers a kernel may bind. Prove the graph here, inside the
+      // ladder, or that failure reaches a caller who can only report it --
+      // where the eager path would have computed the program perfectly
+      // well (engine.execute's `_can_compile = False` arm is the same
+      // move on the Stage 1 side).
+      //
+      // Once per program, exactly like BodyRunner's probe: an
+      // executable's shapes are fixed for its life, so one buildable call
+      // proves every later one, and the steady state keeps handing back
+      // lazy arrays. Not while an msl plan is unproven -- settle_msl owns
+      // that eval, and a generated kernel that fails to build is retired
+      // rather than blamed on the graph that traced it.
+      if (used_compiled && compile_probe_ && t_msl_pending.empty()) {
+        mx::eval(outs);
+        compile_probe_ = false;
+      }
+      return outs;
     } catch (const std::exception& ex) {
       resource_limit = is_resource_limit(ex);
       err = std::current_exception();

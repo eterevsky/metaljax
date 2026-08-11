@@ -2791,7 +2791,14 @@ absl::Status Lowering::LowerConstant(mlir::Operation* op) {
   const size_t item = dt.size();
 
   mx::array value = mx::zeros(shape, dt);
-  if (dt == mx::bool_) {
+  if (numel == 0) {
+    // A zero-size constant still carries a value in the IR, and MLIR stores
+    // it as a SPLAT with one raw element (`dense<1.0> : tensor<0xf32>`, which
+    // is what chlo's decompositions emit when the operand is empty), so the
+    // raw data here is not the elements and neither decode below applies.
+    // Nor is one needed: the `zeros` above already holds every element this
+    // constant has, which is none.
+  } else if (dt == mx::bool_) {
     // i1 elements are BIT-packed in the raw data, splat or not; the typed
     // iterator is the only honest way to read them.
     std::vector<char> bytes(static_cast<size_t>(numel), 0);
@@ -2821,7 +2828,10 @@ absl::Status Lowering::LowerConstant(mlir::Operation* op) {
     // is why bf16 needs no decoding here at all.
     llvm::ArrayRef<char> raw = dense.getRawData();
     if (raw.size() != item * static_cast<size_t>(numel))
-      return Decline("a constant whose raw data is the wrong size");
+      return Decline(absl::StrFormat(
+          "a constant whose raw data is the wrong size (%d bytes for %d "
+          "elements of %d)",
+          raw.size(), numel, item));
     value = OwnedArray(raw.data(), raw.size(), shape, dt);
   }
 

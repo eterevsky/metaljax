@@ -879,7 +879,43 @@ fork authorized but not needed.
   is the point rather than a gap. `smoke_test`/`wheel_poc_test`/one
   execute_test decline all moved their checkpoint from convolution to
   `stablehlo.cholesky`.
-* Next: LAPACK on Accelerate (the only family left in the census), then
-  msl_scan (still the whole texmo gap), then async execute + donation.
+* **P8 landed** (8d99421, notes/cpp-p8-jax-census.md): the whole pinned suite
+  through both stacks, sequential, same tree — native 26,133/2,059 (92.70 %)
+  against Stage 1's 28,062/137 (99.51 %), with all 1,918 native-only failures
+  classified and every one of them LOUD. The phase ordering below is that
+  census's, by measured test count. Second finding: a live Stage 1 bug (M5a's
+  pipelining runs an impure while cond once extra), fixed in P8.5.
+* **P8.5 landed** (notes/cpp-p85-fixes.md): the census's fix batch — one bug in
+  the SHARED runtime and three in the plugin, **126 native-only failures** plus
+  the four Stage-1 regressions.
+  (a) `Program::reads_host` counted control flow but not `kHostCall`, so the
+  pipelined dynamic while built a region that LEAVES the tape one iteration
+  ahead of the condition that decides whether it runs — a second `debug.print`
+  per loop. The bug was wider than the census could see: prints in a BODY are
+  wrong too, and the tests miss it only because their loops are counted.
+  (b) MLX's `sum`/`prod` accumulate wider for small integers (int8 -> int32),
+  so a `stablehlo.reduce` handed back the wrong element type; Stage 1 hid it
+  with a cast in `to_host`, the plugin's result guard caught it. Same line fixes
+  `reduce_window`'s monoid arm. (c) A zero-size constant is stored by MLIR as a
+  splat with ONE raw element, which the lowering's length check rejected — all
+  52 census rows are that one form, and they come from chlo decompositions over
+  an empty operand. (d) `mx::compile` refuses some traces at EVAL, and the eval
+  was the caller's, outside `run_recovering`'s ladder; the ladder now settles
+  the first compiled call of each program itself, exactly as `BodyRunner`
+  probes a freshly bound body. Also classified, not fixed:
+  `lax_test::testScatter1` is a duplicate-write scatter race (index 8 written by
+  three updates; XLA leaves the winner implementation-defined), an in-suite
+  lottery at ~1 run in 14, and a wontfix.
+  Affected files re-run natively: 846 -> **720 failures, -126 exactly, zero
+  regressions**. execute_test 274 -> **284**; the GIL-free runtime test grew a
+  fourth section (loop shape + host-call counts, the one place a host call can
+  be stated end to end); both gates 106/106; pytest 1258.
+  Open, pre-existing, found while measuring: the 8-thread `execute_test`
+  contract fails ~5 % of runs with `There is no Stream(gpu, N) in current
+  thread` — a compiled graph traced on a pool thread and replayed after that
+  thread exited with its `new_thread_unsafe_stream`. Same rate on the
+  unmodified tree, 0/40 under `METALJAX_COMPILE=0`.
+* Next: LAPACK on Accelerate (the largest family left in the census), then
+  the scatter/sort tail, then async execute + donation.
   Suite-vs-suite as the standing gate. (North star per Oleg: everything
   through the new stack, correctness first, performance second.)

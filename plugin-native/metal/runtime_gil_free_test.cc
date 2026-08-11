@@ -7,7 +7,7 @@
 // will, and it is deliberately end-to-end: real mx::arrays, real Metal
 // kernels, exact numbers.
 //
-// Three things are checked, in order of what would hurt most to get wrong:
+// Four things are checked, in order of what would hurt most to get wrong:
 //
 //   1. the image really is Python-free (dyld's loaded-image list, plus a
 //      dlsym for CPython's entry points -- a dependency could arrive through
@@ -17,7 +17,10 @@
 //   3. the same tape through mx::compile does too, which is what says the
 //      engine-owned cache ids of compile.cc work outside the extension --
 //      MLX's own convention is to key that cache by the address of a *Python*
-//      function object.
+//      function object;
+//   4. a dynamic while runs its regions the RIGHT NUMBER OF TIMES -- the one
+//      property the pipelined loop can break, and only for a region that
+//      leaves the tape, which is why it is stated here (P8.5).
 
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
@@ -26,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -195,6 +199,76 @@ int main() {
           "exactly one mx::compile trace was built");
     check(metaljax::g_stats.compiled_calls == calls + 2,
           "both calls went through the compiled graph");
+  }
+
+  // 3. a dynamic while whose COND has an effect, and the pure loops it must
+  //    not slow down.  The pipelined loop builds iteration t+1 before it
+  //    reads t's condition, which is free for a pure region and a second
+  //    print (or a second callback) for one that leaves the tape -- so a
+  //    host call anywhere in either region keeps the serial shape.  Counted
+  //    HERE rather than in tests/: a host call cannot reach the runtime
+  //    through the plugin's PJRT surface, so this is the only process in
+  //    which the rule can be stated end to end.
+  {
+    const std::vector<int> want_calls{6, 0, 5};
+    for (int variant = 0; variant < 3; variant++) {
+      const bool cond_host = variant == 0, body_host = variant == 2;
+      int calls = 0;
+      metaljax::HostFn count =
+          [&calls](const std::vector<mx::array>&) -> std::vector<mx::array> {
+        calls++;
+        return {};
+      };
+      auto cond = std::make_shared<Program>(/*num_slots=*/3, /*num_args=*/1);
+      cond->add(opcode("stablehlo.constant"), {}, {1}, {}, mx::array(5),
+                {}, {}, 4, {}, nullptr, {});
+      if (cond_host)
+        cond->add(opcode("metaljax.host_call"), {0}, {}, {}, std::nullopt, {},
+                  {}, 0, {}, nullptr, count);
+      // [direction] 2 = LT
+      cond->add(opcode("stablehlo.compare"), {0, 1}, {2}, {2}, std::nullopt,
+                {1}, {}, 1, {}, nullptr, {});
+      cond->set_outputs({2}, {});
+
+      auto body = std::make_shared<Program>(/*num_slots=*/3, /*num_args=*/1);
+      body->add(opcode("stablehlo.constant"), {}, {1}, {}, mx::array(1), {},
+                {}, 4, {}, nullptr, {});
+      if (body_host)
+        body->add(opcode("metaljax.host_call"), {0}, {}, {}, std::nullopt, {},
+                  {}, 0, {}, nullptr, count);
+      body->add(opcode("stablehlo.add"), {0, 1}, {2}, {}, std::nullopt, {1},
+                {}, 4, {}, nullptr, {});
+      body->set_outputs({2}, {});
+
+      Program p(/*num_slots=*/2, /*num_args=*/1);
+      // [ncarry, ncond_caps, nbody_caps, counted, k, bound_kind, bound,
+      //  cost, period, chunkable, kmax, body_compile_max]
+      p.add(opcode("stablehlo.while"), {0}, {1},
+            {1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1}, std::nullopt, {},
+            {cond, body}, 4, {}, nullptr, {});
+      p.set_outputs({1}, {});
+
+      const int64_t serial = metaljax::g_stats.serial_loops;
+      const int64_t piped = metaljax::g_stats.pipelined_loops;
+      std::vector<mx::array> outs = p.run({mx::array(0)});
+      outs[0].eval();
+      const std::string what =
+          cond_host ? "impure cond" : (body_host ? "impure body" : "pure");
+      check(outs.size() == 1 && outs[0].item<int>() == 5,
+            "dynamic while (" + what + "): five iterations");
+      check(calls == want_calls[variant],
+            "dynamic while (" + what + "): the host call ran " +
+                std::to_string(calls) + " times, want " +
+                std::to_string(want_calls[variant]));
+      const bool pipelined = metaljax::g_stats.pipelined_loops == piped + 1 &&
+                             metaljax::g_stats.serial_loops == serial;
+      const bool went_serial =
+          metaljax::g_stats.serial_loops == serial + 1 &&
+          metaljax::g_stats.pipelined_loops == piped;
+      check(variant == 1 ? pipelined : went_serial,
+            "dynamic while (" + what + "): ran " +
+                std::string(variant == 1 ? "pipelined" : "serial"));
+    }
   }
 
   if (g_failures == 0) {

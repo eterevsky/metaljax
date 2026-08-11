@@ -1,0 +1,12 @@
+file,passed,failed,skipped,errors,rc,seconds
+jet_test.py,65,0,14,0,0,14.6
+lax_control_flow_test.py,536,6,483,0,1,34.1
+lax_numpy_operators_test.py,1621,1,2,0,1,29.2
+lax_numpy_reducers_test.py,690,0,4,0,0,14.2
+lax_numpy_test.py,3162,48,34,0,1,82.4
+lax_scipy_special_functions_test.py,409,0,0,0,0,95.2
+lax_test.py,2458,63,52,0,1,36.5
+linalg_test.py,374,349,192,0,1,30.2
+random_lax_test.py,512,32,44,0,1,39.9
+scipy_stats_test.py,942,40,0,0,1,67.0
+shape_poly_test.py,2165,181,109,0,1,105.5

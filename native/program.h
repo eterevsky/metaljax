@@ -453,14 +453,18 @@ class Program {
 
   // Does running this program read anything back to the HOST? Every
   // control-flow op does: a while reads its trip count or its condition, an
-  // if/case its predicate. Structure, not policy -- read off the tape itself
-  // so it cannot drift from what the tape actually holds.
+  // if/case its predicate. So does a host call: it hands its operands to a
+  // handler off the device, and whatever that handler does (print, callback)
+  // is done by the time the entry returns. Structure, not policy -- read off
+  // the tape itself so it cannot drift from what the tape actually holds.
   //
   // It is what says whether a loop body may be BUILT ahead of the condition
   // that decides whether it runs (run_while's pipelined path). Building a
   // graph is free and pure; a nested host read is neither -- it would
   // evaluate real work at a carry the loop may be about to abandon, which
-  // for a nested dynamic while is not even guaranteed to terminate.
+  // for a nested dynamic while is not even guaranteed to terminate, and for
+  // an effect it would be a second print of a line the program never asked
+  // for.
   bool reads_host() const;
 
   // The op-by-op walk. `in_trace` is threaded rather than stored: the same
@@ -578,6 +582,7 @@ class Program {
   // moves one way -- toward the eager path, which is always correct.
   bool compile_ = false;
   bool compile_disabled_ = false;
+  bool compile_probe_ = true;   // settle the first compiled call (run_recovering)
   bool no_chunk_ = false;
   mutable int reads_host_ = -1;   // lazily derived, never un-derived
   int64_t max_repeat_ = 1;

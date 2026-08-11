@@ -1011,6 +1011,51 @@ def _cases():
                                          dimension_numbers=C1), x),
          [_rand((1, 2, 6), 180), _rand((2, 2, 3), 181)], *DOT),
 
+        # --- P8.5: the census's fix batch --------------------------------
+        # A StableHLO reduce returns its OPERAND's element type, and MLX's
+        # sum and prod accumulate wider than that for small integers (int8
+        # -> int32, uint8 -> uint32), so the fold back is what makes the
+        # result the declared type.  The values overflow on purpose: the
+        # wrap is the answer XLA computes, and it is the same one whether
+        # the truncation happens per step or once at the end.
+        ("sum with an int8 accumulator", lambda x: jnp.sum(x, dtype=jnp.int8),
+         [np.arange(40, 60, dtype=np.int8)], *EXACT),
+        ("prod with a uint8 accumulator",
+         lambda x: jnp.prod(x, dtype=jnp.uint8),
+         [np.arange(2, 9, dtype=np.uint8)], *EXACT),
+        ("int16 sum over one axis", lambda x: jnp.sum(x, 1, dtype=jnp.int16),
+         [_randint((3, 4), 200, np.int16, -300, 300)], *EXACT),
+        # The dtype has to be right INSIDE the tape, not just at the
+        # boundary: this one wraps AFTER the reduce, which a widened
+        # accumulator would carry through in full precision.
+        ("an int8 sum feeding more int8 arithmetic",
+         lambda x: jnp.sum(x, dtype=jnp.int8) * jnp.int8(3) + x,
+         [np.arange(20, 30, dtype=np.int8)], *EXACT),
+        ("sum pooling over int16", lambda x: jax.lax.reduce_window(
+            x, np.int16(0), jax.lax.add, (3,), (1,), "VALID"),
+         [_randint((8,), 201, np.int16, -20000, 20000)], *EXACT),
+        # A zero-size constant: chlo's decompositions emit one whenever the
+        # operand is empty, and MLIR stores it as a SPLAT holding one raw
+        # element -- so the raw data is not the elements, and the decode has
+        # nothing to read.
+        ("sinh of an empty int8 array", lambda x: jnp.sinh(x),
+         [np.zeros((0,), np.int8)], *F32),
+        ("spacing of an empty f16 array", lambda x: jnp.spacing(x),
+         [np.zeros((0,), np.float16)], *HALF),
+        ("an empty array through a chlo composite",
+         lambda x: (jnp.arcsin(x), jnp.cosh(x)),
+         [np.zeros((0, 3), np.float32)], *F32),
+        # MLX's compiler rejects some fused traces outright ("Too many
+        # inputs/outputs fused in the Metal Compiled primitive": the
+        # generated kernel's most argument-hungry variant would bind more
+        # buffers than Metal allows, notes/data/mlx-fused-args-repro).
+        # polygamma is 334 entries of elementwise chain and is refused
+        # today; the answer below is the eager path's, computed after the
+        # compiled one retires.
+        ("polygamma (a trace MLX's compiler refuses)",
+         lambda x: jax.scipy.special.polygamma(2, x),
+         [np.array([0.5, 1.5, 2.5, 3.5], f)], *F32),
+
         # a realistic little block: the shapes a model's forward pass has
         ("dense + norm + gelu",
          lambda x, w, b: jax.nn.gelu(
@@ -1196,6 +1241,24 @@ module @conv_mixed_reversal {
 """
 
 
+# Zero-size constants of the types jax's own lowerings never hand us empty:
+# a bool one (whose elements are BIT-packed, so the decode reads them through
+# the typed iterator) and an integer one.  Both are splats holding a single
+# raw element under a shape with no elements at all.
+_ZERO_SIZE_CONSTANTS = """
+module @zero_size_constants {
+  func.func public @main(%x: tensor<0xf32>)
+      -> (tensor<0xf32>, tensor<0xi32>, tensor<0xi1>) {
+    %cf = stablehlo.constant dense<1.500000e+00> : tensor<0xf32>
+    %ci = stablehlo.constant dense<7> : tensor<0xi32>
+    %cb = stablehlo.constant dense<true> : tensor<0xi1>
+    %a = stablehlo.add %x, %cf : tensor<0xf32>
+    return %a, %ci, %cb : tensor<0xf32>, tensor<0xi32>, tensor<0xi1>
+  }
+}
+"""
+
+
 def _module_cases():
     return [
         ("while with a captured bound", _WHILE_CAPTURED_BOUND,
@@ -1218,6 +1281,8 @@ def _module_cases():
          [_rand((1, 2, 6), 190), _rand((3, 2, 3), 191)]),
         ("integer convolution with reversal", _CONV_REVERSAL_INT,
          [_randint((1, 2, 6), 192), _randint((3, 2, 3), 193)]),
+        ("zero-size constants", _ZERO_SIZE_CONSTANTS,
+         [np.zeros((0,), np.float32)]),
     ]
 
 

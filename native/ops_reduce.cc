@@ -23,15 +23,29 @@ namespace {
 // dtype, which is static in the IR).
 mx::array reduce_apply(int64_t kind, const mx::array& x,
                        const std::vector<int>& axes) {
-  switch (kind) {
-    case 0: return mx::sum(x, axes);
-    case 1: return mx::prod(x, axes);
-    case 2: return mx::max(x, axes);
-    case 3: return mx::min(x, axes);
-    case 4: return mx::any(x, axes);
-    case 5: return mx::all(x, axes);
-    default: throw std::invalid_argument("tape: bad reduce kind");
-  }
+  mx::array out = [&]() -> mx::array {
+    switch (kind) {
+      case 0: return mx::sum(x, axes);
+      case 1: return mx::prod(x, axes);
+      case 2: return mx::max(x, axes);
+      case 3: return mx::min(x, axes);
+      case 4: return mx::any(x, axes);
+      case 5: return mx::all(x, axes);
+      default: throw std::invalid_argument("tape: bad reduce kind");
+    }
+  }();
+  // MLX's sum and prod ACCUMULATE WIDER, the way numpy does: an int8 sum
+  // comes back int32, a uint8 one uint32 (min/max/any/all do not, and no
+  // float type does). A StableHLO reduce returns the operand's element
+  // type, which is what the executable declares, so fold the accumulator
+  // back to it. The value is XLA's: two's-complement arithmetic is a ring
+  // homomorphism, so one truncation at the end is the same answer as the
+  // wrap XLA takes at every step. Stage 1 never saw this because its
+  // to_host casts a result to the declared dtype on the way out -- which
+  // does nothing for a reduce feeding more ops on the device.
+  if ((kind == 0 || kind == 1) && out.dtype() != x.dtype())
+    out = mx::astype(out, x.dtype());
+  return out;
 }
 
 mx::array reduce_combine(int64_t kind, const mx::array& a,
