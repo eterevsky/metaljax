@@ -109,6 +109,15 @@ const NamedOp kOpNames[] = {
     {"stablehlo.gather", kGather},
     {"stablehlo.scatter", kScatter},
     {"stablehlo.rng_bit_generator", kRng},
+    // ops/conv.py, ported for phase 2 (P7) — under a PSEUDO-NAME, and that
+    // is load-bearing. A tape builder with no `_lower_*` of its own emits an
+    // op it finds in this table with an EMPTY attribute vector (tape.py's
+    // `handler(...) if handler else ([], None)`), and this handler reads a
+    // long one. src/metaljax/tape.py has no convolution lowering, so
+    // `stablehlo.convolution` must stay absent from the table: Stage 1 keeps
+    // declining the op to the Python engine, at compile time, where it
+    // belongs. The phase-2 plugin knows the layout and asks by this name.
+    {"metaljax.conv", kConv},
     {"stablehlo.while", kWhile},
     {"stablehlo.if", kIf},
     {"stablehlo.case", kCase},

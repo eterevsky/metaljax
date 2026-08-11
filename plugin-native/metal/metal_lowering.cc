@@ -1328,6 +1328,9 @@ class Lowering {
   absl::StatusOr<std::vector<int64_t>> LowerPopcnt(mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerFft(mlir::Operation* op);
   absl::StatusOr<std::vector<int64_t>> LowerGather(mlir::Operation* op);
+  // ...and the one with no `_lower_*` to be named after: Stage 1's tape
+  // declines convolution, so this layout is phase 2's own (P7).
+  absl::StatusOr<std::vector<int64_t>> LowerConv(mlir::Operation* op);
   absl::Status LowerConstant(mlir::Operation* op);
   absl::Status LowerReduce(mlir::Operation* op);
   // The families that bind and emit themselves: each may hand back more than
@@ -2310,6 +2313,246 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerGather(
   attrs.insert(attrs.end(), mid.begin(), mid.end());
   attrs.push_back(static_cast<int64_t>(perm.size()));
   attrs.insert(attrs.end(), perm.begin(), perm.end());
+  return attrs;
+}
+
+// ops/conv.py `_convolution` -- the one lowering in this file with no tape.py
+// anchor, because Stage 1 declines convolution and runs it on the Python
+// ENGINE instead.  So the `kConv` attribute layout is phase 2's own; it is
+// documented at the handler that reads it (native/ops_conv.cc), and the
+// Python handler is the specification for the arithmetic.
+//
+// Everything the Python handler decides from the IR is decided here: the
+// three layout permutations (input -> (N, *spatial, C_in), weight ->
+// (C_out, *spatial, C_in), and the transpose back), the window attributes,
+// the negative-padding rewrite, and which of the four arms runs.  What is
+// left for the handler is the arithmetic and the two shape guards.
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerConv(mlir::Operation* op) {
+  auto cv = mlir::dyn_cast<mlir::stablehlo::ConvolutionOp>(op);
+  if (!cv) return Decline("stablehlo.convolution in an unexpected form");
+  ASSIGN_OR_RETURN(std::vector<int64_t> lhs_shape, Dims(op->getOperand(0)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> rhs_shape, Dims(op->getOperand(1)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> out_shape, Dims(op->getResult(0)));
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
+
+  // The result is all zeros: every output element sums an EMPTY set of
+  // products.  Also where a crop lands below -- both stop the attributes
+  // here, and neither lets MLX see an operand it would size differently
+  // from XLA (the conv overread, native/ops_conv.cc).
+  auto zeros_attrs = [&]() {
+    std::vector<int64_t> attrs{1, out_code,
+                               static_cast<int64_t>(out_shape.size())};
+    attrs.insert(attrs.end(), out_shape.begin(), out_shape.end());
+    return attrs;
+  };
+  bool empty = Product(lhs_shape) == 0 || Product(rhs_shape) == 0;
+  for (int64_t s : out_shape) empty = empty || s == 0;
+  if (empty) return zeros_attrs();
+
+  mlir::stablehlo::ConvDimensionNumbersAttr dn = cv.getDimensionNumbers();
+  std::vector<int64_t> ispatial(dn.getInputSpatialDimensions().begin(),
+                                dn.getInputSpatialDimensions().end());
+  std::vector<int64_t> kspatial(dn.getKernelSpatialDimensions().begin(),
+                                dn.getKernelSpatialDimensions().end());
+  std::vector<int64_t> ospatial(dn.getOutputSpatialDimensions().begin(),
+                                dn.getOutputSpatialDimensions().end());
+  const int64_t rank = static_cast<int64_t>(ispatial.size());
+  if (static_cast<int64_t>(kspatial.size()) != rank ||
+      static_cast<int64_t>(ospatial.size()) != rank)
+    return Decline("conv dimension numbers of different ranks");
+
+  std::vector<int64_t> lperm{dn.getInputBatchDimension()};
+  lperm.insert(lperm.end(), ispatial.begin(), ispatial.end());
+  lperm.push_back(dn.getInputFeatureDimension());
+  std::vector<int64_t> rperm{dn.getKernelOutputFeatureDimension()};
+  rperm.insert(rperm.end(), kspatial.begin(), kspatial.end());
+  rperm.push_back(dn.getKernelInputFeatureDimension());
+  // The transpose back: MLX hands back (N, *spatial, C_out), and the output
+  // layout says where each of those belongs.
+  std::vector<int64_t> operm(static_cast<size_t>(rank) + 2, 0);
+  auto place = [&](int64_t at, int64_t from) {
+    if (at < 0 || at >= static_cast<int64_t>(operm.size())) return false;
+    operm[static_cast<size_t>(at)] = from;
+    return true;
+  };
+  bool placed = place(dn.getOutputBatchDimension(), 0) &&
+                place(dn.getOutputFeatureDimension(), rank + 1);
+  for (int64_t k = 0; k < rank; k++)
+    placed = placed && place(ospatial[static_cast<size_t>(k)], 1 + k);
+  // A permutation the handler could not apply is a crash inside MLX (or, at
+  // a repeated dim, a silently wrong layout), so it is checked here where it
+  // costs nothing.
+  auto is_perm = [](const std::vector<int64_t>& p, size_t n) {
+    if (p.size() != n) return false;
+    std::vector<bool> seen(n, false);
+    for (int64_t v : p) {
+      if (v < 0 || v >= static_cast<int64_t>(n) ||
+          seen[static_cast<size_t>(v)])
+        return false;
+      seen[static_cast<size_t>(v)] = true;
+    }
+    return true;
+  };
+  if (!placed || !is_perm(lperm, lhs_shape.size()) ||
+      !is_perm(rperm, rhs_shape.size()) || !is_perm(operm, out_shape.size()))
+    return Decline("conv dimension numbers do not permute the operands");
+
+  auto opt_int = [&](llvm::StringRef n, int64_t dflt) -> int64_t {
+    if (auto a = op->getAttrOfType<mlir::IntegerAttr>(n)) return a.getInt();
+    return dflt;
+  };
+  const int64_t fgc = opt_int("feature_group_count", 1);
+  const int64_t bgc = opt_int("batch_group_count", 1);
+  if (fgc < 1 || bgc < 1) return Decline("conv group count");
+
+  const mx::Dtype out_dt = dtype_of(out_code);
+  std::vector<int64_t> attrs{0, out_code, rank};
+  auto push = [&](const std::vector<int64_t>& v) {
+    attrs.push_back(static_cast<int64_t>(v.size()));
+    attrs.insert(attrs.end(), v.begin(), v.end());
+  };
+  push(lperm);
+  push(rperm);
+  push(operm);
+  attrs.push_back(fgc);
+  attrs.push_back(bgc);
+
+  if (rank == 0) {
+    // No spatial dims: a (grouped) matmul over features.  The Python handler
+    // runs it in f32 whatever the operands are, which drops the imaginary
+    // part of a complex one -- so that combination declines here rather than
+    // transliterating an answer neither engine could defend.
+    if (is_complex(out_dt))
+      return Decline("conv: complex with no spatial dimensions");
+    const int64_t split = bgc > 1 ? bgc : fgc;
+    const int64_t nbatch = lhs_shape[static_cast<size_t>(lperm[0])];
+    const int64_t nin = lhs_shape[static_cast<size_t>(lperm[1])];
+    const int64_t nout = rhs_shape[static_cast<size_t>(rperm[0])];
+    if (split > 1 && (nout % split != 0 ||
+                      (bgc > 1 ? nbatch : nin) % split != 0))
+      return Decline("conv group count does not divide the operands");
+    return attrs;
+  }
+
+  std::vector<int64_t> strides =
+      OptI64List(op, "window_strides", std::vector<int64_t>(rank, 1));
+  std::vector<int64_t> ldil =
+      OptI64List(op, "lhs_dilation", std::vector<int64_t>(rank, 1));
+  std::vector<int64_t> rdil =
+      OptI64List(op, "rhs_dilation", std::vector<int64_t>(rank, 1));
+  std::vector<int64_t> pad =
+      OptI64List(op, "padding", std::vector<int64_t>(2 * rank, 0));
+  if (static_cast<int64_t>(strides.size()) != rank ||
+      static_cast<int64_t>(ldil.size()) != rank ||
+      static_cast<int64_t>(rdil.size()) != rank ||
+      static_cast<int64_t>(pad.size()) != 2 * rank)
+    return Decline("conv window attributes do not match the spatial rank");
+  for (int64_t v : strides) if (v < 1) return Decline("conv window stride");
+  for (int64_t v : ldil) if (v < 1) return Decline("conv lhs dilation");
+  for (int64_t v : rdil) if (v < 1) return Decline("conv rhs dilation");
+
+  // window_reversal flips the kernel (a correlation becomes a convolution).
+  // MLX's `flip` is all-or-nothing, and so is the Python handler.
+  bool flip = false;
+  if (mlir::Attribute rev = op->getAttr("window_reversal")) {
+    std::vector<bool> bits;
+    if (auto arr = mlir::dyn_cast<mlir::DenseBoolArrayAttr>(rev)) {
+      for (bool b : arr.asArrayRef()) bits.push_back(b);
+    } else if (auto den = mlir::dyn_cast<mlir::DenseIntElementsAttr>(rev)) {
+      for (const llvm::APInt& v : den.getValues<llvm::APInt>())
+        bits.push_back(!v.isZero());
+    } else {
+      return Decline("conv window_reversal in an unexpected form");
+    }
+    bool any = false, all = true;
+    for (bool b : bits) { any = any || b; all = all && b; }
+    if (any && !all) return Decline("conv: mixed window_reversal");
+    flip = any;
+  }
+
+  // The negative-padding rewrite.  XLA pads AFTER lhs dilation, so a negative
+  // pad crops the DILATED array; MLX crops the undilated operand instead (its
+  // output comes out a whole dilation step short per cropped element), and
+  // mx::pad has no negative widths on the integer path at all.  Each crop of
+  // k elements becomes: drop q = ceil(k / dilation) OPERAND elements, which
+  // removes q*dilation entries from the dilated array, and pad back the
+  // excess -- which is exactly that many interior holes, i.e. zeros, on that
+  // side.
+  std::vector<int64_t> xs(static_cast<size_t>(rank) + 2);
+  for (size_t i = 0; i < lperm.size(); i++)
+    xs[i] = lhs_shape[static_cast<size_t>(lperm[i])];
+  std::vector<int64_t> cstart(xs.size(), 0), cstop = xs;
+  bool crop = false;
+  for (int64_t a = 0; a < 2 * rank; a++) crop = crop || pad[a] < 0;
+  if (crop) {
+    for (int64_t a = 0; a < rank; a++) {
+      const size_t u = static_cast<size_t>(a);
+      const int64_t dl = ldil[u];
+      const int64_t k0 = std::max<int64_t>(0, -pad[2 * u]);
+      const int64_t k1 = std::max<int64_t>(0, -pad[2 * u + 1]);
+      if (!k0 && !k1) continue;
+      const int64_t q0 = CeilDiv(k0, dl), q1 = CeilDiv(k1, dl);
+      const int64_t n = xs[u + 1];
+      const int64_t start = std::min(q0, n);
+      const int64_t stop = std::max<int64_t>(n - q1, 0);
+      cstart[u + 1] = start;
+      cstop[u + 1] = std::max(stop, start);
+      if (k0) pad[2 * u] = q0 * dl - k0;
+      if (k1) pad[2 * u + 1] = q1 * dl - k1;
+    }
+    for (size_t i = 0; i < xs.size(); i++)
+      if (cstop[i] <= cstart[i]) return zeros_attrs();
+  }
+  std::vector<int64_t> lo(rank), hi(rank);
+  for (int64_t a = 0; a < rank; a++) {
+    lo[static_cast<size_t>(a)] = pad[2 * a];
+    hi[static_cast<size_t>(a)] = pad[2 * a + 1];
+    if (lo[static_cast<size_t>(a)] < 0 || hi[static_cast<size_t>(a)] < 0)
+      return Decline("conv padding");
+  }
+
+  // Integers take the exact im2col path (MLX's convolution is float-only and
+  // an f32 emulation would round); complex is four real convolutions, so it
+  // uses mx::conv_general like the floats.  ...and MLX implements feature
+  // groups for 1-D and 2-D only.
+  const bool mx_conv = is_float(out_dt) || is_complex(out_dt);
+  const int64_t mode = is_complex(out_dt) ? 2 : (mx_conv ? 0 : 1);
+  const bool native_groups = mx_conv && rank <= 2;
+  if (fgc > 1) {
+    const int64_t cin = xs.back(), cout = rhs_shape[
+        static_cast<size_t>(rperm[0])];
+    if (cin % fgc != 0 || cout % fgc != 0)
+      return Decline("conv feature group count does not divide the operands");
+  }
+  if (bgc > 1) {
+    const int64_t nbatch = xs[0], cout = rhs_shape[
+        static_cast<size_t>(rperm[0])];
+    if (nbatch % bgc != 0 || cout % bgc != 0)
+      return Decline("conv batch group count does not divide the operands");
+  }
+
+  push(strides);
+  push(ldil);
+  push(rdil);
+  push(lo);
+  push(hi);
+  attrs.push_back(crop ? 1 : 0);
+  push(cstart);
+  push(cstop);
+  attrs.push_back(flip ? 1 : 0);
+  attrs.push_back(mode);
+  attrs.push_back(native_groups ? 1 : 0);
+  // The result shape in MLX's layout: the guard the handler measures what MLX
+  // produced against, which is what keeps a window MLX sizes differently from
+  // XLA a loud failure instead of a read past the end of a short buffer.
+  std::vector<int64_t> want{out_shape[
+      static_cast<size_t>(dn.getOutputBatchDimension())]};
+  for (int64_t k = 0; k < rank; k++)
+    want.push_back(out_shape[static_cast<size_t>(ospatial[
+        static_cast<size_t>(k)])]);
+  want.push_back(out_shape[
+      static_cast<size_t>(dn.getOutputFeatureDimension())]);
+  push(want);
   return attrs;
 }
 
@@ -3599,13 +3842,20 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
     ASSIGN_OR_RETURN(attrs, LowerFft(op));
   } else if (name == "stablehlo.gather") {
     ASSIGN_OR_RETURN(attrs, LowerGather(op));
+  } else if (name == "stablehlo.convolution") {
+    ASSIGN_OR_RETURN(attrs, LowerConv(op));
   } else if (SimpleOps().contains(name)) {
     // no attributes
   } else {
     return Decline(absl::StrCat("op ", name));
   }
 
-  ASSIGN_OR_RETURN(int opcode, Opcode(name));
+  // Convolution's opcode is registered under a pseudo-name, so that a tape
+  // builder without a convolution lowering (Stage 1's) cannot reach the
+  // handler with an empty attribute vector -- see native/config.cc.
+  ASSIGN_OR_RETURN(int opcode,
+                   Opcode(name == "stablehlo.convolution" ? "metaljax.conv"
+                                                          : name));
   std::vector<int> ins;
   for (mlir::Value v : op->getOperands()) {
     ASSIGN_OR_RETURN(int s, Slot(v));

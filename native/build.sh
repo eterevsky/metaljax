@@ -40,7 +40,7 @@ clang++ -std=c++17 -O2 -fPIC -shared \
   metaljax_native.cc bindings.cc \
   program.cc config.cc dtypes.cc runtime.cc compile.cc \
   ops_elementwise.cc ops_shape.cc ops_reduce.cc ops_index.cc \
-  ops_linalg.cc ops_rng.cc emits.cc control.cc msl.cc host.cc \
+  ops_linalg.cc ops_rng.cc ops_conv.cc emits.cc control.cc msl.cc host.cc \
   "$NBSRC/nb_combined.cpp" \
   -L "$MLX/lib" -lmlx -Wl,-rpath,"$MLX/lib" \
   -undefined dynamic_lookup \

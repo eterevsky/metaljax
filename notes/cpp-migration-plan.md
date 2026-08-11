@@ -843,7 +843,43 @@ fork authorized but not needed.
   which would need a `take_along_axis` entry), `select_and_scatter`, negative
   reduce_window padding (Stage 1 raises too), LAPACK, and `debug_print` (a
   JAX-side registration gap: no lowering rule for platform `metal`).
-* Next: convolution (an opcode + `ops_conv.cc` in `native/`), LAPACK on
-  Accelerate, then msl_scan (still the whole texmo gap), then async execute +
-  donation. Suite-vs-suite as the standing gate. (North star per Oleg: everything
+* **P7 landed** (notes/cpp-p7-conv.md): **convolution, both halves** — the first
+  P-milestone whose work is EXECUTOR work. `native/ops_conv.cc` (329 lines) is
+  `src/metaljax/ops/conv.py` handler for handler: `mx::conv_general` for every
+  float layout, XLA's feature and batch groups (MLX's own `groups` where it
+  serves, one convolution per group where it does not), the exact integer path
+  (zero-hole dilation + pad + ONE `as_strided` im2col view, summed in int64),
+  complex as four real convolutions, the 0-spatial matmul, the negative-pad
+  rewrite, and both zero-size guards — the second of which is the conv
+  short-buffer overread of CLAUDE.md item 20, kept as a `want`-shape check on
+  whatever MLX produced. The plugin's `LowerConv` resolves the three layout
+  permutations, the window attributes and the arm; `precision_config` is
+  ignored, as Stage 1 ignores it. Declined and named: a MIXED
+  `window_reversal` (MLX's flip is all-or-nothing, and the Python handler
+  raises) and a COMPLEX 0-spatial convolution (the Python matmul arm runs its
+  operands through f32 and would drop the imaginary part — a deliberate
+  divergence rather than a transliteration).
+  **The finding: the opcode is registered as `metaljax.conv`, a pseudo-name.**
+  `tape.py` lowers any op it finds in the registry, with an EMPTY attribute
+  vector when it has no `_HANDLERS` entry — so the StableHLO name would have
+  enrolled Stage 1's lowering, which knows nothing about this layout (caught
+  by the two `tests/test_native_tape.py` cases that use convolution as their
+  "an op with no opcode" stand-in). With the pseudo-name Stage 1 declines the
+  op at COMPILE time and keeps running it on the Python engine, which is what
+  the milestone wanted and is now enforced by the registry.
+  Census 31 -> **32 of 35**; execute_test 228 -> **274 checks** (46 conv rows:
+  1/2/3-D, four layouts, all paddings and dilations, feature/batch/depthwise
+  groups, exact integer incl. 2-D strided, complex, 0-spatial, zero-size,
+  jnp.convolve/correlate, the jax wrappers, two grads — which is where the
+  transposed and batch-grouped arms really get tested — and conv inside scan
+  and fori bodies, plus two hand-written `window_reversal` modules); both gates
+  106/106; pytest 1258 unchanged; eager vs compiled 234/235 bit-identical;
+  dylib +0.022 %. **No tape cross-check exists for this family** — `tape.py`
+  declines convolution, so the CPU differential is the only reference, and that
+  is the point rather than a gap. `smoke_test`/`wheel_poc_test`/one
+  execute_test decline all moved their checkpoint from convolution to
+  `stablehlo.cholesky`.
+* Next: LAPACK on Accelerate (the only family left in the census), then
+  msl_scan (still the whole texmo gap), then async execute + donation.
+  Suite-vs-suite as the standing gate. (North star per Oleg: everything
   through the new stack, correctness first, performance second.)

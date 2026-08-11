@@ -96,20 +96,26 @@ def _compile():
     zero = np.asarray(2 * jnp.array([1, 2, 3]))
     print("  2 * jnp.array([1, 2, 3]) ->", zero.tolist())
     assert np.array_equal(zero, np.array([2, 4, 6], np.int32)), zero
-    # An op outside the native set declines, naming itself.  Convolution is
-    # the one left with no opcode in the executor at all (P6); every other
+    # ...and so does a convolution, which is the family this checkpoint
+    # watched decline until P7 gave the executor a `kConv`.
+    cv = np.asarray(jax.jit(lambda a, k: jax.lax.conv_general_dilated(
+        a, k, (1,), "VALID", dimension_numbers=("NCH", "OIH", "NCH")))(
+            jax.device_put(np.ones((1, 2, 4), np.float32)),
+            jax.device_put(np.ones((1, 2, 3), np.float32))))
+    print("  jit(conv_general_dilated) ->", cv.tolist())
+    assert np.array_equal(cv, np.full((1, 1, 2), 6.0, np.float32)), cv
+    # An op outside the native set declines, naming itself.  The host-computed
+    # LAPACK targets are what is left (phase 2's next milestone); every other
     # family the census used to name now lowers.
     try:
-        jax.jit(lambda a, k: jax.lax.conv_general_dilated(
-            a, k, (1,), "SAME", dimension_numbers=("NCH", "OIH", "NCH")))(
-                jax.device_put(np.ones((1, 2, 8), np.float32)),
-                jax.device_put(np.ones((3, 2, 3), np.float32)))
+        jax.jit(lambda a: jnp.linalg.cholesky(a @ a.T + 4 * jnp.eye(3)))(
+            jax.device_put(np.eye(3, dtype=np.float32)))
     except Exception as e:  # noqa: BLE001 - the expected decline
         msg = str(e)
-        print("  convolution declined:", msg.splitlines()[0][:160])
-        assert "stablehlo.convolution" in msg, "the decline did not name the op"
+        print("  cholesky declined:", msg.splitlines()[0][:160])
+        assert "stablehlo.cholesky" in msg, "the decline did not name the op"
         return
-    raise AssertionError("convolution unexpectedly compiled")
+    raise AssertionError("cholesky unexpectedly compiled")
 
 
 if FAILED:

@@ -28,6 +28,7 @@ cc_library(
         "emits.cc",
         "host.cc",
         "msl.cc",
+        "ops_conv.cc",
         "ops_elementwise.cc",
         "ops_index.cc",
         "ops_linalg.cc",

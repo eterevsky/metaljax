@@ -227,7 +227,7 @@ void Program::step(const Entry& e, std::vector<std::optional<mx::array>>& env,
         step_linalg(e, env, in_trace) || step_reduce(e, env, in_trace) ||
         step_index(e, env, in_trace) || step_emit(e, env, in_trace) ||
         step_control(e, env, in_trace) || step_rng(e, env, in_trace) ||
-        step_host(e, env, in_trace)))
+        step_conv(e, env, in_trace) || step_host(e, env, in_trace)))
     throw std::invalid_argument("tape: unknown opcode");
 
   for (int s : e.drops) env[s].reset();

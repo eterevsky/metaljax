@@ -49,6 +49,7 @@
 //   ops_index.cc        ops/gather.py + ops/sort.py
 //   ops_linalg.cc       ops/linalg.py
 //   ops_rng.cc          ops/rng.py
+//   ops_conv.cc         ops/conv.py
 //   emits.cc            the M4 recognizer emits: qmm, sdpa, moe
 //   control.cc          ops/control.py: while/if/case and the body runners
 //   msl.cc, msl.h       msl_scan.py's generated kernels (M5b)
@@ -107,7 +108,7 @@ enum Op : int {
   // data / structured
   kConstant, kReduce, kArgReduce, kGenericReduce, kReduceWindow, kDotGeneral,
   kBitcastConvert, kDynamicSlice, kDynamicUpdateSlice, kSort, kTopK,
-  kGather, kScatter, kRng,
+  kGather, kScatter, kRng, kConv,
   // control flow (M3): each carries its regions as sub-Programs
   kWhile, kIf, kCase,
   // recognizer emits (M4): a REWRITTEN program's roots. These are not
@@ -292,6 +293,9 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //                       2 index into the cond's captures
 //   kIf / kCase         [ncaps_0, ncaps_1, ...] one per region
 //                       regions = the branches; ins [pred/index, caps...]
+//   kConv               documented beside its handler (ops_conv.cc): three
+//                       layout permutations, the window attributes, and the
+//                       arm the result dtype selected
 //   kQmm/kSdpa/kMoe*    documented beside their handlers — the M4 emits'
 //                       layouts are long enough to want reading in place,
 //                       and they are read with a Cursor, not by index
@@ -508,6 +512,9 @@ class Program {
   bool step_rng(const Entry& e,
                 std::vector<std::optional<mx::array>>& env,
                 bool in_trace) const;   // ops_rng.cc
+  bool step_conv(const Entry& e,
+                 std::vector<std::optional<mx::array>>& env,
+                 bool in_trace) const;   // ops_conv.cc
   bool step_host(const Entry& e,
                  std::vector<std::optional<mx::array>>& env,
                  bool in_trace) const;   // host.cc

@@ -48,6 +48,11 @@ def _rand(shape, seed, dtype=np.float32):
                       dtype=dtype)
 
 
+def _randint(shape, seed, dtype=np.int32, lo=-5, hi=6):
+    return np.asarray(np.random.RandomState(seed).randint(lo, hi, shape),
+                      dtype=dtype)
+
+
 def _switch_case(i, x):
     """`lax.switch` over three branches, including two out-of-range indices.
 
@@ -80,6 +85,15 @@ def _cases():
     # where jax-CPU itself is 1.3e-6.
     DOT = (1e-5, 1e-5)
     HALF = (5e-3, 5e-3)
+
+    # stablehlo.convolution's layouts, spelled the way jax spells them.  Every
+    # one of them reaches the executor as three permutations and nothing else,
+    # which is the whole point of testing more than one.
+    conv = jax.lax.conv_general_dilated
+    C1 = ("NCH", "OIH", "NCH")
+    C2 = ("NCHW", "OIHW", "NCHW")
+    C2L = ("NHWC", "HWIO", "NHWC")
+    C3 = ("NCDHW", "OIDHW", "NCDHW")
 
     cases = [
         # milestone zero, exactly as CLAUDE.md states it
@@ -800,6 +814,203 @@ def _cases():
          lambda x: jnp.abs(jnp.fft.fft(x * 2.0)) + 1.0,
          [_rand((16,), 97)], *F32),
 
+        # --- P7: convolution --------------------------------------------
+        # A convolution accumulates like a dot, so the float rows get the DOT
+        # band; the integer rows are EXACT, because their arm exists to be
+        # exact (im2col plus an int64 sum, where MLX's own convolution would
+        # round through f32).
+        ("conv 1d SAME", lambda x, k: conv(x, k, (1,), "SAME",
+                                           dimension_numbers=C1),
+         [_rand((2, 3, 8), 100), _rand((5, 3, 3), 101)], *DOT),
+        ("conv 1d VALID, stride 2",
+         lambda x, k: conv(x, k, (2,), "VALID", dimension_numbers=C1),
+         [_rand((2, 3, 9), 102), _rand((4, 3, 3), 103)], *DOT),
+        ("conv 1d explicit padding",
+         lambda x, k: conv(x, k, (1,), [(2, 1)], dimension_numbers=C1),
+         [_rand((1, 2, 6), 104), _rand((3, 2, 4), 105)], *DOT),
+        ("conv 2d NCHW/OIHW",
+         lambda x, k: conv(x, k, (1, 1), "SAME", dimension_numbers=C2),
+         [_rand((2, 3, 7, 6), 106), _rand((4, 3, 3, 3), 107)], *DOT),
+        # The other common layout: the same op with three different
+        # permutations, which is what says the layout really is data here.
+        ("conv 2d NHWC/HWIO",
+         lambda x, k: conv(x, k, (2, 1), "VALID", dimension_numbers=C2L),
+         [_rand((2, 7, 6, 3), 108), _rand((3, 3, 3, 4), 109)], *DOT),
+        ("conv 3d", lambda x, k: conv(x, k, (1, 1, 1), "VALID",
+                                      dimension_numbers=C3),
+         [_rand((1, 2, 5, 5, 4), 110), _rand((3, 2, 2, 3, 2), 111)], *DOT),
+        ("conv rhs dilation (atrous)",
+         lambda x, k: conv(x, k, (1, 1), "VALID", rhs_dilation=(2, 2),
+                           dimension_numbers=C2),
+         [_rand((1, 2, 9, 9), 112), _rand((3, 2, 3, 3), 113)], *DOT),
+        # lhs dilation is the transposed convolution, and it is what jax's
+        # own backward pass emits -- the two grad rows below are its real
+        # test, this one is the direct spelling.
+        ("conv lhs dilation (transposed)",
+         lambda x, k: conv(x, k, (1,), [(2, 2)], lhs_dilation=(2,),
+                           dimension_numbers=C1),
+         [_rand((1, 2, 5), 114), _rand((3, 2, 3), 115)], *DOT),
+        ("conv both dilations",
+         lambda x, k: conv(x, k, (1, 1), [(1, 1), (0, 0)],
+                           lhs_dilation=(2, 1), rhs_dilation=(1, 2),
+                           dimension_numbers=C2),
+         [_rand((1, 2, 4, 6), 116), _rand((2, 2, 2, 2), 117)], *DOT),
+        ("conv feature groups",
+         lambda x, k: conv(x, k, (1,), "SAME", dimension_numbers=C1,
+                           feature_group_count=2),
+         [_rand((2, 4, 8), 118), _rand((6, 2, 3), 119)], *DOT),
+        ("conv depthwise (groups == channels)",
+         lambda x, k: conv(x, k, (1, 1), "SAME", dimension_numbers=C2,
+                           feature_group_count=4),
+         [_rand((1, 4, 6, 6), 120), _rand((8, 1, 3, 3), 121)], *DOT),
+        # MLX implements `groups` for 1-D and 2-D only, so a 3-D grouped
+        # convolution takes the expanded path: one ungrouped convolution per
+        # group, concatenated along the features.
+        ("conv 3d groups (the expanded path)",
+         lambda x, k: conv(x, k, (1, 1, 1), "VALID", dimension_numbers=C3,
+                           feature_group_count=2),
+         [_rand((1, 4, 4, 4, 4), 122), _rand((6, 2, 2, 2, 2), 123)], *DOT),
+        ("conv batch groups",
+         lambda x, k: conv(x, k, (1,), "VALID", dimension_numbers=C1,
+                           batch_group_count=2),
+         [_rand((4, 2, 6), 124), _rand((6, 2, 3), 125)], *DOT),
+        ("conv 2d batch groups",
+         lambda x, k: conv(x, k, (1, 1), "SAME", dimension_numbers=C2,
+                           batch_group_count=2),
+         [_rand((4, 2, 5, 5), 126), _rand((6, 2, 3, 3), 127)], *DOT),
+        # XLA pads AFTER lhs dilation, so a negative pad crops the DILATED
+        # array -- the rewrite that turns it into an operand slice plus the
+        # leftover holes.  Both spellings, since the second is the one the
+        # dilation arithmetic can get wrong.
+        ("conv negative padding",
+         lambda x, k: conv(x, k, (1,), [(-1, -1)], dimension_numbers=C1),
+         [_rand((1, 2, 8), 128), _rand((3, 2, 3), 129)], *DOT),
+        ("conv negative padding with lhs dilation",
+         lambda x, k: conv(x, k, (1,), [(-3, 1)], lhs_dilation=(2,),
+                           dimension_numbers=C1),
+         [_rand((1, 2, 6), 130), _rand((2, 2, 3), 131)], *DOT),
+        ("conv negative padding that empties the operand",
+         lambda x, k: conv(x, k, (1,), [(-6, 0)], dimension_numbers=C1),
+         [_rand((1, 2, 6), 132), _rand((3, 2, 1), 133)], *EXACT),
+        # A kernel wider than its axis produces no output elements at all --
+        # the guard that keeps MLX from sizing a window its own way and
+        # handing back a short buffer (CLAUDE.md item 20's conv overread).
+        ("conv with a kernel wider than the axis",
+         lambda x, k: conv(x, k, (1,), "VALID", dimension_numbers=C1),
+         [_rand((1, 2, 2), 134), _rand((3, 2, 5), 135)], *EXACT),
+        ("conv with a zero-size batch",
+         lambda x, k: conv(x, k, (1,), "SAME", dimension_numbers=C1),
+         [_rand((0, 2, 6), 136), _rand((3, 2, 3), 137)], *EXACT),
+        ("conv with zero-size channels",
+         lambda x, k: conv(x, k, (1,), "VALID", dimension_numbers=C1),
+         [_rand((1, 0, 6), 138), _rand((3, 0, 3), 139)], *EXACT),
+        ("conv int32 (exact)",
+         lambda x, k: conv(x, k, (1,), "SAME", dimension_numbers=C1),
+         [_randint((2, 3, 7), 140), _randint((4, 3, 3), 141)], *EXACT),
+        ("conv int8 (exact)",
+         lambda x, k: conv(x, k, (1,), "VALID", dimension_numbers=C1),
+         [_randint((1, 2, 6), 142, np.int8),
+          _randint((3, 2, 3), 143, np.int8)], *EXACT),
+        ("conv uint8 (exact)",
+         lambda x, k: conv(x, k, (1,), "VALID", dimension_numbers=C1),
+         [_randint((1, 2, 6), 144, np.uint8, 0, 5),
+          _randint((3, 2, 3), 145, np.uint8, 0, 5)], *EXACT),
+        ("conv int with both dilations (exact)",
+         lambda x, k: conv(x, k, (1,), [(0, 0)], lhs_dilation=(2,),
+                           rhs_dilation=(2,), dimension_numbers=C1),
+         [_randint((1, 2, 5), 146), _randint((3, 2, 2), 147)], *EXACT),
+        ("conv int with feature groups (exact)",
+         lambda x, k: conv(x, k, (1,), "SAME", dimension_numbers=C1,
+                           feature_group_count=2),
+         [_randint((1, 4, 6), 148), _randint((6, 2, 3), 149)], *EXACT),
+        # The im2col view is one strided read over the whole padded operand,
+        # so its stride arithmetic only has more than one spatial axis to get
+        # wrong from 2-D up -- which the 1-D rows above cannot see.
+        ("conv int 2d (exact)",
+         lambda x, k: conv(x, k, (1, 1), "SAME", dimension_numbers=C2),
+         [_randint((2, 3, 5, 6), 182), _randint((4, 3, 3, 3), 183)], *EXACT),
+        ("conv int 2d strided, dilated (exact)",
+         lambda x, k: conv(x, k, (2, 1), "VALID", rhs_dilation=(2, 1),
+                           dimension_numbers=C2),
+         [_randint((1, 2, 9, 7), 184), _randint((3, 2, 3, 2), 185)], *EXACT),
+        ("conv int with negative padding (exact)",
+         lambda x, k: conv(x, k, (1,), [(-1, -1)], dimension_numbers=C1),
+         [_randint((1, 2, 8), 186), _randint((3, 2, 3), 187)], *EXACT),
+        # complex is four real convolutions.
+        ("conv complex64",
+         lambda x, k: conv(x, k, (1,), "SAME", dimension_numbers=C1),
+         [(_rand((1, 2, 6), 150) + 1j * _rand((1, 2, 6), 151)
+           ).astype(np.complex64),
+          (_rand((3, 2, 3), 152) + 1j * _rand((3, 2, 3), 153)
+           ).astype(np.complex64)], *DOT),
+        # No spatial dims at all: the convolution IS a contraction over the
+        # features, and the grouped forms of it are a block-diagonal one.
+        ("conv with no spatial dims",
+         lambda x, k: conv(x, k, (), [],
+                           dimension_numbers=("NC", "OI", "NC")),
+         [_rand((3, 4), 154), _rand((5, 4), 155)], *DOT),
+        ("conv with no spatial dims, feature groups",
+         lambda x, k: conv(x, k, (), [],
+                           dimension_numbers=("NC", "OI", "NC"),
+                           feature_group_count=2),
+         [_rand((3, 4), 156), _rand((6, 2), 157)], *DOT),
+        ("conv with no spatial dims, batch groups",
+         lambda x, k: conv(x, k, (), [],
+                           dimension_numbers=("NC", "OI", "NC"),
+                           batch_group_count=2),
+         [_rand((4, 3), 158), _rand((6, 3), 159)], *DOT),
+        ("conv f16", lambda x, k: conv(x, k, (1,), "SAME",
+                                       dimension_numbers=C1),
+         [_rand((1, 2, 6), 160, np.float16),
+          _rand((3, 2, 3), 161, np.float16)], *HALF),
+        ("conv bf16",
+         lambda x, k: conv(x, k, (1,), "SAME",
+                           dimension_numbers=C1).astype(jnp.float32),
+         [np.asarray(_rand((1, 2, 6), 162)).astype(jnp.bfloat16),
+          np.asarray(_rand((3, 2, 3), 163)).astype(jnp.bfloat16)], *HALF),
+        # jax's own wrappers, which spell their own dimension numbers.
+        ("jnp.convolve", lambda a, b: jnp.convolve(a, b),
+         [_rand((7,), 164), _rand((3,), 165)], *DOT),
+        ("jnp.correlate", lambda a, b: jnp.correlate(a, b, mode="full"),
+         [_rand((7,), 166), _rand((3,), 167)], *DOT),
+        ("lax.conv", lambda x, k: jax.lax.conv(x, k, (1, 1), "SAME"),
+         [_rand((1, 2, 5, 5), 168), _rand((3, 2, 3, 3), 169)], *DOT),
+        ("lax.conv_with_general_padding",
+         lambda x, k: jax.lax.conv_with_general_padding(
+             x, k, (1,), [(1, 1)], (1,), (2,)),
+         [_rand((1, 2, 6), 170), _rand((3, 2, 2), 171)], *DOT),
+        ("lax.conv_transpose",
+         lambda x, k: jax.lax.conv_transpose(x, k, (2,), "SAME",
+                                             dimension_numbers=C1),
+         [_rand((1, 2, 4), 172), _rand((3, 2, 3), 173)], *DOT),
+        # The backward pass of a strided convolution is a TRANSPOSED one (the
+        # gradient wrt the input) plus a BATCH-GROUPED one (the gradient wrt
+        # the weights), so one grad exercises the two arms jax's forward
+        # spelling barely reaches.
+        ("conv grad wrt input and weights",
+         lambda x, k: jax.grad(
+             lambda a, b: (conv(a, b, (2,), "SAME",
+                                dimension_numbers=C1) ** 2).sum(),
+             argnums=(0, 1))(x, k),
+         [_rand((2, 3, 8), 174), _rand((4, 3, 3), 175)], *DOT),
+        ("conv 2d grad",
+         lambda x, k: jax.grad(
+             lambda a, b: jnp.sum(jnp.tanh(
+                 conv(a, b, (1, 1), "SAME", dimension_numbers=C2))),
+             argnums=(0, 1))(x, k),
+         [_rand((2, 3, 6, 6), 176), _rand((4, 3, 3, 3), 177)], *DOT),
+        ("conv in a scan body",
+         lambda xs, k: jax.lax.scan(
+             lambda c, v: (c + conv(v[None], k, (1,), "SAME",
+                                    dimension_numbers=C1)[0], None),
+             np.zeros((3, 6), f), xs)[0],
+         [_rand((4, 2, 6), 178), _rand((3, 2, 3), 179)], *DOT),
+        ("conv in a fori_loop body",
+         lambda x, k: jax.lax.fori_loop(
+             0, 3, lambda i, c: c + conv(c, k, (1,), "SAME",
+                                         dimension_numbers=C1), x),
+         [_rand((1, 2, 6), 180), _rand((2, 2, 3), 181)], *DOT),
+
         # a realistic little block: the shapes a model's forward pass has
         ("dense + norm + gelu",
          lambda x, w, b: jax.nn.gelu(
@@ -931,6 +1142,60 @@ module @reduce_generic_body {
 """
 
 
+# `window_reversal` flips the kernel, turning a correlation into a true
+# convolution.  jax's `conv_general_dilated` has no parameter for it -- it
+# flips the kernel itself when it wants one -- so the only way to reach the
+# executor's `flip` (mx::conv_general's on the float path, an index reversal
+# of the weights on the integer one) is to write the op out.
+_CONV_REVERSAL = """
+module @conv_reversal {
+  func.func public @main(%x: tensor<1x2x6xf32>, %k: tensor<3x2x3xf32>)
+      -> tensor<1x3x6xf32> {
+    %r = stablehlo.convolution(%x, %k)
+      dim_numbers = [b, f, 0]x[o, i, 0]->[b, f, 0],
+      window = {stride = [1], pad = [[1, 1]], lhs_dilate = [1],
+                rhs_dilate = [1], reverse = [1]}
+      {batch_group_count = 1 : i64, feature_group_count = 1 : i64}
+      : (tensor<1x2x6xf32>, tensor<3x2x3xf32>) -> tensor<1x3x6xf32>
+    return %r : tensor<1x3x6xf32>
+  }
+}
+"""
+
+_CONV_REVERSAL_INT = """
+module @conv_reversal_int {
+  func.func public @main(%x: tensor<1x2x6xi32>, %k: tensor<3x2x3xi32>)
+      -> tensor<1x3x4xi32> {
+    %r = stablehlo.convolution(%x, %k)
+      dim_numbers = [b, f, 0]x[o, i, 0]->[b, f, 0],
+      window = {stride = [1], pad = [[0, 0]], lhs_dilate = [1],
+                rhs_dilate = [1], reverse = [1]}
+      {batch_group_count = 1 : i64, feature_group_count = 1 : i64}
+      : (tensor<1x2x6xi32>, tensor<3x2x3xi32>) -> tensor<1x3x4xi32>
+    return %r : tensor<1x3x4xi32>
+  }
+}
+"""
+
+# ...and a MIXED reversal, which must decline: MLX's flip is all-or-nothing
+# and so is the Python handler, so reversing one spatial axis and not the
+# other has no spelling on either engine.
+_CONV_MIXED_REVERSAL = """
+module @conv_mixed_reversal {
+  func.func public @main(%x: tensor<1x1x4x4xf32>, %k: tensor<1x1x2x2xf32>)
+      -> tensor<1x1x3x3xf32> {
+    %r = stablehlo.convolution(%x, %k)
+      dim_numbers = [b, f, 0, 1]x[o, i, 0, 1]->[b, f, 0, 1],
+      window = {stride = [1, 1], pad = [[0, 0], [0, 0]],
+                lhs_dilate = [1, 1], rhs_dilate = [1, 1], reverse = [1, 0]}
+      {batch_group_count = 1 : i64, feature_group_count = 1 : i64}
+      : (tensor<1x1x4x4xf32>, tensor<1x1x2x2xf32>) -> tensor<1x1x3x3xf32>
+    return %r : tensor<1x1x3x3xf32>
+  }
+}
+"""
+
+
 def _module_cases():
     return [
         ("while with a captured bound", _WHILE_CAPTURED_BOUND,
@@ -949,6 +1214,10 @@ def _module_cases():
          [np.float32(1.5), np.int32(0)]),
         ("while with a captured bound (negative)", _WHILE_CAPTURED_BOUND,
          [np.float32(1.5), np.int32(-3)]),
+        ("convolution with window reversal", _CONV_REVERSAL,
+         [_rand((1, 2, 6), 190), _rand((3, 2, 3), 191)]),
+        ("integer convolution with reversal", _CONV_REVERSAL_INT,
+         [_randint((1, 2, 6), 192), _randint((3, 2, 3), 193)]),
     ]
 
 
@@ -1029,13 +1298,23 @@ def _declines():
         ("sort on complex", lambda x: jnp.sort(x),
          [np.array([1 + 2j, 1 - 1j, 0 + 0j], np.complex64)],
          "sort: complex lexicographic comparator"),
-        # convolution has no opcode in the executor at all -- unlike every
-        # other family in P6, this one is not "the lowering is missing".
-        ("convolution",
+        # P7 gave convolution an executor, and two of its corners stay
+        # declined.  A MIXED window reversal is one: MLX's flip is
+        # all-or-nothing and so is the Python handler, so one axis reversed
+        # and the other not has no spelling on either engine.
+        ("convolution with a mixed window reversal", _CONV_MIXED_REVERSAL,
+         [np.zeros((1, 1, 4, 4), np.float32),
+          np.zeros((1, 1, 2, 2), np.float32)],
+         "conv: mixed window_reversal"),
+        # ...and a COMPLEX convolution with no spatial dims, where the Python
+        # handler's matmul arm runs its operands through f32 and would drop
+        # the imaginary part.  Transliterating that would be a wrong answer
+        # nobody could defend; the arm declines instead.
+        ("complex convolution with no spatial dims",
          lambda x, k: jax.lax.conv_general_dilated(
-             x, k, (1,), "SAME", dimension_numbers=("NCH", "OIH", "NCH")),
-         [np.zeros((1, 2, 8), np.float32), np.zeros((3, 2, 3), np.float32)],
-         "stablehlo.convolution"),
+             x, k, (), [], dimension_numbers=("NC", "OI", "NC")),
+         [np.zeros((3, 4), np.complex64), np.zeros((5, 4), np.complex64)],
+         "conv: complex with no spatial dimensions"),
         # An ASYMMETRIC comparator is not a sort by a key: the two sides
         # compute different functions of their arguments, so no single key
         # array orders the operand the way the comparator does.  It must
@@ -1077,13 +1356,14 @@ def _declines():
          "scatter on complex"),
         # A loop whose BODY holds an op outside the set declines the whole
         # program, naming that op -- the region is lowered by the same
-        # `Lowering` as main, so its declines are main's.
+        # `Lowering` as main, so its declines are main's.  (Convolution used
+        # to be the op here; it computes now, so the LAPACK targets --
+        # phase 2's next milestone -- stand in for it.)
         ("while loop over an unlowered op",
          lambda x: jax.lax.fori_loop(
-             0, 4, lambda i, c: jax.lax.conv_general_dilated(
-                 c, c, (1,), "SAME",
-                 dimension_numbers=("NCH", "OIH", "NCH")) + 1.0, x),
-         [np.zeros((1, 1, 4), np.float32)], "stablehlo.convolution"),
+             0, 4, lambda i, c: jnp.linalg.cholesky(
+                 c @ c.T + 4 * jnp.eye(3)), x),
+         [np.eye(3, dtype=np.float32)], "stablehlo.cholesky"),
     ]
 
 

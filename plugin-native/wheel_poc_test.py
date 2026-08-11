@@ -121,19 +121,27 @@ def _compile():
         jax.device_put(np.array([3.0, 1.0, 2.0], np.float32))))
     print("  jit(jnp.sort) ->", srt.tolist())
     assert np.array_equal(srt, np.array([1.0, 2.0, 3.0], np.float32)), srt
-    # An op outside the native set still declines, and says which one.
-    # Convolution is the one left with no opcode in the executor at all.
+    # ...and a convolution computes here too (P7), which is the family this
+    # checkpoint watched decline after sort.
+    cv = np.asarray(jax.jit(lambda a, k: jax.lax.conv_general_dilated(
+        a, k, (1,), "VALID", dimension_numbers=("NCH", "OIH", "NCH")))(
+            jax.device_put(np.ones((1, 2, 4), np.float32)),
+            jax.device_put(np.ones((1, 2, 3), np.float32))))
+    print("  jit(conv_general_dilated) ->", cv.tolist())
+    assert np.array_equal(cv, np.full((1, 1, 2), 6.0, np.float32)), cv
+    # An op outside the native set still declines, and says which one.  The
+    # host-computed LAPACK targets are what is left (phase 2's next
+    # milestone); nothing else in reach of this checkpoint declines.
     try:
-        jax.jit(lambda a, k: jax.lax.conv_general_dilated(
-            a, k, (1,), "SAME", dimension_numbers=("NCH", "OIH", "NCH")))(
-                jax.device_put(np.ones((1, 2, 8), np.float32)),
-                jax.device_put(np.ones((3, 2, 3), np.float32)))
+        jax.jit(lambda a: jax.numpy.linalg.cholesky(
+            a @ a.T + 4 * jax.numpy.eye(3)))(
+                jax.device_put(np.eye(3, dtype=np.float32)))
     except Exception as e:  # noqa: BLE001 - the expected decline
         msg = str(e)
-        print("  convolution declined:", msg.splitlines()[0][:160])
-        assert "stablehlo.convolution" in msg, "the decline did not name the op"
+        print("  cholesky declined:", msg.splitlines()[0][:160])
+        assert "stablehlo.cholesky" in msg, "the decline did not name the op"
         return
-    raise AssertionError("convolution unexpectedly compiled")
+    raise AssertionError("cholesky unexpectedly compiled")
 
 
 if FAILED:
