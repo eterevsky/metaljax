@@ -994,6 +994,22 @@ def _cases():
                            dimension_numbers=("NC", "OI", "NC"),
                            batch_group_count=2),
          [_rand((4, 3), 158), _rand((6, 3), 159)], *DOT),
+        # ...and the COMPLEX one, which is four real matmuls exactly as the
+        # spatial arm is four real convolutions.  It used to decline, because
+        # `ops/conv.py`'s matmul arm runs its operands through f32 and drops
+        # the imaginary part -- and the Stage 1 engine SHIPS that: the jax test
+        # that covers this shape (`lax_test::testConvGeneralDilated0D2`)
+        # compares metal against metal and never saw it.  These rows compare
+        # against jax-CPU, which is the whole difference.
+        ("conv complex64 with no spatial dims",
+         lambda x, k: conv(x, k, (), [],
+                           dimension_numbers=("NC", "OI", "NC")),
+         [_crand((3, 4), 350), _crand((5, 4), 351)], *DOT),
+        ("conv complex64 with no spatial dims, feature groups",
+         lambda x, k: conv(x, k, (), [],
+                           dimension_numbers=("NC", "OI", "NC"),
+                           feature_group_count=2),
+         [_crand((3, 4), 352), _crand((6, 2), 353)], *DOT),
         ("conv f16", lambda x, k: conv(x, k, (1,), "SAME",
                                        dimension_numbers=C1),
          [_rand((1, 2, 6), 160, np.float16),
@@ -1181,6 +1197,25 @@ def _cases():
          lambda x, i, u: x.at[i].multiply(u, unique_indices=True),
          [_crand((6, 4), 324), np.array([7, 5, 99], np.int32),
           _crand((3, 4), 325)], *F32),
+        # WITHOUT the promise -- which is every plain `.at[i].multiply(u)`,
+        # since jax sets `unique_indices = false` for all of them, literal
+        # indices included.  Keying the arm on the flag refused programs whose
+        # answer was right; the sequential apply arm answers them instead, one
+        # update at a time in XLA's order, so a REPEATED index really does
+        # multiply twice.  Both shapes are here, and the duplicate one is the
+        # case the gather-multiply-set rewrite would get wrong.
+        ("complex scatter multiply (no promise, distinct indices)",
+         lambda x, i, u: x.at[i].multiply(u),
+         [_crand((6, 4), 326), np.array([0, 5, 2], np.int32),
+          _crand((3, 4), 327)], *F32),
+        ("complex scatter multiply (no promise, duplicate indices)",
+         lambda x, i, u: x.at[i].multiply(u),
+         [_crand((6, 4), 328), np.array([1, 1, 4, 1], np.int32),
+          _crand((4, 4), 329)], *F32),
+        ("complex scatter multiply (no promise, out of bounds)",
+         lambda x, i, u: x.at[i].multiply(u),
+         [_crand((6, 4), 330), np.array([2, 99, 2], np.int32),
+          _crand((3, 4), 331)], *F32),
         ("complex scatter over a partial window",
          lambda x, i, u: x.at[i, 0:2].set(u),
          [_crand((6, 4), 320), np.array([0, 3], np.int32),
@@ -2050,6 +2085,49 @@ module @collective_permute_empty {
 """
 
 
+# The ASYNC wrapper (`jax.experimental.parallel`'s `psum_start(...).done()`
+# family).  `async_start` hands its operands to a region holding one
+# collective and yields a `!stablehlo.future`; `async_done` awaits it.  On one
+# device there is no asynchrony to emulate -- the collective inside is one of
+# the identities above -- so the pair lowers to the region's ops plus two
+# aliases, and the CPU backend with its one replica is again the reference.
+# The dot is here because jax puts one there: a real async collective needs
+# something to overlap with, and a program that is only the pair would not say
+# whether the ORDER survived.
+_ASYNC_COLLECTIVES = """
+module @async_collectives {
+  func.func public @main(%x: tensor<4xf32>, %a: tensor<4x4xf32>)
+      -> (tensor<4xf32>, tensor<4xf32>, tensor<4x4xf32>) {
+    %d = stablehlo.dot_general %a, %a, contracting_dims = [1] x [0]
+        : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+    %s = "stablehlo.async_start"(%x) ({
+    ^bb0(%arg: tensor<4xf32>):
+      %r = "stablehlo.all_reduce"(%arg) <{
+          replica_groups = dense<0> : tensor<1x1xi64>}> ({
+      ^bb0(%p: tensor<f32>, %q: tensor<f32>):
+        %t = stablehlo.add %p, %q : tensor<f32>
+        stablehlo.return %t : tensor<f32>
+      }) : (tensor<4xf32>) -> tensor<4xf32>
+      stablehlo.return %r : tensor<4xf32>
+    }) : (tensor<4xf32>) -> !stablehlo.future<tensor<4xf32>>
+    %done = "stablehlo.async_done"(%s)
+        : (!stablehlo.future<tensor<4xf32>>) -> tensor<4xf32>
+    %g = "stablehlo.async_start"(%x) ({
+    ^bb0(%arg2: tensor<4xf32>):
+      %h = "stablehlo.all_gather"(%arg2) <{all_gather_dim = 0 : i64,
+          replica_groups = dense<0> : tensor<1x1xi64>}>
+          : (tensor<4xf32>) -> tensor<4xf32>
+      stablehlo.return %h : tensor<4xf32>
+    }) : (tensor<4xf32>) -> !stablehlo.future<tensor<4xf32>>
+    %gdone = "stablehlo.async_done"(%g)
+        : (!stablehlo.future<tensor<4xf32>>) -> tensor<4xf32>
+    return %done, %gdone, %d
+        : tensor<4xf32>, tensor<4xf32>, tensor<4x4xf32>
+  }
+}
+"""
+
+
 def _module_cases():
     return [
         ("while with a captured bound", _WHILE_CAPTURED_BOUND,
@@ -2078,6 +2156,8 @@ def _module_cases():
          [_rand((4,), 260)]),
         ("collective_permute with no pairs", _COLLECTIVE_PERMUTE_EMPTY,
          [_rand((4,), 261)]),
+        ("async collectives (start/done)", _ASYNC_COLLECTIVES,
+         [_rand((4,), 262), _rand((4, 4), 263)]),
     ]
 
 
@@ -2231,15 +2311,6 @@ def _declines():
          [np.zeros((1, 1, 4, 4), np.float32),
           np.zeros((1, 1, 2, 2), np.float32)],
          "conv: mixed window_reversal"),
-        # ...and a COMPLEX convolution with no spatial dims, where the Python
-        # handler's matmul arm runs its operands through f32 and would drop
-        # the imaginary part.  Transliterating that would be a wrong answer
-        # nobody could defend; the arm declines instead.
-        ("complex convolution with no spatial dims",
-         lambda x, k: jax.lax.conv_general_dilated(
-             x, k, (), [], dimension_numbers=("NC", "OI", "NC")),
-         [np.zeros((3, 4), np.complex64), np.zeros((5, 4), np.complex64)],
-         "conv: complex with no spatial dimensions"),
         # An ASYMMETRIC comparator is not a sort by a key: the two sides
         # compute different functions of their arguments, so no single key
         # array orders the operand the way the comparator does.  It must
@@ -2262,18 +2333,16 @@ def _declines():
              x, 0.0, jax.lax.add, (2,), (1,), [(-1, 0)]),
          [np.arange(6, dtype=np.float32)],
          "reduce_window negative padding"),
-        # A complex scatter runs as two real ones (P10), which is exact only
-        # while the combiner is componentwise.  MULTIPLY is not, and the
-        # rewrite that answers it (gather, multiply, set) is equal to the
-        # combiner only when no two updates land on the same slot -- so
-        # without the op's `unique_indices` it declines, where ops/gather.py
-        # assumes the promise and runs.
-        ("complex scatter multiply with no uniqueness promise",
+        # A complex scatter multiply without a uniqueness promise runs one
+        # update at a time, which is exact -- but only up to the cap the
+        # sequential arm carries.  Above it the op declines by name rather
+        # than emitting thousands of MLX ops per call.
+        ("complex scatter multiply above the sequential cap",
          lambda x, i, u: x.at[i].multiply(u),
-         [np.array([1 + 1j, 2 - 2j, 0j], np.complex64),
-          np.array([0, 2], np.int32),
-          np.array([5 + 0j, 6 + 1j], np.complex64)],
-         "complex scatter multiply without unique indices"),
+         [np.ones(4096, np.complex64),
+          np.arange(2048, dtype=np.int32),
+          np.full(2048, 2 + 0j, np.complex64)],
+         "complex scatter multiply with duplicates: 2048 updates"),
         # A loop whose BODY holds an op outside the set declines the whole
         # program, naming that op -- the region is lowered by the same
         # `Lowering` as main, so its declines are main's.  (Convolution used
@@ -2442,6 +2511,19 @@ def _p13_contracts(jax, jnp):
             return False, "None"
         return "metaljax_tape_entries" in info, f"{sorted(info)[:3]}"
 
+    def optimized_program_is_answered():
+        """PJRT's `OptimizedProgram`, which jax turns into
+        `compiled.as_text()`.  What comes back is the program this executable
+        RUNS, as HLO -- unoptimized, because nothing here optimizes at the HLO
+        level -- and answering nothing at all is worse: jax turns a refusal
+        into `None`, and every caller that greps the text then fails on a
+        `NoneType` (five `async_collectives_test` rows did)."""
+        text = jax.jit(lambda v: jnp.sin(v) + 1.0).lower(
+            jnp.arange(3, dtype=jnp.float32)).compile().as_text()
+        if not isinstance(text, str):
+            return False, f"{type(text).__name__}"
+        return ("sine" in text and "add" in text), text.splitlines()[0][:70]
+
     def compile_options_are_validated():
         lowered = jax.jit(lambda v: v + 1).lower(
             jnp.arange(3, dtype=jnp.float32))
@@ -2458,15 +2540,85 @@ def _p13_contracts(jax, jnp):
         got = np.asarray(exe(jnp.arange(3, dtype=jnp.float32)))
         return np.array_equal(got, np.arange(3) + 1), f"{got}"
 
+    def double_donation_raises():
+        """The donation contract is per CALL: the same buffer in a donated
+        and in a plain position asks for it to be consumed and read at once.
+        Every PjRtClient refuses that; this one used to delete the buffer out
+        from under the second use."""
+        x = jax.device_put(np.ones(3, np.float32))
+        try:
+            jax.jit(lambda a, b: a + b, donate_argnums=(0,))(x, x)
+        except BaseException as exc:  # noqa: BLE001 - this is the contract
+            msg = str(exc)
+            if "donated" not in msg:
+                return False, f"raised {msg.splitlines()[0][:70]}"
+            if x.is_deleted():
+                return False, "the buffer was consumed by the refused call"
+            return True, ""
+        return False, "double donation was accepted"
+
+    def host_memory_space_is_honoured():
+        """Apple silicon's memory is unified, so a host placement costs
+        nothing -- but the KIND is something jax asks about and reports back,
+        and answering `device` to every request made the annotation vanish.
+        The client carries both spaces; a buffer points at the one asked
+        for."""
+        kinds = {m.kind for m in jax.devices()[0].addressable_memories()}
+        if not {"device", "pinned_host"} <= kinds:
+            return False, f"memory kinds {sorted(kinds)}"
+        dev = jax.devices()[0]
+        place = lambda kind: jax.sharding.SingleDeviceSharding(  # noqa: E731
+            dev, memory_kind=kind)
+        x = jax.device_put(np.arange(4, dtype=np.float32),
+                           place("pinned_host"))
+        if x.sharding.memory_kind != "pinned_host":
+            return False, f"device_put gave {x.sharding.memory_kind}"
+        if not np.array_equal(np.asarray(x), np.arange(4)):
+            return False, "the values did not survive the placement"
+        back = jax.device_put(x, place("device"))
+        if back.sharding.memory_kind != "device":
+            return False, f"copy back gave {back.sharding.memory_kind}"
+        # ...and the kind a PROGRAM asks for, which is the annotation the
+        # module carries on main's result (`mhlo.memory_kind`).
+        out = jax.jit(lambda v: v * 2.0,
+                      out_shardings=place("pinned_host"))(x)
+        if out.sharding.memory_kind != "pinned_host":
+            return False, f"out_shardings gave {out.sharding.memory_kind}"
+        return np.array_equal(np.asarray(out), np.arange(4) * 2.0), \
+            "the values did not survive the annotation"
+
+    def outputs_own_their_bytes():
+        """A buffer this plugin hands out must own its bytes.  A tape output
+        can be an MLX view over a SMALLER buffer -- a broadcast is 4 bytes
+        pretending to be N -- and jax passes that straight back as the next
+        executable's argument, where a consumer reading it as dense memory
+        computes on whatever follows those 4 bytes."""
+        big = jax.jit(lambda v: jnp.broadcast_to(v, (64, 64)))(
+            jnp.float32(2.5))
+        # The pointer identifies the buffer; a real one is far apart from its
+        # neighbour, and the read below is what would fault or read garbage on
+        # a short one.
+        got = np.asarray(big)
+        if not np.array_equal(got, np.full((64, 64), 2.5, np.float32)):
+            return False, "the broadcast did not read back"
+        # ...and as an ARGUMENT of a program whose kernel reads it densely.
+        rolled = np.asarray(jax.jit(lambda v: jnp.roll(v, 3, axis=1))(big))
+        return np.array_equal(rolled, np.full((64, 64), 2.5, np.float32)), \
+            "a dense consumer read the broadcast wrongly"
+
     return [
         ("callbacks run in order", callbacks_run_in_order),
         ("ordered effects thread tokens", ordered_effects_thread_tokens),
         ("pure_callback computes", pure_callback_values),
         ("a callback's error propagates", callback_error_propagates),
         ("donation invalidates its input", donation_invalidates),
+        ("double donation raises", double_donation_raises),
         ("buffer pointers are stable", buffer_pointer_is_stable),
+        ("outputs own their bytes", outputs_own_their_bytes),
+        ("the host memory space is honoured", host_memory_space_is_honoured),
         ("the default layout is answered", default_layout_is_answered),
         ("cost analysis is answered", cost_analysis_is_answered),
+        ("the optimized program is answered", optimized_program_is_answered),
         ("compile options are validated", compile_options_are_validated),
     ]
 

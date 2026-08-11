@@ -34,6 +34,7 @@ Licensed under the Apache License, Version 2.0.
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 #include "metal/metal_dtypes.h"
+#include "metal/metal_names.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -191,6 +192,13 @@ constexpr int64_t kTokenShape = 0;
 bool IsToken(mlir::Type t) { return mlir::isa<mlir::stablehlo::TokenType>(t); }
 bool IsToken(mlir::Value v) { return IsToken(v.getType()); }
 
+// The handle an `async_start` yields.  It is not a value the tape can hold --
+// nothing computes on it -- so it never gets a slot; the lowering remembers
+// which slots it stands for (`futures_`) and `async_done` reads them back.
+bool IsFuture(mlir::Value v) {
+  return mlir::isa<mlir::stablehlo::FutureType>(v.getType());
+}
+
 // A caller-requested LAYOUT, as jax spells it on main's arguments and results
 // (`mhlo.layout_mode`, XLA's minor-to-major order: "{1,0}" is row-major at
 // rank 2, "{0,1}" is column-major).  MLX's storage is major-to-minor and
@@ -215,6 +223,27 @@ absl::Status CheckLayoutMode(mlir::Attribute attr, size_t rank,
   if (mode == want) return absl::OkStatus();
   return Decline(absl::StrCat("a ", what, " layout of ", mode,
                               " (metaljax is row-major: ", want, ")"));
+}
+
+// A caller-requested MEMORY SPACE, as jax spells it on main's arguments and
+// results (`mhlo.memory_kind`, and the `annotate_device_placement` custom call
+// that carries the same string in a frontend attribute).  Apple silicon's
+// memory is unified, so "device" and "pinned_host" name one physical pool and
+// the placement costs nothing to honour -- the client exposes both spaces and
+// the buffer points at whichever was asked for.  Anything else (XLA also
+// spells "unpinned_host") declines BY NAME rather than being ignored: this
+// backend has nowhere else to put a buffer, and answering "device" to a
+// request it did not serve is what made these annotations silently vanish.
+absl::StatusOr<bool> ReadMemoryKind(mlir::Attribute attr,
+                                    absl::string_view what) {
+  auto s = mlir::dyn_cast_or_null<mlir::StringAttr>(attr);
+  if (!s) return false;
+  const absl::string_view kind = View(s.getValue());
+  if (kind.empty() || kind == kMemoryKind) return false;
+  if (kind == kHostMemoryKind) return true;
+  return Decline(absl::StrCat("a ", what, " in memory space '", kind,
+                              "' (metaljax has '", kMemoryKind, "' and '",
+                              kHostMemoryKind, "', one unified pool)"));
 }
 
 // Cross-replica collectives (src/metaljax/ops/collectives.py).  This plugin
@@ -1666,6 +1695,9 @@ class Lowering {
 
   // P12: ops/collectives.py, on the one device this plugin has.
   absl::Status LowerCollective(mlir::Operation* op, absl::string_view name);
+  // P15: the async wrapper around one of them, run synchronously.
+  absl::Status LowerAsyncStart(mlir::Operation* op);
+  absl::Status LowerAsyncDone(mlir::Operation* op);
 
   // tape.py `_generic_reduce_attrs`: a reduce body neither table recognizes,
   // lowered into a sub-Program the handler calls once per halving round.
@@ -1783,6 +1815,10 @@ class Lowering {
   // ARGUMENT slots of this frame whose very array object it may be.
   absl::flat_hash_map<int, absl::flat_hash_set<int>> arg_alias_;
   absl::flat_hash_set<int> const_view_;
+  // The slots an `!stablehlo.future` stands for.  A future is not a value the
+  // tape can hold, so it never gets a slot of its own: `async_start` records
+  // what its region computed and `async_done` reads it back.
+  llvm::DenseMap<mlir::Value, std::vector<int>> futures_;
 };
 
 absl::Status Lowering::CheckValue(mlir::Value v) {
@@ -2907,11 +2943,12 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerConv(mlir::Operation* op) {
 
   if (rank == 0) {
     // No spatial dims: a (grouped) matmul over features.  The Python handler
-    // runs it in f32 whatever the operands are, which drops the imaginary
-    // part of a complex one -- so that combination declines here rather than
-    // transliterating an answer neither engine could defend.
-    if (is_complex(out_dt))
-      return Decline("conv: complex with no spatial dimensions");
+    // runs it in f32 whatever the operands are, which DROPS the imaginary
+    // part of a complex one -- shipped Stage 1 computes this case wrong and
+    // silently (`lax_test::testConvGeneralDilated0D2` never caught it: its
+    // reference is the same backend).  So the arm carries the same `mode` the
+    // spatial one does, and complex goes through four real matmuls.
+    attrs.push_back(is_complex(out_dt) ? 2 : 0);
     const int64_t split = bgc > 1 ? bgc : fgc;
     const int64_t nbatch = lhs_shape[static_cast<size_t>(lperm[0])];
     const int64_t nin = lhs_shape[static_cast<size_t>(lperm[1])];
@@ -3188,13 +3225,22 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
     // MULTIPLY is the one combiner ops/gather.py rewrites rather than
     // splitting: `method = "apply"`, which gathers the current values,
     // combines them with the updates and SETS the result -- and that equals
-    // the combiner only while no two updates land on the same slot.  The
-    // Python handler assumes it; here it is checked, because jax's own
-    // `unique_indices` says so on the op (scatter_apply and the static
-    // indexing forms set it; a plain `.at[i].multiply(u)` does not).
-    if (!sc.getUniqueIndices())
-      return Decline("complex scatter multiply without unique indices");
-    method_code = 6;
+    // the combiner only while no two updates land on the same slot.
+    //
+    // jax's `unique_indices` is the promise, and it is FALSE for every plain
+    // `.at[i].multiply(u)` even when the indexer is a literal `[0, 1, 2]`, so
+    // keying the arm on it refused programs whose answer was right (the
+    // report's `testStaticIndexing5`).  Asking the flag is also the wrong
+    // question: what matters is whether two updates land on one slot, and the
+    // indices are a computed value this lowering cannot read.
+    //
+    // So a missing promise takes the SEQUENTIAL apply arm over the op's own
+    // multiply body instead -- one update at a time, in XLA's order, which is
+    // exact whether or not the indices repeat.  It costs a constant number of
+    // MLX ops per update, so it keeps the same cap the computed-body arm has
+    // (checked below, from the static update count) and declines by name
+    // above it rather than computing a product it cannot defend.
+    method_code = sc.getUniqueIndices() ? 6 : 8;
   } else if (complex_parts && method_code != 0 && method_code != 1 &&
              method_code != 5 && method_code != 7 && method_code != 8) {
     // An APPLY body is componentwise by construction -- it bottoms out in a
@@ -3348,7 +3394,10 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
     // MLX ops PER UPDATE, which is only sane for the small op-semantics
     // shapes this pattern shows up in.
     return Decline(absl::StrFormat(
-        "scatter computed-body with duplicates: %d updates",
+        "%s with duplicates: %d updates",
+        complex_parts && combiner == Combiner::kMultiply
+            ? "complex scatter multiply"
+            : "scatter computed-body",
         Product(plan.batch_shape)));
   }
   if (method_code == 7 || method_code == 8) {
@@ -4145,6 +4194,19 @@ absl::Status Lowering::LowerCustomCall(mlir::Operation* op) {
       return Decline("a shape_assertion with results");
     return absl::OkStatus();   // nothing to run: the shapes are already static
   }
+  // `lax.dce_sink`: a marker that keeps its operand alive through a compiler's
+  // dead-code elimination, and computes nothing.  This tape has no DCE -- it
+  // lowers every op the block holds -- so the marker's whole job is already
+  // done and it emits no entry.  The operands are still resolved, so a sink
+  // over something this lowering never bound says so instead of passing.
+  // Declining the target outright was a regression against the Stage 1 engine,
+  // which compiles a program containing `lax.dce_sink` and runs it.
+  if (target == "dce_sink") {
+    if (op->getNumResults() != 0)
+      return Decline("a dce_sink with results");
+    for (mlir::Value v : op->getOperands()) RETURN_IF_ERROR(Slot(v).status());
+    return absl::OkStatus();
+  }
   if (target == "ApproxTopK") return LowerApproxTopK(op);
   if (target == kCallbackTarget) return LowerCallback(op);
 
@@ -4419,6 +4481,71 @@ absl::Status Lowering::LowerCollective(mlir::Operation* op,
           " that changes shape (a replica group wider than this device)"));
     ASSIGN_OR_RETURN(int s, Slot(op->getOperand(i)));
     Alias(op->getResult(i), s);
+  }
+  return absl::OkStatus();
+}
+
+// The async wrapper: `async_start` hands its operands to a region holding one
+// collective and yields a `!stablehlo.future`, which `async_done` awaits.
+//
+// There is no asynchrony to emulate here -- the collective inside is one of
+// LowerCollective's arms, and on one device every one of those is an alias or
+// a constant.  So the region is INLINED where the start sits (the tape's order
+// is the block's order, which is exactly the order XLA's own erasure of a
+// single-device async pair would leave), the future remembers the slots the
+// region returned, and the done reads them back.  A start whose region does
+// something other than a collective declines through the ordinary walk, from
+// inside, naming that op.
+absl::Status Lowering::LowerAsyncStart(mlir::Operation* op) {
+  if (op->getNumRegions() != 1 || op->getRegion(0).getBlocks().size() != 1)
+    return Decline("stablehlo.async_start with no single-block region");
+  if (op->getNumResults() != 1 || !IsFuture(op->getResult(0)))
+    return Decline("stablehlo.async_start that does not produce one future");
+  mlir::Block& block = op->getRegion(0).front();
+  if (block.getNumArguments() != op->getNumOperands())
+    return Decline("stablehlo.async_start whose region arity does not match");
+
+  std::vector<int> args;
+  for (mlir::Value v : op->getOperands()) {
+    RETURN_IF_ERROR(CheckValue(v));
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    args.push_back(s);
+  }
+  for (size_t i = 0; i < args.size(); i++)
+    Alias(block.getArgument(static_cast<unsigned>(i)), args[i]);
+
+  std::vector<mlir::Value> returned;
+  bool terminated = false;
+  for (mlir::Operation& inner : block) {
+    if (mlir::isa<mlir::stablehlo::ReturnOp>(inner)) {
+      returned.assign(inner.getOperands().begin(), inner.getOperands().end());
+      terminated = true;
+      break;
+    }
+    RETURN_IF_ERROR(LowerOp(&inner));
+  }
+  if (!terminated) return Decline("stablehlo.async_start with no terminator");
+
+  std::vector<int> slots;
+  for (mlir::Value v : returned) {
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    slots.push_back(s);
+  }
+  futures_[op->getResult(0)] = std::move(slots);
+  return absl::OkStatus();
+}
+
+absl::Status Lowering::LowerAsyncDone(mlir::Operation* op) {
+  if (op->getNumOperands() != 1)
+    return Decline("stablehlo.async_done with an unexpected arity");
+  auto it = futures_.find(op->getOperand(0));
+  if (it == futures_.end())
+    return Decline("stablehlo.async_done on a future this tape does not hold");
+  if (it->second.size() != op->getNumResults())
+    return Decline("stablehlo.async_done whose result count does not match");
+  for (unsigned i = 0; i < op->getNumResults(); i++) {
+    RETURN_IF_ERROR(CheckValue(op->getResult(i)));
+    Alias(op->getResult(i), it->second[i]);
   }
   return absl::OkStatus();
 }
@@ -4840,6 +4967,12 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   // nothing in it runs.
   if (IsCollectiveOp(name)) return LowerCollective(op, name);
 
+  // ...and the async wrapper around one of them, likewise ahead of the region
+  // gate.  On one device there is nothing to overlap, so the pair is the
+  // collective itself plus two aliases.
+  if (name == "stablehlo.async_start") return LowerAsyncStart(op);
+  if (name == "stablehlo.async_done") return LowerAsyncDone(op);
+
   // tape.py `_REGION_BODY_OPS`: the four ops whose region is a BODY the
   // lowering reads (structurally, or into a sub-Program) rather than a branch
   // of control flow.
@@ -5055,7 +5188,7 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
   auto spec_of = [&](mlir::Value v) -> absl::StatusOr<ValueSpec> {
     ASSIGN_OR_RETURN(std::vector<int64_t> dims, Dims(v));
     if (IsToken(v))
-      return ValueSpec{xla::PRED, std::move(dims), mx::bool_};
+      return ValueSpec{xla::TOKEN, std::move(dims), mx::bool_};
     auto t = mlir::cast<mlir::RankedTensorType>(v.getType());
     return ValueSpec{*PrimitiveTypeOf(t.getElementType()), std::move(dims),
                      *MxDtypeOf(t.getElementType())};
@@ -5078,14 +5211,20 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
     RETURN_IF_ERROR(CheckLayoutMode(fn.getArgAttr(i, "mhlo.layout_mode"),
                                     lowered.parameters.back().dims.size(),
                                     "parameter"));
+    ASSIGN_OR_RETURN(lowered.parameters.back().host_memory,
+                     ReadMemoryKind(fn.getArgAttr(i, "mhlo.memory_kind"),
+                                    "parameter"));
   }
 
   ASSIGN_OR_RETURN(Built built, LowerBlock(block, {}));
   for (mlir::Value v : built.returned) {
     ASSIGN_OR_RETURN(ValueSpec spec, spec_of(v));
+    const size_t r = lowered.results.size();
     RETURN_IF_ERROR(CheckLayoutMode(
-        fn.getResultAttr(lowered.results.size(), "mhlo.layout_mode"),
-        spec.dims.size(), "result"));
+        fn.getResultAttr(r, "mhlo.layout_mode"), spec.dims.size(), "result"));
+    ASSIGN_OR_RETURN(
+        spec.host_memory,
+        ReadMemoryKind(fn.getResultAttr(r, "mhlo.memory_kind"), "result"));
     lowered.results.push_back(std::move(spec));
   }
 
@@ -5157,6 +5296,7 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
 }  // namespace
 
 xla::Shape ValueSpec::shape() const {
+  if (type == xla::TOKEN) return xla::ShapeUtil::MakeTokenShape();
   return xla::ShapeUtil::MakeShape(type, dims);
 }
 

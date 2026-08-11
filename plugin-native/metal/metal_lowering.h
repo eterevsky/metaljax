@@ -44,6 +44,13 @@ struct ValueSpec {
   xla::PrimitiveType type;
   std::vector<int64_t> dims;
   mlx::core::Dtype dtype;
+  // Which of the client's memory spaces this value belongs to: false for the
+  // default "device", true for "pinned_host" (`mhlo.memory_kind` on main's
+  // argument or result).  Apple silicon's pool is unified, so nothing about
+  // the allocation changes -- the flag exists so the buffer handed back points
+  // at the space the CALLER asked for, and jax's `sharding.memory_kind` and
+  // `GetOutputMemoryKinds` answer with it instead of assuming "device".
+  bool host_memory = false;
 
   xla::Shape shape() const;
   int64_t element_count() const;
@@ -66,6 +73,13 @@ struct LoweredProgram {
   // Whether the whole tape is traced through mx::compile (the P5 decision;
   // while BODIES carry theirs in the entry's attrs instead).
   bool compiled = false;
+  // The StableHLO this tape was built from, as MLIR bytecode -- the program
+  // `GetHloModules` (PJRT's `OptimizedProgram`) hands back, converted to HLO
+  // on demand.  Kept serialized rather than as a live module because the
+  // module and its MLIRContext belong to the compile call, and kept at ALL
+  // because a debugging surface that answers nothing is one jax turns into
+  // `None` and every caller then trips over.
+  std::string stablehlo;
 };
 
 absl::StatusOr<LoweredProgram> LowerModule(mlir::ModuleOp module);

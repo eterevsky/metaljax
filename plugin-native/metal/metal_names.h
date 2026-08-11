@@ -20,6 +20,13 @@ namespace metaljax {
 inline constexpr absl::string_view kPlatformName = "metal";
 inline constexpr absl::string_view kDeviceKind = "Apple GPU";
 inline constexpr absl::string_view kMemoryKind = "device";
+// Apple silicon is UNIFIED memory: the GPU and the CPU address one physical
+// pool, so a buffer jax asks to keep on the host is already where the host can
+// read it and the device can compute on it.  The kind is therefore real
+// metadata over identical physics -- the client exposes the space so that
+// `device_put(..., Space.Host)`, an `out_memory_spaces=Host` annotation and
+// `sharding.memory_kind` are answered truthfully instead of ignored.
+inline constexpr absl::string_view kHostMemoryKind = "pinned_host";
 // The sentinel names the PLUGIN, not the phase it has reached: the test
 // harnesses match on it to prove which dylib answered, so it stays put as the
 // plugin grows.

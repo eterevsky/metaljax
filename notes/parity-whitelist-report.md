@@ -1,5 +1,30 @@
 # The 142: a per-test review of every failing row in the pinned jax suite
 
+> **STATUS after Oleg's review verdicts (2026-08-11): 142 -> 129.** Thirteen
+> rows were implemented rather than whitelisted; the per-class sections below
+> carry a **[FIXED]** line each. What changed, in the order Oleg asked for it:
+>
+> | # | class | rows | outcome |
+> |---:|---|---:|---|
+> | 1 | Q sparse `spdot_general` | 2 | **NOT ours** — diagnosed to MLX's compiled-kernel FUSION (`METALJAX_MLX_COMPILE_MODE=no_fuse` makes both pass, the eager walk is right). Still failing; MLX bug #8, evidence below |
+> | 2 | C async collectives | 5 | `async_start`/`async_done` implemented (2 pass; 3 now fail only on an *unoptimized-HLO* expectation, with class E) |
+> | 3 | I complex scatter-multiply, complex 0-spatial conv | 2 | both implemented — and the conv one uncovered that **shipped Stage 1 computes it wrong** |
+> | 4 | F memory spaces | 4 | a second `PjRtMemorySpace` (`pinned_host`) |
+> | 5 | L double donation | 1 | XLA's own clash check |
+> | 6 | E PJRT surface | 8 | aot topology 2 (message), `dce_sink` 1 (compiles again), `OptimizedProgram` implemented — `XlaTransform` 4 and the inline row NOT done |
+> | 7 | B export allowlist / A2 f64 pass-through | 49 + 9 | both investigated, neither implemented — findings below |
+> | 8 | M token representation | 1 | a token result is `xla::TOKEN` now |
+> | 9 | J skew/harness | 6 | both mechanisms nailed down; jax-side, stay whitelisted |
+>
+> Affected files, re-run natively before and after: `async_collectives_test`
+> 5->3, `aot_test` 2->0 (both become SKIPs), `api_test` 7->5, `lax_test` 2->0,
+> `lax_numpy_indexing_test` 1->0, `memories_test` 2->0, `export_test` 7->5,
+> `sparse_bcoo_bcsr_test` 2->2. Whole pinned suite: **28,068 passed / 129
+> failed = 99.54 %**, past Stage 1's 99.51 % on this tree and the 0.11.0
+> release artifact's 99.53 %. Batteries: `execute_test` 493 -> **502 checks**,
+> `texmo_gate` **106 ok / 0 decline / 0 FAIL**, smoke, wheel PoC from a fresh
+> 3.13 venv, `bazel test //...`.
+
 Manual review of **all 142 failures** of the pinned `jax-v0.11.0` suite through
 the **native** PJRT plugin (HEAD `6dddbff`, 99.50 %: 28,057 passed / 142 failed
 / 6,158 skipped / 35 errors), one entry per test id, for sign-off on every
@@ -50,27 +75,27 @@ Raw logs (session scratch, not committed):
 
 ## Executive summary
 
-| # | class | count | verdict |
-|---:|---|---:|---|
-| A | `[f64-policy]` | 48 | intentional platform constraint — **but 9 of them are pass-through, not compute** ([VERIFY]) |
-| B | `[export-platform-allowlist]` | 49 | test/jax-side hard-coded `(cpu, gpu, tpu)`; unreachable from a plugin |
-| C | `[async-collectives-unimplemented]` | 5 | genuine unimplemented op, **no recorded disposition** ([VERIFY]) |
-| D | `[jax-side-allowlist]` (callbacks, `check`) | 4 | jax hard-codes the platform list; not reachable from a plugin |
-| E | `[PJRT-surface]` | 8 | optional PJRT extensions/debug surfaces we do not implement (2 rows [VERIFY]) |
-| F | `[memory-spaces]` | 4 | one memory space on this device (2 rows [VERIFY]) |
-| G | `[layout-column-major]` | 2 | MLX storage is row-major; declined by name |
-| H | `[better-than-reference]` | 5 | we fail by succeeding where the harness demands a refusal |
-| I | `[intentional-native]` (stricter than Stage 1) | 2 | deliberate refusals from P7/P10 (both [VERIFY]) |
-| J | `[skew/harness]` | 6 | fails identically on CPU / is an absl-under-pytest artifact |
-| K | `[denormals]` | 1 | GPU flushes subnormals to zero |
-| L | `[donation-contract]` | 1 | double donation is not raised (contract already broken by caller) |
-| M | `[token-representation]` | 1 | tokens are `bool[0]`, so they convert instead of raising |
-| N | `[numerics/FD-reference]` | 1 | the test's f32 reference is meaningless at this tolerance |
-| O | `[sdy-op-unimplemented]` | 1 | `sdy.sharding_group` declined ([VERIFY]) |
-| P | `[jax-generic-LU × shard_map]` | 1 | jax's own generic LU is incompatible with `shard_map` vma typing |
-| Q | `[tracked-open]` — **not benign** | 2 | sparse `spdot_general` wrong values; Oleg ruled non-blocking, fix scheduled |
-| R | `[registration-artifact]` | 1 | our own `metaljax_*` custom-call targets are "declared stable, untested" |
-| | **total** | **142** | |
+| # | class | count | now | verdict |
+|---:|---|---:|---:|---|
+| A | `[f64-policy]` | 48 | 48 | intentional platform constraint — **but 9 of them are pass-through, not compute** ([VERIFY]; design written, not implemented) |
+| B | `[export-platform-allowlist]` | 49 | 49 | test/jax-side hard-coded `(cpu, gpu, tpu)`; **sorted: 0 reachable from a plugin, 49 upstream** |
+| C | `[async-collectives-unimplemented]` | 5 | **3** | `async_start`/`async_done` implemented; the 3 left want optimized HLO (class E) |
+| D | `[jax-side-allowlist]` (callbacks, `check`) | 4 | 4 | jax hard-codes the platform list; not reachable from a plugin |
+| E | `[PJRT-surface]` | 8 | **5** | topology message + `dce_sink` + `OptimizedProgram` landed; `XlaTransform` 4 + the inline row remain |
+| F | `[memory-spaces]` | 4 | **0** | a second `PjRtMemorySpace` (`pinned_host`) over the one unified pool |
+| G | `[layout-column-major]` | 2 | 2 | MLX storage is row-major; declined by name |
+| H | `[better-than-reference]` | 5 | 5 | we fail by succeeding where the harness demands a refusal |
+| I | `[intentional-native]` (stricter than Stage 1) | 2 | **0** | both gates lifted: sequential complex scatter-multiply, complex 0-spatial conv |
+| J | `[skew/harness]` | 6 | 6 | fails identically on CPU / is an absl-under-pytest artifact — both mechanisms nailed down |
+| K | `[denormals]` | 1 | 1 | GPU flushes subnormals to zero |
+| L | `[donation-contract]` | 1 | **0** | XLA's own `TestBufferDonationClashes`, its messages word for word |
+| M | `[token-representation]` | 1 | **0** | a token result is `xla::TOKEN`; the device array stays the empty bool one |
+| N | `[numerics/FD-reference]` | 1 | 1 | the test's f32 reference is meaningless at this tolerance |
+| O | `[sdy-op-unimplemented]` | 1 | 1 | `sdy.sharding_group` declined ([VERIFY]) |
+| P | `[jax-generic-LU × shard_map]` | 1 | 1 | jax's own generic LU is incompatible with `shard_map` vma typing |
+| Q | `[tracked-open]` — **not benign** | 2 | 2 | sparse `spdot_general` wrong values — **diagnosed to MLX's kernel fusion**, not this tape |
+| R | `[registration-artifact]` | 1 | 1 | our own `metaljax_*` custom-call targets are "declared stable, untested" |
+| | **total** | **142** | **129** | |
 
 **Classes from earlier reviews that no longer have any rows.** *Complex
 inf/NaN pole semantics* (~24 at 0.4.2, reclassified INTENTIONAL at the 0.11.0
@@ -238,6 +263,37 @@ one-line-per-site question for Oleg: keep the tighter native rule (and update
 the policy text), or teach the native lowering the same pass-through
 narrowing Stage 1 does.
 
+**Oleg's verdict: match Stage 1 exactly. NOT implemented in this batch** — the
+9 rows still fail, and the design is written down here so it is an afternoon
+rather than a rediscovery. Half the machinery is already in place and proven:
+the BUFFER side does f64 pass-through today (`metal_dtypes.cc`
+`case xla::F64: WireType{mx::float32, 8, /*widen=*/true, 1}`, and
+`execute_test`'s `f64 passes through, f64 math not` row asserts both halves), and
+`PrimitiveTypeOf` already answers `xla::F64`. What is missing is the LOWERING:
+
+1. a pre-pass over the module, before the walk, that is Stage 1's
+   `interpreter._check_no_f64_compute` verbatim — every op outside
+   `_F64_DATA_MOVEMENT` (constant, convert, reshape, broadcast, transpose,
+   slice, ds/dus, concatenate, reverse, gather, scatter, select, iota, pad,
+   while/if/case, composite, custom_call, the two sdy identities, the calls and
+   returns) that touches an f64 or complex<f64> value declines, keeping the
+   current message so nothing that greps `element type f64` changes;
+2. with that gate passed, `TapeDtypeCode` may map f64 → the f32 code and
+   complex<f64> → complex<f32> (this is exactly Stage 1's arrangement: the
+   value is STORED as f32 and the policy check is what keeps it honest);
+3. `LowerConstant` needs an f64 arm — its raw-data fast path assumes the IR
+   bytes ARE the device bytes, which is false at 8 bytes per element, so f64
+   constants have to go through `APFloat` like the emulated grids do (splat and
+   rank-0 included);
+4. `C128` needs a `WireType` beside `F64`'s for
+   `lax_numpy_test::testArrayExplicitDtypes`, the one row of the nine that
+   carries a complex128 value.
+
+The risk is contained by the pre-pass: with it in place no arithmetic can reach
+an f64 value, so the widening cannot silently compute in f32 — which is the
+failure mode CLAUDE.md item 20 records for c128 on Stage 1 ("the f64 checker
+didn't match c128 — compute silently ran in c64").
+
 ---
 
 # B. `[export-platform-allowlist]` — 49 rows
@@ -253,7 +309,26 @@ ValueError: Function 'dyn_fun' was exported for platforms '('cpu', 'cuda', 'tpu'
 
 The platform tuples are hard-coded **in the tests**, not derived from the
 available devices. Nothing a plugin can do reaches this: the artifact would
-have to be exported for `metal` in the first place. Verified `cpu_pass` for all
+have to be exported for `metal` in the first place.
+
+**Sorted, per Oleg's ask (2026-08-11): (a) fixable from a registration hook —
+NONE; (b) upstream — all 49.** The check has exactly two escapes and a plugin
+owns neither. `platform in exported.platforms` compares against a tuple the
+CALLER passed to `jax.export`, and the override,
+`DisabledSafetyCheck.platform() in exported.disabled_safety_checks`, is also a
+per-export argument — there is no config flag, no environment variable and no
+registry behind it (`_export.py` reads the field and nothing else). The one
+remaining idea, registering `metal` as an ALIAS of `gpu` in
+`xla_bridge._alias_to_platforms`, would make `exported.platforms` match by
+making jax believe this backend IS a GPU everywhere else too
+(`jtu.test_device_matches(["gpu"])`, every `skip_on_devices`, every
+GPU-specific expectation) — a lie with hundreds of consequences, for 49 rows.
+The upstream-patch pile therefore gets: `export_harnesses_multi_platform_test`
+should export for the platforms actually present rather than the literal
+`("cpu","gpu","tpu")` (44 rows), `export_test`'s four hard-coded tuples (4
+rows), and `test_multi_platform_mlir_lower_fun_with_platform_specific_primitives`,
+whose expectation table is `dict(cpu=2, gpu=3, tpu=4)[jtu.device_under_test()]`
+and raises `KeyError: 'metal'` (1 row). Verified `cpu_pass` for all
 49 in `cpu_parity.json` — they pass on CPU because `cpu` is inside the
 hard-coded tuple. Approved category: `notes/jax-test-suite-2026-07.md`
 ("export_harnesses_multi_platform (44) — jax-side platform allowlist, cpu_pass
@@ -385,6 +460,27 @@ i.e. this looks implementable in the same way P12's collectives were, and the
 5 rows are a real feature gap rather than a platform constraint. **Needs Oleg's
 explicit ruling.**
 
+**[FIXED] 5 -> 3.** Oleg's verdict was to emulate async with sync, and that is
+what `Lowering::LowerAsyncStart` / `LowerAsyncDone` do: the `async_start`
+region is INLINED where the start sits (its collective is one of
+`LowerCollective`'s single-device arms, so it is an alias or a constant), the
+`!stablehlo.future` never gets a slot — the lowering remembers which slots it
+stands for, in `futures_` — and `async_done` aliases its results back. The
+order is the block's order, which is what XLA's own erasure of a single-device
+async pair would leave. A start whose region holds something else declines from
+inside, naming that op. `execute_test` grew an `async collectives (start/done)`
+module (all-reduce and all-gather pairs around a dot, against jax-CPU).
+
+`test_async_ppermute` and `test_async_all_to_all` now pass. The other three
+compute correctly and then fail on a different assertion: they read
+`compiled().as_text()` for both the sync and the async form and require that if
+the SYNC text names `all-gather(` / `all-reduce(` / `reduce-scatter(`, the ASYNC
+one does too. Ours does not, because `GetHloModules` hands back the program as
+GIVEN (class E): the sync form keeps its plain collective and the async form its
+`all-gather-start(` / `-done(` pair, where an optimizing backend would have
+rewritten or erased both. They belong with the inline row: what they need is an
+HLO optimization stage, not an async collective.
+
 ---
 
 # D. `[jax-side-allowlist]` (callbacks and `check`) — 4 rows
@@ -472,6 +568,44 @@ HLO pipeline in this backend to insert a pass into (the release review already
 noted that adopting XLA's pass pipeline as a library is a Stage-2 idea; that is
 the only route that would make these four implementable).
 
+**[FIXED] 8 -> 5, in three pieces.**
+
+* **aot topology (2) -> SKIP.** The decline now reads `metaljax: topology not
+  implemented (ahead-of-time compilation against a described machine; metaljax
+  compiles for the attached GPU)`, which is the substring both tests' own
+  skip-detector looks for. `aot_test` is 21 passed / 7 skipped, 0 failed.
+* **`dce_sink` (1) -> PASS, and the Stage 1 regression is gone.**
+  `lax.dce_sink(...)` lowers to nothing again: the marker keeps its operand
+  alive through a compiler's DCE, this tape has no DCE (it lowers every op the
+  block holds), so the marker's job is already done. The test's other half —
+  `assertNotIn("add", hlo)` for the default form — passes because XLA's own
+  parse, which runs before `CompileAndLoad`, has already dropped the dead add.
+* **`OptimizedProgram` (1) -> implemented, the row still fails.**
+  `MetalExecutable::GetHloModules` now answers: the compile keeps the StableHLO
+  it was handed as MLIR bytecode (written once, cheap) and converts it to HLO
+  on demand, cached, degrading to `UNIMPLEMENTED` — the code jax's `as_text`
+  turns into `None` — if the module has no HLO form. That is what unblocked two
+  `async_collectives_test` rows and it is the surface the planned XLA
+  optimization layer will publish through. What comes back is the program this
+  executable RUNS, **unoptimized**: nothing here optimizes at the HLO level (the
+  recognizers and the compile decisions work on the tape, below this
+  representation). So `test_inline_optimized_hlo` still fails — it asserts XLA
+  inlined an `inlineable = "xla_early"` call and preserved an `xla_late` one,
+  which is a property of XLA's pass pipeline, and running `CallInliner` here
+  purely to satisfy it would claim an optimization this backend does not
+  perform.
+* **`XlaTransform` (4) — NOT attempted in this batch.** The route is now clear
+  and cheap to describe: `pjrt::CreateXlaTransformExtension()` in
+  `xla/pjrt/c/pjrt_c_api_xla_transform_internal.h` is a complete implementation
+  of the extension (registry included), so the plugin only has to add it to its
+  extension chain and, in `CompileAndLoad`, call
+  `xla::ApplyXlaTransformsToModule` on the converted HLO **when a transform is
+  registered** (`GetHloXlaTransforms(...)` is empty otherwise, so a normal
+  compile pays nothing) and lower the result back through
+  `ConvertHloToStablehlo`. That would take `test_sin_to_cos{0,1}` and
+  `test_clear_transform`; `XlaTransformE2ETest` also needs
+  `GetCompiledMemoryStats`, which this executable does not answer.
+
 ---
 
 # F. `[memory-spaces]` — 4 rows
@@ -502,6 +636,24 @@ numbers with a memory placement the caller did not ask for. Everywhere else this
 backend's policy is "decline loudly by name". Same on Stage 1 (identical
 `- device / + pinned_host`), so this is a long-standing behaviour, not a P12-14
 change — but it has no written disposition either.
+
+**[FIXED] 4 -> 0.** Of the three shapes this could take — a metadata field per
+buffer, a second memory SPACE, or keeping the silence where it is provably
+inert — the middle one is Oleg's and is what landed, because it adds **no
+per-tensor state at all**: the client exposes a second `MetalMemorySpace` of
+kind `pinned_host` (`kind_id` 1) beside `device`, and a buffer points at
+whichever space it was asked for through the `memory_space_` pointer it already
+carries. Apple silicon's memory is unified, so both spaces name one physical
+pool and the placement costs nothing; what changes is that the plugin now SAYS
+which one a buffer is on. `mhlo.memory_kind` on main's arguments and results is
+read at lowering into `ValueSpec::host_memory` (compile-time, one bit per
+boundary value, not per buffer), `GetParameterMemoryKinds` /
+`GetOutputMemoryKinds` answer from it, and `RunOnce` builds the result buffer on
+the space the module asked for. Any OTHER kind — XLA also spells
+`unpinned_host` — declines by name rather than being ignored. Silence was not
+an option for any of the four: two of them assert `sharding.memory_kind`
+directly and two need `memory_space_by_kind('pinned_host')` to exist before
+export can even build the sharding.
 
 ---
 
@@ -614,6 +766,30 @@ jax's CPU backend itself rejects**").
   Flagged so Oleg sees the Stage-1 bug, which is *not* covered by any existing
   note beyond P7's one-line remark.
 
+**[FIXED] 2 -> 0, both gates lifted per Oleg.**
+
+* **complex scatter multiply.** Asking `unique_indices` was the wrong question
+  twice over: jax sets it FALSE for every plain `.at[i].multiply(u)`, literal
+  indices included, and what actually matters is whether two updates land on
+  one slot — which the lowering cannot read off a computed index array. So a
+  missing promise no longer refuses and no longer guesses: it takes the
+  SEQUENTIAL apply arm over the op's own multiply body (`method_code = 8`, the
+  arm `.at[].apply()` already uses), one update at a time in XLA's order, which
+  is exact whether or not the indices repeat. It keeps that arm's cap — a
+  constant number of MLX ops per update — and above it declines by name
+  (`complex scatter multiply with duplicates: N updates`). With the promise the
+  fast gather-multiply-set rewrite is unchanged. Four new `execute_test` rows,
+  including the duplicate-index one the rewrite would get wrong.
+* **complex 0-spatial convolution.** Implemented as four real matmuls, exactly
+  as the spatial arm is four real convolutions; the matmul arm now carries the
+  same `mode` field the spatial one does. Measured against jax-CPU on the
+  report's own case: both now `[15.-5.j, 42.-14.j, 42.-14.j, 150.-50.j]`.
+  **Stage 1 is still wrong here and is frozen** — `plugin/` keeps the f32 cast
+  that drops the imaginary part, and `lax_test::testConvGeneralDilated0D2`
+  cannot see it because `_CompileAndCheck` compares metal against metal. The
+  two new `execute_test` rows compare against CPU, which is the whole
+  difference.
+
 ---
 
 # J. `[skew/harness]` — 6 rows
@@ -633,6 +809,19 @@ today.
   "errors" the suite reports for this file), and the cascade leaves the cache
   object `None` for this test's guard. Whole file on `JAX_PLATFORMS=cpu`:
   **35 passed, 1 skipped**, no errors.
+
+  **Diagnosed (2026-08-11), jax-side, stays whitelisted.** The allowlist is in
+  the TEST — `compilation_cache_test.py:145`, `supported_platforms = ["tpu",
+  "gpu", "cpu"]`, then `raise SkipTest(...)` — and it is raised from `setUp`,
+  *after* `CompilationCacheTestCase.setUp` has already run
+  `cc.reset_cache(); cc._cache = InMemoryCache()`. unittest does not call
+  `tearDown` when `setUp` raises, so the matching `cc.reset_cache()` never runs
+  and every one of the 33 skips leaves the module-level cache object where it
+  was; jtu's config guard reports that as an error, and by the time
+  `CompilationCacheDisabledTest::test_jit` compares the object before and after
+  itself, it is `None`. Nothing here is about compilation caching on this
+  backend, and nothing a plugin can register joins that list
+  (`jtu.test_device_matches` compares `device_under_test()`, which is `metal`).
 * `logging_test.py::LoggingTest::test_subprocess_stderr_info_logging` — runs a
   subprocess with `JAX_LOGGING_LEVEL=INFO` and asserts stderr contains `"INFO"`
   and not `"DEBUG"`. Fails: `AssertionError: 'INFO' not found in 'I0811 …
@@ -643,6 +832,19 @@ today.
 * `logging_test.py::LoggingTest::test_subprocess_stderr_debug_logging` — same
   with `JAX_LOGGING_LEVEL=DEBUG`, asserting both `INFO` and `DEBUG` appear.
   Same missing-`INFO` assertion; **also reproduced on CPU**.
+
+  **Is the absl log format ours to set up? No** (re-measured 2026-08-11). The
+  subprocess the test runs emits FOUR stderr lines under
+  `JAX_LOGGING_LEVEL=INFO`, and on `JAX_PLATFORMS=cpu` they are:
+  `I0811 … pjrt_api.cc:119] GetPjrtApi was found …`,
+  `I0811 … profiler_utils.cc:40] PJRT_Profiler_Extension is not registered …`,
+  and two `pjrt_client.cc` device lines — all four from XLA's C++ absl logger,
+  whose severity glyph is `I`, never the word `INFO`. jax's own Python loggers
+  emit nothing at INFO level in this environment at all, which is what the
+  assertion is really about; the format they would use (`INFO:2026-…:jax._src…`)
+  is set by `jax._src.logging_config`, not by a backend. A plugin has no hook
+  into either, and both tests fail identically with no metal plugin in the
+  picture.
 * `profiler_session_test.py::ProfilerSessionTest::test_programmatic_profiling_without_session_id`
 * `…::test_programmatic_profiling_with_empty_session_id`
 * `…::test_programmatic_profiling_with_custom_session_id`
@@ -687,6 +889,16 @@ today.
   the contract in any case." Donation itself works end-to-end (P13; 21 jax tests
   unskipped at 0.11.0, `tests/test_donation` 3 → 0 on the native plugin).
 
+**[FIXED] 1 → 0.** `RunOnce` calls XLA's own `TestBufferDonationClashes`
+(`xla/pjrt/utils.h`) while it walks the arguments, so the three messages are
+word for word the ones a jax user sees on cpu/cuda/tpu — `f(donate(a), a)`,
+`f(a, donate(a))`, `f(donate(a), donate(a))` each have their own — and
+`non_donatable_input_indices` takes the promise back for one call exactly as it
+does for the deletion. The refused call consumes nothing: the check runs while
+the arguments are being read, before the tape does anything. `execute_test`
+grew a `double donation raises` contract that asserts both halves (it raises,
+and the buffer survives).
+
 ---
 
 # M. `[token-representation]` — 1 row
@@ -704,6 +916,29 @@ today.
   `debugging_primitives_test` 32 → 0). Converting the buffer is therefore
   legitimate on this backend; the test asserts a property of XLA's token
   representation.
+
+**Why jax "asserts tokens can't be arrays", precisely** — it is not jax, it is
+jaxlib, and it keys off the buffer's DTYPE. `PyHostValue::AsNumPyArray`
+(`jax/jaxlib/py_array.cc:1832`) refuses when `ifrt_array->dtype().kind() ==
+ifrt::DType::kToken`, with the comment "The only `jax.Array` with token-shape
+buffer is the one wrapped by `jax.core.Token`. Since it is an internal
+implementation detail, we don't support converting it to a numpy array." So the
+test asserts that the BACKEND hands jax a buffer whose element type is XLA's
+`TOKEN` — the empty bool array could never satisfy it, whatever the engine did,
+because the refusal never looks at the shape.
+
+**[FIXED] 1 → 0, and the empty-bool representation survives it.** Only main's
+boundary SPEC changed: a token parameter or result is now
+`ValueSpec{xla::TOKEN, …}` and `ValueSpec::shape()` answers
+`ShapeUtil::MakeTokenShape()` for it (a token shape is not an array shape —
+`MakeShape(TOKEN, {0})` is invalid and was the first thing that broke). The
+device side is untouched: the array is still `mx::bool_` of extent 0, which is
+what `RunOnce` checks against and what jax's `RuntimeTokenSet` seeds a token
+with (`np.zeros(0, np.bool_)`), so a token argument still arrives as a plain
+bool buffer and is still accepted. Ordered effects were re-measured on the
+change: `jaxpr_effects_test` + `debugging_primitives_test` + `api_test::JitTest`
+= 237 passed, 1 failed (the class D `EmitPythonCallback` allowlist row, which is
+not this).
 
 ---
 
@@ -811,6 +1046,73 @@ nonzero entries where the dense reference has exact zeros.
   [VERIFY] because the ruling is explicit and recent — but it is the one class
   in this report that is a known wrong answer rather than an accepted
   limitation, and the C++ migration it was deferred behind is now landing.
+
+## Diagnosed (2026-08-11): MLX's compiled-kernel FUSION, not this tape
+
+**It is not ours, and it is not the test.** Still 2 failing rows, but they are
+no longer unexplained, and the whole chain is reproducible in seconds instead of
+in a 283-test prefix.
+
+*The repro is two tests.* Bisecting the file's 445 ids by prefix (30 ok, 31
+FAIL) named a single predecessor: `test_bcoo_concatenate5` followed by
+`test_bcoo_spdot_general{0,6}` fails in 2.5 s, and either row alone passes. The
+data is not what changes — `jtu.JaxTestCase._rng` is seeded from the test's own
+NAME, so both rows draw the same matrices whatever ran before them. **The whole
+file passes on `JAX_PLATFORMS=cpu`** (420 passed, re-measured), so it is
+metal-side.
+
+*Which program.* `METALJAX_VERIFY_COMPILE=1` (new, off by default,
+`metal_executable.cc`) runs every executable a SECOND time op by op and compares
+the two answers. Exactly one of the ~390 executables in the repro diverges:
+`jit_scatter-add`, a one-entry tape,
+`(f32[22,5], i32[22,5,2], f32[22,5]) -> f32[22,5]`, an XLA scatter with
+`inserted_window_dims = [0,1]`, `index_vector_dim = 2`, no window dims. Its
+indices are the full `(i, j)` grid, so nothing is out of bounds and nothing
+repeats. 18 of its 110 output elements differ; the compiled answer keeps the
+updates at flat positions 0 and 14 and ZEROES every one from 16 on — the shape
+of an out-of-bounds mask that is true for everything past element 15, i.e. a
+fused elementwise kernel that stopped writing.
+
+*Where it lives.* Four knobs, each a fresh process on the same two tests:
+
+| setting | result |
+|---|---|
+| default | 2 failed |
+| `METALJAX_COMPILE=0` (no tape compiles) | **passes** |
+| `MLX_DISABLE_COMPILE=1` | **passes** |
+| `METALJAX_MLX_COMPILE_MODE=no_fuse` | **passes** |
+| `METALJAX_MLX_COMPILE_MODE=no_simplify` | **passes** |
+| `MLX_MAX_OPS_PER_BUFFER` / `MLX_MAX_MB_PER_BUFFER` at 1 or at 10⁸ | 2 failed |
+
+so it is neither the command-buffer split (the 0.32 corruption this plugin
+already pins budgets against) nor the tape: it is MLX's `compile`, and
+specifically its kernel FUSION. `METALJAX_MLX_COMPILE_MODE` is new and exists
+for exactly this attribution — MLX's `set_compile_mode` has no environment
+variable of its own, so the earlier `MLX_COMPILE_MODE=...` probes in this
+report's own methodology were silently no-ops.
+
+*What it is NOT.* Two hypotheses were tested to destruction and both are
+innocent: the strided VIEW that `index_component` slices out of the coordinate
+vector (materializing it changes nothing), and the process's buffer pool (200
+allocate-compute-free rounds before the rows do not reproduce it).
+
+*A real hazard found on the way, and fixed.* At the divergence the scatter's
+OPERAND argument was `size=110, data_size=1, strides=[0,0]` — a broadcast VIEW
+that a previous executable had handed jax as a PJRT buffer: 4 bytes presenting
+themselves as 440. Every consumer that reads a buffer as dense memory is
+exposed to that, `unsafe_buffer_pointer` included. `RunOnce` now materializes
+any output whose `data_size != size` or which is not row-contiguous, after the
+eval that makes those flags meaningful (`mx::contiguous`, not `fresh_copy` —
+the select `fresh_copy` builds keeps the broadcast's strides, measured). It did
+**not** fix these two rows: they fail with fully dense arguments. It is kept on
+its own merits, with an `outputs own their bytes` contract in `execute_test`.
+
+*Open, for Oleg.* A minimal MLX-level reproducer (a C++ one — MLX's Python API
+exposes no general scatter) is the next step, and then an upstream report; this
+is **MLX bug #8** on CLAUDE.md item 20's tally. Until then the only sound
+workarounds are global (`no_fuse`, or refusing to compile any tape holding a
+scatter), both of which cost far more than these two rows are worth, so the two
+stay failing and named.
 
 ---
 

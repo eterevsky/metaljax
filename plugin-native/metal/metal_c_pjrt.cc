@@ -38,8 +38,16 @@ PJRT_Error* MetalExecuteContextCreate(PJRT_ExecuteContext_Create_Args* args) {
 }
 
 PJRT_Error* MetalTopologyCreate(PJRT_TopologyDescription_Create_Args* args) {
+  // The wording carries information: jax's own AOT tests catch this refusal
+  // and skip on the substring "topology not implemented" (aot_test's
+  // `test_get_topology_from_devices`, `test_topology_jit_serialize`), so
+  // spelling it that way is the difference between two reported failures and
+  // two honest skips.  There is nothing to describe here -- a topology is a
+  // machine shape compiled for WITHOUT the machine, and this plugin compiles
+  // against the one GPU in the process.
   return pjrt::StatusToPjRtError(absl::UnimplementedError(
-      "metaljax: ahead-of-time topology compilation is not supported."));
+      "metaljax: topology not implemented (ahead-of-time compilation against "
+      "a described machine; metaljax compiles for the attached GPU)."));
 }
 
 const PJRT_Api* GetMetalPjrtApi() {

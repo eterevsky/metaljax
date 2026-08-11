@@ -14,6 +14,8 @@ Licensed under the Apache License, Version 2.0.
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -22,10 +24,15 @@ Licensed under the Apache License, Version 2.0.
 #include "metal/metal_buffer.h"
 #include "metal/metal_names.h"
 #include "metal/metal_stream.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
 #include "mlx/mlx.h"
 #include "program.h"
+#include "xla/hlo/translate/stablehlo.h"
 #include "xla/layout_util.h"
+#include "xla/pjrt/mlir_to_hlo.h"
 #include "xla/pjrt/pjrt_layout.h"
+#include "xla/pjrt/utils.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -60,6 +67,13 @@ const bool kDebug = [] {
   const char* v = std::getenv("METALJAX_DEBUG");
   return v != nullptr && std::string(v) == "1";
 }();
+
+// METALJAX_VERIFY_COMPILE=1 compares the two paths; =dump also prints the
+// arguments and both answers of whatever diverged.
+const char* const kVerifyCompileEnv = std::getenv("METALJAX_VERIFY_COMPILE");
+const bool kVerifyCompile = kVerifyCompileEnv != nullptr;
+const bool kVerifyDump =
+    kVerifyCompile && std::string(kVerifyCompileEnv) == "dump";
 
 std::string StatsDelta(const Stats& before, const Stats& after) {
   return absl::StrFormat(
@@ -99,6 +113,13 @@ MetalLoadedExecutable::MetalLoadedExecutable(
       executable_(std::make_unique<MetalExecutable>(lowered_,
                                                     std::move(options), name_)),
       device_assignment_(/*replica_count=*/1, /*computation_count=*/1) {
+  // The space a result annotated `mhlo.memory_kind = "pinned_host"` is handed
+  // back on.  Same unified pool as `memory_space_`, so this is which SPACE the
+  // buffer names and nothing else; if the client has no such space the result
+  // stays where every other one goes.
+  absl::StatusOr<xla::PjRtMemorySpace*> host =
+      device->memory_space_by_kind(kHostMemoryKind);
+  host_memory_space_ = host.ok() ? *host : memory_space;
   device_assignment_(0, 0) = device->id();
   logical_ids_.push_back(LogicalDeviceIds{/*replica=*/0, /*partition=*/0});
   devices_.push_back(device);
@@ -119,6 +140,18 @@ MetalLoadedExecutable::RunOnce(
   }
   BindThread();
   std::unique_lock<std::recursive_mutex> submission = SubmissionLock();
+
+  // XLA's donation contract is per CALL, not only per buffer: a caller that
+  // hands the same buffer to a donated and to a plain position has asked for
+  // an argument to be both consumed and read.  Every PjRtClient refuses that
+  // (`f(donate(a), a)`), and this plugin used to accept it and delete the
+  // buffer out from under the second use.  XLA's own bookkeeping is called
+  // here, so the three messages are word for word the ones jax users see on
+  // cpu/cuda/tpu.
+  absl::flat_hash_map<const void*, std::pair<bool, int>> donation_clashes;
+  donation_clashes.reserve(argument_handles.size());
+  const absl::flat_hash_set<int> donated(lowered_->donated_parameters.begin(),
+                                         lowered_->donated_parameters.end());
 
   std::vector<mx::array> inputs;
   inputs.reserve(argument_handles.size());
@@ -142,18 +175,95 @@ MetalLoadedExecutable::RunOnce(
           "metaljax-native: argument %d is %s, the program expects %s", i,
           ShapeString(a), xla::ShapeUtil::HumanString(spec.shape())));
     }
+    const bool must_donate =
+        donated.contains(static_cast<int>(i)) &&
+        !options.non_donatable_input_indices.contains(static_cast<int>(i));
+    RETURN_IF_ERROR(xla::TestBufferDonationClashes(
+        handle, donation_clashes, must_donate, static_cast<int>(i),
+        /*replica=*/0, /*partition=*/0));
     inputs.push_back(a);
   }
 
   std::vector<mx::array> outs;
   const Stats before = g_stats;
   try {
+    const std::vector<mx::array> kept =
+        kVerifyCompile ? inputs : std::vector<mx::array>{};
     outs = lowered_->program->run(std::move(inputs));
     // P2 executes SYNCHRONOUSLY: correctness before pipelining.  Settling
     // here is what makes every buffer this returns honestly ready, and it is
     // the one thing to revisit first when the plugin is measured -- the Stage
     // 1 engine hands out lazy arrays and submits with async_eval instead.
     mx::eval(outs);
+    // ...and MATERIALIZED.  A tape's output can be an MLX VIEW whose buffer is
+    // smaller than the array says it is -- the plain case is a broadcast, which
+    // comes back as 110 elements over a buffer of ONE (`strides=[0,0]`,
+    // `data_size=1`).  That is fine inside MLX, which reads the strides, and it
+    // is not fine as a PJRT buffer: this thing is handed to jax, kept, and
+    // passed back as the ARGUMENT of the next executable, where its consumer
+    // may be a kernel that reads it as dense memory.  `mx::scatter` under
+    // `mx::compile` is one such consumer, and it silently dropped updates
+    // (metaljax's tracked-open sparse `spdot_general` pair: the failure needed
+    // one earlier program in the process to put such a buffer in jax's hands,
+    // so it looked positional rather than structural).  `unsafe_buffer_pointer`
+    // has the same stake -- P12 kept a settled view for it because a
+    // re-gathered broadcast handed out a new address every call.
+    //
+    // The flags are only meaningful AFTER the eval above (M5c's `to_host`
+    // reads them in the same order), and only the offenders pay.  It must be
+    // `mx::contiguous` and not `fresh_copy`: the select `fresh_copy` builds
+    // keeps the broadcast's strides, so it de-aliases (which is its job in
+    // `Program::run`) without ever widening the buffer -- measured, the
+    // `data_size` comes back 1.  `contiguous` is a pure re-layout, so bits
+    // move unchanged and -0 and NaN payloads survive it.
+    bool refreshed = false;
+    for (mx::array& a : outs) {
+      if (a.data_size() != a.size() || !a.flags().row_contiguous) {
+        a = mx::contiguous(a);
+        refreshed = true;
+      }
+    }
+    if (refreshed) mx::eval(outs);
+    // METALJAX_VERIFY_COMPILE=1: run the tape a SECOND time op by op and
+    // compare.  The compiled path is the only place this plugin can be right
+    // in one mode and wrong in the other, and a divergence is silent by
+    // construction -- so the diagnostic that finds it lives here, next to the
+    // one call that has both paths in reach.  Off by default and never taken
+    // by a normal run; the sparse `spdot_general` pair was found with it.
+    if (kVerifyCompile) {
+      std::vector<mx::array> eager = lowered_->program->interpret(kept, false);
+      mx::eval(eager);
+      for (size_t j = 0; j < outs.size() && j < eager.size(); j++) {
+        if (outs[j].shape() != eager[j].shape()) continue;
+        mx::array d = mx::sum(mx::astype(
+            mx::not_equal(mx::astype(outs[j], mx::float32),
+                          mx::astype(eager[j], mx::float32)), mx::int32));
+        mx::eval(d);
+        if (d.item<int>() != 0) {
+          std::fprintf(stderr,
+                       "[metaljax-native] VERIFY %s result %zu: %d of %zu "
+                       "elements differ between the compiled and the eager "
+                       "walk\n",
+                       name_.c_str(), j, d.item<int>(), (size_t)outs[j].size());
+          if (kVerifyDump) {
+            auto dump = [](const char* tag, const mx::array& a) {
+              std::fprintf(stderr, "  %s %s ds=%zu rowc=%d: ", tag,
+                           ShapeString(a).c_str(), (size_t)a.data_size(),
+                           (int)a.flags().row_contiguous);
+              mx::array f = mx::astype(mx::reshape(a, mx::Shape{-1}), mx::float32);
+              mx::eval(f);
+              for (int q = 0; q < f.size() && q < 60; q++)
+                std::fprintf(stderr, "%g ", f.data<float>()[q]);
+              std::fprintf(stderr, "\n");
+            };
+            for (const mx::array& in : kept) dump("in", in);
+            dump("compiled", outs[j]);
+            dump("eager", eager[j]);
+          }
+          std::fflush(stderr);
+        }
+      }
+    }
   } catch (const std::exception& e) {
     return absl::InternalError(
         absl::StrCat("metaljax-native: ", name_, " failed: ", e.what()));
@@ -184,7 +294,8 @@ MetalLoadedExecutable::RunOnce(
           xla::ShapeUtil::HumanString(spec.shape())));
     }
     buffers.push_back(std::make_unique<MetalBuffer>(
-        client_, memory_space_, device_, spec.shape(), outs[j]));
+        client_, spec.host_memory ? host_memory_space_ : memory_space_, device_,
+        spec.shape(), outs[j]));
   }
 
   // The donation contract (P13), collected only after a run that succeeded:
@@ -333,16 +444,54 @@ MetalExecutable::GetOutputLayouts() const {
   return DefaultLayouts(lowered_->results);
 }
 
+absl::StatusOr<std::vector<std::shared_ptr<xla::HloModule>>>
+MetalExecutable::GetHloModules() const {
+  std::lock_guard<std::mutex> lock(hlo_mu_);
+  if (hlo_ == nullptr) {
+    if (lowered_->stablehlo.empty()) {
+      return absl::UnimplementedError(
+          "metaljax-native: this executable kept no program text.");
+    }
+    mlir::MLIRContext context;
+    absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> module =
+        xla::ParseMlirModuleString(lowered_->stablehlo, context);
+    if (!module.ok()) {
+      return absl::UnimplementedError(absl::StrCat(
+          "metaljax-native: cannot re-read this executable's program: ",
+          module.status().message()));
+    }
+    absl::StatusOr<std::unique_ptr<xla::HloModule>> hlo =
+        xla::ConvertStablehloToHlo(**module);
+    if (!hlo.ok()) {
+      return absl::UnimplementedError(absl::StrCat(
+          "metaljax-native: this executable's program has no HLO form: ",
+          hlo.status().message()));
+    }
+    hlo_ = std::shared_ptr<xla::HloModule>(std::move(*hlo));
+  }
+  return std::vector<std::shared_ptr<xla::HloModule>>{hlo_};
+}
+
 absl::StatusOr<std::vector<std::vector<absl::string_view>>>
 MetalExecutable::GetParameterMemoryKinds() const {
-  return std::vector<std::vector<absl::string_view>>{
-      std::vector<absl::string_view>(lowered_->parameters.size(), kMemoryKind)};
+  std::vector<absl::string_view> kinds;
+  kinds.reserve(lowered_->parameters.size());
+  for (const ValueSpec& spec : lowered_->parameters)
+    kinds.push_back(spec.host_memory ? kHostMemoryKind : kMemoryKind);
+  return std::vector<std::vector<absl::string_view>>{std::move(kinds)};
 }
 
 absl::StatusOr<std::vector<std::vector<absl::string_view>>>
 MetalExecutable::GetOutputMemoryKinds() const {
-  return std::vector<std::vector<absl::string_view>>{
-      std::vector<absl::string_view>(lowered_->results.size(), kMemoryKind)};
+  // What the MODULE asked for, per result, which is what jax turns into the
+  // output shardings' `memory_kind`.  One unified pool underneath, so the
+  // answer is metadata -- but it is the caller's own annotation coming back,
+  // rather than "device" for everything.
+  std::vector<absl::string_view> kinds;
+  kinds.reserve(lowered_->results.size());
+  for (const ValueSpec& spec : lowered_->results)
+    kinds.push_back(spec.host_memory ? kHostMemoryKind : kMemoryKind);
+  return std::vector<std::vector<absl::string_view>>{std::move(kinds)};
 }
 
 }  // namespace metaljax

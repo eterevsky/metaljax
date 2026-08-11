@@ -25,6 +25,9 @@ Licensed under the Apache License, Version 2.0.
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "llvm/ADT/APFloat.h"
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/Bytecode/BytecodeWriter.h"
+#include "mlir/Support/LogicalResult.h"
 #include "metal/metal_buffer.h"
 #include "metal/metal_dtypes.h"
 #include "metal/metal_executable.h"
@@ -124,6 +127,22 @@ bool EnvFlag(const char* name) {
 // KEEP IN SYNC with src/metaljax/__init__.py, which owns the numbers and the
 // measurements behind them.
 [[maybe_unused]] const bool kMlxEnvPinned = [] {
+  // METALJAX_MLX_COMPILE_MODE=no_fuse|no_simplify|disabled: MLX's own compiler
+  // mode, which has no environment variable of its own (`MLX_DISABLE_COMPILE`
+  // is all it reads).  A diagnostic, not a setting -- but the one that
+  // ATTRIBUTES a compiled-vs-eager divergence to MLX's kernel FUSION rather
+  // than to this tape, which is how the tracked-open sparse `spdot_general`
+  // pair was placed (`no_fuse` makes both rows pass; see the notes).
+  if (const char* m = std::getenv("METALJAX_MLX_COMPILE_MODE")) {
+    const std::string v(m);
+    if (v == "no_fuse") {
+      mx::set_compile_mode(mx::CompileMode::no_fuse);
+    } else if (v == "no_simplify") {
+      mx::set_compile_mode(mx::CompileMode::no_simplify);
+    } else if (v == "disabled") {
+      mx::set_compile_mode(mx::CompileMode::disabled);
+    }
+  }
   ::setenv("MLX_MAX_OPS_PER_BUFFER", "800", /*overwrite=*/0);
   ::setenv("MLX_MAX_MB_PER_BUFFER", "512", /*overwrite=*/0);
   const char* precision = std::getenv("METALJAX_MATMUL_PRECISION");
@@ -155,14 +174,18 @@ MetalDeviceDescription::MetalDeviceDescription(int id, int process_index)
       debug_string_(absl::StrFormat("MetalDevice(id=%d)", id)),
       to_string_(absl::StrFormat("MetalDevice(id=%d)", id)) {
   memory_space_ptrs_.push_back(&memory_space_);
+  memory_space_ptrs_.push_back(&host_memory_space_);
 }
 
 // ------------------------------------------------------------ memory space
 
-MetalMemorySpace::MetalMemorySpace(xla::PjRtClient* client, int id)
+MetalMemorySpace::MetalMemorySpace(xla::PjRtClient* client, int id,
+                                   absl::string_view kind, int kind_id)
     : client_(client),
       id_(id),
-      debug_string_(absl::StrFormat("MetalMemory(id=%d)", id)) {}
+      kind_(kind),
+      kind_id_(kind_id),
+      debug_string_(absl::StrFormat("MetalMemory(id=%d, kind=%s)", id, kind)) {}
 
 absl::Span<xla::PjRtDevice* const> MetalMemorySpace::devices() const {
   return client_->devices();
@@ -212,10 +235,14 @@ MetalClient::MetalClient() {
   // Once, here: the client is built when jax first asks for the platform, and
   // every execute in the process runs under these cadences.
   ConfigureFromEnv();
-  // One GPU, one unified memory space.  Apple silicon exposes a single
-  // integrated GPU per process; multi-device is out of scope.
-  owned_memory_spaces_.push_back(
-      std::make_unique<MetalMemorySpace>(this, /*id=*/0));
+  // One GPU; multi-device is out of scope.  Two memory SPACES over the one
+  // unified pool: the default "device", and "pinned_host" for the placements
+  // jax spells (see metal_names.h -- same physics, honest metadata).  Order
+  // matters: `default_memory_space` is the first.
+  owned_memory_spaces_.push_back(std::make_unique<MetalMemorySpace>(
+      this, /*id=*/0, kMemoryKind, /*kind_id=*/0));
+  owned_memory_spaces_.push_back(std::make_unique<MetalMemorySpace>(
+      this, /*id=*/1, kHostMemoryKind, /*kind_id=*/1));
   owned_devices_.push_back(
       std::make_unique<MetalDevice>(this, /*id=*/0, /*process_index=*/0));
   for (auto& space : owned_memory_spaces_) {
@@ -430,6 +457,15 @@ MetalClient::CompileAndLoad(xla::MaybeOwningMlirModule module,
   }
 
   ASSIGN_OR_RETURN(LoweredProgram lowered, LowerModule(mlir_module));
+  // Keep the program this executable runs, so that PJRT's `OptimizedProgram`
+  // can hand it back (`MetalExecutable::GetHloModules`).  Bytecode, written
+  // once here: the module belongs to this call, and printing it as text would
+  // spell out every baked constant.
+  {
+    llvm::raw_string_ostream os(lowered.stablehlo);
+    if (mlir::failed(mlir::writeBytecodeToFile(mlir_module, os)))
+      lowered.stablehlo.clear();  // no text view; not a compile failure
+  }
   std::string name = "main";
   if (auto sym = mlir_module.getSymName(); sym.has_value())
     name = sym->str();

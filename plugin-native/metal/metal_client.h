@@ -64,20 +64,28 @@ class MetalDeviceDescription final : public xla::PjRtDeviceDescription {
   std::string to_string_;
   absl::flat_hash_map<std::string, xla::PjRtDeviceAttribute> attributes_;
   xla::PjRtMemorySpaceDescription memory_space_{kMemoryKind, /*kind_id=*/0};
+  xla::PjRtMemorySpaceDescription host_memory_space_{kHostMemoryKind,
+                                                    /*kind_id=*/1};
   std::vector<const xla::PjRtMemorySpaceDescription*> memory_space_ptrs_;
 };
 
-// Unified memory: on Apple silicon the GPU and CPU share one physical pool, so
-// the client exposes exactly one memory space of kind "device".
+// Unified memory: on Apple silicon the GPU and CPU share one physical pool.
+// The client still exposes TWO spaces -- "device" and "pinned_host" -- because
+// the kind is something jax asks about and reports back to the user, and one
+// space meant every host placement was silently answered with "device".  They
+// name the same pool, so a copy between them is the identity and no allocation
+// differs; what differs is that the plugin now says which one a buffer is on
+// rather than assuming the question away.
 class MetalMemorySpace final : public xla::PjRtMemorySpace {
  public:
-  MetalMemorySpace(xla::PjRtClient* client, int id);
+  MetalMemorySpace(xla::PjRtClient* client, int id, absl::string_view kind,
+                   int kind_id);
 
   xla::PjRtClient* client() const override { return client_; }
   absl::Span<xla::PjRtDevice* const> devices() const override;
   int id() const override { return id_; }
-  absl::string_view kind() const override { return kMemoryKind; }
-  int kind_id() const override { return 0; }
+  absl::string_view kind() const override { return kind_; }
+  int kind_id() const override { return kind_id_; }
   absl::string_view DebugString() const override { return debug_string_; }
   absl::string_view ToString() const override { return debug_string_; }
   PJRT_Memory* ToCApiPtr() override { return capi_delegator_.ToCApiPtr(); }
@@ -85,6 +93,8 @@ class MetalMemorySpace final : public xla::PjRtMemorySpace {
  private:
   xla::PjRtClient* client_;
   int id_;
+  absl::string_view kind_;
+  int kind_id_;
   std::string debug_string_;
   xla::PjRtMemorySpaceCApiDelegator capi_delegator_{this};
 };

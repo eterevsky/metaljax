@@ -52,6 +52,14 @@ XLA comes from the read-only `metaljax/xla` checkout via `local_repository`
 `third_party/mlx`. First build is ~7 minutes, everything after that is seconds
 (see `--disk_cache` in `.bazelrc`).
 
+`METALJAX_VERIFY_COMPILE=1` runs every executable a SECOND time op by op and
+reports any output that differs from the compiled path — the one divergence
+this plugin can have that is silent by construction (`=dump` also prints the
+arguments and both answers). `METALJAX_MLX_COMPILE_MODE=no_fuse` then says
+whether such a divergence is MLX's kernel fusion rather than this tape; MLX's
+own `set_compile_mode` has no environment variable, which is why the knob is
+here. Both are off by default and cost nothing when unset.
+
 Status, measurements, gotchas and the route decision:
 [`../notes/pjrt-native-p0.md`](../notes/pjrt-native-p0.md), then
 [`../notes/cpp-p1-runtime.md`](../notes/cpp-p1-runtime.md) for the runtime and

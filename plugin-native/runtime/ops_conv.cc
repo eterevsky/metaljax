@@ -167,7 +167,7 @@ mx::array int_conv(mx::array x, mx::array w, const std::vector<int>& strides,
 //                                          and the attrs stop right there
 //     0 -> [out dtype, rank,
 //           [lhs perm], [rhs perm], [out perm], fgc, bgc,
-//           rank == 0 ? (nothing more)
+//           rank == 0 ? mode
 //                     : [strides], [lhs dilation], [rhs dilation],
 //                       [pad lo], [pad hi],
 //                       crop?, [crop start], [crop stop],
@@ -180,7 +180,8 @@ mx::array int_conv(mx::array x, mx::array w, const std::vector<int>& strides,
 // dimension-numbers layout XLA can spell arrives here as three permutations
 // and nothing else. `crop` carries the negative-padding rewrite the lowering
 // resolved (a slice of the operand, plus the non-negative remainder of the
-// pad); `mode` is 0 float / 1 exact integer / 2 complex; `native groups?`
+// pad); `mode` is 0 float / 1 exact integer / 2 complex (the matmul arm has
+// no exact-integer form, so it spells only 0 and 2); `native groups?`
 // says MLX's own `groups` can serve this feature grouping. `want` is the
 // result shape in MLX's layout -- the guard, not a hint.
 bool Program::step_conv(const Entry& e,
@@ -209,17 +210,18 @@ bool Program::step_conv(const Entry& e,
       const int64_t fgc = c.next(), bgc = c.next();
 
       if (rank == 0) {
-        // No spatial dims: a (grouped) matmul over features. Both operands
-        // go through f32, which is what the Python handler does -- the arm
-        // exists for the degenerate shapes jax's own conv wrappers produce,
-        // not for exact integer arithmetic.
-        mx::array x0 = mx::astype(mx::transpose(in(0), lperm), mx::float32);
-        mx::array w0 = mx::astype(mx::transpose(in(1), rperm), mx::float32);
+        // No spatial dims: a (grouped) matmul over features. The arm exists
+        // for the degenerate shapes jax's own conv wrappers produce, so the
+        // real case goes through f32 (never exact integer arithmetic) -- but
+        // a COMPLEX one is four real matmuls, exactly as the spatial arm is
+        // four real convolutions. Running complex operands through f32, which
+        // is what the Python handler does, discards the imaginary part.
+        const int64_t mode0 = c.next();
         auto mm = [](const mx::array& xg, const mx::array& wg) {
           return mx::matmul(xg, mx::transpose(wg));
         };
-        std::optional<mx::array> out;
-        if (bgc > 1 || fgc > 1) {
+        auto grouped = [&](const mx::array& x0, const mx::array& w0) {
+          if (bgc <= 1 && fgc <= 1) return mm(x0, w0);
           const int n = static_cast<int>(bgc > 1 ? bgc : fgc);
           // Batch groups split the BATCH axis, feature groups the feature
           // axis; the weight splits along its output features either way.
@@ -229,9 +231,20 @@ bool Program::step_conv(const Entry& e,
           parts.reserve(xs.size());
           for (size_t g = 0; g < xs.size(); g++)
             parts.push_back(mm(xs[g], ws[g]));
-          out = mx::concatenate(parts, -1);
+          return mx::concatenate(parts, -1);
+        };
+        std::optional<mx::array> out;
+        if (mode0 == 2) {
+          mx::array xc = mx::astype(mx::transpose(in(0), lperm), mx::complex64);
+          mx::array wc = mx::astype(mx::transpose(in(1), rperm), mx::complex64);
+          mx::array ar = mx::real(xc), ai = mx::imag(xc);
+          mx::array br = mx::real(wc), bi = mx::imag(wc);
+          out = make_complex(mx::subtract(grouped(ar, br), grouped(ai, bi)),
+                             mx::add(grouped(ar, bi), grouped(ai, br)));
         } else {
-          out = mm(x0, w0);
+          mx::array x0 = mx::astype(mx::transpose(in(0), lperm), mx::float32);
+          mx::array w0 = mx::astype(mx::transpose(in(1), rperm), mx::float32);
+          out = grouped(x0, w0);
         }
         env[e.outs[0]] = mx::transpose(mx::astype(*out, out_dt), operm);
         break;

@@ -23,6 +23,7 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 | `METALJAX_MSL_INLANE` | `1` | user knob | =0 disables the in-lane small-dot rewrite (matrix-state cells) |
 | `METALJAX_MSL_PACK_TRIGGER` | `30` | user knob | bindings above which kernel inputs pool per dtype (default 30) |
 | `METALJAX_MSL_REG` | `16` | user knob | vector-mode register width cap (default 16) |
+| `METALJAX_MLX_COMPILE_MODE` | `None` | debug-bisect | plugin-native only: MLX's own compiler mode (`no_fuse`/`no_simplify`/`disabled`), which has no MLX env var; attributes a compiled-vs-eager divergence to MLX's fusion |
 | `METALJAX_MSL_VOLATILE` | `t` | workaround-retest | Metal compiler loop miscompile workaround; t=default, tmap/tv/load/0 to retest on OS updates |
 | `METALJAX_MSL_WNORM` | `1` | user knob | =0 keeps source weight layouts (skips coalescing materialization) |
 | `METALJAX_PLUGIN_PATH` | `None` | user knob | override the plugin dylib location |
@@ -33,6 +34,7 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 | `MJDBG_NOHOIST` | `None` | debug-bisect | (see src/metaljax/msl_scan.py) |
 | `MJDBG_NONESTED` | `None` | debug-bisect | (see src/metaljax/msl_scan.py) |
 | `MJDBG_NOREDREG` | `None` | debug-bisect | disable in-lane register reduces for bisection |
+| `METALJAX_VERIFY_COMPILE` | `None` | debug-bisect | plugin-native only: =1 runs every executable a second time op by op and reports outputs that differ from the compiled path; =dump also prints the arguments and both answers |
 | `MJDBG_VERIFY_MSL` | `None` | debug-bisect | verify every msl plan against the raw loop; dumps mismatches |
 
 metaljax also sets `MLX_METAL_GPU_ARCH` (accurate-matmul arch pin,

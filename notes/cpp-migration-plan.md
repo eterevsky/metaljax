@@ -1079,3 +1079,105 @@ other three declines this migration chose. Nothing on the census is
 unported; what is left is the f64 decision (Oleg: aspirational, last
 stage) and the recognizer-emit families in `tests/`, which are the
 performance phases'.
+
+## P15: Oleg's review verdicts on the 142 (2026-08-11)
+
+`notes/parity-whitelist-report.md` reviewed all 142 pinned-suite failures and
+flagged 22 for scrutiny; this milestone is Oleg's rulings implemented. **142 ->
+129 (99.54 %)**, past Stage 1's 99.51 % on this tree and the 0.11.0 release
+artifact's 99.53 %. Thirteen rows flipped, and the two that did not are the ones
+worth reading about.
+
+**Class Q (sparse `spdot_general`, the only known wrong answers): NOT this
+tape.** Bisecting the file's 445 ids gave a two-test repro
+(`test_bcoo_concatenate5` then `test_bcoo_spdot_general{0,6}`, 2.5 s, and either
+alone passes; the data is identical either way -- jtu seeds its rng from the
+test NAME). A new `METALJAX_VERIFY_COMPILE=1` runs every executable a second
+time op by op and compares: exactly ONE of ~390 diverges, a one-entry
+`jit_scatter-add` tape whose compiled answer drops 18 of its 20 updates. The
+attribution knob is new too (`METALJAX_MLX_COMPILE_MODE=no_fuse|no_simplify|
+disabled`, since MLX's `set_compile_mode` has no environment variable): the rows
+pass under `no_fuse`, under `MLX_DISABLE_COMPILE=1` and under
+`METALJAX_COMPILE=0`, and fail at every command-buffer budget -- so it is MLX's
+kernel FUSION, **MLX bug #8**. Two hypotheses were tested and cleared (the
+strided index view; the buffer pool). Left failing on purpose: the only sound
+workarounds are global.
+
+*Found on the way and fixed*: the scatter's operand argument was a broadcast
+VIEW (`size=110, data_size=1, strides=[0,0]`) that an earlier executable had
+handed jax as a PJRT buffer -- 4 bytes presenting themselves as 440. `RunOnce`
+now materializes any output whose `data_size != size` or which is not
+row-contiguous, after the eval that makes those flags readable. It must be
+`mx::contiguous`: the select `fresh_copy` builds keeps the broadcast's strides
+(measured, `data_size` stays 1), which is fine for its de-aliasing job in
+`Program::run` and useless here.
+
+**What landed, by class.**
+
+* **C, async collectives (5 -> 3).** `async_start` inlines its region where the
+  start sits and the `!stablehlo.future` never gets a slot -- `futures_` records
+  which slots it stands for and `async_done` aliases them back. On one device
+  the collective inside is already an alias or a constant, so the pair is the
+  synchronous form plus two aliases, in the block's order.
+* **I, both gates lifted (2 -> 0).** A complex scatter MULTIPLY without
+  `unique_indices` (which is every plain `.at[i].multiply(u)`, literal indices
+  included) takes the SEQUENTIAL apply arm over the op's own body instead of
+  refusing -- exact whether or not indices repeat, capped like every other use
+  of that arm. And the complex 0-spatial convolution is four real matmuls; the
+  matmul arm now carries the same `mode` the spatial one does. **Frozen Stage 1
+  computes that convolution wrong and silently** (its f32 cast drops the
+  imaginary part; the jax test never saw it because `_CompileAndCheck` compares
+  metal against metal).
+* **F, memory spaces (4 -> 0).** A second `MetalMemorySpace` of kind
+  `pinned_host` beside `device`, and a buffer points at whichever was asked for
+  through the pointer it already carries -- no per-tensor state. `mhlo.memory_kind`
+  on main's arguments and results is read at lowering into
+  `ValueSpec::host_memory`; any other kind declines by name. Unified memory
+  makes the physics free, so this is honest metadata rather than a placement.
+* **L, double donation (1 -> 0).** XLA's own `TestBufferDonationClashes` in
+  `RunOnce`, so the three messages match cpu/cuda/tpu exactly.
+* **M, token representation (1 -> 0).** A token boundary value is
+  `xla::TOKEN` with `ShapeUtil::MakeTokenShape()`; the device array stays the
+  empty bool one jax's `RuntimeTokenSet` passes. jaxlib's refusal
+  (`py_array.cc:1832`) keys off the IFRT dtype, so nothing else could have
+  satisfied it.
+* **E, PJRT surface (8 -> 5).** The topology decline says "topology not
+  implemented", which both `aot_test` rows' own skip-detector reads (2 -> SKIP);
+  `lax.dce_sink` lowers to nothing again, undoing a Stage 1 -> native
+  regression; and `GetHloModules` answers -- the compile keeps its StableHLO as
+  bytecode and converts it to HLO on demand, cached, degrading to UNIMPLEMENTED
+  (the code jax's `as_text` turns into `None`). That is the surface the planned
+  XLA optimization layer will publish through, and it is what unblocked two
+  async-collective rows. It reports the program **as given**: no HLO-level
+  optimization happens here, which is why `test_inline_optimized_hlo` and the
+  three remaining async rows still fail -- all four assert that XLA's pipeline
+  ran (an early-inlined call, a rewritten collective).
+* **B and A2, investigated not implemented.** Every one of the 49 export rows is
+  upstream: `exported.platforms` and `disabled_safety_checks` are per-export
+  arguments with no registry behind them, and aliasing `metal` to `gpu` would
+  lie to every other test in the suite. The 9 f64 pass-through rows have a
+  written design in the report (policy pre-pass -> f64 storage widening ->
+  constant `APFloat` arm -> a C128 wire type); the buffer half already works.
+* **J, both mechanisms nailed down.** `compilation_cache_test` skips in `setUp`
+  after the base class has already replaced the cache object, and unittest skips
+  `tearDown` on a `setUp` raise -- so 33 skips leave it changed and a later
+  test's guard reports it. `logging_test` asserts on the word "INFO", which
+  never appears: XLA's absl logger writes `I0811 …` and jax's Python loggers
+  emit nothing at INFO level here, on CPU too.
+
+**Battery** (the standing one, all green): `execute_test` 493 -> **502 checks**
+(complex 0-spatial conv incl. groups, four complex scatter-multiply shapes, the
+async start/done module, and four new contracts -- double donation, outputs own
+their bytes, the host memory space, the optimized program); `texmo_gate`
+**106 ok / 0 decline / 0 FAIL**; `smoke_test`; `decline_census` 35 of 35;
+`bazel test //...`; the native wheel built and run from a fresh 3.13 venv
+(`wheel_poc_test`). Affected jax files re-run natively: `async_collectives_test`
+5->3, `aot_test` 2->0, `api_test` 7->5, `lax_test` 2->0,
+`lax_numpy_indexing_test` 1->0, `memories_test` 2->0, `export_test` 7->5,
+`sparse_bcoo_bcsr_test` 2->2, with `lax_numpy_test` / `nn_test` / `random_test`
+unchanged as controls.
+
+Open, for scrutiny: `api_test::test_concurrent_device_get_and_put` failed once
+in two whole-file runs and passes standalone 3/3 -- the same intermittent
+multi-thread row P8.5 left open (`There is no Stream(gpu, N) in current
+thread`), not a new one, but it now has a second sighting.

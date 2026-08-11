@@ -23,6 +23,7 @@ Licensed under the Apache License, Version 2.0.
 
 #include <cstdint>
 #include <memory>
+#include <mutex>  // NOLINT(build/c++11)
 #include <optional>
 #include <string>
 #include <utility>
@@ -58,11 +59,24 @@ class MetalExecutable final : public xla::PjRtExecutable {
   int64_t SizeOfGeneratedCodeInBytes() const override { return -1; }
   absl::string_view name() const override { return name_; }
 
+  // PJRT's `OptimizedProgram`, which jax turns into `compiled.as_text()`.
+  //
+  // What comes back is the program this executable RUNS, expressed as HLO:
+  // the StableHLO the compile was handed, converted.  It is not optimized,
+  // because nothing here optimizes at the HLO level -- the recognizers and the
+  // compile decisions work on the tape, below this representation -- and
+  // saying so by handing back the real program beats answering nothing at all
+  // (jax turns a refusal into `None`, and every caller that greps the text
+  // then fails on a `NoneType`).  A test that asserts XLA's own pipeline ran
+  // (an early-inlined call, a DCE'd dead add) still fails, and correctly so.
+  //
+  // Converted on demand and cached: the conversion costs more than any caller
+  // of a debugging surface should pay per compile, and a module using
+  // something the HLO exporter cannot spell must degrade to `None` rather than
+  // failing a compile that is otherwise fine -- hence UNIMPLEMENTED, which is
+  // the code jax's `as_text` catches.
   absl::StatusOr<std::vector<std::shared_ptr<xla::HloModule>>> GetHloModules()
-      const override {
-    return absl::UnimplementedError(
-        "metaljax-native: the executable is a tape, not an HLO module.");
-  }
+      const override;
 
   // Answered from the function signature rather than from an HloModule, which
   // is the whole reason this class exists.
@@ -97,6 +111,8 @@ class MetalExecutable final : public xla::PjRtExecutable {
   std::shared_ptr<const LoweredProgram> lowered_;
   xla::CompileOptions options_;
   std::string name_;
+  mutable std::mutex hlo_mu_;
+  mutable std::shared_ptr<xla::HloModule> hlo_;
 };
 
 class MetalLoadedExecutable final : public xla::PjRtLoadedExecutable {
@@ -153,6 +169,7 @@ class MetalLoadedExecutable final : public xla::PjRtLoadedExecutable {
   xla::PjRtClient* client_;
   xla::PjRtDevice* device_;
   xla::PjRtMemorySpace* memory_space_;
+  xla::PjRtMemorySpace* host_memory_space_;
   std::shared_ptr<const LoweredProgram> lowered_;
   std::string name_;
   std::unique_ptr<MetalExecutable> executable_;
