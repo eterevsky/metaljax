@@ -1,0 +1,16 @@
+# The complete public surface of libmetal_pjrt_native.dylib (ld64
+# -exported_symbols_list; C names, hence the leading underscore).
+#
+# Everything else in this image -- XLA, MLIR/LLVM, StableHLO, protobuf, absl,
+# and the executor runtime -- becomes private extern.  That is not cosmetic:
+# dyld coalesces WEAK DEFINITIONS across images by name, so a plugin that
+# exports protobuf's `AddDescriptors`/arena symbols binds them to whatever
+# protobuf is already loaded (TensorFlow's, array_record's) and executes a
+# foreign descriptor pool -- SIGSEGV at dlopen, both load orders (with this
+# plugin first, TF's LLVM instead aborts on duplicate CommandLine options).
+# It reached every keras / gemma-lib / maxtext benchmark row.
+#
+# Keep this list at exactly two entries.  A third export is a decision about
+# what this plugin promises the process it is loaded into.
+_GetPjrtApi
+_metaljax_native_set_callback_trampoline

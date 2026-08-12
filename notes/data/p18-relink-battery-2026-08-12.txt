@@ -1,0 +1,62 @@
+P18: the exported-symbols relink, landed and validated (2026-08-12, tree 8c61e72)
+================================================================================
+Change:  plugin-native/metal/exported_symbols.exp (new)
+         plugin-native/metal/BUILD -- additional_linker_inputs + linkopts
+             -Wl,-exported_symbols_list,$(location exported_symbols.exp)
+         plugin-native/coexist_test.py (new; the contract, both load orders)
+Default build.  No other build flag added: ld64 strips what the two exports
+cannot reach on its own.
+
+SIZE
+  dylib   166,439,752 B (158.7 MiB) -> 46,877,160 B (44.7 MiB)   -71.8 %
+  wheel    42,210,335 B             -> 11,839,566 B              -71.9 %
+  exported symbols: 2  (`nm -gU`)
+      0000000000002f9c T _GetPjrtApi
+      00000000000030a8 T _metaljax_native_set_callback_trampoline
+
+COEXISTENCE (plugin-native/coexist_test.py; each case a fresh subprocess --
+the failure is a SIGSEGV, so only process isolation can report it)
+
+  carrier       order                 pristine dylib        relinked dylib
+  tensorflow    TF then plugin        FAIL rc=-11 (SIGSEGV) PASS
+  tensorflow    plugin then TF        FAIL rc=-11 (SIGSEGV) PASS
+  array_record  AR then plugin        FAIL rc=-11 (SIGSEGV) PASS
+  array_record  plugin then AR        FAIL rc=-11 (SIGSEGV) PASS
+
+  tensorflow 2.20.0 in ~/.cache/metaljax-bench/venvs/bench
+  array_record in ~/.cache/metaljax-bench/maxtext/venv
+  each PASS runs jax.devices() -> MetalDevice(id=0) and a jit on the GPU.
+  logs: ~/.cache/metaljax-bench/logs/p18-relink/coexist-*.log
+
+PERF NEUTRALITY (P16's five suite configs, scripts/bench_texmo_pjrt.py,
+PJRT route, 64-step chunks, machine lock held, A/B/A interleave)
+
+  config           relinked-a  pristine-b  relinked-c   rel(mean)/pristine
+  big05-b32l128        30.198      30.519      30.744          0.998
+  big05-b8l256         43.804      45.031      44.856          0.984
+  db11-b256l512        58.636      60.170      58.785          0.976
+  db11-b64l256         28.783      29.404      29.107          0.984
+  mid13-b64l128         6.197       6.188       6.190          1.001
+  ms/step; the relinked passes' own spread (a vs c) is up to 2.4 %, so every
+  delta is inside the run-to-run band.  Nothing regressed.
+  artifacts: perfneutral-{relinked-a,pristine-b,relinked-c}.jsonl,
+             perfneutral-configs.csv
+
+BATTERY (all on the relinked dylib)
+  execute_test.py        520 of 520 checks ok, 0 fail   (incl. the 8-thread
+                         row that is the known intermittent
+                         "There is no Stream(gpu, N)" -- clean this run)
+  texmo_gate.py          106 ok (25 via sensitivity scaling), 0 decline,
+                         0 FAIL, 0 error, of 106       [4m55s]
+  smoke_test.py          all checkpoints passed
+  decline_census.py      35 of 35 programs lower
+  ingest_test.py         8 of 8, 0 failed
+  bazel test //...       1 test passes (//metal:runtime_gil_free_test; cached
+                         -- it depends on //runtime, which the linkopt does
+                         not touch)
+  wheel_poc_test.py      fresh 3.13 venv, wheel-only stack, all checkpoints
+                         passed (11.8 MB wheel)
+  logs: ~/.cache/metaljax-bench/logs/p18-relink/*.log
+
+The pristine (no-list) dylib is kept for future A/Bs at
+~/.cache/metaljax-bench/p18-relink/libmetal_pjrt_native.pristine.dylib

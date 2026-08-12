@@ -14,6 +14,10 @@ cd .. && ./.venv/bin/python plugin-native/smoke_test.py    # it works at all
 ./.venv/bin/python plugin-native/texmo_gate.py             # the whole suite
 ./.venv/bin/python plugin-native/decline_census.py         # what still declines
 ./.venv/bin/python plugin-native/ingest_test.py            # the transfer path
+
+# coexistence with a static-protobuf/LLVM carrier -- needs a python that has
+# TensorFlow or array_record, so not the repo venv:
+~/.cache/metaljax-bench/venvs/bench/bin/python plugin-native/coexist_test.py
 ```
 
 `execute_test.py` is the differential suite: every expression is run through
@@ -39,7 +43,13 @@ parsed StableHLO into one of its `Program`s and `Execute` replays it.
 `//metal:runtime_gil_free_test` builds a tape through the same C++ API and
 runs it on the GPU in a process with no interpreter in it.
 
-The dylib exports two symbols. `GetPjrtApi` is the plugin; the other,
+The dylib exports two symbols, and `metal/exported_symbols.exp` is what holds it
+to exactly those: everything else — XLA, MLIR/LLVM, StableHLO, protobuf, absl —
+is private extern, because dyld coalesces weak definitions across images and an
+unrestricted export table makes this plugin SIGSEGV at `dlopen` in a process
+that already holds TensorFlow or array_record (`coexist_test.py` is the
+contract, both load orders). The list is also why the dylib is 46 MB and not
+166. `GetPjrtApi` is the plugin; the other,
 `metaljax_native_set_callback_trampoline`, is the callback bridge (P13):
 `src/jax_plugins/metal/__init__.py` keeps the registry of Python callables that
 `jax.debug.print` / `pure_callback` / `io_callback` lower to and installs a

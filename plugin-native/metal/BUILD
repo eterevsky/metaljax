@@ -214,8 +214,16 @@ cc_library(
 # the tape, libmlx and XLA's statically-linked LLVM/MLIR/absl can share one
 # image.  Discovering otherwise while wiring up CompileAndLoad would be a much
 # worse place to find out.
+#
+# `exported_symbols.exp` is what makes the dylib loadable into a process that
+# already holds another statically-linked protobuf or LLVM (TensorFlow,
+# array_record): see the file for the failure it prevents.  It also lets ld64
+# dead-strip everything unreachable from those two symbols, which is most of
+# the image.
 metaljax_cc_binary(
     name = "libmetal_pjrt_native.dylib",
+    additional_linker_inputs = ["exported_symbols.exp"],
+    linkopts = ["-Wl,-exported_symbols_list,$(location exported_symbols.exp)"],
     linkshared = True,
     deps = [
         ":metal_c_pjrt",

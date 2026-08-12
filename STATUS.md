@@ -8,6 +8,13 @@ pre-migration `metaljax` one — footnotes 24–26 and
 That campaign ended in kernel panic #8 (footnote 25); the empty native cells
 were never attempted.*
 
+*Updated 2026-08-12 (later): the native column is **re-measured with the P17
+recognizer emits** on the relinked plugin — footnote 27. Rows 3/5/6/14/16/17
+moved to 0.95–1.13× of Stage 1 (three of them past it); row 7 is now blocked on
+pack-build MEMORY rather than compute; row 13's residual is one compile-gate
+bug, itemised in footnote 27. Cells not re-run keep their P16 value and are
+marked ᴾ¹⁶.*
+
 *Last updated: 2026-08-04 — 0.11.2 baseline cells are FINAL (sequential
 release-gate run at shipped defaults, token agreement audited per
 footnotes 21/22); rows re-measured on the 0.11.3 tree are marked by
@@ -20,25 +27,25 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 
 | # | benchmark | jax CPU | metaljax | metaljax-native ²⁴ | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|---|
-| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | **301.6** (1.24×) | 137 | 148.7 | 111.2 ²⁰ |
-| 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | **98.8** (1.05×) | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
-| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **300.5** (6.88× — no MoE gather emit) | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
-| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | **27.2** (1.00×) | 10.5 ¹⁵ | — | — |
-| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **61.5** (1.04×) | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
-| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **57.6** (1.04×) | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
-| 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **9497.6** (434× — no qmm/MoE emit; 21 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
+| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | 301.6 (1.24×) ᴾ¹⁶ | 137 | 148.7 | 111.2 ²⁰ |
+| 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | 98.8 (1.05×) ᴾ¹⁶ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **43.4** (0.99× ²⁷) | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
+| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | 27.2 (1.00×) ᴾ¹⁶ | 10.5 ¹⁵ | — | — |
+| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.9** (0.99× ²⁷) | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
+| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.7** (0.99× ²⁷) | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
+| 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | ✗ guard-killed @62 GB (pack build ²⁷) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | not run (PAUSED ¹⁷) | **13.7** | — | — |
-| 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | ✗ **PANIC #8** ²⁵ | 131.8 | — | — |
+| 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | ✗ **PANIC #8** ²⁵ (retry pending) | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | not run (embargo) | **10.6** | — | — |
-| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | **16.67** (1.02×) | — | — | — |
+| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | 16.67 (1.02×) ᴾ¹⁶ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | not run (PAUSED ¹⁷) | **52.8** (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **454.6** (5.64× — no qmm emit) | — | — | — |
-| 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **62.1** (1.03×) ²⁶ | — | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **249.0** (3.09× — qmm fires, decode body does not compile ²⁷) | — | — | — |
+| 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **56.8** (0.95× ²⁷) ²⁶ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ MLX command-buffer bug ⁸ | not run (embargo) | — | — | — |
-| 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | **108.7** (1.27×; b32 1.78×) | — | 29.8 (b32: 591) | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512², 5141 @1024² ⁹ | **16016** @1024² (3.14× — no sdpa emit); 512² not run | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
-| 18 | LoRA E2B train (ms/step) | 2048 | **407** | **656.3** (1.63×) | — | 135.6 ¹⁰ | — |
-| 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | **962.0** (1.01×) ²⁶ | — | — | — |
+| 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | **96.9** (1.13×; b32 0.96× ²⁷) | — | 29.8 (b32: 591) | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512², 5141 @1024² ⁹ | **1234.8** @512² (0.81×), **5781.6** @1024² (1.13×) ²⁷ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
+| 18 | LoRA E2B train (ms/step) | 2048 | **407** | 656.3 (1.63×) ᴾ¹⁶ | — | 135.6 ¹⁰ | — |
+| 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | 962.0 (1.01×) ᴾ¹⁶ ²⁶ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | — | **28.0** (102.9 GB, load 12 s) | — | — |
 
 **Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
@@ -282,6 +289,45 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
     peaks at **56 GB** and the E2B-int4 row's at **44 GB** (steady states
     10.2 and 3.1 GB) — a 45 GB budget guard-kills both.
 
+27. **The native column re-measured with the P17 emits** (2026-08-12, tree
+    8c61e72; raw `~/.cache/metaljax-bench/logs/p18-relink/`, summary
+    `notes/data/p18-relink-models-2026-08-12.jsonl`, ratios vs the Stage 1
+    column re-measured the same day — a Qwen3-8B control gives 58.2 against the
+    morning's 59.1, so that column is stable to 1.5 %). Cells still carrying a
+    P16 number are marked ᴾ¹⁶.
+    **Closed by the emits**: MoE 6.88× → **0.99×** (row 3, and its greedy tokens
+    are 64/64 identical to Stage 1 — it is the P16 *dense* run that diverges at
+    token 52, footnote 16's ladder class); sdpa 3.14× → **1.13×** at 1024² and
+    **0.81×** at 512² (row 17), 1.78× → **0.96×** at SigLIP b32 (row 16); the
+    dense rows and the int8 row went *past* Stage 1 (rows 5/6 0.99×, row 14
+    0.95×).
+    **Row 7 is now a MEMORY block, not a compute one.** The emits fire (94
+    quantized matmuls recognised, 47 gathered expert dispatches, 188 packs) but
+    P17 deliberately left out qmm's row-blocked `_Source` evaluation and its
+    cross-executable pack cache, so a full pack set per compiled shape is live
+    at once: guard-killed at 46 GB under the row's historical 45 GB budget and
+    at 62 GB under 60, where Stage 1 runs the row at 25 GB. No further budget
+    escalation was attempted (62 GB is panic #7/#8 territory).
+    **Row 13's residual 3.09× is one bug, and it is not qmm.** All 777 quantized
+    dots fuse (group 64/128, interleaved regrouping engaged) and prefill is
+    already *ahead* of Stage 1 (218.3 vs 241.0 ms); what is left is that the
+    fused program reports `compiles=0 compiled_calls=0` — the decode while body
+    never compiles, so the loop runs op by op. The compile gate's `BlockCost`
+    walks the StableHLO block and still charges every op the emit ABSORBS, so
+    the body looks over `METALJAX_TRACE_BUDGET`. Proof: the byte budget alone
+    changes nothing (274.6 ms/tok), `METALJAX_RECOGNIZE=0` reports `compiles=0`
+    too, and `METALJAX_TRACE_BUDGET=1e7` measures **85.5 ms/tok = 1.06× of
+    Stage 1**. Fix belongs in the fused lowering's cost/byte accounting.
+    Also from this pass: row 5's greedy tokens now diverge from Stage 1 at token
+    61 of 64 (they agreed before the sdpa emit) — footnote-21 tie-flip class but
+    a *new* divergence, worth the logit-delta ladder rather than an assumption.
+    Mechanically, all of it rides on the exported-symbols relink finally being
+    in the tree (`plugin-native/metal/exported_symbols.exp`, default build, 166
+    → 46 MB dylib and 42.2 → 11.8 MB wheel), without which none of these rows
+    can even `dlopen` the plugin — `plugin-native/coexist_test.py` is its
+    standing contract and `notes/data/p18-relink-battery-2026-08-12.txt` its
+    evidence.
+
 ## Bug ledger (found by this suite)
 
 - **Splat-constant retention** (FIXED, d9d774e, gated): whole-shape
@@ -308,3 +354,15 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
   progress.
 - **keras load-path memory** (open, blocks ≥60 GB keras rows): footnote 17.
 - **int4 unpack re-materialization on metal** (open, 11.7×): footnote 18.
+- **native plugin: the fused lowering's compile gate reads the UNFUSED IR**
+  (open, worth 2.9× on row 13): `BlockCost`/`BlockBytes` charge the ops a
+  recognizer absorbs, so an emit-cheapened decode body still trips
+  `METALJAX_TRACE_BUDGET` and runs uncompiled. Footnote 27.
+- **native plugin: pack building has no memory discipline** (open, blocks row 7
+  natively): no row-blocked `_Source` evaluation, no cross-executable pack
+  cache — 49–62 GB where Stage 1 uses 25. Footnote 27.
+- **native plugin dylib could not coexist with TensorFlow / array_record**
+  (FIXED 2026-08-12, exported-symbols list, default build): static protobuf +
+  LLVM weak-definition coalescing, SIGSEGV at `dlopen` in both load orders; it
+  blocked every keras / gemma-lib / maxtext row. Contract:
+  `plugin-native/coexist_test.py`. Footnote 27.

@@ -1318,3 +1318,65 @@ the dylib cannot be dlopened into such a process without the exported-symbols
 relink P16 found and left out of the tree (a separate deliberate commit).  One
 row is worth carrying forward: at `Tq=1` the FUSED attention is slower than the
 literal chain (0.85x), on both stacks.
+
+## P18: the relink lands, and the emits meet the model rows (2026-08-12)
+
+Two things, in that order: P16's exported-symbols relink became a real,
+default part of the build with its validation re-run from scratch, and the
+model rows were re-measured on the P17 emits through the relinked plugin.
+Evidence: `notes/data/p18-relink-battery-2026-08-12.txt` (relink) and
+`notes/data/p18-relink-models-2026-08-12.jsonl` (rows); Table 3 of
+`benchmarks/perf-2026-08-native-baseline.md` and STATUS.md footnote 27 carry
+the numbers.
+
+**The relink.** `plugin-native/metal/exported_symbols.exp` plus a
+`linkopts`/`additional_linker_inputs` pair on
+`//metal:libmetal_pjrt_native.dylib`; nothing else was needed (ld64 strips what
+the two exports cannot reach on its own). Dylib 166 -> 46 MB, wheel 42.2 ->
+11.8 MB, `nm -gU` reports exactly `_GetPjrtApi` and
+`_metaljax_native_set_callback_trampoline`. `plugin-native/coexist_test.py` is
+the standing contract: TensorFlow and array_record, each in both load orders,
+each in a fresh subprocess because the failure is a SIGSEGV. On the kept
+pristine dylib all four cases are `rc=-11`; on the relinked one all four pass
+and run a jit on the GPU. Perf neutrality was re-measured A/B/A on P16's five
+suite configs (relinked/pristine 0.976-1.001, inside the relinked passes' own
+2.4 % spread). The battery came out *better* than P16's transcript claimed:
+execute_test **520 of 520** (the intermittent 8-thread stream row passed),
+texmo_gate 106/106, smoke, decline_census 35/35, ingest_test 8/8,
+`bazel test //...`, wheel from a fresh 3.13 venv.
+
+**The rows.** Items 2, 3 and 4 of the P16 frontier are closed wherever a row
+could be re-run: MoE 6.88x -> 0.99x, sdpa 3.14x -> 1.13x (SD 3.5 @1024) and
+1.78x -> 0.96x (SigLIP b32), with SD 3.5 @512 at **0.81x** and the dense/int8
+rows at 0.95-0.99x -- native is now at or past Stage 1 on six of the eight rows
+measured. Row 3's greedy tokens are 64/64 identical to Stage 1 (it is the P16
+*dense* run that diverges, at token 52 -- footnote 16's ladder class), and so
+are row 13's.
+
+Two things did NOT close, and both are one mechanism each:
+
+* **Row 7 (gpt-oss) is now a memory block.** The emits fire (94 qmm recognized,
+  47 gathered expert dispatches, 188 packs) but the two optimizations P17
+  deliberately skipped -- qmm's row-blocked `_Source` evaluation and its
+  cross-executable pack cache -- put a full pack set per compiled shape in
+  memory: guard kill at 46 GB under the row's 45 GB budget, 62 GB under 60,
+  against Stage 1's 25 GB. Not escalated further; 62 GB is panic #7/#8
+  territory.
+* **The fused lowering's compile decisions read the UNFUSED IR.** Row 13 fuses
+  every one of its 777 quantized dots and its PREFILL is already ahead of
+  Stage 1 (218.3 vs 241.0 ms), yet the fused program reports `compiles=0
+  compiled_calls=0 serial_loops=1`: `BlockCost` walks the StableHLO block and
+  charges the dequant chain the emit absorbs, so `body_compile_max` solves to
+  zero and the decode loop runs op by op. The byte budget is not it
+  (`METALJAX_COMPILE_BYTES_MB=1e8` alone: 274.6 ms/tok) and the packs are not it
+  (`METALJAX_RECOGNIZE=0` also reports `compiles=0`); `METALJAX_TRACE_BUDGET=1e7`
+  gives **85.5 ms/tok = 1.06x of Stage 1**. Cost and byte accounting must follow
+  the rewrite plan, as Stage 1's does. Worth 2.9x on that row and a candidate
+  for any emit row short of parity.
+
+Scrutiny carried forward: row 5's greedy tokens now diverge from Stage 1 at
+token 61 of 64 where they agreed before the sdpa emit (tie-flip class, but new);
+the two SD 3.5 stacks produce different images at the same prompt (pixel_std
+61.1 vs 77.5 at 512); Stage 1's own SD 3.5 @512 has drifted 1389 -> 1520.7
+against its 0.11.3 anchor, a third Stage-1-vs-anchor regression beside rows 14
+and 19.

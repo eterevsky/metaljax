@@ -6,6 +6,13 @@ trampoline, on the tree at 845ab89. Sequential throughout, machine lock held
 for every measured run, `guarded_run.sh` (precheck + `mem_guard.sh`) for every
 model row.*
 
+> **2026-08-12 update (P18, tree 8c61e72).** The exported-symbols relink is in
+> the tree as the default build and its validation was re-run for real; the
+> model rows were then re-measured with the P17 recognizer emits. Table 3 now
+> carries both native columns, and "Where the performance phases must act" has a
+> status section. Everything above the tables is the original P16 campaign and
+> is left as written.
+
 **The campaign was HALTED at 03:33 by kernel panic #8**, during the row-9
 (R1-Distill-32B) *native* attempt — a watchdog wedge in the 65 GB streaming
 load, the same signature as panic #7 (footprint 54 GB, RSS 54.6, system
@@ -141,33 +148,64 @@ Headline metric per row as in STATUS.md (LLM = warm decode ms/token; vision =
 forward ms; diffusion = ms/step; training = ms/step). "peak" = guard flight-log
 footprint. Anchor column = `benchmarks/models.md` 0.11.3.
 
-| # | model | metric | 0.11.3 anchor | Stage 1 today | native today | native/S1 | notes |
-|---|---|---|---:|---:|---:|---:|---|
-| 1 | gemma4-31B bf16 | ms/tok | 237.5 | **243.1** (peak 66 G) | **301.6** (peak 67 G) | **1.24×** | dense decode; no sdpa emit |
-| 2 | gemma4-12B bf16 | ms/tok | 92.5 | **93.9** (29 G) | **98.8** (30 G) | **1.05×** | |
-| 3 | gemma4-26B-A4B (MoE) | ms/tok | 44.3 | **43.7** (53 G) | **300.5** (54 G) | **6.88×** | no MoE expert-gather emit → dense dispatch; memory identical |
-| 4 | gemma4-E2B bf16 | ms/tok | 27.5 | **27.2** (12 G) | **27.2** (12 G) | **1.00×** | exact parity |
-| 5 | Qwen3-8B bf16 | ms/tok | 57.8 | **59.1** (18 G) | **61.5** (18 G) | **1.04×** | |
-| 6 | Llama-3.1-8B bf16 | ms/tok | 54.2 | **55.5** (18 G) | **57.6** (18 G) | **1.04×** | |
-| 7 | gpt-oss-20b (MXFP4) | ms/tok | 22.2 | **21.9** (26 G) | **9497.6** (21 G) | **434×** | no qmm + no MoE gather; measured at `--decode-tokens 8` after the 128-token run passed 33 min unfinished. Memory FITS (21 G) — this is compute, not the memory block that was predicted |
-| 8 | Qwen3.6-35B-A3B | — | ✗ | *not run* | *not run* | — | PAUSED, kernel-panic embargo (TASKS.md) |
-| 9 | R1-Distill-32B | ms/tok | 217.7 | **213.8** (67 G) | **PANIC #8** | — | Stage 1 clean; native wedged the machine mid-load (54 G, all samples ok). **Embargoed pending the native streaming-load cadence** |
-| 10 | DeepSeek-V2-Lite | — | ✗ | *not run* | *not run* | — | embargoed (maxtext 8B class) |
-| 11 | Qwen3-0.6B maxtext decode | ms/tok | 15.8 | **16.42** | **16.67** | **1.02×** | token stream diverges from Stage 1 at token ~3 (see incidents) |
-| 12 | Mixtral 8×7B | — | ✗ | *not run* | *not run* | — | PAUSED, same wedge class as row 8 |
-| 13 | gemma4-E2B keras-int4 | ms/tok | 81.1 | **80.6** (peak 44 G) | **454.6** (44 G) | **5.64×** | no qmm emit → in-graph unpack; packed storage survives (2.7 G active) |
-| 14 | maxtext qwix-int8 0.6B | ms/tok | 32.5 | **60.1** ⚠ | **62.1** | **1.03×** | ⚠ **Stage-1 regression vs anchor, 1.85×** (see below) |
-| 15 | qwix-int8 Qwen3-8B | — | ✗ | *not run* | *not run* | — | embargoed (MLX command-buffer bug) |
-| 16 | SigLIP 2 fwd b1 | ms | 82.9 | **85.8** (7.6 G) | **108.7** (11 G) | **1.27×** | |
-| 16b | SigLIP 2 fwd b32 | ms | — | **2501.6** | **4444.8** | **1.78×** | the sdpa gap opens with batch |
-| 17 | SD 3.5 Large @1024² | ms/step | 5141 | **5107** (23 G) | **16016** (27 G) | **3.14×** | no sdpa emit; both produced real images (pixel_std 94.4 / 76.1). 512² cell *not run* |
-| 18 | LoRA E2B train | ms/step | 407 | **402.1** (56 G) | **656.3** (49 G) | **1.63×** | |
-| 19 | maxtext train 0.6B | ms/step | 440 | **956.5** ⚠ | **962.0** | **1.01×** | ⚠ **Stage-1 regression vs anchor, 2.17×**; losses bit-identical across stacks |
-| 20 | 235B-A22B 3-bit | — | ✗ | — | — | — | mlx-only row |
+Two native columns: **P16** is the baseline this campaign measured (no
+recognizer emits, no msl_scan, no exported-symbols relink) and **P18** is the
+same rows re-measured on 2026-08-12 after the P17 emits landed and the relink
+became the default build (`notes/data/p18-relink-models-2026-08-12.jsonl`;
+artifacts under `~/.cache/metaljax-bench/logs/p18-relink/`). The ratio column is
+**P18 / Stage 1 today**.
 
-**Unmeasured after the halt**: row 9 native (embargoed), rows 8/10/12/15
-(pre-existing embargoes), the SD 3.5 512² cell, and CPU-column re-measurements
-(not in scope — anchors used).
+| # | model | metric | 0.11.3 anchor | Stage 1 today | native P16 | native P18 | P18/S1 | notes |
+|---|---|---|---|---:|---:|---:|---:|---|
+| 1 | gemma4-31B bf16 | ms/tok | 237.5 | **243.1** (peak 66 G) | 301.6 (67 G) | *not re-run* | — | dense decode; the sdpa emit now exists but this is a 66 G row |
+| 2 | gemma4-12B bf16 | ms/tok | 92.5 | **93.9** (29 G) | 98.8 (30 G) | *not re-run* | — | |
+| 3 | gemma4-26B-A4B (MoE) | ms/tok | 44.3 | **43.7** (53 G) | 300.5 (54 G) | **43.4** (53 G) | **0.99×** | the MoE expert-gather emit closes 6.88× to parity; greedy tokens 64/64 identical to Stage 1 |
+| 4 | gemma4-E2B bf16 | ms/tok | 27.5 | **27.2** (12 G) | 27.2 (12 G) | *not re-run* | — | was already exact parity |
+| 5 | Qwen3-8B bf16 | ms/tok | 57.8 | **58.2** (18 G) ᶜ | 61.5 (18 G) | **57.9** (18 G) | **0.99×** | ᶜ same-day control re-measure (P16 read 59.1 — the Stage 1 column is stable to 1.5 %) |
+| 6 | Llama-3.1-8B bf16 | ms/tok | 54.2 | **55.5** (18 G) | 57.6 (18 G) | **54.7** (18 G) | **0.99×** | |
+| 7 | gpt-oss-20b (MXFP4) | ms/tok | 22.2 | **21.9** (26 G) | 9497.6 (21 G) | **guard-killed** | — | the emits fire (94 qmm recognized, 47 gathered expert dispatches, 188 packs, MXFP4 group 32) but the pack BUILD blows the budget: killed at 46 G under 45, and at 62 G under 60. **Blocked on row-blocked packing + the cross-executable pack cache** |
+| 8 | Qwen3.6-35B-A3B | — | ✗ | *not run* | *not run* | *not run* | — | PAUSED, kernel-panic embargo (TASKS.md) |
+| 9 | R1-Distill-32B | ms/tok | 217.7 | **213.8** (67 G) | **PANIC #8** | *(main agent)* | — | native embargoed; the retry is the main agent's |
+| 10 | DeepSeek-V2-Lite | — | ✗ | *not run* | *not run* | *not run* | — | embargoed (maxtext 8B class) |
+| 11 | Qwen3-0.6B maxtext decode | ms/tok | 15.8 | **16.42** | 16.67 | *not re-run* | — | token stream diverges from Stage 1 at token ~3 (see incidents) |
+| 12 | Mixtral 8×7B | — | ✗ | *not run* | *not run* | *not run* | — | PAUSED, same wedge class as row 8 |
+| 13 | gemma4-E2B keras-int4 | ms/tok | 81.1 | **80.6** (peak 44 G) | 454.6 (44 G) | **249.0** (48 G) | **3.09×** | qmm fires on all 777 dots (group 64/128, regrouping engaged) and **prefill is already ahead of Stage 1** (218.3 vs 241.0); the residual is the decode loop running UNCOMPILED — see below. Greedy tokens 64/64 identical to Stage 1 |
+| 14 | maxtext qwix-int8 0.6B | ms/tok | 32.5 | **60.1** ⚠ | 62.1 | **56.8** | **0.95×** | ⚠ **Stage-1 regression vs anchor, 1.85×** (see below); same greedy text |
+| 15 | qwix-int8 Qwen3-8B | — | ✗ | *not run* | *not run* | *not run* | — | embargoed (MLX command-buffer bug) |
+| 16 | SigLIP 2 fwd b1 | ms | 82.9 | **85.8** (7.6 G) | 108.7 (11 G) | **96.9** (8.2 G) | **1.13×** | |
+| 16b | SigLIP 2 fwd b32 | ms | — | **2501.6** | 4444.8 | **2400.5** | **0.96×** | the sdpa emit closes 1.78× and goes past Stage 1 |
+| 17 | SD 3.5 Large @1024² | ms/step | 5141 | **5107** (23 G) | 16016 (27 G) | **5781.6** (24 G) | **1.13×** | sdpa emit: 3.14× → 1.13×; real image (pixel_std 68.0) |
+| 17b | SD 3.5 Large @512² | ms/step | 1389 | **1520.7** (21 G) ᶜ | *not run* | **1234.8** (21 G) | **0.81×** | ᶜ measured today for this pairing. Native is 19 % **faster** than Stage 1 and 11 % faster than the 0.11.3 anchor; real images both (pixel_std 61.1 native / 77.5 Stage 1) |
+| 18 | LoRA E2B train | ms/step | 407 | **402.1** (56 G) | 656.3 (49 G) | *not re-run* | — | |
+| 19 | maxtext train 0.6B | ms/step | 440 | **956.5** ⚠ | 962.0 | *not re-run* | — | ⚠ **Stage-1 regression vs anchor, 2.17×**; losses bit-identical across stacks |
+| 20 | 235B-A22B 3-bit | — | ✗ | — | — | — | — | mlx-only row |
+
+**Unmeasured**: rows 8/10/12/15 (pre-existing embargoes), row 9 native
+(embargoed; the retry is the main agent's), the P18 cells of rows 1/2/4/11/18/19
+(not re-run — 1/2/18 are 30–67 GB rows and 4/11/19 were already at parity), and
+CPU-column re-measurements (not in scope — anchors used).
+
+### The one blocked row, and the one gap the emits did not close
+
+**Row 7 (gpt-oss-20b) is blocked on memory, not compute.** The emits fire, but
+building those packs without qmm's row-blocked `_Source` evaluation and without
+its cross-executable build cache (P17 left both out deliberately) keeps a full
+pack set per compiled shape live at once. Measured: a steady climb to 46 GB at
+the row's historical 45 GB budget, and an oscillating 49–62 GB plateau at 60.
+Stage 1 runs the same row at 25 GB. No further escalation was attempted — 62 GB
+is panic #7/#8 territory.
+
+**Row 13's residual 3.09× is the compile gate reading the UNFUSED IR.** The
+fused decode program reports `compiles=0 compiled_calls=0 serial_loops=1`: the
+decode while body never compiles, so the loop runs op by op. It is not the byte
+budget (`METALJAX_COMPILE_BYTES_MB=1e8` alone: 274.6 ms/tok, no change) and it
+is not the packs (`METALJAX_RECOGNIZE=0` also reports `compiles=0`). It is the
+**cost** term: `body_compile_max = min(kTraceBudget/cost, …)`, and `BlockCost`
+walks the StableHLO block, still charging every op the qmm emit ABSORBS — the
+whole int4 dequant chain. With `METALJAX_TRACE_BUDGET=1e7` the same row measures
+**85.5 ms/tok = 1.06× of Stage 1**. Making the fused lowering's cost and byte
+estimates follow the rewrite plan is worth 2.9× here, and is a candidate
+explanation for any other emit row that lands short of parity.
 
 ---
 
@@ -199,6 +237,28 @@ bf16 decode is within 4–5 % (rows 2/5/6), E2B is exact parity, maxtext decode
 and training are within 1–2 %, and on large matmul-bound texmo configs the
 native path is **up to 32 % faster** than Stage 1 (`big09-b8l256` 0.68×). The
 dispatch argument for the C++ engine is settled — what is left is the emits.
+
+### Status of that list after P17 + P18 (2026-08-12)
+
+Items 2, 3 and 4 are **closed on the rows that could be re-run**: MoE 6.88× →
+0.99×, sdpa 3.14× → 1.13× (@1024²), 1.78× → 0.96× (SigLIP b32), and at 512² SD
+3.5 is now 0.81× of Stage 1. Item 1 (`msl_scan`) is untouched and remains the
+whole texmo gap. Three new items join the list, all of them found by re-running
+these rows:
+
+6. **The fused lowering's compile decisions read the unfused IR** — `BlockCost` /
+   `BlockBytes` charge the ops a recognizer absorbs, so a decode body that the
+   emits made cheap can still exceed `METALJAX_TRACE_BUDGET` and run
+   uncompiled. Worth **2.9×** on row 13 (249.0 → 85.5 ms/tok with the budget
+   lifted). Suspected on any emit row that lands short of parity.
+7. **Pack building has no memory discipline** — no row-blocked `_Source`
+   evaluation and no cross-executable build cache, which is what blocks row 7
+   (49–62 GB against Stage 1's 25 GB) and what makes row 13 peak at 48 GB for a
+   3 GB model.
+8. **Row 5's greedy tokens now diverge from Stage 1 at token 61 of 64**
+   (they agreed before the sdpa emit) — the footnote-21 tie-flip class, but it
+   is a *new* divergence introduced by fusion and should be walked down the
+   logit-delta ladder rather than assumed benign.
 
 ---
 
@@ -237,6 +297,11 @@ both were guard-killed at a 45 GB budget before completing at 70.
   afterwards and the tree carries no trace of it (the experimental dylib lived
   in session scratch and was wiped by the reboot). It is a one-line build
   change and it belongs in the plugin.
+  **LANDED 2026-08-12 (P18)** as `plugin-native/metal/exported_symbols.exp` +
+  the `linkopts`/`additional_linker_inputs` pair in `plugin-native/metal/BUILD`,
+  the DEFAULT build, with `plugin-native/coexist_test.py` as its standing
+  contract. Re-verified from scratch, not from the transcript:
+  `notes/data/p18-relink-battery-2026-08-12.txt`.
 * **`mx.get_active_memory()` is unreliable under the native plugin** (0.0 on
   the gemma-venv rows): the Python `mlx` module and the plugin's linked libmlx
   can be two runtimes. Read memory from the guard flight log.
@@ -266,13 +331,16 @@ Every number in the tables is sourced to a surviving artifact under
 | model rows 1–7, 9, 13, 16, 17, 18 | `<bench-id>-0812-<stamp>.jsonl` + `-flight.log` |
 | row 7 native (8 tokens) | `native-baseline/row7-native-0812-024351.jsonl` |
 | model rows 11, 14, 19 (both stacks + py-engine controls) | `native-baseline/{qwen3-06b-maxtext,maxtext-qwix-int8,maxtext-train-06b}-{s1,native}-0812-*.log` |
+| **P18 native cells + the Stage 1 controls** | `p18-relink/<bench-id>-<tag>-0812-<stamp>.{jsonl,log,flight.log}`, summarised in `notes/data/p18-relink-models-2026-08-12.jsonl` |
+| **P18 relink evidence** (coexistence, size, perf neutrality, battery) | `p18-relink/{coexist-*,execute_test-relinked,texmo_gate-relinked,wheel_poc-relinked,perfneutral-*}.log`, summarised in `notes/data/p18-relink-battery-2026-08-12.txt` |
 
-**UNVERIFIED (session scratch wiped by the reboot; from the transcript only)**:
-the relinked dylib's validation — `plugin-native/execute_test.py` 501 of 502
-checks (the one failure being the known intermittent
-`There is no Stream(gpu, N) in current thread` 8-thread row, P8.5/P15 open
-item) and `smoke_test.py` clean — and its perf-neutrality check against the
-pristine dylib on five suite configs (`db11-b256l512` 62.19 vs 63.24,
-`db11-b64l256` 30.09 vs 30.19, `big05-b32l128` 32.08 vs 32.11, `big05-b8l256`
-47.97 vs 47.57, `mid13-b64l128` 6.24 vs 6.27 — all within 1 %). The Table 3
-native cells rest on that check; re-run it when the linker change lands.
+**The formerly UNVERIFIED relink validation is now verified**, from a rebuilt
+dylib rather than a transcript, and it came out better than the transcript said:
+`execute_test.py` **520 of 520** (the intermittent 8-thread
+`There is no Stream(gpu, N) in current thread` row passed this run),
+`texmo_gate.py` 106/106, `smoke_test.py`, `decline_census.py` 35/35,
+`ingest_test.py` 8/8, `bazel test //...`, and the wheel run from a fresh 3.13
+venv. Perf neutrality was re-measured A/B/A against a kept copy of the pristine
+no-list dylib on the same five suite configs (relinked mean / pristine: 0.998,
+0.984, 0.976, 0.984, 1.001 — every delta inside the relinked passes' own 2.4 %
+spread). The wheel drops 42.2 MB → 11.8 MB with the dylib.
