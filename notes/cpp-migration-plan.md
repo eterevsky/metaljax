@@ -1225,3 +1225,17 @@ Two blockers found on the way, neither of them the tape:
   watchdog wedge with every memory metric healthy - panic #7's signature).
   The native plugin has no equivalent of Stage 1's load-phase clear cadence.
   Row 9 native is embargoed until it does; the campaign was halted there.
+
+## Performance era goals (Oleg, 2026-08-12)
+
+1. Completion parity: everything that completed on 0.11.3 completes
+   natively (row 9 via cadence fix + ladder + supervised retry;
+   exported-symbols relink lands properly with its validation re-run).
+2. The big gaps, measured order: qmm 434x/5.6x -> msl_scan 36.5x
+   geomean -> MoE 6.9x -> sdpa 3.1x. Runtime already executes the
+   fused opcodes; only recognizers/lowerings are missing.
+Then: NEW RELEASE at ~parity with the old implementation; then the
+remaining STATUS.md rows (all 20 must eventually complete); then
+perf parity with other frameworks. Also open: Stage-1-vs-anchor
+regressions (qwix-int8 1.85x, maxtext train 2.17x) to investigate
+despite the freeze; row 11 token divergence to classify.
