@@ -1,0 +1,39 @@
+# P17 standing battery (2026-08-12), native plugin at the P17 tree
+
+## plugin-native/execute_test.py
+
+all cases match the CPU backend
+checks: 520 (final tree; 18 recognizer rows)
+
+## plugin-native/smoke_test.py
+all checkpoints passed
+
+## plugin-native/decline_census.py
+35 of 35 programs lower.  Declines by reason:
+
+## tests/ through the native plugin
+71 failed, 1187 passed, 6 warnings in 64.10s (0:01:04)
+
+## tests/ with the Stage-1 recognizer COUNTERS neutralized (the numeric
+## content of the 70 rows that assert them; see the report)
+8 failed, 256 passed in 8.12s
+
+## plugin-native/texmo_gate.py  (run before the micro-benchmarks, lock free)
+SUMMARY: 106 ok (28 via sensitivity scaling), 0 decline, 0 FAIL, 0 error, of 106
+## (re-run after the final lowering cleanups; the earlier run was 106 ok / 27)
+
+## bazel test //...
+//metal:runtime_gil_free_test    PASSED
+
+## The 8 rows that stay failing with the counters neutralized (each asserts a
+## Stage 1 internal this port did not bring over):
+##   test_qmm.py::test_blocked_affine_pack_is_bit_identical
+##   test_qmm.py::test_blocked_affine_falls_back_when_groups_interleave
+##   test_qmm.py::test_second_executable_reuses_the_pack
+##   test_qmm_mxfp4.py::test_blocked_pack_is_bit_identical[dense]
+##   test_qmm_mxfp4.py::test_blocked_pack_is_bit_identical[experts]
+##   test_qmm_mxfp4.py::test_blocked_pack_bounds_the_transient
+##   test_qmm_mxfp4.py::test_blocked_pack_reads_a_decode_table_whole
+##   test_moe.py::test_dead_sweep_worklist_agrees_with_the_fixpoint
+## (the first seven are qmm.py's row-blocked `_Source` evaluation and its
+## cross-executable build cache; the last is moe.py's dead-sweep worklist)

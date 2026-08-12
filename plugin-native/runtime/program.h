@@ -182,6 +182,7 @@ struct Config {
   int64_t flush_sync_every = 1;               // METALJAX_EAGER_FLUSH_SYNC
   int64_t flush_clear_bytes = 2048LL << 20;   // METALJAX_FLUSH_CLEAR_MB
   int64_t loop_clear_cost = 500000;           // METALJAX_LOOP_CLEAR_COST
+  int64_t ingest_clear_bytes = 8LL << 30;     // METALJAX_INGEST_CLEAR_MB
   int64_t while_pipeline = 1;                 // METALJAX_WHILE_PIPELINE
   bool debug = false;                         // METALJAX_DEBUG
   bool memdbg = false;                        // METALJAX_MEMDBG
@@ -193,13 +194,16 @@ extern Config g_cfg;
 
 void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
                int64_t flush_clear_bytes, int64_t loop_clear_cost,
-               int64_t while_pipeline, bool debug, bool memdbg);
+               int64_t ingest_clear_bytes, int64_t while_pipeline, bool debug,
+               bool memdbg);
 
 struct Stats {
   int64_t flushes = 0;         // eager byte-denominated sync points
   int64_t cache_clears = 0;    // ...that returned cache memory to the OS
   int64_t loop_flushes = 0;    // loop sync points
   int64_t loop_clears = 0;     // ...that cleared on the op-unit cadence
+  int64_t ingest_bytes = 0;    // device bytes taken in by transfers
+  int64_t ingest_clears = 0;   // ...reclamation points the ingest cadence hit
   int64_t limit_retries = 0;   // Metal buffer-limit recoveries
   int64_t compiled_calls = 0;  // replays of a compiled tape (main or body)
   int64_t compiles = 0;        // mx::compile traces built
@@ -237,6 +241,7 @@ void flush_eval(const std::vector<mx::array>& arrays, bool hard);
 void loop_eval(const std::vector<mx::array>& arrays);
 void loop_account(int64_t cost_units);
 void loop_flush(const std::vector<mx::array>& arrays, int64_t cost_units);
+void ingest_account(int64_t bytes);
 int64_t item_int(const mx::array& a);
 bool item_bool(const mx::array& a);
 bool loop_item_bool(const mx::array& a);

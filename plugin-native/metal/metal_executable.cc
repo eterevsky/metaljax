@@ -23,6 +23,7 @@ Licensed under the Apache License, Version 2.0.
 #include "absl/types/span.h"
 #include "metal/metal_buffer.h"
 #include "metal/metal_names.h"
+#include "metal/metal_recognize.h"
 #include "metal/metal_stream.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -77,13 +78,19 @@ const bool kVerifyDump =
 
 std::string StatsDelta(const Stats& before, const Stats& after) {
   return absl::StrFormat(
-      "flushes=%d(+clear %d) loop_flushes=%d(+clear %d) limit_retries=%d "
+      "flushes=%d(+clear %d) loop_flushes=%d(+clear %d) ingest=%dMB(+clear %d) "
+      "limit_retries=%d "
       "serial_loops=%d pipelined_loops=%d pipelined_steps=%d "
       "compiles=%d compiled_calls=%d unrolls=%d drops=%d/%d",
       after.flushes - before.flushes,
       after.cache_clears - before.cache_clears,
       after.loop_flushes - before.loop_flushes,
       after.loop_clears - before.loop_clears,
+      // Not this execute's work -- transfers happen BETWEEN executes -- but
+      // the delta says how much a load moved since the last program ran,
+      // which is the only place a flight log can read it.
+      (after.ingest_bytes - before.ingest_bytes) >> 20,
+      after.ingest_clears - before.ingest_clears,
       after.limit_retries - before.limit_retries,
       after.serial_loops - before.serial_loops,
       after.pipelined_loops - before.pipelined_loops,
@@ -123,6 +130,79 @@ MetalLoadedExecutable::MetalLoadedExecutable(
   device_assignment_(0, 0) = device->id();
   logical_ids_.push_back(LogicalDeviceIds{/*replica=*/0, /*partition=*/0});
   devices_.push_back(device);
+}
+
+const std::shared_ptr<const LoweredProgram>& MetalLoadedExecutable::Tape(
+    const std::vector<mx::array>& inputs) const {
+  std::lock_guard<std::mutex> lock(fuse_mu_);
+  if (fused_ != nullptr) {
+    // The pack is a pure function of the buffers its reconstruction read: a
+    // call that hands over the same arrays reuses it, and one that does not
+    // has to repack (qmm.py `_Pack.matches`).
+    bool same = true;
+    for (size_t i = 0; i < fused_->pack_args.size() && same; i++) {
+      const int a = fused_->pack_args[i];
+      same = a < static_cast<int>(inputs.size()) &&
+             inputs[a].id() == fused_->pack_arg_ids[i];
+    }
+    if (same) return fused_;
+    fused_ = nullptr;
+    if (++repacks_ > kMaxRepacks) {
+      // Weights being trained, or a "scale" that is really per-call data.
+      fuse_done_ = true;
+      return lowered_;
+    }
+  } else if (fuse_done_) {
+    return lowered_;
+  }
+  fuse_done_ = true;
+  if (!RecognizeEnabled() || lowered_->stablehlo.empty()) return lowered_;
+  // The module the compile was handed is long gone (it belongs to that call),
+  // so the program is re-read from the bytecode this executable kept.  The
+  // context lives only as long as the lowering: a tape holds no MLIR.
+  mlir::MLIRContext context;
+  absl::StatusOr<mlir::OwningOpRef<mlir::ModuleOp>> module =
+      xla::ParseMlirModuleString(lowered_->stablehlo, context);
+  if (!module.ok()) return lowered_;
+  absl::StatusOr<LoweredProgram> fused;
+  try {
+    fused = LowerModuleFused(**module, inputs);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "[metaljax-native] %s: recognizers failed (%s)\n",
+                 name_.c_str(), e.what());
+    std::fflush(stderr);
+    return lowered_;
+  }
+  if (!fused.ok()) {
+    if (kDebug && !absl::IsNotFound(fused.status())) {
+      std::fprintf(stderr, "[metaljax-native] %s: no fused tape (%s)\n",
+                   name_.c_str(),
+                   std::string(fused.status().message()).c_str());
+      std::fflush(stderr);
+    }
+    return lowered_;
+  }
+  // The fused tape must present the same boundary as the plain one: it is the
+  // SAME program, and jax has already been told what this executable takes and
+  // returns.  A disagreement would be a lowering bug, and handing back the
+  // plain tape is the safe half of it.
+  if (fused->parameters.size() != lowered_->parameters.size() ||
+      fused->results.size() != lowered_->results.size())
+    return lowered_;
+  fused->stablehlo = lowered_->stablehlo;
+  if (kDebug) {
+    std::fprintf(stderr,
+                 "[metaljax-native] %s: %lld fused quantized matmul(s), "
+                 "%lld gathered expert dispatch(es), %lld fused "
+                 "attention(s), %zu packed arrays\n",
+                 name_.c_str(), static_cast<long long>(fused->num_qmm),
+                 static_cast<long long>(fused->num_moe),
+                 static_cast<long long>(fused->num_sdpa), fused->packs.size());
+    std::fflush(stderr);
+  }
+  fused_ = std::make_shared<const LoweredProgram>(std::move(*fused));
+  fuse_done_ = false;
+  return fused_;
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<xla::PjRtBuffer>>>
@@ -184,12 +264,18 @@ MetalLoadedExecutable::RunOnce(
     inputs.push_back(a);
   }
 
+  // Which tape runs, and the packed weights it takes after the caller's own
+  // arguments (P17).  The packs are INPUTS rather than constants: mx::compile
+  // bakes a captured constant by value, and a repack would then never be seen.
+  const std::shared_ptr<const LoweredProgram>& tape = Tape(inputs);
+  for (const mx::array& pack : tape->packs) inputs.push_back(pack);
+
   std::vector<mx::array> outs;
   const Stats before = g_stats;
   try {
     const std::vector<mx::array> kept =
         kVerifyCompile ? inputs : std::vector<mx::array>{};
-    outs = lowered_->program->run(std::move(inputs));
+    outs = tape->program->run(std::move(inputs));
     // P2 executes SYNCHRONOUSLY: correctness before pipelining.  Settling
     // here is what makes every buffer this returns honestly ready, and it is
     // the one thing to revisit first when the plugin is measured -- the Stage
@@ -231,7 +317,7 @@ MetalLoadedExecutable::RunOnce(
     // one call that has both paths in reach.  Off by default and never taken
     // by a normal run; the sparse `spdot_general` pair was found with it.
     if (kVerifyCompile) {
-      std::vector<mx::array> eager = lowered_->program->interpret(kept, false);
+      std::vector<mx::array> eager = tape->program->interpret(kept, false);
       mx::eval(eager);
       for (size_t j = 0; j < outs.size() && j < eager.size(); j++) {
         if (outs[j].shape() != eager[j].shape()) continue;
@@ -274,15 +360,15 @@ MetalLoadedExecutable::RunOnce(
     std::fflush(stderr);
   }
 
-  if (outs.size() != lowered_->results.size()) {
+  if (outs.size() != tape->results.size()) {
     return absl::InternalError(absl::StrFormat(
         "metaljax-native: %s returned %d values, the module declares %d",
-        name_, outs.size(), lowered_->results.size()));
+        name_, outs.size(), tape->results.size()));
   }
   std::vector<std::unique_ptr<xla::PjRtBuffer>> buffers;
   buffers.reserve(outs.size());
   for (size_t j = 0; j < outs.size(); j++) {
-    const ValueSpec& spec = lowered_->results[j];
+    const ValueSpec& spec = tape->results[j];
     // A mismatch here would be a lowering bug handing back the wrong bytes
     // under the right shape, which is the one failure mode this plugin must
     // never have: check it on every call rather than trusting the tape.
@@ -307,7 +393,7 @@ MetalLoadedExecutable::RunOnce(
   // goes back to MLX's pool one execute earlier than the caller's own
   // reference would have freed it).  `non_donatable_input_indices` is the
   // caller taking the promise back for one call, and it wins.
-  for (int i : lowered_->donated_parameters) {
+  for (int i : tape->donated_parameters) {
     if (options.non_donatable_input_indices.contains(i)) continue;
     if (static_cast<size_t>(i) < argument_handles.size() &&
         argument_handles[i] != nullptr)

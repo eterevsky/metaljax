@@ -166,6 +166,17 @@ class MetalLoadedExecutable final : public xla::PjRtLoadedExecutable {
       absl::Span<xla::PjRtBuffer* const> argument_handles,
       const xla::ExecuteOptions& options) const;
 
+  // The tape this call runs: the fused one when the recognizers claimed
+  // anything, the plain one otherwise (P17).  Packing needs concrete buffers,
+  // so the fused tape is built at the FIRST call and kept -- and rebuilt when
+  // a later call hands over different weights, up to a bound past which
+  // repacking costs more than the chain it replaces (qmm.py `_MAX_REPACKS`).
+  const std::shared_ptr<const LoweredProgram>& Tape(
+      const std::vector<mlx::core::array>& inputs) const;
+
+  // How many times the packs have been rebuilt, and whether to stop trying.
+  static constexpr int kMaxRepacks = 8;
+
   xla::PjRtClient* client_;
   xla::PjRtDevice* device_;
   xla::PjRtMemorySpace* memory_space_;
@@ -177,6 +188,11 @@ class MetalLoadedExecutable final : public xla::PjRtLoadedExecutable {
   std::vector<LogicalDeviceIds> logical_ids_;
   std::vector<xla::PjRtDevice*> devices_;
   bool deleted_ = false;
+  // The recognizers' tape and the state of the one attempt to build it.
+  mutable std::mutex fuse_mu_;
+  mutable std::shared_ptr<const LoweredProgram> fused_;
+  mutable bool fuse_done_ = false;   // tried and got nothing: do not retry
+  mutable int repacks_ = 0;
 };
 
 }  // namespace metaljax

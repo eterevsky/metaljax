@@ -13,9 +13,13 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 | `METALJAX_COMPILE_OPTIONS` | `` | user knob | =ignore skips XLA compile-option validation |
 | `METALJAX_DEBUG` | `` | debug-bisect | =1 logs loop/compile/msl decisions |
 | `METALJAX_F64` | `error` | user knob | f64 policy: unset=strict (compute errors), downcast=f32 emulation |
+| `METALJAX_INGEST_CLEAR_MB` | `8192` | user knob | plugin-native only: reclamation cadence of the host->device TRANSFER path, in megabytes ingested (0 disables); a model load reaches no other sync point |
 | `METALJAX_LOOP_CLEAR_COST` | `500000` | user knob | cache-clear cadence in loop op-units (default 500000) |
 | `METALJAX_MATMUL_PRECISION` | `highest` | user knob | default=MLX default arch; unset picks the accurate g16g matmul path |
 | `METALJAX_MEMDBG` | `` | debug-bisect | =1 logs active/cache memory at loop clears and execute end |
+| `METALJAX_MOE` | `1` | debug-bisect | =0 disables the expert-gather rewrite (Stage 1 and plugin-native) |
+| `METALJAX_MOE_VERIFY` | `1` | debug-bisect | =0 skips the router check the expert gather rests on -- a misread axis is then SILENT |
+| `METALJAX_MOE_VERIFY_DRAWS` | `3` | user knob | synthetic-logit draws per router check |
 | `METALJAX_MSL` | `1` | debug-bisect | =0 disables msl_scan kernel codegen |
 | `METALJAX_MSL_COOP_CAP` | `2200000` | user knob | coop dot work cap in elems/step (default 2.2M) |
 | `METALJAX_MSL_COOP_MIN_F` | `8` | user knob | min state width for the coop preference (default 8) |
@@ -27,6 +31,11 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 | `METALJAX_MSL_VOLATILE` | `t` | workaround-retest | Metal compiler loop miscompile workaround; t=default, tmap/tv/load/0 to retest on OS updates |
 | `METALJAX_MSL_WNORM` | `1` | user knob | =0 keeps source weight layouts (skips coalescing materialization) |
 | `METALJAX_PLUGIN_PATH` | `None` | user knob | override the plugin dylib location |
+| `METALJAX_QMM` | `1` | debug-bisect | =0 disables the quantized-matmul rewrite (Stage 1 and plugin-native) |
+| `METALJAX_QMM_BATCH` | `1` | debug-bisect | =0 rejects dots that carry batching dims (a stack of per-expert weights) |
+| `METALJAX_QMM_SCALES` | `auto` | user knob | pack scale/bias width: auto keeps the source when lossless, `source` always narrows, `f32` never does |
+| `METALJAX_RECOGNIZE` | `1` | debug-bisect | plugin-native only: =0 turns off ALL THREE recognizer emits, i.e. the second (fused) lowering is never built -- the control for what an emit is worth |
+| `METALJAX_SDPA` | `1` | debug-bisect | =0 disables the fused-attention rewrite (Stage 1 and plugin-native) |
 | `METALJAX_SYNC` | `0` | debug-bisect | (see src/metaljax/engine.py) |
 | `METALJAX_TRACE_BUDGET` | `20000` | user knob | max ops in one mx.compile trace (default 20000) |
 | `METALJAX_WHILE_PIPELINE` | `1` | debug-bisect | =0 restores the serial (two-round-trip) dynamic while on the native engine |

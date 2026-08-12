@@ -22,6 +22,7 @@ Licensed under the Apache License, Version 2.0.
 #include "metal/metal_dtypes.h"
 #include "metal/metal_stream.h"
 #include "mlx/mlx.h"
+#include "program.h"
 #include "xla/future.h"
 #include "xla/literal.h"
 #include "xla/shape.h"
@@ -280,6 +281,11 @@ absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> MetalBuffer::CopyToMemorySpace(
     BindThread();
     std::unique_lock<std::recursive_mutex> submission = SubmissionLock();
     fresh.eval();   // honestly ready, like every buffer this plugin hands out
+    // The second bulk-ingest entry: a loop of `device_put(x, may_alias=False)`
+    // moves as many bytes as one of BufferFromHostBuffer, and unlike that one
+    // it allocates through MLX -- so its garbage really does land in the
+    // buffer cache the ingest cadence clears (runtime.cc `ingest_account`).
+    ingest_account(static_cast<int64_t>(fresh.nbytes()));
   }
   return std::make_unique<MetalBuffer>(
       client_,

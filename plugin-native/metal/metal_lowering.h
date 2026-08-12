@@ -73,6 +73,20 @@ struct LoweredProgram {
   // Whether the whole tape is traced through mx::compile (the P5 decision;
   // while BODIES carry theirs in the entry's attrs instead).
   bool compiled = false;
+  // P17: the recognizer emits' packed weights, which are trailing INPUTS of
+  // the tape (never constants -- mx::compile bakes a captured constant by
+  // value, and a repack would then never be seen).  `Execute` appends them to
+  // the caller's arguments; `pack_args` names the @main arguments they were
+  // built from and `pack_arg_ids` the arrays those held at build time, which
+  // is what says a later call has to repack.
+  std::vector<mlx::core::array> packs;
+  std::vector<int> pack_args;
+  std::vector<std::uintptr_t> pack_arg_ids;
+  // How many fused entries the tape holds, per family (diagnostics, and what
+  // the tests assert on).
+  int64_t num_qmm = 0;
+  int64_t num_moe = 0;
+  int64_t num_sdpa = 0;
   // The StableHLO this tape was built from, as MLIR bytecode -- the program
   // `GetHloModules` (PJRT's `OptimizedProgram`) hands back, converted to HLO
   // on demand.  Kept serialized rather than as a live module because the
@@ -83,6 +97,15 @@ struct LoweredProgram {
 };
 
 absl::StatusOr<LoweredProgram> LowerModule(mlir::ModuleOp module);
+
+// The same module lowered again with the recognizers ON, against the concrete
+// arguments of an execute (P17).  Packing needs real buffers, so this runs at
+// the FIRST call rather than at compile: the executable keeps the plain tape
+// `LowerModule` built, asks for this one once, and keeps whichever it got --
+// a module that recognizes nothing, or a pack that fails an exactness check,
+// comes back `NotFound` and the plain tape stays.
+absl::StatusOr<LoweredProgram> LowerModuleFused(
+    mlir::ModuleOp module, const std::vector<mlx::core::array>& args);
 
 }  // namespace metaljax
 

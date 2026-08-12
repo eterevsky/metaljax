@@ -21,6 +21,9 @@ namespace {
 // The op-unit budget the loop cadence below spends.
 int64_t g_flushed_cost = 0;
 
+// The byte budget the ingest cadence below spends (see `ingest_account`).
+int64_t g_ingested_since_clear = 0;
+
 }  // namespace
 
 bool is_resource_limit(const std::exception& e) {
@@ -106,6 +109,63 @@ void loop_account(int64_t cost_units) {
 void loop_flush(const std::vector<mx::array>& arrays, int64_t cost_units) {
   loop_eval(arrays);
   loop_account(cost_units);
+}
+
+// The INGEST cadence: a reclamation point every `ingest_clear_bytes` taken in
+// by transfers (metal_client.cc `BufferFromHostBuffer`, and
+// `MetalBuffer::CopyToMemorySpace`, which really allocates). The callers
+// charge the bytes the DEVICE ends up holding, which is what the cadence is
+// about; a wire that is wider than the device dtype (f64 -> f32, an emulated
+// grid) moves more host bytes than it charges, transiently.
+//
+// WHY IT IS ITS OWN CADENCE. Every other reclamation point above is reached
+// by EXECUTING something. A model load executes almost nothing: it is
+// thousands of host->device transfers, tens of GB of them, with a handful of
+// tiny programs in between -- so a process streaming a 65 GB checkpoint can
+// run for minutes without crossing a single flush or loop boundary, while
+// the OS page cache is simultaneously saturated by the mapped checkpoint
+// (the VM-pressure wedge class: CLAUDE.md item 21 and the panic ledger in
+// TASKS.md). Stage 1's big loads got a reclamation point from the BENCH
+// HARNESS -- scripts/model_bench/adapter_keras_extra.py `_stream_clear`,
+// gc.collect() + mx.clear_cache() every BENCH_STREAM_CLEAR_GB (8) of
+// assigned weights, 16 of them in the R1-Distill-32B load -- and a plugin
+// cannot depend on its embedder for a discipline the embedder does not know
+// it is providing. The default is that harness's number.
+//
+// WHAT IT RECLAIMS, measured (2026-08-12, notes/data/ingest-cadence-*):
+// MLX's cache holds NOTHING from the transfers themselves. The staging
+// block becomes the array's storage through MLX's alien-buffer path, so it
+// is freed to the C allocator and never enters the buffer cache -- probed at
+// 4 KB, 256 KB and 256 MB per transfer, `mx::get_cache_memory()` stays at 0
+// through 16 GB of churn. What it does reclaim is what the work AROUND the
+// transfers left cached (a loader's casts and copies) plus, on the
+// embedder's side, whatever `g_gc_hook` breaks loose. Cheap either way: an
+// empty `clear_cache` is microseconds, and at 8 GB the cadence fires ~8
+// times in a 65 GB load.
+//
+// The budget is a plain counter, like `g_flushed_cost`: both of this
+// function's callers hold the plugin's submission lock, so it is serialized
+// in every configuration but `METALJAX_CONCURRENT_EXECUTE=1`, where a racing
+// transfer can cost the cadence a clear -- the same benign inexactness every
+// other counter in `g_stats` has.
+void ingest_account(int64_t bytes) {
+  if (bytes <= 0) return;
+  g_stats.ingest_bytes += bytes;
+  if (g_cfg.ingest_clear_bytes <= 0) return;   // METALJAX_INGEST_CLEAR_MB=0
+  g_ingested_since_clear += bytes;
+  if (g_ingested_since_clear < g_cfg.ingest_clear_bytes) return;
+  g_ingested_since_clear = 0;
+  g_stats.ingest_clears++;
+  const int64_t cache_before = mx::get_cache_memory();
+  gc_collect();  // dead refcycles pin buffers clear_cache cannot free
+  mx::clear_cache();
+  if (g_cfg.debug || g_cfg.memdbg)
+    debug_line("[metaljax-mem] ingest clear #" +
+               std::to_string(g_stats.ingest_clears) + ": ingested=" +
+               std::to_string(g_stats.ingest_bytes >> 20) + "MB active=" +
+               std::to_string(mx::get_active_memory() >> 20) + "MB cache=" +
+               std::to_string(cache_before >> 20) + "->" +
+               std::to_string(mx::get_cache_memory() >> 20) + "MB");
 }
 
 // The loop counter / branch index of a control-flow op, on the host. Reading

@@ -162,7 +162,8 @@ int main() {
   metaljax::configure(/*eager_flush_bytes=*/1024LL << 20,
                       /*flush_sync_every=*/1,
                       /*flush_clear_bytes=*/2048LL << 20,
-                      /*loop_clear_cost=*/500000, /*while_pipeline=*/1,
+                      /*loop_clear_cost=*/500000,
+                      /*ingest_clear_bytes=*/8LL << 30, /*while_pipeline=*/1,
                       /*debug=*/false, /*memdbg=*/false);
 
   const std::vector<float> a = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};

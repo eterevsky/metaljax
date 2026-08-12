@@ -1239,3 +1239,82 @@ remaining STATUS.md rows (all 20 must eventually complete); then
 perf parity with other frameworks. Also open: Stage-1-vs-anchor
 regressions (qwix-int8 1.85x, maxtext train 2.17x) to investigate
 despite the freeze; row 11 token divergence to classify.
+
+## The ingest cadence (2026-08-12, P16's row-9 blocker)
+
+`notes/ingest-cadence-2026-08-12.md`. The plugin now has the reclamation
+point a model load needs — `runtime.cc::ingest_account`, charged by every
+transfer (`BufferFromHostBuffer`'s `wrap`, `CopyToMemorySpace`), clearing
+every `METALJAX_INGEST_CLEAR_MB` (default 8192 = the bench harness's
+`BENCH_STREAM_CLEAR_GB=8`, which is where Stage 1's `"clears": 16` came
+from; the Stage 1 *engine* has no transfer-denominated cadence at all).
+Counters ride in `g_stats` (`ingest_bytes` / `ingest_clears`, in the
+per-execute `METALJAX_DEBUG` line) and each clear narrates its cache before
+and after, so a flight log can prove it engaged.
+
+Two findings the ladder produced, both of which cut against the premise:
+
+* **The transfer path never touches MLX's buffer cache.** The staging block
+  becomes the array's storage through the alien-buffer path, so it is freed
+  to the C allocator; `get_cache_memory()` stays at 0 through 4 KB, 256 KB
+  and 256 MB transfers, 9.8 GB of churn, and a real 15.26 GB checkpoint.
+  The cadence reclaims what the work AROUND the transfers leaves (2.58 GB
+  on a cast-per-tensor load; nothing on a plain one) and costs nothing.
+* **Panic #8 is not the missing cadence.** At the moment it wedged, the
+  native run's memory was no worse than the Stage 1 run that had passed the
+  same point twice 8 minutes earlier (54.0/54.6/64.5 GB vs 51.5/62.7 at
+  t≈150 s), only ~20 % faster to fill. It belongs with #4/#7's wedge class,
+  and the 65 GB retry should vary the RATE, not the cache.
+
+Ladder: `plugin-native/ingest_test.py` (synthetic 8/8, plus `--checkpoint`
+for a real one) and, through the temporarily-relinked dylib, the panic's own
+shape at 10 GB — `gemma4-e2b-bf16` keras streaming, harness clears off,
+3 plugin clears, peak footprint 12.00 GB against a 10.2 GB model, decode
+26.8 ms/tok. P16's exported-symbols relink is STILL not in the tree, and it
+is what every keras/gemma-lib row is blocked on.
+
+## P17: the recognizer emits, natively (2026-08-12,
+## notes/cpp-p17-emits.md)
+
+All three of Stage 1's rewrites are now recognized and emitted by the phase-2
+lowering -- `metaljax.qmm` (affine int4/int8, per-channel, MXFP4, batched, with
+the regrouping pack), `metaljax.moe.*` (the expert gather, `gather_mm` and
+`gather_qmm`) and `metaljax.sdpa` -- so items 2, 3 and 4 of the P16 frontier
+are closed and `msl_scan` (item 1) is the whole of what is left there.
+
+The architecture is a TWO-PHASE compile, forced by the fact that a quantized
+weight is an ARGUMENT and its pack must be a tape INPUT (`mx::compile` bakes a
+captured constant by value): `CompileAndLoad` lowers the plain tape as before,
+and the FIRST `Execute` re-parses the kept StableHLO, runs the analyses, builds
+the packs and the router checks on the real buffers and lowers a second tape
+with the emits.  Any decline at any point leaves the plain tape in place, so
+the fallback is structural rather than a policy.  `Lowering::LowerCone` -- the
+cone of a set of values over @main's arguments, as a Program of its own -- is
+what evaluates an operand subtree on concrete buffers, and its `bound` argument
+pins values in the middle of a graph, which is how the MoE router check runs on
+synthetic logits (without that, a dispatch inside a decode loop can never be
+verified: its logits are a loop carry).
+
+Deliberately not ported: qmm's row-blocked `_Source` evaluation and its
+cross-executable build cache (memory/latency optimizations over an evaluation
+the tape already stages with last-use pruning), and an sdpa or moe root that
+lives wholly inside a callee.
+
+Battery: `execute_test` 502 -> **520 checks** (18 new differential rows -- the
+FUSED answer against the literal chain jax-CPU runs); `texmo_gate` 106/106;
+`smoke_test`; `decline_census` 35 of 35; `bazel test //...`; `tests/` on native
+1187/71, the same 71 rows as before.  Those 71 do not move and cannot: 70 of
+them assert Stage 1 PYTHON counters (`qmm.stats()`, `moe.stats()`) that a
+plugin with no interpreter can never tick, and `src/`/`tests/` are frozen --
+with the counters neutralized by an instrument the same files go 70 -> 8, and
+each of the 8 asserts one of the internals above.
+
+Measured (`notes/data/p17-emits-*`, machine lock held; the same native plugin
+under `METALJAX_RECOGNIZE=0` is the control): qmm mxfp4 decode at gpt-oss's
+gate_up shape **7.63x**, qmm int4 decode **6.62x**, moe decode **4.43x**, sdpa
+1024x1024 **2.61x**, and against Stage 1 the native path is at or ahead on four
+of seven rows.  The MODEL rows were not run: they all import TensorFlow, and
+the dylib cannot be dlopened into such a process without the exported-symbols
+relink P16 found and left out of the tree (a separate deliberate commit).  One
+row is worth carrying forward: at `Tq=1` the FUSED attention is slower than the
+literal chain (0.85x), on both stacks.

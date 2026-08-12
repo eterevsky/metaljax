@@ -13,6 +13,7 @@ cd .. && ./.venv/bin/python plugin-native/smoke_test.py    # it works at all
 ./.venv/bin/python plugin-native/execute_test.py           # vs jax-CPU
 ./.venv/bin/python plugin-native/texmo_gate.py             # the whole suite
 ./.venv/bin/python plugin-native/decline_census.py         # what still declines
+./.venv/bin/python plugin-native/ingest_test.py            # the transfer path
 ```
 
 `execute_test.py` is the differential suite: every expression is run through

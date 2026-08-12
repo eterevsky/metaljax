@@ -48,6 +48,7 @@ cc_library(
     deps = [
         ":metal_dtypes",
         ":metal_stream",
+        "//runtime",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -63,6 +64,34 @@ cc_library(
     ],
 )
 
+# The recognizers, as passes over the parsed module (P17).  The analysis is
+# structural and the packing runs on concrete buffers at the first execute;
+# `metal_lowering` consults the plan and supplies the prologue evaluator.
+cc_library(
+    name = "metal_recognize",
+    srcs = [
+        "metal_moe.cc",
+        "metal_qmm.cc",
+        "metal_sdpa.cc",
+    ],
+    hdrs = ["metal_recognize.h"],
+    deps = [
+        ":metal_dtypes",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "//runtime",
+        "@mlx",
+        "@stablehlo//:stablehlo_ops",
+    ],
+)
+
 # StableHLO -> the executor's tape.  Depends on the runtime (for the opcode
 # and dtype registries and the Program itself) and on the StableHLO dialect,
 # and on no part of the plugin shell: a lowering is a pure function of the
@@ -74,11 +103,13 @@ cc_library(
     deps = [
         ":metal_dtypes",
         ":metal_names",
+        ":metal_recognize",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:IR",
@@ -98,6 +129,7 @@ cc_library(
         ":metal_buffer",
         ":metal_lowering",
         ":metal_names",
+        ":metal_recognize",
         ":metal_stream",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",

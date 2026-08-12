@@ -159,6 +159,16 @@ void ConfigureFromEnv() {
       /*flush_clear_bytes=*/EnvInt("METALJAX_FLUSH_CLEAR_MB", 2048) *
           (int64_t{1} << 20),
       /*loop_clear_cost=*/EnvInt("METALJAX_LOOP_CLEAR_COST", 500000),
+      // METALJAX_INGEST_CLEAR_MB is this plugin's own (there is no Stage 1
+      // module to copy it from): the reclamation cadence of the TRANSFER
+      // path, in megabytes of device memory taken in, 0 to disable. The
+      // default is the number the bench harness has been giving Stage 1's
+      // big loads all along --
+      // scripts/model_bench/adapter_keras_extra.py's BENCH_STREAM_CLEAR_GB=8
+      // -- because a plugin cannot depend on its embedder for it. See
+      // runtime.cc `ingest_account` for what it does and does not reclaim.
+      /*ingest_clear_bytes=*/EnvInt("METALJAX_INGEST_CLEAR_MB", 8192) *
+          (int64_t{1} << 20),
       /*while_pipeline=*/EnvInt("METALJAX_WHILE_PIPELINE", 1),
       /*debug=*/EnvFlag("METALJAX_DEBUG"),
       /*memdbg=*/EnvFlag("METALJAX_MEMDBG"));
@@ -348,6 +358,14 @@ MetalClient::BufferFromHostBuffer(
       memory_space != nullptr ? memory_space : memory_spaces_.front();
   auto wrap = [&](mx::array array) {
     array.eval();  // honestly ready before the buffer is handed out
+    // Every transfer this plugin makes funnels through here, which is what
+    // makes this the honest place to charge the ingest cadence (runtime.cc
+    // `ingest_account`): the bytes counted are the ones the device is now
+    // holding, after the wire has been narrowed or a grid decoded. The
+    // staging block is already gone or already the array's storage by now --
+    // and there is nothing lazy left to pin it, since the eval above is the
+    // one every ingest path takes.
+    ingest_account(static_cast<int64_t>(array.nbytes()));
     if (on_done_with_host_buffer) std::move(on_done_with_host_buffer)();
     return std::make_unique<MetalBuffer>(this, space, devices_.front(),
                                          xla::ShapeUtil::MakeShape(type, dims),

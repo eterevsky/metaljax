@@ -35,6 +35,7 @@ Licensed under the Apache License, Version 2.0.
 #include "llvm/Support/raw_ostream.h"
 #include "metal/metal_dtypes.h"
 #include "metal/metal_names.h"
+#include "metal/metal_recognize.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -867,6 +868,11 @@ struct Counted {
 // large.
 struct LowerContext {
   mlir::ModuleOp module;
+  // The recognizers' plan for this module, or null when nothing was
+  // recognized (the compile-time lowering, which has no buffers to pack
+  // from, always runs with none).  Absorbed ops get no entry and no slot;
+  // a root lowers to its fused opcode instead of itself.
+  const RewritePlan* plan = nullptr;
   absl::flat_hash_map<mlir::Block*, int64_t> cost;   // interp._cost_cache
   // interp._counted_cache, keyed by the COND block exactly as the Python one
   // is (no two while ops can share one).
@@ -902,6 +908,46 @@ std::vector<mlir::Value> FreeValues(mlir::Block& block) {
   };
   walk(block);
   return free;
+}
+
+// tape.py `_uses_packs`: whether `block`, or anything it calls, holds a root
+// that reads packed weights.  The packs are threaded into a region only then
+// -- every capture is an input of the region's Program, and a compiled body
+// pays for inputs it never uses.
+bool UsesPacks(const RewritePlan* plan, mlir::ModuleOp module,
+               mlir::Block& block,
+               llvm::DenseSet<mlir::Operation*>* seen = nullptr) {
+  if (plan == nullptr) return false;
+  llvm::DenseSet<mlir::Operation*> local;
+  if (seen == nullptr) seen = &local;
+  for (mlir::Operation& op : block) {
+    auto it = plan->qmm_roots.find(&op);
+    if (it != plan->qmm_roots.end() && it->second->nvals > 0) return true;
+    // ...and an expert gather whose dots read a pack of their own.
+    auto moe = plan->moe_roots.find(&op);
+    if (moe != plan->moe_roots.end()) {
+      for (const MoeNode& n : moe->second->order)
+        if (n.kind == MoeNode::kDot && n.pack != nullptr &&
+            n.pack->nvals > 0)
+          return true;
+    }
+    const absl::string_view name = View(op.getName().getStringRef());
+    if (name == "func.call" || name == "stablehlo.composite") {
+      auto sym = op.getAttrOfType<mlir::FlatSymbolRefAttr>(
+          name == "func.call" ? "callee" : "decomposition");
+      if (sym) {
+        auto fn = module.lookupSymbol<mlir::func::FuncOp>(sym.getValue());
+        if (fn && fn.getBody().getBlocks().size() == 1 &&
+            seen->insert(fn.getOperation()).second &&
+            UsesPacks(plan, module, fn.getBody().front(), seen))
+          return true;
+      }
+    }
+    for (mlir::Region& r : op.getRegions())
+      for (mlir::Block& b : r.getBlocks())
+        if (UsesPacks(plan, module, b, seen)) return true;
+  }
+  return false;
 }
 
 // ops/control.py `_splat_int`: the value of a rank-0 constant as an integer,
@@ -1587,12 +1633,28 @@ class Lowering {
   explicit Lowering(LowerContext* ctx) : ctx_(ctx) {}
   absl::StatusOr<LoweredProgram> Run(mlir::func::FuncOp fn);
 
+  // M4/P17: the cone of `roots` over @main's arguments, as a Program of its
+  // own -- what evaluates a recognizer's operand subtrees on the buffers of
+  // one execute (qmm.py `_eval`, whose staging this gets for free: the tape's
+  // drop lists release every intermediate at its last use, and these are full
+  // weight size).  The ops come from wherever they are defined: a decode
+  // loop's weights are read inside the body and hoisted out to the while's
+  // initial operand, so the cone spans blocks and is lowered into ONE frame.
+  absl::StatusOr<std::shared_ptr<Program>> LowerCone(
+      mlir::Block& main, const std::vector<mlir::Value>& roots,
+      const std::vector<mlir::Value>& bound);
+
  private:
   struct Pending {
     int op;
     std::vector<int> ins;
     std::vector<int> outs;
     std::vector<int64_t> attrs;
+    // Float attributes.  Only the recognizer emits have any: an attention's
+    // scale and its mask sentinel are real numbers, and squeezing them
+    // through the integer vector would be a bit-pattern encoding nobody
+    // could read (native/program.h `Entry::fattrs`).
+    std::vector<double> fattrs;
     std::optional<mx::array> payload;
     int64_t bytes = 0;
     std::vector<std::shared_ptr<Program>> regions;
@@ -1616,7 +1678,8 @@ class Lowering {
     DumpNode dump;
   };
   absl::StatusOr<Built> LowerBlock(mlir::Block& block,
-                                   const std::vector<mlir::Value>& captures);
+                                   const std::vector<mlir::Value>& captures,
+                                   int npacks = 0);
   absl::StatusOr<Built> Finish(int nargs, const std::vector<int>& outputs);
 
   // One region block as a sub-Program, lowered in a CHILD frame (tape.py's
@@ -1634,6 +1697,23 @@ class Lowering {
   absl::StatusOr<Region> LowerRegion(mlir::Block& block);
 
   absl::Status LowerOp(mlir::Operation* op);
+  // The recognizer roots (M4's emits): one fused entry in place of the whole
+  // chain the match absorbed.  The attribute layout is the one
+  // runtime/emits.cc reads and src/metaljax/tape.py writes.
+  absl::Status LowerQmm(mlir::Operation* op, const QmmMatch& m);
+  absl::Status LowerSdpa(mlir::Operation* op, const SdpaMatch& m);
+  absl::Status LowerMoe(mlir::Operation* op, const MoeMatch& m);
+  // One node of the pair-space plan, as one tape entry; `slots` holds the
+  // slot each earlier node landed in.
+  absl::StatusOr<int> LowerMoeNode(const MoeMatch& m, const MoeNode& node,
+                                   const std::vector<int>& slots, int eidx,
+                                   int tidx);
+  // The pack arrays this match owns, as slots of THIS frame (tape.py
+  // `_pack_ins`).
+  absl::StatusOr<std::vector<int>> PackIns(const QmmMatch& m);
+  // ops/control.py's `_ABSORBED`: the stand-in a region is handed for a
+  // capture that was absorbed.  Never read -- see `LowerRegion`.
+  int AbsorbedSlot();
   absl::Status LowerControl(mlir::Operation* op);
   absl::Status LowerWhile(mlir::Operation* op);
   absl::Status LowerBranch(mlir::Operation* op);
@@ -1739,9 +1819,19 @@ class Lowering {
             std::vector<DumpNode> region_dumps = {}, HostFn host = {},
             int64_t regrid = -1) {
     entries_.push_back(Pending{op, std::move(ins), std::move(outs),
-                               std::move(attrs), std::move(payload), bytes,
+                               std::move(attrs), {}, std::move(payload), bytes,
                                std::move(regions), std::move(region_dumps),
                                std::move(host), regrid});
+  }
+
+  // ...and the two entries that carry real numbers (sdpa's scale and its
+  // mask sentinel).
+  void EmitF(int op, std::vector<int> ins, std::vector<int> outs,
+             std::vector<int64_t> attrs, std::vector<double> fattrs,
+             int64_t bytes) {
+    entries_.push_back(Pending{op, std::move(ins), std::move(outs),
+                               std::move(attrs), std::move(fattrs),
+                               std::nullopt, bytes});
   }
 
   int64_t ResultBytes(mlir::Operation* op) {
@@ -1808,6 +1898,33 @@ class Lowering {
   LowerContext* ctx_;
   llvm::DenseMap<mlir::Value, int> slots_;
   int nslots_ = 0;
+  // The packed quantized weights, as slots of this frame: trailing arguments
+  // of its Program, after the block's own and after the captures.  They are
+  // arrays rather than SSA values, and they are INPUTS rather than constants
+  // because mx::compile bakes a captured constant by value and a repack would
+  // then never be seen.
+  std::vector<int> pack_slots_;
+  std::optional<int> absorbed_slot_;
+  // sdpa's additive-mask cache, as slots of this frame: one entry per
+  // distinct mask, emitted at the first attention that reads it.  Every layer
+  // of a transformer shares one causal mask and building it costs a full
+  // [.., .., Tq, Tk] tensor, so the sharing is the whole point (Stage 1 keeps
+  // the same cache in its `env`, keyed the same way).
+  struct MaskKey {
+    mlir::Value base;
+    int kind;
+    double konst, mul;
+    int dtype;
+    bool operator<(const MaskKey& o) const {
+      if (base.getAsOpaquePointer() != o.base.getAsOpaquePointer())
+        return base.getAsOpaquePointer() < o.base.getAsOpaquePointer();
+      if (kind != o.kind) return kind < o.kind;
+      if (konst != o.konst) return konst < o.konst;
+      if (mul != o.mul) return mul < o.mul;
+      return dtype < o.dtype;
+    }
+  };
+  std::map<MaskKey, int> masks_;
   std::vector<Pending> entries_;
   std::vector<std::string> calls_;   // callees currently being inlined
   // The two aliasing taints, consumed by the output-copy rule in `Run` and
@@ -4626,12 +4743,31 @@ absl::StatusOr<Lowering::Region> Lowering::LowerRegion(mlir::Block& block) {
   out.free = FreeValues(block);
   for (mlir::Value v : out.free) {
     auto it = slots_.find(v);
-    if (it == slots_.end())
-      return Decline("a region capture defined outside the block");
-    out.caps.push_back(it->second);
+    if (it != slots_.end()) {
+      out.caps.push_back(it->second);
+      continue;
+    }
+    // An op the enclosing block ABSORBED is still a syntactic free value of
+    // this region, and it has no slot because it never runs.  A free value
+    // missing for any OTHER reason still declines, as it must.
+    if (ctx_->plan != nullptr && ctx_->plan->absorbed(v.getDefiningOp())) {
+      out.caps.push_back(AbsorbedSlot());
+      continue;
+    }
+    return Decline("a region capture defined outside the block");
+  }
+  // A region holding a root that reads packed weights needs them too, and
+  // they are not SSA values, so they ride as extra captures after the free
+  // ones.  Only when something inside actually reads them: every capture is
+  // an input of the region's Program, and a compiled body pays for inputs it
+  // never uses.
+  int npacks = 0;
+  if (!pack_slots_.empty() && UsesPacks(ctx_->plan, ctx_->module, block)) {
+    npacks = static_cast<int>(pack_slots_.size());
+    out.caps.insert(out.caps.end(), pack_slots_.begin(), pack_slots_.end());
   }
   Lowering child(ctx_);
-  ASSIGN_OR_RETURN(Built built, child.LowerBlock(block, out.free));
+  ASSIGN_OR_RETURN(Built built, child.LowerBlock(block, out.free, npacks));
   out.program = std::move(built.program);
   out.outputs = built.outputs;
   out.dump = std::move(built.dump);
@@ -4918,6 +5054,37 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   const llvm::StringRef ref = op->getName().getStringRef();
   const absl::string_view name = View(ref);
 
+  // What each op DOES, per the recognizers' plan (M4; the Python engine asks
+  // `metaljax.interpreter._rewrite_plan` the same question here).  An absorbed
+  // op is not executed and gets no slot -- so no static last use can land on
+  // one -- and a root runs its recognizer's emit instead of itself.  Ahead of
+  // everything else, the call splicing included: a root or an absorbed op is
+  // as likely to sit inside a callee as at the top level.
+  if (ctx_->plan != nullptr) {
+    if (ctx_->plan->absorbed(op)) return absl::OkStatus();
+    auto it = ctx_->plan->qmm_roots.find(op);
+    if (it != ctx_->plan->qmm_roots.end()) {
+      if (op->getNumResults() != 1)
+        return Decline("a recognizer root with several results");
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      return LowerQmm(op, *it->second);
+    }
+    auto sdpa = ctx_->plan->sdpa_roots.find(op);
+    if (sdpa != ctx_->plan->sdpa_roots.end()) {
+      if (op->getNumResults() != 1)
+        return Decline("a recognizer root with several results");
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      return LowerSdpa(op, *sdpa->second);
+    }
+    auto moe = ctx_->plan->moe_roots.find(op);
+    if (moe != ctx_->plan->moe_roots.end()) {
+      if (op->getNumResults() != 1)
+        return Decline("a recognizer root with several results");
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      return LowerMoe(op, *moe->second);
+    }
+  }
+
   // Symbol-carrying calls are spliced in rather than lowered: both run the
   // callee's block on the caller's arrays, so inlining is a transliteration
   // of the handler and not an optimization.
@@ -5096,6 +5263,382 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   return absl::OkStatus();
 }
 
+// tape.py `_absorbed_slot`.  A region's `free_values` is purely syntactic, so
+// an op the ENCLOSING block absorbed still shows up as a capture -- and it has
+// no slot, because it never runs.  Every consumer of it inside the region is
+// absorbed too, so nothing can read it; the stand-in keeps the region's arity
+// what the executor and the compile analyses both see.
+int Lowering::AbsorbedSlot() {
+  if (!absorbed_slot_.has_value()) {
+    const int s = nslots_++;
+    Emit(kConstant, {}, {s}, {}, mx::zeros(mx::Shape{}, mx::uint8), 0);
+    const_view_.insert(s);
+    absorbed_slot_ = s;
+  }
+  return *absorbed_slot_;
+}
+
+// tape.py `_pack_ins`.
+absl::StatusOr<std::vector<int>> Lowering::PackIns(const QmmMatch& m) {
+  if (m.slot < 0 || m.nvals <= 0)
+    return Decline("a quantized match with no pack");
+  if (pack_slots_.empty())
+    return Decline("packed weights are not in scope");
+  // `emit` reads vals[0..2] and vals[-1] positionally; a pack that does not
+  // have that shape would be read wrong rather than rejected, so say so here.
+  const int want = 2 + (m.mode == 0 ? 1 : 0) + (m.has_perm ? 1 : 0);
+  if (m.nvals != want)
+    return Decline("a pack whose arity does not match its mode");
+  if (m.slot + m.nvals > static_cast<int>(pack_slots_.size()))
+    return Decline("a pack slot out of range");
+  return std::vector<int>(pack_slots_.begin() + m.slot,
+                          pack_slots_.begin() + m.slot + m.nvals);
+}
+
+// tape.py `_lower_qmm`: metaljax.qmm.emit, resolved statically.  One
+// mx::quantized_matmul in place of the whole dequant-and-dot.
+absl::Status Lowering::LowerQmm(mlir::Operation* op, const QmmMatch& m) {
+  if (m.mode != 0 && m.mode != 1)
+    return Decline("a quantized matmul mode this tape cannot spell");
+  RETURN_IF_ERROR(CheckValue(m.lhs));
+  ASSIGN_OR_RETURN(std::vector<int64_t> xdims, Dims(m.lhs));
+  const int64_t rank = static_cast<int64_t>(xdims.size());
+  std::vector<int64_t> lperm = m.lperm;
+  std::vector<int64_t> sorted = lperm;
+  std::sort(sorted.begin(), sorted.end());
+  std::vector<int64_t> ramp(rank);
+  std::iota(ramp.begin(), ramp.end(), 0);
+  if (static_cast<int64_t>(lperm.size()) != rank || sorted != ramp)
+    return Decline("a quantized matmul lhs permutation");
+  ASSIGN_OR_RETURN(std::vector<int> packs, PackIns(m));
+  ASSIGN_OR_RETURN(int x, Slot(m.lhs));
+  std::vector<int> ins{x};
+  ins.insert(ins.end(), packs.begin(), packs.end());
+
+  std::vector<int64_t> attrs{lperm == ramp ? 0 : 1,
+                             static_cast<int64_t>(lperm.size())};
+  attrs.insert(attrs.end(), lperm.begin(), lperm.end());
+  attrs.push_back(m.bshape.empty() ? 0 : 1);
+  attrs.push_back(m.B);
+  attrs.push_back(m.M);
+  attrs.push_back(m.K);
+  attrs.push_back(m.gs);
+  attrs.push_back(m.bits);
+  attrs.push_back(m.mode);
+  attrs.push_back(m.has_perm ? 1 : 0);
+  attrs.push_back(m.swapped ? 1 : 0);
+  attrs.push_back(m.out_dtype);
+  for (const std::vector<int64_t>* s : {&m.bshape, &m.mshape, &m.nshape}) {
+    attrs.push_back(static_cast<int64_t>(s->size()));
+    attrs.insert(attrs.end(), s->begin(), s->end());
+  }
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.qmm"));
+  std::vector<int> outs{Bind(op->getResult(0))};
+  Emit(opcode, std::move(ins), outs, std::move(attrs), std::nullopt,
+       ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// tape.py `_rec_attrs`: metaljax.sdpa._apply's (perm, shape) recipe.
+void RecAttrs(const Rec& rec, std::vector<int64_t>* out) {
+  if (!rec.has_perm) {
+    out->push_back(0);
+    out->push_back(0);
+  } else {
+    out->push_back(1);
+    out->push_back(static_cast<int64_t>(rec.perm.size()));
+    out->insert(out->end(), rec.perm.begin(), rec.perm.end());
+  }
+  if (!rec.has_shape) {
+    out->push_back(0);
+    out->push_back(0);
+  } else {
+    out->push_back(1);
+    out->push_back(static_cast<int64_t>(rec.shape.size()));
+    out->insert(out->end(), rec.shape.begin(), rec.shape.end());
+  }
+}
+
+// tape.py `_lower_sdpa`: metaljax.sdpa.emit, one
+// mx::fast::scaled_dot_product_attention in place of the whole chain.
+absl::Status Lowering::LowerSdpa(mlir::Operation* op, const SdpaMatch& m) {
+  for (mlir::Value v : {m.q, m.k, m.v}) RETURN_IF_ERROR(CheckValue(v));
+  ASSIGN_OR_RETURN(int q, Slot(m.q));
+  ASSIGN_OR_RETURN(int k, Slot(m.k));
+  ASSIGN_OR_RETURN(int v, Slot(m.v));
+  std::vector<int> ins{q, k, v};
+  std::vector<int64_t> attrs;
+  RecAttrs(m.q_rec, &attrs);
+  RecAttrs(m.k_rec, &attrs);
+  RecAttrs(m.v_rec, &attrs);
+  attrs.push_back(m.dtype);
+  attrs.push_back(m.out_dtype);
+  if (!m.has_mask) {
+    attrs.push_back(0);
+    RecAttrs(Rec{}, &attrs);
+  } else {
+    if (m.mask_kind != 0 && m.mask_kind != 1)
+      return Decline("an attention mask this tape cannot spell");
+    RETURN_IF_ERROR(CheckValue(m.mask_base));
+    const MaskKey key{m.mask_base, m.mask_kind, m.mask_const, m.mask_mul,
+                      m.dtype};
+    auto hit = masks_.find(key);
+    if (hit == masks_.end()) {
+      ASSIGN_OR_RETURN(int base, Slot(m.mask_base));
+      const int s = nslots_++;
+      ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.sdpa.mask"));
+      EmitF(opcode, {base}, {s},
+            {m.mask_kind, m.dtype, m.mask_mul != 1.0 ? 1 : 0},
+            {m.mask_const * m.mask_mul, m.mask_mul}, 0);
+      hit = masks_.emplace(key, s).first;
+    }
+    ins.push_back(hit->second);
+    attrs.push_back(1);
+    RecAttrs(m.mask_rec, &attrs);
+  }
+  // The output recipe is (reshape, transpose, reshape), each optional, and
+  // each spelled the way `_rec_attrs` spells half of one.
+  if (!m.has_pre) {
+    attrs.push_back(0);
+    attrs.push_back(0);
+  } else {
+    attrs.push_back(1);
+    attrs.push_back(static_cast<int64_t>(m.pre.size()));
+    attrs.insert(attrs.end(), m.pre.begin(), m.pre.end());
+  }
+  if (!m.has_out_perm) {
+    attrs.push_back(0);
+    attrs.push_back(0);
+  } else {
+    attrs.push_back(1);
+    attrs.push_back(static_cast<int64_t>(m.out_perm.size()));
+    attrs.insert(attrs.end(), m.out_perm.begin(), m.out_perm.end());
+  }
+  if (!m.has_post) {
+    attrs.push_back(0);
+    attrs.push_back(0);
+  } else {
+    attrs.push_back(1);
+    attrs.push_back(static_cast<int64_t>(m.post.size()));
+    attrs.insert(attrs.end(), m.post.begin(), m.post.end());
+  }
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.sdpa"));
+  EmitF(opcode, std::move(ins), {Bind(op->getResult(0))}, std::move(attrs),
+        {m.scale}, ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// tape.py `_moe_node`: one node of metaljax.moe's pair-space plan.  The plan
+// is an interpreter over these in `emit`, so the lowering spreads it over the
+// tape -- one entry per node, in the plan's own dependency order -- and
+// liveness then prunes the pair-space intermediates exactly as it prunes
+// anything else.
+absl::StatusOr<int> Lowering::LowerMoeNode(const MoeMatch& m,
+                                           const MoeNode& node,
+                                           const std::vector<int>& slots,
+                                           int eidx, int tidx) {
+  auto vec = [](std::vector<int64_t>* out, const std::vector<int64_t>& xs) {
+    out->push_back(static_cast<int64_t>(xs.size()));
+    out->insert(out->end(), xs.begin(), xs.end());
+  };
+  switch (node.kind) {
+    case MoeNode::kExt: {
+      if (node.op != nullptr) {
+        // A nullary op bound inside a callee (a constant or an iota): the
+        // emit re-runs its handler on an empty environment, so the tape emits
+        // it as the op it is.
+        const absl::string_view name = View(node.op->getName().getStringRef());
+        if (name == "stablehlo.constant") {
+          RETURN_IF_ERROR(LowerConstant(node.op));
+        } else if (name == "stablehlo.iota") {
+          ASSIGN_OR_RETURN(std::vector<int64_t> attrs, LowerIota(node.op));
+          ASSIGN_OR_RETURN(int opcode, Opcode(name));
+          Emit(opcode, {}, {Bind(node.op->getResult(0))}, std::move(attrs),
+               std::nullopt, ValueBytes(node.op->getResult(0)));
+        } else {
+          return Decline(absl::StrCat("moe: ", name, " inside a callee"));
+        }
+        return Slot(node.op->getResult(0));
+      }
+      RETURN_IF_ERROR(CheckValue(node.value));
+      ASSIGN_OR_RETURN(int src, Slot(node.value));
+      const int s = nslots_++;
+      Emit(Opcode("metaljax.moe.gather").value(), {src, eidx, tidx}, {s},
+           {node.ea >= 0 ? 1 : 0, node.ea >= 0 ? node.ea : 0,
+            node.ta >= 0 ? 1 : 0, node.ta >= 0 ? node.ta : 0, m.P},
+           std::nullopt, 0);
+      if (node.ea < 0 && node.ta < 0) {
+        // The handler hands the array straight back, so the slot may BE an
+        // argument's (or a constant's) storage; carry the taints.
+        auto it = arg_alias_.find(src);
+        if (it != arg_alias_.end()) arg_alias_[s] = it->second;
+        if (const_view_.count(src)) const_view_.insert(s);
+      }
+      return s;
+    }
+
+    case MoeNode::kElem: {
+      std::vector<int> ins;
+      for (int i : node.srcs) ins.push_back(slots[i]);
+      const int s = nslots_++;
+      const absl::string_view name = View(node.op->getName().getStringRef());
+      if (name == "stablehlo.concatenate") {
+        auto attr = node.op->getAttrOfType<mlir::IntegerAttr>("dimension");
+        if (!attr) return Decline("moe: a concatenate with no dimension");
+        int64_t axis = 1;
+        for (int64_t i = 0; i < attr.getValue().getSExtValue(); i++)
+          if (i != node.ea && i != node.ta) axis++;
+        ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.moe.concat"));
+        Emit(opcode, std::move(ins), {s}, {axis}, std::nullopt, 0);
+        return s;
+      }
+      for (mlir::Value v : node.op->getOperands())
+        RETURN_IF_ERROR(CheckValue(v));
+      for (mlir::Value v : node.op->getResults())
+        RETURN_IF_ERROR(CheckValue(v));
+      std::vector<int64_t> attrs;
+      if (name == "stablehlo.compare") {
+        ASSIGN_OR_RETURN(attrs, LowerCompare(node.op));
+      } else if (name == "stablehlo.convert") {
+        ASSIGN_OR_RETURN(attrs, LowerConvert(node.op));
+      } else if (!SimpleOps().contains(name)) {
+        return Decline(absl::StrCat("moe: ", name, " needs its own lowering"));
+      }
+      ASSIGN_OR_RETURN(int opcode, Opcode(name));
+      Emit(opcode, std::move(ins), {s}, std::move(attrs), std::nullopt, 0, {},
+           {}, {}, RegridOf(node.op, name));
+      return s;
+    }
+
+    case MoeNode::kView: {
+      // `pair_lead` asks whether the SOURCE has a pair axis, not this node.
+      const MoeNode& src = m.order[node.src];
+      std::vector<int64_t> attrs{(src.ea >= 0 || src.ta >= 0) ? 1 : 0,
+                                 node.view};
+      if (node.view == 0) {
+        attrs.push_back(static_cast<int64_t>(node.keep.size()));
+        for (int64_t d : node.keep) {
+          attrs.push_back(d < 0 ? 0 : 1);
+          attrs.push_back(d < 0 ? 0 : d);
+        }
+        vec(&attrs, node.trailing);
+      } else if (node.view == 1) {
+        vec(&attrs, node.order);
+      } else if (node.view == 2) {
+        vec(&attrs, node.trailing);
+      } else if (node.view == 3) {
+        attrs.push_back(static_cast<int64_t>(node.slices.size() / 3));
+        attrs.insert(attrs.end(), node.slices.begin(), node.slices.end());
+      } else if (node.view == 4) {
+        std::vector<int64_t> sorted = node.order;
+        std::sort(sorted.begin(), sorted.end());
+        attrs.push_back(node.order != sorted ? 1 : 0);
+        vec(&attrs, node.order);
+        vec(&attrs, node.trailing);
+      } else {
+        return Decline("moe: an unknown view");
+      }
+      const int s = nslots_++;
+      ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.moe.view"));
+      Emit(opcode, {slots[node.src]}, {s}, std::move(attrs), std::nullopt, 0);
+      return s;
+    }
+
+    case MoeNode::kDot: {
+      const MoeNode& data = m.order[node.data];
+      const bool shortcut =
+          data.kind == MoeNode::kExt && data.ea < 0 && data.op == nullptr;
+      std::vector<int> ins;
+      int64_t ta = 0;
+      if (shortcut) {
+        if (data.ta < 0)
+          return Decline("moe: an ungathered dot operand with no token axis");
+        RETURN_IF_ERROR(CheckValue(data.value));
+        ASSIGN_OR_RETURN(int s, Slot(data.value));
+        ins = {s, eidx, tidx};
+        ta = data.ta;
+      } else {
+        ins = {slots[node.data], eidx};
+      }
+      int64_t gs = 0, bits = 0, mode = 0;
+      bool has_perm = false;
+      if (node.pack != nullptr) {
+        ASSIGN_OR_RETURN(std::vector<int> packs, PackIns(*node.pack));
+        ins.insert(ins.end(), packs.begin(), packs.end());
+        gs = node.pack->gs;
+        bits = node.pack->bits;
+        mode = node.pack->mode;
+        has_perm = node.pack->has_perm;
+      } else {
+        RETURN_IF_ERROR(CheckValue(node.weight));
+        ASSIGN_OR_RETURN(int w, Slot(node.weight));
+        ins.push_back(w);
+      }
+      std::vector<int64_t> attrs{
+          shortcut ? 1 : 0,
+          (data.ea >= 0 || data.ta >= 0) ? 1 : 0,
+          ta,
+          node.pack != nullptr ? 1 : 0,
+          m.E,
+          node.n_first ? 1 : 0,
+          gs,
+          bits,
+          mode,
+          has_perm ? 1 : 0,
+          m.P,
+          node.M,
+          node.K,
+          node.N,
+          node.out_dtype};
+      vec(&attrs, node.mshape);
+      vec(&attrs, node.nshape);
+      const int s = nslots_++;
+      ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.moe.dot"));
+      Emit(opcode, std::move(ins), {s}, std::move(attrs), std::nullopt, 0);
+      return s;
+    }
+  }
+  return Decline("moe: an unknown plan node");
+}
+
+// tape.py `_lower_moe`: the gathered expert dispatch.  Only the TAIL is
+// charged the root's bytes, which keeps the eager flush landing where the
+// Python engine's lands.
+absl::Status Lowering::LowerMoe(mlir::Operation* op, const MoeMatch& m) {
+  RETURN_IF_ERROR(CheckValue(m.indices));
+  RETURN_IF_ERROR(CheckValue(m.weights));
+  ASSIGN_OR_RETURN(int idx, Slot(m.indices));
+  const int eidx = nslots_++;
+  ASSIGN_OR_RETURN(int eop, Opcode("metaljax.moe.eidx"));
+  Emit(eop, {idx}, {eidx}, {m.P}, std::nullopt, 0);
+  const int tidx = nslots_++;
+  ASSIGN_OR_RETURN(int top, Opcode("metaljax.moe.tidx"));
+  Emit(top, {}, {tidx}, {m.T, m.K}, std::nullopt, 0);
+
+  std::vector<int> slots(m.order.size(), -1);
+  for (size_t i = 0; i < m.order.size(); i++) {
+    ASSIGN_OR_RETURN(slots[i], LowerMoeNode(m, m.order[i], slots, eidx, tidx));
+  }
+  if (m.out < 0 || m.out >= static_cast<int>(slots.size()))
+    return Decline("moe: the plan's output is not in its order");
+
+  const MoeNode& out = m.order[m.out];
+  std::vector<int64_t> attrs{(out.ea >= 0 || out.ta >= 0) ? 1 : 0,
+                             m.P,
+                             m.T,
+                             m.K,
+                             m.sum_dtype,
+                             m.out_dtype,
+                             m.out_axis,
+                             static_cast<int64_t>(m.out_shape.size())};
+  attrs.insert(attrs.end(), m.out_shape.begin(), m.out_shape.end());
+  ASSIGN_OR_RETURN(int wslot, Slot(m.weights));
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.moe.tail"));
+  Emit(opcode, {slots[m.out], wslot}, {Bind(op->getResult(0))},
+       std::move(attrs), std::nullopt, ResultBytes(op));
+  return absl::OkStatus();
+}
+
 // tape.py `_build`: the entries, their drop lists, and the Program.
 absl::StatusOr<Lowering::Built> Lowering::Finish(
     int nargs, const std::vector<int>& outputs) {
@@ -5122,7 +5665,8 @@ absl::StatusOr<Lowering::Built> Lowering::Finish(
           e.region_dumps});
     }
     built.program->add(e.op, e.ins, e.outs, e.attrs, e.payload, drops[i],
-                       e.regions, e.bytes, {}, nullptr, e.host, e.regrid);
+                       e.regions, e.bytes, e.fattrs, nullptr, e.host,
+                       e.regrid);
   }
   // A region Program never needs output copies: its results are a loop's
   // carries or a branch's values, which stay inside this engine.  Only a
@@ -5135,7 +5679,7 @@ absl::StatusOr<Lowering::Built> Lowering::Finish(
 }
 
 absl::StatusOr<Lowering::Built> Lowering::LowerBlock(
-    mlir::Block& block, const std::vector<mlir::Value>& captures) {
+    mlir::Block& block, const std::vector<mlir::Value>& captures, int npacks) {
   // The block's own arguments first, then the captures: that order is what
   // the executor feeds a region (native/control.cc builds `carry... caps...`),
   // so it is part of the encoding.
@@ -5148,6 +5692,13 @@ absl::StatusOr<Lowering::Built> Lowering::LowerBlock(
     RETURN_IF_ERROR(CheckValue(cap));
     const int s = Bind(cap);
     arg_alias_[s] = {s};
+  }
+  // ...and the packed weights last: arguments of the Program with no SSA
+  // value behind them (tape.py `lower_block`'s `npacks`).
+  for (int i = 0; i < npacks; i++) {
+    const int s = nslots_++;
+    arg_alias_[s] = {s};
+    pack_slots_.push_back(s);
   }
 
   std::vector<mlir::Value> returned;
@@ -5171,10 +5722,75 @@ absl::StatusOr<Lowering::Built> Lowering::LowerBlock(
   }
   ASSIGN_OR_RETURN(Built built,
                    Finish(static_cast<int>(block.getNumArguments() +
-                                           captures.size()),
+                                           captures.size()) + npacks,
                           outputs));
   built.returned = std::move(returned);
   return built;
+}
+
+absl::StatusOr<std::shared_ptr<Program>> Lowering::LowerCone(
+    mlir::Block& main, const std::vector<mlir::Value>& roots,
+    const std::vector<mlir::Value>& bound) {
+  for (mlir::BlockArgument arg : main.getArguments()) {
+    RETURN_IF_ERROR(CheckValue(arg));
+    const int s = Bind(arg);
+    arg_alias_[s] = {s};
+  }
+  // ...and the values the caller pins, as arguments of their own: the walk
+  // stops at anything that already has a slot.
+  for (mlir::Value v : bound) {
+    RETURN_IF_ERROR(CheckValue(v));
+    const int s = Bind(v);
+    arg_alias_[s] = {s};
+  }
+  // A post-order walk: an operand is lowered before the op that reads it, and
+  // a block argument that is a loop-invariant carry aliases the value the
+  // loop was handed.
+  llvm::DenseSet<mlir::Value> done;
+  std::vector<std::pair<mlir::Value, bool>> stack;
+  for (auto it = roots.rbegin(); it != roots.rend(); ++it)
+    stack.emplace_back(*it, false);
+  while (!stack.empty()) {
+    auto [v, expanded] = stack.back();
+    stack.pop_back();
+    if (slots_.contains(v) || done.contains(v)) continue;
+    if (mlir::isa<mlir::BlockArgument>(v)) {
+      mlir::Value outer = HoistInvariant(v);
+      if (outer == v)
+        return Decline("a prologue value that is an inner block argument");
+      if (!slots_.contains(outer)) {
+        stack.emplace_back(v, false);
+        stack.emplace_back(outer, false);
+        continue;
+      }
+      ASSIGN_OR_RETURN(int s, Slot(outer));
+      Alias(v, s);
+      continue;
+    }
+    mlir::Operation* op = v.getDefiningOp();
+    if (op == nullptr) return Decline("a prologue value with no definition");
+    if (!expanded) {
+      stack.emplace_back(v, true);
+      for (mlir::Value x : op->getOperands()) stack.emplace_back(x, false);
+      continue;
+    }
+    RETURN_IF_ERROR(LowerOp(op));
+    for (mlir::Value r : op->getResults()) done.insert(r);
+  }
+  std::vector<int> outputs;
+  for (mlir::Value v : roots) {
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    outputs.push_back(s);
+  }
+  ASSIGN_OR_RETURN(Built built,
+                   Finish(static_cast<int>(main.getNumArguments() +
+                                           bound.size()),
+                          outputs));
+  // A prologue's results are read straight back by the packer, which never
+  // hands them to a caller: no output copy rule applies, and the one thing
+  // that could break is an output that IS an argument -- the packer only
+  // reads them, so an alias is fine.
+  return built.program;
 }
 
 absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
@@ -5216,7 +5832,9 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
                                     "parameter"));
   }
 
-  ASSIGN_OR_RETURN(Built built, LowerBlock(block, {}));
+  const int npacks =
+      ctx_->plan == nullptr ? 0 : static_cast<int>(ctx_->plan->packs.size());
+  ASSIGN_OR_RETURN(Built built, LowerBlock(block, {}, npacks));
   for (mlir::Value v : built.returned) {
     ASSIGN_OR_RETURN(ValueSpec spec, spec_of(v));
     const size_t r = lowered.results.size();
@@ -5293,6 +5911,22 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
   return lowered;
 }
 
+// --------------------------------------------------------------------------
+// the recognizers' two-phase entry (P17)
+// --------------------------------------------------------------------------
+
+// Which argument positions the caller may reuse: a quantized weight among
+// them cannot be packed once and kept.
+absl::flat_hash_set<int> DonatedArgs(mlir::func::FuncOp fn) {
+  absl::flat_hash_set<int> out;
+  for (unsigned i = 0; i < fn.getNumArguments(); i++) {
+    if (fn.getArgAttr(i, "tf.aliasing_output") ||
+        fn.getArgAttr(i, "jax.buffer_donor"))
+      out.insert(static_cast<int>(i));
+  }
+  return out;
+}
+
 }  // namespace
 
 xla::Shape ValueSpec::shape() const {
@@ -5323,7 +5957,7 @@ absl::StatusOr<LoweredProgram> LowerModule(mlir::ModuleOp module) {
     // plugin has never seen, so say so rather than guessing which to run.
     return Decline("a module with no @main function");
   }
-  LowerContext ctx{module, {}, {}};
+  LowerContext ctx{module};
   Lowering lowering(&ctx);
   try {
     return lowering.Run(main);
@@ -5331,6 +5965,85 @@ absl::StatusOr<LoweredProgram> LowerModule(mlir::ModuleOp module) {
     return absl::InternalError(
         absl::StrCat("metaljax-native: lowering failed: ", e.what()));
   }
+}
+
+absl::StatusOr<LoweredProgram> LowerModuleFused(
+    mlir::ModuleOp module, const std::vector<mx::array>& args) {
+  if (!module) return absl::NotFoundError("no module");
+  if (!RecognizeEnabled()) return absl::NotFoundError("recognizers are off");
+  mlir::func::FuncOp main = module.lookupSymbol<mlir::func::FuncOp>("main");
+  if (!main || main.getBody().getBlocks().size() != 1)
+    return absl::NotFoundError("no single-block @main");
+  if (main.getBody().front().getNumArguments() != args.size())
+    return absl::NotFoundError("argument count does not match @main");
+
+  RewritePlan plan;
+  try {
+    // In the Python engine's order, and for its reason: the expert gather is
+    // found on top of the quantized matmuls, taking over the dots whose
+    // weights were packed there.
+    AnalyzeQmm(main, DonatedArgs(main), &plan);
+    AnalyzeMoe(main, &plan);
+    // ...and the attentions, which claim nothing the other two did (the
+    // three recognizers are disjoint by construction: sdpa drops any
+    // candidate overlapping a quantized matmul).
+    AnalyzeSdpa(main, &plan);
+    plan.rebuild();
+  } catch (const std::exception& e) {
+    // Analysis must never break a program (qmm.py `analyze`).
+    return absl::NotFoundError(
+        absl::StrCat("recognizer analysis failed: ", e.what()));
+  }
+  if (plan.empty()) return absl::NotFoundError("nothing recognized");
+
+  // The operand subtrees, evaluated on these buffers.  Each call builds a
+  // prologue tape of its own -- with the plan OFF, since what it has to
+  // compute is exactly the chain the rewrite absorbs.
+  mlir::Block& block = main.getBody().front();
+  SubtreeEval eval =
+      [&](const std::vector<mlir::Value>& roots,
+          const std::vector<std::pair<mlir::Value, mx::array>>& bound)
+      -> absl::StatusOr<std::vector<mx::array>> {
+    LowerContext sub{module};
+    Lowering cone(&sub);
+    std::vector<mlir::Value> pinned;
+    std::vector<mx::array> ins = args;
+    for (const auto& [v, a] : bound) {
+      pinned.push_back(v);
+      ins.push_back(a);
+    }
+    ASSIGN_OR_RETURN(std::shared_ptr<Program> prog,
+                     cone.LowerCone(block, roots, pinned));
+    return prog->run(std::move(ins));
+  };
+  absl::Status packed = BuildQmmPacks(&plan, eval);
+  if (!packed.ok()) return packed;
+  // ...and the router check, which is a value question too (moe.py's is in
+  // the same eager prologue, for the same reason: it syncs with the host).
+  absl::Status verified = VerifyMoe(&plan, eval);
+  if (!verified.ok()) return verified;
+  if (plan.empty()) return absl::NotFoundError("every rewrite declined");
+
+  LowerContext ctx{module};
+  ctx.plan = &plan;
+  Lowering lowering(&ctx);
+  absl::StatusOr<LoweredProgram> lowered;
+  try {
+    lowered = lowering.Run(main);
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("metaljax-native: fused lowering failed: ", e.what()));
+  }
+  if (!lowered.ok()) return lowered;
+  lowered->packs = plan.packs;
+  lowered->pack_args = plan.pack_args;
+  for (int i : plan.pack_args)
+    lowered->pack_arg_ids.push_back(args[i].id());
+  for (const auto& m : plan.qmm)
+    if (!m->disabled && !m->absorbed) lowered->num_qmm++;
+  lowered->num_moe = static_cast<int64_t>(plan.moe.size());
+  lowered->num_sdpa = static_cast<int64_t>(plan.sdpa.size());
+  return lowered;
 }
 
 }  // namespace metaljax

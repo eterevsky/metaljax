@@ -1,0 +1,70 @@
+# P17 recognizer census: what fires on plugin-native/execute_test.py's own rows
+# (METALJAX_DEBUG=1, one jitted program per row, native plugin)
+
+[case] qmm int4 sub-channel float32
+[metaljax-native] qmm: 1 quantized matmul(s) recognized
+[metaljax-native] qmm: packed 4x256x128 mode=affine bits=4 group=128
+[metaljax-native] jit__lambda: 1 fused quantized matmul(s), 0 gathered expert dispatch(es), 0 fused attention(s), 3 packed arrays
+[case] qmm int4 sub-channel bfloat16
+[metaljax-native] qmm: 1 quantized matmul(s) recognized
+[metaljax-native] qmm: packed 4x256x128 mode=affine bits=4 group=128
+[metaljax-native] jit__lambda: 1 fused quantized matmul(s), 0 gathered expert dispatch(es), 0 fused attention(s), 3 packed arrays
+[case] qmm int8 codes
+[metaljax-native] qmm: 1 quantized matmul(s) recognized
+[metaljax-native] qmm: packed 3x128x64 mode=affine bits=8 group=64
+[metaljax-native] jit__lambda: 1 fused quantized matmul(s), 0 gathered expert dispatch(es), 0 fused attention(s), 3 packed arrays
+[case] qmm per-channel (scale divides the output)
+[metaljax-native] qmm: 1 quantized matmul(s) recognized
+[metaljax-native] qmm: packed 5x128x64 mode=affine bits=4 group=128
+[metaljax-native] jit__lambda: 1 fused quantized matmul(s), 0 gathered expert dispatch(es), 0 fused attention(s), 3 packed arrays
+[case] qmm einsum projection (interleaved groups, regrouped)
+[metaljax-native] qmm: 1 quantized matmul(s) recognized
+[metaljax-native] qmm: packed 2x256x256 mode=affine bits=4 group=128 regrouped
+[metaljax-native] jit__lambda: 1 fused quantized matmul(s), 0 gathered expert dispatch(es), 0 fused attention(s), 4 packed arrays
+[case] qmm mxfp4 projection float32
+[metaljax-native] qmm: 1 quantized matmul(s) recognized
+[metaljax-native] qmm: packed 6x128x64 mode=mxfp4 bits=4 group=32
+[metaljax-native] jit__lambda: 1 fused quantized matmul(s), 0 gathered expert dispatch(es), 0 fused attention(s), 2 packed arrays
+[case] qmm mxfp4 projection bfloat16
+[metaljax-native] qmm: 1 quantized matmul(s) recognized
+[metaljax-native] qmm: packed 6x128x64 mode=mxfp4 bits=4 group=32
+[metaljax-native] jit__lambda: 1 fused quantized matmul(s), 0 gathered expert dispatch(es), 0 fused attention(s), 2 packed arrays
+[case] qmm mxfp4 batched experts
+[metaljax-native] qmm: 1 quantized matmul(s) recognized
+[metaljax-native] qmm: packed 4|3x64x32 mode=mxfp4 bits=4 group=32
+[metaljax-native] jit__lambda: 1 fused quantized matmul(s), 0 gathered expert dispatch(es), 0 fused attention(s), 2 packed arrays
+[case] qmm inside a decode loop (packs cross the region)
+[metaljax-native] qmm: 1 quantized matmul(s) recognized
+[metaljax-native] qmm: packed 2x128x128 mode=affine bits=4 group=128
+[metaljax-native] jit_qmm_loop: 1 fused quantized matmul(s), 0 gathered expert dispatch(es), 0 fused attention(s), 3 packed arrays
+[case] moe gather E8/K2/T5
+[metaljax-native] moe: 1 expert dispatch(es) gathered (E8/K2/T5->5x32)
+[metaljax-native] moe: E8/K2/T5->5x32 verified
+[metaljax-native] jit__lambda: 0 fused quantized matmul(s), 1 gathered expert dispatch(es), 0 fused attention(s), 0 packed arrays
+[case] moe gather E32/K4/T1
+[metaljax-native] moe: 1 expert dispatch(es) gathered (E32/K4/T1->1x32)
+[metaljax-native] moe: E32/K4/T1->1x32 verified
+[metaljax-native] jit__lambda: 0 fused quantized matmul(s), 1 gathered expert dispatch(es), 0 fused attention(s), 0 packed arrays
+[case] moe gather with mxfp4 experts (gather_qmm)
+[metaljax-native] qmm: 1 quantized matmul(s) recognized
+[metaljax-native] moe: 1 expert dispatch(es) gathered (E4/K2/T3->3x32)
+[metaljax-native] qmm: packed 3x64x128' mode=mxfp4 bits=4 group=32
+[metaljax-native] moe: E4/K2/T3->3x32 verified
+[metaljax-native] jit__lambda: 0 fused quantized matmul(s), 1 gathered expert dispatch(es), 0 fused attention(s), 2 packed arrays
+[case] moe gather inside a decode loop
+[metaljax-native] moe: 2 expert dispatch(es) gathered (E8/K2/T5->5x64, E8/K2/T1->1x64)
+[metaljax-native] moe: E8/K2/T5->5x64 verified
+[metaljax-native] moe: E8/K2/T1->1x64 verified
+[metaljax-native] jit_moe_loop: 0 fused quantized matmul(s), 2 gathered expert dispatch(es), 0 fused attention(s), 0 packed arrays
+[case] sdpa bqhd float32
+[metaljax-native] sdpa: 1 fused attention(s) recognized
+[metaljax-native] jit__lambda: 0 fused quantized matmul(s), 0 gathered expert dispatch(es), 1 fused attention(s), 0 packed arrays
+[case] sdpa bqhd bfloat16
+[metaljax-native] sdpa: 1 fused attention(s) recognized
+[metaljax-native] jit__lambda: 0 fused quantized matmul(s), 0 gathered expert dispatch(es), 1 fused attention(s), 0 packed arrays
+[case] sdpa causal (boolean mask)
+[metaljax-native] sdpa: 1 fused attention(s) recognized
+[metaljax-native] jit__lambda: 0 fused quantized matmul(s), 0 gathered expert dispatch(es), 1 fused attention(s), 0 packed arrays
+[case] sdpa additive mask
+[metaljax-native] sdpa: 1 fused attention(s) recognized
+[metaljax-native] jit__lambda: 0 fused quantized matmul(s), 0 gathered expert dispatch(es), 1 fused attention(s), 0 packed arrays

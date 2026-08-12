@@ -1747,7 +1747,283 @@ def _cases():
          [np.arange(24, dtype=np.float32).reshape(2, 3, 4) * 0.7,
           np.arange(12, dtype=np.float32).reshape(2, 2, 3)], 1e-6, 1e-6),
     ]
+    cases += _recognizer_cases()
     return cases
+
+
+# --------------------------------------------------------------------------
+# the recognizer emits (P17)
+# --------------------------------------------------------------------------
+#
+# Each of these graphs is one the native lowering REWRITES: a dequantize-and-
+# matmul chain into `quantized_matmul`, a dense expert dispatch into
+# `gather_mm`/`gather_qmm`, a softmax attention into
+# `fast::scaled_dot_product_attention`.  The CPU backend runs the literal
+# chain, so every row is the fused answer against the unfused one -- which is
+# the only differential that can catch a misread axis, a wrong pack layout or
+# a router the rewrite read backwards.
+#
+# The tolerances say what each rewrite is allowed to change.  A pack is EXACT
+# (the reconstructed weight is bit-identical to a float32 dequantization), so
+# what is left is the dot's own summation order, which is the `DOT` band; the
+# gathered expert sum runs over K terms instead of E and the fused attention
+# is a different kernel, so those get the same band their dtype earns.
+#
+# `tests/test_qmm.py`, `test_qmm_mxfp4.py`, `test_moe.py` and `test_sdpa.py`
+# are the graphs' source: these are the same layer shapes, cut down to what a
+# differential needs.  They live HERE as well because those files assert on
+# Stage 1's Python counters, which a plugin with no interpreter in it cannot
+# tick -- the numbers are the part that carries over.
+
+
+def _quantize(rows, cols, block, dtype, seed=0, bits=4):
+    """Codes + scale/zero maps in keras' storage layout, and the exact
+    dequantized weight."""
+    rng = np.random.RandomState(seed)
+    lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    q = rng.randint(lo, hi + 1, size=(rows, cols)).astype(np.int8)
+    bsz = rows if block < 0 else block
+    ng = rows // bsz
+    scale = ((rng.rand(ng, cols).astype(np.float32) + 0.5) * 0.05)
+    zero = (np.zeros((ng, cols), np.int8) if block < 0
+            else rng.randint(-3, 4, size=(ng, cols)).astype(np.int8))
+    g_idx = (np.arange(rows) // bsz).astype(np.float32)
+    packed = ((q[:, 0::2] & 0x0F) | (q[:, 1::2] << 4)).astype(np.int8)
+    return q, packed, scale.astype(dtype), zero, g_idx
+
+
+def _mxfp4(shape_nk, seed, dtype, exp=(118, 133)):
+    """Random on-grid MXFP4 blocks + E8M0 scale bytes for a [.., N, K] weight.
+
+    `exp` is the E8M0 byte range, i.e. the per-group scale's exponent + 127.
+    The default spans what a real checkpoint uses; a row that feeds its own
+    output back wants a narrow band around 1.0, or three iterations of a
+    64-wide contraction leave the differential comparing 1e10s.
+    """
+    rng = np.random.RandomState(seed)
+    n, k = shape_nk[-2], shape_nk[-1]
+    lead = tuple(shape_nk[:-2])
+    codes = rng.randint(0, 16, size=lead + (n, k)).astype(np.uint8)
+    blocks = (codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8)
+    sb = rng.randint(exp[0], exp[1], size=lead + (n, k // 32)).astype(np.uint8)
+    return blocks, sb
+
+
+def _recognizer_cases():
+    import jax
+    import jax.numpy as jnp
+
+    DOT = (1e-5, 1e-5)
+    HALF = (5e-3, 5e-3)
+    E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                    np.float32)
+    # Byte 0 is 2**-127, a subnormal Metal may flush, and byte 255 is NaN by
+    # the OCP spec; a real checkpoint lives at 117..126.
+    _tab = np.ldexp(np.ones(256), np.arange(256) - 127)
+    _tab[255] = np.nan
+    SCALE_TABLE = _tab.astype(np.float32)
+
+    def unpack(packed, columns):
+        lo = jnp.bitwise_and(packed, jnp.int8(0x0F))
+        lo = jnp.where(lo > 7, lo - 16, lo)
+        hi = jnp.right_shift(packed, jnp.int8(4))
+        w = jnp.reshape(jnp.stack([lo, hi], axis=-1),
+                        packed.shape[:-1] + (columns,))
+        return w
+
+    def dense_sub(packed, scale, zero, g_idx, x, columns):
+        """keras Dense._int4_call, sub-channel branch."""
+        w = unpack(packed, columns)
+        g = g_idx.astype(jnp.int32)
+        s = jnp.take(scale, g, axis=0)
+        z = jnp.take(zero, g, axis=0)
+        return x @ ((w.astype(x.dtype) - z.astype(x.dtype)) * s)
+
+    def dense_perchannel(packed, scale, x, columns):
+        """...and its per-channel branch: the scale divides the OUTPUT."""
+        return (x @ unpack(packed, columns).astype(x.dtype)) / scale
+
+    def einsum_out(packed, scale, zero, g_idx, x, n, h, d):
+        """keras EinsumDense, `btnh,nhd->btd`: the groups arrive interleaved
+        along the canonical contraction axis, so the pack has to permute it."""
+        w = unpack(packed, d)
+        g = g_idx.astype(jnp.int32)
+        wf = ((w.astype(x.dtype) - jnp.take(zero, g, axis=0).astype(x.dtype))
+              * jnp.take(scale, g, axis=0))
+        return jnp.einsum("btnh,nhd->btd", x, jnp.reshape(wf, (n, h, d)))
+
+    def mxfp4_weight(blocks, sb, k, dtype):
+        vt = jnp.asarray(E2M1, dtype=dtype)
+        st = jnp.asarray(SCALE_TABLE)
+        lead = tuple(blocks.shape[:-1])
+        lo = jnp.bitwise_and(blocks, jnp.uint8(0x0F))
+        hi = jnp.right_shift(blocks, jnp.uint8(4))
+        nib = jnp.reshape(jnp.stack([lo, hi], axis=-1), lead + (k,))
+        vals = jnp.take(vt, nib.astype(jnp.int32), axis=0)
+        scale = jnp.take(st, sb.astype(jnp.int32), axis=0)
+        w = (jnp.reshape(vals, lead + (k // 32, 32))
+             * scale[..., None].astype(dtype))
+        return jnp.reshape(w, lead + (k,))
+
+    def moe_block(x, wg, wd, k):
+        """The dense dispatch every jax MoE lowers to: all E experts, then
+        the router's weights null the E - K that were never selected."""
+        logits = x @ wg                                   # [T, E]
+        vals, idx = jax.lax.top_k(logits, k)              # [T, K]
+        w = jax.nn.softmax(vals, axis=-1)
+        onehot = (idx[..., None] == jnp.arange(wg.shape[1])).astype(w.dtype)
+        scores = jnp.sum(onehot * w[..., None], axis=1)   # [T, E]
+        y = jnp.einsum("th,ehd->etd", x, wd)              # [E, T, D]
+        return jnp.sum(y * scores.T[..., None], axis=0)
+
+    def moe_mxfp4(x, wg, blocks, sb, k, kdim):
+        wd = mxfp4_weight(blocks, sb, kdim, x.dtype)
+        return moe_block(x, wg, jnp.swapaxes(wd, -1, -2), k)
+
+    def attn(q, k, v, scale):
+        logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) * scale
+        p = jax.nn.softmax(logits, axis=-1)
+        return jnp.einsum("bhqk,bkhd->bqhd", p, v)
+
+    def attn_causal(q, k, v, scale):
+        logits = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        mask = jnp.tril(jnp.ones((q.shape[2], k.shape[2]), bool))
+        # `finfo.min`, which is what jax's own causal masks use: a sentinel
+        # too small to be one is a `select` the rewrite must NOT read as a
+        # mask (sdpa.py `_MASK_FRACTION`).
+        logits = jnp.where(mask, logits, jnp.finfo(jnp.float32).min)
+        return jnp.einsum("bhqk,bhkd->bhqd", jax.nn.softmax(logits, -1), v)
+
+    def attn_additive(q, k, v, bias, scale):
+        logits = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale + bias
+        return jnp.einsum("bhqk,bhkd->bhqd", jax.nn.softmax(logits, -1), v)
+
+    out = []
+
+    # --- qmm ---------------------------------------------------------
+    for dt, tol in (("float32", DOT), ("bfloat16", HALF)):
+        rows, cols = 256, 128
+        _q, packed, scale, zero, g_idx = _quantize(rows, cols, 128, dt)
+        x = _rand((4, rows), 3).astype(dt) * 0.5
+        out.append((f"qmm int4 sub-channel {dt}",
+                    lambda p, s, z, g, a, c=cols: dense_sub(p, s, z, g, a, c),
+                    [packed, scale, zero, g_idx, x], *tol))
+    rows, cols = 128, 64
+    _q, packed, scale, zero, g_idx = _quantize(rows, cols, 64, "float32",
+                                               seed=5, bits=8)
+    x = _rand((3, rows), 1).astype(np.float32) * 0.5
+    out.append(("qmm int8 codes",
+                lambda q, s, z, g, a: (a @ ((q.astype(a.dtype)
+                                             - jnp.take(z, g.astype(jnp.int32),
+                                                        axis=0).astype(a.dtype))
+                                            * jnp.take(s,
+                                                       g.astype(jnp.int32),
+                                                       axis=0))),
+                [_q, scale, zero, g_idx, x], *DOT))
+    _q, packed, scale, zero, g_idx = _quantize(128, 64, -1, "float32", seed=7)
+    # The per-channel form folds the divide into the weight scale: `1/s` is
+    # computed once in f32 instead of dividing every output element, which is
+    # a rounding CHANGE and not a rounding error (Stage 1 compares both sides
+    # against an exactly dequantized reference and requires the fused one to
+    # be no further from it; the band here is what that difference measures).
+    out.append(("qmm per-channel (scale divides the output)",
+                lambda p, s, a: dense_perchannel(p, s, a, 64),
+                [packed, scale[0], _rand((5, 128), 2)], 1e-4, 1e-4))
+    n, h, d = 8, 32, 256
+    _q, packed, scale, zero, g_idx = _quantize(n * h, d, 128, "float32",
+                                               seed=9)
+    out.append(("qmm einsum projection (interleaved groups, regrouped)",
+                lambda p, s, z, g, a: einsum_out(p, s, z, g, a, n, h, d),
+                [packed, scale, zero, g_idx,
+                 _rand((1, 2, n, h), 4) * 0.3], *DOT))
+    for dt, tol in (("float32", DOT), ("bfloat16", HALF)):
+        blocks, sb = _mxfp4((64, 128), 11, dt)
+        out.append((f"qmm mxfp4 projection {dt}",
+                    lambda b, s, a: jnp.einsum(
+                        "th,nh->tn", a, mxfp4_weight(b, s, 128, a.dtype)),
+                    [blocks, sb, _rand((6, 128), 12).astype(dt) * 0.4], *tol))
+    blocks, sb = _mxfp4((4, 32, 64), 13, "float32")
+    out.append(("qmm mxfp4 batched experts",
+                lambda b, s, a: jnp.einsum(
+                    "etm,ehm->eth", a, mxfp4_weight(b, s, 64, a.dtype)),
+                [blocks, sb, _rand((4, 3, 64), 14) * 0.4], *DOT))
+
+    def qmm_loop(packed, scale, zero, g_idx, x):
+        def body(c):
+            i, y = c
+            return i + 1, jnp.tanh(dense_sub(packed, scale, zero, g_idx, y,
+                                             128) * 0.3)
+        return jax.lax.while_loop(lambda c: c[0] < 3, body, (0, x))[1]
+
+    _q, packed, scale, zero, g_idx = _quantize(128, 128, 128, "float32",
+                                               seed=15)
+    out.append(("qmm inside a decode loop (packs cross the region)", qmm_loop,
+                [packed, scale, zero, g_idx, _rand((2, 128), 16) * 0.3], *DOT))
+
+    # --- moe ---------------------------------------------------------
+    for E, K, T in ((8, 2, 5), (32, 4, 1)):
+        wg = _rand((64, E), 20) * 0.5
+        wd = _rand((E, 64, 32), 21) * 0.3
+        out.append((f"moe gather E{E}/K{K}/T{T}",
+                    lambda a, g, w, k=K: moe_block(a, g, w, k),
+                    [_rand((T, 64), 22), wg, wd], *DOT))
+    wg = _rand((64, 4), 23) * 0.5
+    blocks, sb = _mxfp4((4, 32, 64), 24, "float32")
+    out.append(("moe gather with mxfp4 experts (gather_qmm)",
+                lambda a, g, b, s: moe_mxfp4(a, g, b, s, 2, 64),
+                [_rand((3, 64), 25), wg, blocks, sb], *DOT))
+
+    def moe_loop(x, wg, wd):
+        pre = moe_block(x, wg, wd, 2)
+
+        def body(c):
+            i, tok = c
+            return i + 1, moe_block(tok, wg, wd, 2)
+
+        return jax.lax.while_loop(lambda c: c[0] < 3, body, (0, pre[-1:]))[1]
+
+    # Three dispatches deep, each summing K terms where the dense graph sums
+    # E: the reduction order differs at every step and the loop feeds its own
+    # output back, so this row earns a band the single dispatches above do
+    # not.
+    out.append(("moe gather inside a decode loop", moe_loop,
+                [_rand((5, 64), 26), _rand((64, 8), 27) * 0.5,
+                 _rand((8, 64, 64), 28) * 0.3], 1e-4, 1e-4))
+
+    def moe_q_loop(x, wg, blocks, sb):
+        pre = moe_mxfp4(x, wg, blocks, sb, 2, 64)
+
+        def body(c):
+            i, tok = c
+            return i + 1, moe_mxfp4(tok, wg, blocks, sb, 2, 64)
+
+        return jax.lax.while_loop(lambda c: c[0] < 3, body, (0, pre[-1:]))[1]
+
+    # gpt-oss in miniature: a QUANTIZED dispatch inside a decode loop, which is
+    # the one shape that needs the packs threaded into a region as extra
+    # captures AND the router verified on synthetic logits.
+    blocks, sb = _mxfp4((4, 64, 64), 24, "float32", exp=(121, 125))
+    out.append(("moe gather_qmm inside a decode loop", moe_q_loop,
+                [_rand((3, 64), 25) * 0.1, _rand((64, 4), 23) * 0.5,
+                 blocks, sb], 1e-4, 1e-4))
+
+    # --- sdpa --------------------------------------------------------
+    for dt, tol in (("float32", DOT), ("bfloat16", HALF)):
+        q = _rand((2, 8, 4, 16), 30).astype(dt) * 0.5
+        k = _rand((2, 8, 4, 16), 31).astype(dt) * 0.5
+        v = _rand((2, 8, 4, 16), 32).astype(dt) * 0.5
+        out.append((f"sdpa bqhd {dt}", lambda a, b, c: attn(a, b, c, 0.25),
+                    [q, k, v], *tol))
+    q = _rand((2, 4, 8, 16), 33) * 0.5
+    k = _rand((2, 4, 8, 16), 34) * 0.5
+    v = _rand((2, 4, 8, 16), 35) * 0.5
+    out.append(("sdpa causal (boolean mask)",
+                lambda a, b, c: attn_causal(a, b, c, 0.25), [q, k, v], *DOT))
+    out.append(("sdpa additive mask",
+                lambda a, b, c, m: attn_additive(a, b, c, m, 0.25),
+                [q, k, v, _rand((2, 4, 8, 8), 36) * 0.1], *DOT))
+    return out
 
 
 def _sas_add(source, operand, select_prim, window_dimensions, window_strides,
