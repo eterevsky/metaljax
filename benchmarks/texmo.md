@@ -26,3 +26,12 @@ Suite-wide context (0.11.3 anchor): metal wins 53/163 configs vs
 jax-CPU; crossover ~500–700 weights; the sub-crossover dispatch floor
 (~0.7–1.0 ms/step flat across sizes) is the native-replay-engine
 target.
+
+**Native-plugin baseline (2026-08-12, tree 845ab89):** Stage 1 re-measured on
+this tree is **1.046x faster** than the 0.11.3 anchor (163/163 checks ok, CPU
+control 0.986), so the anchor stands. The phase-2 plugin, same configurations
+through jax/PJRT, is **36.5x slower** on top_confs (median 46x, worst 175x)
+and **4.24x** on the 106-config suite (`db` class 14.6x, `big` class 1.34x,
+five `big`/`mid` rows *faster* than Stage 1) - it has no msl_scan in its
+lowering, and where no msl plan fires the two stacks are equal to 1%. Details
+and per-row data: benchmarks/perf-2026-08-native-baseline.md.

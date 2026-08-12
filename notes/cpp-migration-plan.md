@@ -1181,3 +1181,47 @@ Open, for scrutiny: `api_test::test_concurrent_device_get_and_put` failed once
 in two whole-file runs and passes standalone 3/3 -- the same intermittent
 multi-thread row P8.5 left open (`There is no Stream(gpu, N) in current
 thread`), not a new one, but it now has a second sighting.
+
+## P16: the performance baseline, native vs Stage 1 (2026-08-12)
+
+The first end-to-end perf measurement of the phase-2 plugin, both texmo suites
+and every non-embargoed model row, on tree 845ab89:
+**[benchmarks/perf-2026-08-native-baseline.md](../benchmarks/perf-2026-08-native-baseline.md)**
+(raw data under `~/.cache/metaljax-bench/logs/native-baseline/`; the PJRT-route
+runner is `scripts/bench_texmo_pjrt.py`, since `texmo_topconfs.py` drives
+`metaljax.engine` and can only ever measure Stage 1).
+
+Headline: **the parity work is done and the emits are the whole remaining
+gap.** Where no recognizer emit and no msl plan fires, the two stacks are
+indistinguishable (top_confs at parity 0.98-1.00x, gemma4-E2B decode exact,
+maxtext decode/train within 2%) and on large matmul-bound texmo configs the
+native path is *ahead* (`big09-b8l256` 0.68x, transformer d512 0.82x) - P5's
+`METALJAX_MSL=0` finding, confirmed across 269 configurations. Everything else
+is a missing emit, ordered by measured gap:
+
+1. **msl_scan** - top_confs geomean **36.5x** slower (median 46x, worst 175x),
+   texmo suite `db` class 14.6x, whole suite 4.24x. It costs every one of the
+   54 top_confs where metaljax beats jax-CPU (native: 0 of 163).
+2. **qmm** - gpt-oss-20b **434x** (9.5 s/token vs 21.9 ms; memory is fine at
+   21 GB, so it is pure compute), E2B-int4 5.6x.
+3. **MoE expert gather** - gemma4-26B-A4B 6.9x (300.5 vs 43.7 ms/tok), memory
+   identical; reproduces the pre-gather Stage 1 number.
+4. **sdpa** - SD 3.5 @1024 3.1x, SigLIP b32 1.8x, 31B decode 1.24x, LoRA 1.63x.
+
+Two blockers found on the way, neither of them the tape:
+
+* **Static-protobuf/LLVM symbol collision.** The dylib cannot be dlopened into
+  a process holding TensorFlow or array_record - weak-def coalescing binds the
+  plugin's `AddDescriptors` to the other image's protobuf (SIGSEGV), or, with
+  the plugin first, TF's LLVM aborts on duplicate CommandLine options. It
+  blocked *every* model row (keras directly, gemma-lib through `kauldron`,
+  maxtext through `array_record_module.so`). Fixed by linking with an
+  exported-symbols list of exactly `_GetPjrtApi` and
+  `_metaljax_native_set_callback_trampoline` (166 -> 46 MB, coexists with TF,
+  perf-neutral on five suite configs, execute_test clean bar the known
+  thread-stream flake). The change is not in the tree - it belongs in
+  `plugin-native/metal/BUILD` as a deliberate commit.
+* **KERNEL PANIC #8** on the row-9 native attempt (65 GB streaming load,
+  watchdog wedge with every memory metric healthy - panic #7's signature).
+  The native plugin has no equivalent of Stage 1's load-phase clear cadence.
+  Row 9 native is embargoed until it does; the campaign was halted there.
