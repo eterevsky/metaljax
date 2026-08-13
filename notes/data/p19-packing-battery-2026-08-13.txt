@@ -1,0 +1,75 @@
+P19 battery -- row-blocked pack evaluation + the cross-executable build cache
+=============================================================================
+Tree: f52e3d9 + the P19 working diff (plugin-native/** only).
+Artifacts: ~/.cache/metaljax-bench/logs/p19-packing/*.log
+
+plugin-native/execute_test.py        524 of 524 checks match jax-CPU
+                                     (520 before P19 + the 4 new rows below)
+  blocked pack == whole pack         ok
+  one pack for two executables       ok
+  the build cache has an off switch  ok
+  a blocked pack bounds its peak     ok (0.13 GB blocked vs 0.76 GB whole)
+
+plugin-native/smoke_test.py          all checkpoints passed
+plugin-native/decline_census.py      35 of 35 programs lower
+plugin-native/ingest_test.py         0 failed (8 of 8)
+plugin-native/coexist_test.py        all coexistence checks passed
+                                     (TensorFlow, both load orders; array_record
+                                     not installed in that interpreter)
+bazel test //...                     1 test passes (runtime_gil_free_test)
+wheel (METALJAX_WHEEL_PLUGIN=native) built 11.9 MB, installed into a fresh
+                                     uv 3.13 venv, wheel_poc_test.py: all
+                                     checkpoints passed
+
+plugin-native/texmo_gate.py          106 ok / 0 decline / 0 FAIL / 0 error,
+                                     of 106 (25 via sensitivity scaling), 5m09s
+model rows 7 and 13                  measured; cells in
+                                     notes/data/p19-packing-models-2026-08-13.jsonl
+
+
+The four new execute_test rows, and what each one proves
+--------------------------------------------------------
+
+1. "blocked pack == whole pack".  Five quantized graphs -- MXFP4 f32, MXFP4
+   bf16, MXFP4 batched experts, a keras int4 sub-channel Dense, and an MXFP4
+   projection inside a decode loop (the weight arrives as a loop carry) --
+   answered twice in two child processes, one with METALJAX_QMM_BLOCK=1<<30
+   (whole) and one with 4096 (blocked), compared as BYTES.  Bit equality, not
+   a tolerance: blocking changes when the verification sees a value and
+   nothing about what is derived from it.  The check also reads the plugin's
+   own log back: four of the five must report "in N row blocks" and the keras
+   one -- whose [K, N] layout needs a transpose to reach the [(B,) N, K]
+   matrix quantized_matmul wants -- must report "whole".
+
+2. "one pack for two executables".  Two jits of different activation shapes
+   over ONE weight set (keras-hub's per-sequence-length sampler in miniature),
+   then a third over different buffers.  Exactly one "packed", one "reused",
+   and the third "packed" again: the cache is keyed on the buffers the
+   reconstruction reads, not on the graph alone.
+
+3. "the build cache has an off switch".  The same program under
+   METALJAX_QMM_BUILD_CACHE=0: three builds, no reuse.
+
+4. "a blocked pack bounds its peak".  One 8192x4096 MXFP4 weight (33.5 M
+   values) packed whole and packed in blocks, compared on the plugin's own
+   pack-wave peak -- `mx::get_peak_memory()` inside the dylib, since host RSS
+   never sees a Metal allocation and the host process's `mlx.core` is a
+   different runtime whose counters read zero for the plugin (the P16
+   campaign's finding).  0.76 GB -> 0.13 GB, same checksum.
+
+
+Measurements taken along the way (not gates)
+--------------------------------------------
+
+METALJAX_QMM_BLOCK=1  on a [64, 128] MXFP4 weight: "in 64 row blocks"
+METALJAX_QMM_BLOCK=4096 on the same:               "in 2 row blocks"
+   (per = 128 elements per row, so 4096/128 = 32 rows per block, 64 rows)
+
+A gap the LOWERING's guard found, not a test: `func.call` was missing from
+the row-local set, so every MXFP4 weight -- jax lowers `jnp.take` as a call --
+fell back to a whole evaluation with the message "a row-blocked func.call".
+A call emits no tape entry at all (the lowering splices the callee's body and
+aliases the results), so narrowing one is narrowing the values it forwards,
+each of which is guarded on its own.  This is exactly the class of bug the
+second lock exists for: without it the fallback would have been silent and
+row 7 would have measured no better than P18.

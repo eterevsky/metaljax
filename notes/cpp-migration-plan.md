@@ -1380,3 +1380,89 @@ the two SD 3.5 stacks produce different images at the same prompt (pixel_std
 61.1 vs 77.5 at 512); Stage 1's own SD 3.5 @512 has drifted 1389 -> 1520.7
 against its 0.11.3 anchor, a third Stage-1-vs-anchor regression beside rows 14
 and 19.
+
+## P19: the two pack optimizations P17 deferred (2026-08-13,
+## notes/cpp-p19-packing.md)
+
+Item 7 of the P18 frontier -- "pack building has no memory discipline" -- is
+the block on row 7 and the reason row 13 peaks at 48 GB for a 3 GB model.
+Both halves are now ported from `src/metaljax/qmm.py`:
+
+* **Row-blocked evaluation** (`_Source`). The operand subtrees are evaluated
+  one slice of the weight's leading axis at a time and packed as they go, so
+  the reconstruction -- several times the size of the weight -- never exists
+  at once. The shape of the port is the thing worth knowing: there is no
+  second evaluator. `RowSource` does only the ANALYSIS (qmm.py's `_op` rules,
+  producing a SET of values that carry the row axis) and
+  `Lowering::LowerConeBlocked` builds the ordinary cone with those values
+  declared `c` rows tall -- one override inside `Dims()`, the single place a
+  declared shape enters a lowering, plus `stablehlo.slice`, whose extent is an
+  attribute. A block is therefore computed by exactly the code a whole
+  evaluation would have used.
+* **The cross-executable build cache**. A canonical serialization of the
+  reconstruction (qmm.py's `_Fingerprint`, transliterated) plus the identity of
+  the buffers it reads, so keras-hub's per-sequence-length generate programs
+  build each weight once between them. Bounded by
+  `METALJAX_QMM_BUILD_CACHE` (512, LRU, dead-leaf sweep); `0` restores P17.
+  The one difference from the Python: an `mx::array` cannot be rebuilt from a
+  weak handle, so the PACK is held strongly and the LEAVES weakly (through
+  `data_shared_ptr`), and leaf identity is re-proven three ways on every hit
+  because `mx::array::id()` is a recyclable address.
+
+**A wrongly narrowed value is silent wrongness** -- the exactness checks pass
+happily on the wrong rows -- so there are two locks in two files: `RowSource`
+decides what may be narrowed, and `Lowering::LowerOp` asserts the consequence
+at emission (an op that reads a block must hand back a block; only
+`RowLocalOps()` may be narrowed). The second lock earned itself immediately:
+`func.call` was missing from the set, so every MXFP4 weight (jax lowers
+`jnp.take` as a call) fell back to a whole evaluation, and the guard named it
+instead of failing silently.
+
+Deliberately narrower than Stage 1, each a fall-back to the P17 behaviour and
+each reported under `METALJAX_DEBUG=1`: a value read BOTH whole and blocked
+declines (a tape has one slot per value where Stage 1 keys on (value, demand)),
+as does a callee invoked twice in one subtree; and a callee's body is swept
+after the walk, because the lowering splices a callee whole, dead ops included.
+
+**Row 7 is unblocked** (`notes/data/p19-packing-models-2026-08-13.jsonl`).
+gpt-oss-20b completes at its historical 45 GB budget -- 35 GB peak, 128 tokens,
+**25.3 ms/tok = 1.16x** of Stage 1's 21.9 (re-measured same-day, reproducing its
+anchor exactly), four samples inside 25.3-25.5. P18 was guard-killed at 46 GB
+under 45 and 62 GB under 60.
+
+**The ablation contradicts the P18 diagnosis in a useful way.** One knob at a
+time, same budget: cache off / blocking on is killed at 46 GB (P18's number to
+the gigabyte); blocking off / cache on completes at 36 GB; both on, 35 GB. So
+the **build cache is the load-bearing half** -- three executables were each
+building their own ~10 GB pack set -- and row-blocking is worth a further
+gigabyte. P17's argument that "the tape already stages op by op with last-use
+pruning" was substantially right about the per-weight TRANSIENT; what it did not
+cover was the same pack set built three times. Only the pair clears the line.
+Mechanism from the run's log: 94 built / **188 reused**, all 94 blocked (47 in
+16 row blocks, 47 in 32), pack-wave peak 33.9 GB then **0.000 GB** twice.
+
+Row 7 does not share row 13's compile bug: `METALJAX_TRACE_BUDGET=1e7` returns
+the same 25.3 ms/tok with bit-identical compile decisions (16 compiles / 354
+compiled calls either way), so item 6 of the P18 frontier does not touch it.
+
+**Row 13 is timing-neutral under P19** (275.6 vs a P19-off control of 271.7 on
+the same binary; P18's own byte-cap control read 274.6, so its 249.0 headline
+was the low end of the row's spread). What P19 changes there is the steady state
+**4.2 -> 3.2 GB** and 518 of the 777 pack builds -- 259 built, 518 reused across
+three executables, 0 fingerprint declines, all 259 packing whole because a keras
+`[K, N]` weight fails `_blocking`'s no-transpose precondition on both stacks.
+Its 46 GB peak is now attributed rather than open: it is the keras streaming
+LOAD transient (Stage 1's own is 44 GB), not the packs, whose wave peaks at
+6.6 GB.
+
+Scrutiny carried forward: row 7's greedy tokens diverge from Stage 1 at index 52
+of 64. P18 never completed this row, so there is no prior native record and this
+is a first observation rather than a change; same late-divergence ladder class
+as rows 3, 5 and 11.
+
+Battery: `notes/data/p19-packing-battery-2026-08-13.txt`. execute_test 520 ->
+**524** checks (blocked-vs-whole bit equality over five quantized graphs incl.
+one inside a decode loop; cross-executable reuse; the cache's off switch; and
+the pack-wave peak, 0.76 -> 0.13 GB on one 8192x4096 MXFP4 weight), `texmo_gate`
+**106 ok / 0 decline / 0 FAIL**, smoke, decline_census 35/35, ingest_test 8/8,
+coexist_test, `bazel test //...`, native wheel from a fresh 3.13 venv.

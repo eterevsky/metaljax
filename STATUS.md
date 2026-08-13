@@ -33,13 +33,13 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | 27.2 (1.00×) ᴾ¹⁶ | 10.5 ¹⁵ | — | — |
 | 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.9** (0.99× ²⁷) | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
 | 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.7** (0.99× ²⁷) | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
-| 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | ✗ guard-killed @62 GB (pack build ²⁷) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
+| 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **25.3** (1.16×, 35 GB ²⁸) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | not run (PAUSED ¹⁷) | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | ✗ **PANIC #8** ²⁵ (retry pending) | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | not run (embargo) | **10.6** | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | 16.67 (1.02×) ᴾ¹⁶ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | not run (PAUSED ¹⁷) | **52.8** (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **249.0** (3.09× — qmm fires, decode body does not compile ²⁷) | — | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **275.6** (qmm fires, decode body does not compile ²⁷; steady state 3.2 GB ²⁸) | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **56.8** (0.95× ²⁷) ²⁶ | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ MLX command-buffer bug ⁸ | not run (embargo) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | **96.9** (1.13×; b32 0.96× ²⁷) | — | 29.8 (b32: 591) | — |
@@ -327,6 +327,37 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
     can even `dlopen` the plugin — `plugin-native/coexist_test.py` is its
     standing contract and `notes/data/p18-relink-battery-2026-08-12.txt` its
     evidence.
+28. **Row 7 unblocked, and what actually did it** (2026-08-13, P19; raw
+    `notes/data/p19-packing-models-2026-08-13.jsonl`, mechanism
+    `notes/cpp-p19-packing.md`). The two optimizations P17 named and skipped —
+    qmm's row-blocked `_Source` evaluation and its cross-executable build cache
+    — are ported, and **gpt-oss-20b now completes at its historical 45 GB
+    budget**: 35 GB peak, 128 tokens, **25.3 ms/tok = 1.16× of Stage 1's 21.9**
+    (re-measured the same day and reproducing its anchor exactly), four samples
+    inside 25.3–25.5.
+    **The ablation says the CACHE was the load-bearing half**, which is not what
+    the P18 diagnosis predicted: at the same budget, cache off / blocking on is
+    guard-killed at 46 GB (P18's number to the gigabyte) while blocking off /
+    cache on completes at 36 GB. Three executables were each building their own
+    ~10 GB pack set; row-blocking is worth a further gigabyte on top, and only
+    the pair clears the line. Evidence from the run's own log: 94 packs built,
+    **188 reused** (100 % hit rate on the second and third executables), all 94
+    blocked, and the plugin's pack-wave peak 33.9 GB → **0.000 GB** for the two
+    reuse waves.
+    Row 7 does *not* share row 13's compile bug: `METALJAX_TRACE_BUDGET=1e7`
+    returns the same 25.3 ms/tok with bit-identical compile decisions (16
+    compiles / 354 compiled calls either way).
+    **Row 13 is timing-neutral under P19** — 275.6 against a P19-off control of
+    271.7 on the same binary, and P18's own byte-cap control read 274.6, so the
+    249.0 headline was the low end of this row's spread rather than a mark P19
+    missed. What P19 changes there is the steady state (**4.2 → 3.2 GB**) and
+    518 of the 777 pack builds. Its 46 GB peak is now *attributed*: it is the
+    keras streaming LOAD transient, which Stage 1 shares at 44 GB, and not the
+    packs — the pack wave peaks at 6.6 GB.
+    Scrutiny: row 7's greedy tokens diverge from Stage 1 at index 52 of 64.
+    There is no prior native token record for this row (P18 never completed it),
+    so it is a first observation rather than a change, and it is the same
+    late-divergence ladder class as rows 3, 5 and 11.
 
 ## Bug ledger (found by this suite)
 

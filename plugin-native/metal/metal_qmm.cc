@@ -6,16 +6,33 @@ The two halves are the Python module's two halves, and neither is re-designed
 here: `AnalyzeQmm` is its structural matching (`_try_affine`, `_try_perchannel`,
 `_finish`, `_prune`) and touches no value; `BuildQmmPacks` is its first-execute
 verification and packing (`_build_affine_pack`, `_build_mxfp4_pack`), on the
-concrete buffers of this execute.  What is deliberately NOT ported is
-`_Source`'s row-blocked evaluation and the cross-executable build cache: both
-are memory/latency optimizations over an evaluation the tape already stages
-op by op with last-use pruning, and leaving them out costs peak memory on a
-20-GB weight set, never an answer.  The two facts that ARE load-bearing are
-kept: MLX's buffer cache is off while a pack runs (a pack's dead buffers are
-claimed memory a watchdog reads), and every exactness check is exact.
+concrete buffers of this execute.  MLX's buffer cache is off while a pack runs
+(a pack's dead buffers are claimed memory a watchdog reads), and every
+exactness check is exact.  A check that fails DISABLES that one dot: its chain
+then lowers literally, as it did before this file existed.
 
-A check that fails DISABLES that one dot: its chain then lowers literally, as
-it did before this file existed.
+P19 adds the two things the P17 port left out, which is what a 20-GB weight
+set costs in PEAK MEMORY rather than in answers:
+
+* **`RowSource`** is qmm.py's `_Source`: the operand subtrees are evaluated one
+  BLOCK of the weight's rows at a time and packed as they go, so the
+  reconstruction -- several times the size of the weight it packs -- never
+  exists at once.  What is derived from a block (a 4-bit code, one scale per
+  group) is an eighth of it, and every element is still read exactly once by
+  the same exact checks: blocking changes WHEN the verification sees a value,
+  never whether.  A subtree not provably row-local raises `NotBlockable` and
+  the caller retries whole, where `blocks()` yields one block covering
+  everything and the packers above are unchanged.
+* **The build cache** keys a finished pack on a canonical serialization of its
+  reconstruction plus the identity of the buffers that subtree reads, so the
+  prefill and decode executables of one model -- separate programs, separate
+  plans, separate empty pack sets -- build each weight once between them.
+
+The rules that decide which values a block may narrow are qmm.py `_Source._op`'s
+and they live in `RowLocalOps` + `RowSource::DemandOp`; the LOWERING asserts
+their consequence a second time (`Lowering::LowerOp`'s row-block guard), because
+a wrong narrowing is a weight that passes every exactness check on the wrong
+rows.
 
 Licensed under the Apache License, Version 2.0.
 ==============================================================================*/
@@ -28,7 +45,9 @@ Licensed under the Apache License, Version 2.0.
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -37,6 +56,7 @@ Licensed under the Apache License, Version 2.0.
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/str_format.h"
 #include "llvm/ADT/StringRef.h"
 #include "metal/metal_dtypes.h"
@@ -78,11 +98,58 @@ constexpr uint32_t kMix = 2246822519u;
 // the digest must not materialize a second copy of one.
 constexpr int64_t kKeyChunk = 1 << 22;
 
+// qmm.py `_BLOCK_ELEMS` (METALJAX_QMM_BLOCK): weight elements per block.  The
+// reconstruction chain is much wider than its result -- jax's `take` wrapper
+// alone carries three int32 copies of the index tensor -- so a block costs
+// ~16 bytes per element while it runs; 16M elements keeps that under a few
+// hundred MB and still gives every kernel millions of lanes of work.
+const int64_t kBlockElems = [] {
+  const char* v = std::getenv("METALJAX_QMM_BLOCK");
+  if (v == nullptr) return int64_t{1} << 24;
+  const int64_t n = std::atoll(v);
+  return n > 0 ? n : (int64_t{1} << 24);
+}();
+// qmm.py `_WHOLE_MAX`: a ceiling on a value the blocking decides is
+// block-INDEPENDENT (a decode table, a splat constant).  Those are
+// re-evaluated for every block, so a big one means the blocking misread the
+// graph and evaluating whole is honest.
+constexpr int64_t kWholeMax = int64_t{1} << 22;
+// qmm.py `_MAX_BUILT` (METALJAX_QMM_BUILD_CACHE): packs retained by the
+// cross-executable build cache; 0 turns the reuse off entirely (every
+// executable rebuilds, which is what P17 did).
+const int64_t kMaxBuilt = [] {
+  const char* v = std::getenv("METALJAX_QMM_BUILD_CACHE");
+  if (v == nullptr) return int64_t{512};
+  const int64_t n = std::atoll(v);
+  return n >= 0 ? n : int64_t{512};
+}();
+// qmm.py `_FP_DENSE_ELEMS` / `_FP_ATTR_CHARS`: what a fingerprint may carry.
+// A weight subtree's constants are decode tables and thresholds; thousands of
+// elements means the weight itself is baked into the graph, and hashing that
+// costs more than the build it would save.
+constexpr int64_t kFpDenseElems = 1024;
+constexpr size_t kFpAttrChars = 1u << 16;
+
 // A candidate does not match (or cannot be trusted): run it literally.
 struct Reject {
   std::string why;
 };
 [[noreturn]] void Bail(const std::string& why) { throw Reject{why}; }
+
+// qmm.py `_NotBlockable`: this subtree cannot be evaluated one row block at a
+// time.  NOT a `Reject` -- the weight still packs, from a whole evaluation.
+struct NotBlockable {
+  std::string why;
+};
+[[noreturn]] void NoBlock(const std::string& why) { throw NotBlockable{why}; }
+
+// qmm.py `_NoFingerprint`: this reconstruction cannot be serialized exactly,
+// so it is not build-cached.  Declining is free, and it is the only thing
+// standing between "we can prove it" and a wrong weight.
+struct NoFingerprint {
+  std::string why;
+};
+[[noreturn]] void NoFp(const std::string& why) { throw NoFingerprint{why}; }
 
 void Debug(const std::string& line) {
   if (!kDebug) return;
@@ -715,6 +782,432 @@ mx::array ToRows(mx::array x, const QmmMatch& m) {
   return out;
 }
 
+// --------------------------------------------------------------------------
+// row-blocked evaluation of the operand subtrees (qmm.py `_Source`)
+// --------------------------------------------------------------------------
+
+// qmm.py `_replay_rows`: `_replay` on ONE block -- the shape ops between the
+// reconstruction and the dot must leave the blocked axis be.
+mx::array ReplayRows(mx::array x, const std::vector<mlir::Operation*>& post,
+                     int64_t lead, int64_t c) {
+  for (mlir::Operation* o : post) {
+    if (OpName(o) == "stablehlo.reshape") {
+      std::vector<int64_t> src = ShapeOf(o->getOperand(0));
+      std::vector<int64_t> out = ShapeOf(o->getResult(0));
+      if (src.empty() || out.empty() || src[0] != lead || out[0] != lead ||
+          Prod(std::vector<int64_t>(src.begin() + 1, src.end())) !=
+              Prod(std::vector<int64_t>(out.begin() + 1, out.end())))
+        NoBlock("a reshape below the weight mixes rows");
+      out[0] = c;
+      x = mx::reshape(x, ToMxShape(out));
+    } else {
+      std::vector<int64_t> perm = I64List(o, "permutation");
+      if (perm.empty() || perm[0] != 0)
+        NoBlock("a transpose below the weight moves rows");
+      std::vector<int> p(perm.begin(), perm.end());
+      x = mx::transpose(x, p);
+    }
+  }
+  return x;
+}
+
+// qmm.py `_ROW_LOCAL`, plus the ops whose row-locality is a rule about their
+// dimension attributes rather than a property of the handler.  A `Lowering`
+// consults this to assert that nothing else was ever narrowed.
+const absl::flat_hash_set<std::string>& RowLocalNames() {
+  // Elementwise ops, whose handler is a pure function of the arrays it is
+  // handed and never of the shape the IR declares: feeding it a slice of the
+  // leading axis produces exactly that slice of its result.
+  static const auto* set = new absl::flat_hash_set<std::string>{
+      "stablehlo.abs", "stablehlo.add", "stablehlo.and", "stablehlo.cbrt",
+      "stablehlo.ceil", "stablehlo.clamp", "stablehlo.compare",
+      "stablehlo.convert", "stablehlo.cosine",
+      "stablehlo.count_leading_zeros", "stablehlo.divide",
+      "stablehlo.exponential", "stablehlo.exponential_minus_one",
+      "stablehlo.floor", "stablehlo.is_finite", "stablehlo.log",
+      "stablehlo.log_plus_one", "stablehlo.logistic", "stablehlo.maximum",
+      "stablehlo.minimum", "stablehlo.multiply", "stablehlo.negate",
+      "stablehlo.not", "stablehlo.or", "stablehlo.popcnt", "stablehlo.power",
+      "stablehlo.reduce_precision", "stablehlo.remainder",
+      "stablehlo.round_nearest_afz", "stablehlo.round_nearest_even",
+      "stablehlo.rsqrt", "stablehlo.select", "stablehlo.shift_left",
+      "stablehlo.shift_right_arithmetic", "stablehlo.shift_right_logical",
+      "stablehlo.sign", "stablehlo.sine", "stablehlo.sqrt",
+      "stablehlo.subtract", "stablehlo.tanh", "stablehlo.xor",
+      // ...and the seven whose leading axis survives under a condition
+      // `RowSource::DemandOp` checks before it narrows anything.
+      "stablehlo.reshape", "stablehlo.broadcast_in_dim", "stablehlo.slice",
+      "stablehlo.transpose", "stablehlo.concatenate", "stablehlo.gather",
+      "stablehlo.reduce",
+      // A call emits no entry at all -- the lowering splices the callee's
+      // body into the frame and aliases the results -- so narrowing one is
+      // narrowing the values it forwards, each of which is guarded on its
+      // own.  jax's `take` wrapper is a call, and it is on the critical path
+      // of every MXFP4 weight.
+      "func.call", "stablehlo.composite"};
+  return *set;
+}
+
+// qmm.py `_Source`.  The demand analysis (`Demand`/`DemandOp`) decides which
+// values of a subtree carry the weight's row axis; `Rows` then asks the
+// lowering for a Program narrowed to those values and runs it once per block.
+//
+// `row` is a DEMAND, passed down from the weight: a chain read elementwise
+// wants a block of each operand, a table gathered through wants all of it.
+// Stage 1 keys its evaluation on (value, demand) and may read one value both
+// ways; a tape has ONE slot per value, so reading a value both ways declines
+// the blocking here instead (the weight then packs whole).  Nothing in reach
+// does it: the case Stage 1's comment is about -- a 16-entry decode table in
+// a model with 16 experts -- is two different values.
+class RowSource {
+ public:
+  RowSource(const QmmMatch& m, const PackContext& ctx) : m_(m), ctx_(ctx) {
+    for (mlir::BlockArgument a : ctx.main->getArguments())
+      main_args_[a] = static_cast<int>(a.getArgNumber());
+    // qmm.py `_blocking`: blocks are slices of the weight's LEADING axis.
+    // That axis is the row axis of the [(B,) N, K] matrix quantized_matmul
+    // wants only when the dot needs no transpose to get there, and when it is
+    // not part of the contraction (`per % K`: whole rows have to live inside
+    // one block, since the group scales and the packed nibble stream both run
+    // along K).
+    lead_ = m.rshape.empty() ? 0 : m.rshape[0];
+    std::vector<int64_t> ramp(m.rshape.size());
+    std::iota(ramp.begin(), ramp.end(), 0);
+    if (m.rperm != ramp || lead_ < 2) return;
+    const int64_t per =
+        Prod(std::vector<int64_t>(m.rshape.begin() + 1, m.rshape.end()));
+    if (per <= 0 || m.K <= 0 || per % m.K) return;
+    const int64_t step = std::max<int64_t>(1, kBlockElems / per);
+    if (step < lead_) step_ = step;
+  }
+
+  bool blocked() const { return step_ > 0; }
+
+  void unblock() {
+    step_ = 0;
+    whole_.clear();
+    plans_.clear();
+    // ...and the narrowed Programs, which hold their constants' arrays: the
+    // whole path is about to build the widest thing this weight ever needs.
+    progs_.clear();
+  }
+
+  std::vector<std::pair<int64_t, int64_t>> blocks() const {
+    if (step_ <= 0) return {{0, lead_}};
+    std::vector<std::pair<int64_t, int64_t>> out;
+    for (int64_t lo = 0; lo < lead_; lo += step_)
+      out.emplace_back(lo, std::min(lo + step_, lead_));
+    return out;
+  }
+
+  // Forget a whole-evaluated subtree (it is full weight size).
+  void Drop(mlir::Value v) {
+    if (v != nullptr) whole_.erase(v.getAsOpaquePointer());
+  }
+
+  // `value`'s rows for this block, as a `[rows, K]` matrix.  Always
+  // two-dimensional, batching dimensions included in the row count: every
+  // check and every packer reads groups along the last axis and nothing else,
+  // and the packed arrays are folded back into `[(B,) N, ...]` once, at the
+  // end (`Join`).
+  mx::array Rows(mlir::Value value, int64_t lo, int64_t hi) {
+    if (step_ <= 0) {
+      auto it = whole_.find(value.getAsOpaquePointer());
+      if (it != whole_.end()) return it->second;
+      mx::array got = ToRows(Whole(value), m_);
+      whole_.insert({value.getAsOpaquePointer(), got});
+      return got;
+    }
+    const int64_t c = hi - lo;
+    const Plan& p = PlanFor(value);
+    std::shared_ptr<Program> prog = ProgramFor(value, p, c);
+    std::vector<mx::array> ins = *ctx_.args;
+    for (int i : p.blocked_args) {
+      const mx::array& a = ins[i];
+      mx::Shape start(a.ndim(), 0), stop = a.shape();
+      start[0] = static_cast<mx::ShapeElem>(lo);
+      stop[0] = static_cast<mx::ShapeElem>(hi);
+      ins[i] = mx::contiguous(mx::slice(a, start, stop));
+    }
+    std::vector<mx::array> outs = prog->run(std::move(ins));
+    if (outs.size() != 1) NoBlock("a blocked cone with several outputs");
+    mx::array x = ReplayRows(outs[0], m_.post, lead_, c);
+    std::vector<int64_t> want{c};
+    want.insert(want.end(), m_.rshape.begin() + 1, m_.rshape.end());
+    if (FromMxShape(x.shape()) != want)
+      NoBlock("a block evaluated to the wrong shape");
+    mx::array out = mx::contiguous(
+        mx::reshape(x, mx::Shape{-1, static_cast<mx::ShapeElem>(m_.K)}));
+    mx::eval(out);
+    return out;
+  }
+
+  // A value that is NOT weight-shaped (the per-channel form's scale divides
+  // the OUTPUT), which is only ever read whole.
+  mx::array Whole(mlir::Value value) {
+    absl::StatusOr<std::vector<mx::array>> got = ctx_.eval({value}, {});
+    if (!got.ok()) Bail(std::string(got.status().message()));
+    if (got->size() != 1) Bail("a cone with several outputs");
+    return (*got)[0];
+  }
+
+ private:
+  struct Plan {
+    llvm::DenseSet<mlir::Value> blocked;
+    std::vector<int> blocked_args;   // @main argument positions, sorted
+  };
+
+  const Plan& PlanFor(mlir::Value root) {
+    auto it = plans_.find(root.getAsOpaquePointer());
+    if (it != plans_.end()) return it->second;
+    Plan p;
+    demand_.clear();
+    binds_.clear();
+    bodies_.clear();
+    Demand(root, /*row=*/true, &p);
+    // A callee is INLINED whole by the lowering, dead ops included, so an op
+    // this walk never reached can still be handed a block.  Sweeping the
+    // bodies here turns that into a fall-back to the whole evaluation rather
+    // than a decline of the cone (which would disable the dot entirely).
+    for (mlir::Block* b : bodies_) {
+      for (mlir::Operation& o : *b) {
+        if (o.hasTrait<mlir::OpTrait::IsTerminator>()) continue;
+        bool reads = false;
+        for (mlir::Value x : o.getOperands())
+          reads = reads || p.blocked.contains(x);
+        if (!reads) continue;
+        for (mlir::Value r : o.getResults())
+          if (!p.blocked.contains(r))
+            NoBlock(absl::StrCat("a callee op (", OpName(&o),
+                                 ") reads the block and does not keep it"));
+      }
+    }
+    for (const auto& [v, i] : main_args_)
+      if (p.blocked.contains(v)) p.blocked_args.push_back(i);
+    std::sort(p.blocked_args.begin(), p.blocked_args.end());
+    return plans_.insert({root.getAsOpaquePointer(), std::move(p)})
+        .first->second;
+  }
+
+  std::shared_ptr<Program> ProgramFor(mlir::Value root, const Plan& p,
+                                      int64_t c) {
+    auto key = std::make_pair(root.getAsOpaquePointer(), c);
+    auto it = progs_.find(key);
+    if (it != progs_.end()) return it->second;
+    absl::StatusOr<std::shared_ptr<Program>> prog =
+        ctx_.blocked_cone({root}, p.blocked, c);
+    // A cone the tape cannot build from a NARROWED graph is exactly what
+    // `NotBlockable` is for: the caller retries whole, where the same cone is
+    // the one P17 already builds.
+    if (!prog.ok()) NoBlock(std::string(prog.status().message()));
+    progs_.insert({key, *prog});
+    return *prog;
+  }
+
+  void Demand(mlir::Value v, bool row, Plan* p) {
+    auto it = demand_.find(v);
+    if (it != demand_.end()) {
+      if (it->second != row)
+        NoBlock("a value read both whole and one block at a time");
+      return;
+    }
+    demand_[v] = row;
+    if (row) p->blocked.insert(v);
+    if (auto ba = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+      auto arg = main_args_.find(v);
+      if (arg != main_args_.end()) {
+        if (row) {
+          std::vector<int64_t> s = ShapeOf(v);
+          if (s.empty() || s[0] != lead_)
+            NoBlock(absl::StrCat("argument ", arg->second,
+                                 " does not carry the blocked axis"));
+        }
+        return;
+      }
+      auto bound = binds_.find(v);
+      if (bound != binds_.end()) {
+        // A callee parameter: resolve the demand in the caller.
+        Demand(bound->second, row, p);
+        return;
+      }
+      mlir::Value outer = Hoist(v);
+      if (outer == v) Bail("unbound value in operand subtree");
+      Demand(outer, row, p);
+      return;
+    }
+    mlir::Operation* o = Owner(v);
+    if (o == nullptr) Bail("unbound value in operand subtree");
+    for (mlir::Value r : o->getResults()) {
+      if (r == v) continue;
+      auto seen = demand_.find(r);
+      if (seen != demand_.end() && seen->second != row)
+        NoBlock("an op whose results are read both ways");
+      demand_[r] = row;
+      if (row) p->blocked.insert(r);
+    }
+    DemandOp(o, row, p);
+  }
+
+  void DemandOp(mlir::Operation* o, bool row, Plan* p) {
+    const std::string name = OpName(o);
+    if (!row) {
+      // Block-independent: the declared shapes are the real ones, so the
+      // cone lowers this op exactly as it always did.  What it may NOT be is
+      // big -- it is re-evaluated for every block, and a big one means the
+      // blocking misread the graph.
+      for (mlir::Value r : o->getResults()) {
+        if (Prod(ShapeOf(r)) > kWholeMax)
+          NoBlock(absl::StrCat(name, " is block-independent but produces ",
+                               Prod(ShapeOf(r)), " elements"));
+      }
+      for (mlir::Value x : o->getOperands()) Demand(x, false, p);
+      return;
+    }
+    for (mlir::Value r : o->getResults()) {
+      std::vector<int64_t> s = ShapeOf(r);
+      if (s.empty() || s[0] != lead_)
+        NoBlock(absl::StrCat(name, " does not keep the blocked axis"));
+    }
+    if (name == "stablehlo.reshape") {
+      std::vector<int64_t> src = ShapeOf(o->getOperand(0));
+      std::vector<int64_t> out = ShapeOf(o->getResult(0));
+      if (src.empty() || src[0] != lead_ ||
+          Prod(std::vector<int64_t>(src.begin() + 1, src.end())) !=
+              Prod(std::vector<int64_t>(out.begin() + 1, out.end())))
+        NoBlock("reshape mixes the blocked axis");
+      Demand(o->getOperand(0), true, p);
+    } else if (name == "stablehlo.broadcast_in_dim") {
+      std::vector<int64_t> dims = I64List(o, "broadcast_dimensions");
+      std::vector<int64_t> src = ShapeOf(o->getOperand(0));
+      // The operand is blocked only when its own leading axis IS the
+      // result's; a size-1 leading axis expanded to the full extent is one
+      // row repeated, which every block can read whole.
+      const bool sub =
+          !dims.empty() && !src.empty() && dims[0] == 0 && src[0] == lead_;
+      // ...and when it is NOT, nothing it contributes to the result's leading
+      // axis may be the blocked extent (qmm.py's `interim[0] not in (1, c)`).
+      if (!sub) {
+        for (size_t i = 0; i < dims.size() && i < src.size(); i++)
+          if (dims[i] == 0 && src[i] != 1)
+            NoBlock("broadcast expands the blocked axis");
+      }
+      Demand(o->getOperand(0), sub, p);
+    } else if (name == "stablehlo.slice") {
+      std::vector<int64_t> starts = I64List(o, "start_indices");
+      std::vector<int64_t> limits = I64List(o, "limit_indices");
+      std::vector<int64_t> strides = I64List(o, "strides");
+      if (starts.empty() || starts[0] != 0 || limits[0] != lead_ ||
+          strides[0] != 1)
+        NoBlock("slice cuts the blocked axis");
+      Demand(o->getOperand(0), true, p);
+    } else if (name == "stablehlo.gather") {
+      auto ga = mlir::dyn_cast<mlir::stablehlo::GatherOp>(o);
+      if (!ga) NoBlock("a gather in an unexpected form");
+      mlir::stablehlo::GatherDimensionNumbersAttr d = ga.getDimensionNumbers();
+      std::vector<int64_t> offset(d.getOffsetDims().begin(),
+                                  d.getOffsetDims().end());
+      std::vector<int64_t> idx = ShapeOf(o->getOperand(1));
+      // Only the INDICES may carry the block, which is the shape of a table
+      // lookup (jax's `take`): the handler reads `slice_sizes` off the op, so
+      // a blocked OPERAND -- a per-group scale gathered by a group ramp, say
+      // -- would have it reassemble the result with the full leading extent.
+      if (std::find(offset.begin(), offset.end(), 0) != offset.end() ||
+          d.getIndexVectorDim() == 0 || !d.getOperandBatchingDims().empty() ||
+          idx.empty() || idx[0] != lead_)
+        NoBlock("gather does not batch over the blocked axis");
+      Demand(o->getOperand(0), false, p);
+      Demand(o->getOperand(1), true, p);
+    } else if (name == "stablehlo.reduce") {
+      std::vector<int64_t> dims = I64List(o, "dimensions");
+      if (std::find(dims.begin(), dims.end(), 0) != dims.end())
+        NoBlock("reduce folds the blocked axis");
+      const size_t n = o->getNumOperands() / 2;
+      for (size_t i = 0; i < o->getNumOperands(); i++)
+        Demand(o->getOperand(i), i < n, p);
+    } else if (name == "func.call" || name == "stablehlo.composite") {
+      DemandCall(o, name == "func.call" ? "callee" : "decomposition", p);
+    } else if (RowLocalNames().contains(name) &&
+               name != "stablehlo.transpose" &&
+               name != "stablehlo.concatenate") {
+      DemandElementwise(o, p);
+    } else if (name == "stablehlo.transpose" &&
+               !I64List(o, "permutation").empty() &&
+               I64List(o, "permutation")[0] == 0) {
+      DemandElementwise(o, p);
+    } else if (name == "stablehlo.concatenate" &&
+               mlir::cast<mlir::stablehlo::ConcatenateOp>(o).getDimension() !=
+                   0) {
+      DemandElementwise(o, p);
+    } else {
+      NoBlock(absl::StrCat(name, " is not known to be row-local"));
+    }
+  }
+
+  // An operand is blocked exactly when it carries the blocked axis;
+  // StableHLO's elementwise ops take operands of the result's own shape, with
+  // rank-0 scalars (select's predicate, clamp's bounds) the only exception.
+  void DemandElementwise(mlir::Operation* o, Plan* p) {
+    for (mlir::Value x : o->getOperands()) {
+      std::vector<int64_t> s = ShapeOf(x);
+      Demand(x, !s.empty() && s[0] == lead_, p);
+    }
+  }
+
+  // A call, demanded INSIDE the callee.  The lowering splices a callee's body
+  // into the frame with its parameters aliased to the call's operands, so the
+  // parameters have to carry the demand too -- and a callee invoked TWICE
+  // would need one parameter to be two things at once, which is a decline.
+  void DemandCall(mlir::Operation* o, const char* attr, Plan* p) {
+    auto sym = o->getAttrOfType<mlir::FlatSymbolRefAttr>(attr);
+    if (!sym) NoBlock("a call with no callee");
+    mlir::ModuleOp mod = ctx_.module;
+    auto fn = mod.lookupSymbol<mlir::func::FuncOp>(sym.getValue());
+    if (!fn || fn.getBody().getBlocks().size() != 1)
+      NoBlock("a callee that is not a single block");
+    mlir::Block& body = fn.getBody().front();
+    if (body.getNumArguments() != o->getNumOperands())
+      NoBlock("a call whose arity does not match its callee");
+    if (body.empty()) NoBlock("an empty callee");
+    mlir::Operation* term = &body.back();
+    if (!term->hasTrait<mlir::OpTrait::IsTerminator>() ||
+        term->getNumOperands() != o->getNumResults())
+      NoBlock("a callee with no matching terminator");
+    for (unsigned i = 0; i < o->getNumOperands(); i++) {
+      mlir::Value param = body.getArgument(i);
+      auto had = binds_.find(param);
+      if (had != binds_.end() && had->second != o->getOperand(i))
+        NoBlock("a callee invoked more than once in one subtree");
+      binds_[param] = o->getOperand(i);
+    }
+    bodies_.insert(&body);
+    for (unsigned i = 0; i < o->getNumResults(); i++)
+      Demand(term->getOperand(i), true, p);
+  }
+
+  const QmmMatch& m_;
+  const PackContext& ctx_;
+  llvm::DenseMap<mlir::Value, int> main_args_;
+  int64_t lead_ = 0;
+  int64_t step_ = 0;
+  // The whole-evaluation memo (qmm.py `_Source.memo`), and the per-root
+  // blocking analysis with the Programs it produced.  Keyed by the value's
+  // opaque pointer in an ordered map: `PlanFor` hands back a reference, and a
+  // DenseMap's would not survive the next insertion.
+  std::map<const void*, mx::array> whole_;
+  std::map<const void*, Plan> plans_;
+  std::map<std::pair<const void*, int64_t>, std::shared_ptr<Program>> progs_;
+  // Scratch for one analysis.
+  llvm::DenseMap<mlir::Value, bool> demand_;
+  llvm::DenseMap<mlir::Value, mlir::Value> binds_;
+  llvm::DenseSet<mlir::Block*> bodies_;
+};
+
+// qmm.py `_cat`.
+mx::array Cat(const std::vector<mx::array>& parts) {
+  if (parts.size() == 1) return parts[0];
+  return mx::concatenate(parts, 0);
+}
+
 // qmm.py `_group_const`.
 bool GroupConst(const mx::array& x, int64_t gs) {
   const int64_t k = x.shape().back();
@@ -1034,50 +1527,77 @@ mx::array Join(mx::array out, const QmmMatch& m) {
   return out;
 }
 
-// qmm.py `_build_mxfp4_pack`.
-Pack BuildMxfp4(const QmmMatch& m, mx::array scale_map, mx::array values) {
+// qmm.py `_build_mxfp4_pack`: verify and repack an MXFP4 weight, one row block
+// at a time.  Each block's two factors are derived and dropped before the next
+// block is evaluated: the reconstruction is full weight size, what is kept
+// from it (a nibble per value, a byte per 32) is an eighth of that, and the
+// verification -- every value read back off the E2M1 grid by exact integer
+// equality, every group scale an exact power of two -- covers every element
+// either way.
+Pack BuildMxfp4(const QmmMatch& m, RowSource& src) {
   const int64_t gs = kMxfp4Group;
   if (m.K % gs)
     Bail(absl::StrFormat("K=%d is not a multiple of %d", m.K, gs));
   std::optional<mx::array> perm;
-  if (!GroupConst(scale_map, gs)) {
-    // The same interleaving story as the affine path: permuting the
-    // contraction axis on BOTH operands leaves the dot unchanged.
-    std::vector<int32_t> p;
-    if (Regroup(m.K, {&scale_map}, &p)) {
-      perm = HostPerm(p);
-      scale_map = TakeK(scale_map, *perm);
+  std::vector<mx::array> ws, sbs;
+  for (auto [lo, hi] : src.blocks()) {
+    {
+      mx::array scale_map = src.Rows(m.scale, lo, hi);
+      if (!GroupConst(scale_map, gs)) {
+        if (src.blocked())
+          // The permutation that un-interleaves the groups is a property of
+          // the whole contraction axis: hand this weight back to the
+          // unblocked path, which can see all of it.
+          NoBlock(absl::StrFormat(
+              "MXFP4 scales are not constant within a group of %d", gs));
+        // The same interleaving story as the affine path: permuting the
+        // contraction axis on BOTH operands leaves the dot unchanged.
+        std::vector<int32_t> p;
+        if (Regroup(m.K, {&scale_map}, &p)) {
+          perm = HostPerm(p);
+          scale_map = TakeK(scale_map, *perm);
+        }
+        if (!GroupConst(scale_map, gs))
+          Bail(absl::StrFormat(
+              "MXFP4 scales are not constant within a group of %d", gs));
+      }
+      sbs.push_back(Mxfp4ScaleBytes(GroupHeads(scale_map, gs)));
     }
-    if (!GroupConst(scale_map, gs))
-      Bail(absl::StrFormat("MXFP4 scales are not constant within a group of %d",
-                           gs));
+    src.Drop(m.scale);
+    {
+      mx::array values = src.Rows(m.codes, lo, hi);
+      if (perm.has_value()) values = TakeK(values, *perm);
+      // The E2M1 nibble order is MLX's: element i of a row occupies bits
+      // [4i, 4i+4) of the little-endian uint32 stream.
+      ws.push_back(PackCodes(Mxfp4Codes(values), 4));
+    }
+    src.Drop(m.codes);
+    mx::eval(ws.back(), sbs.back());
   }
-  Pack pk{mx::array(0.0f), mx::array(0.0f), std::nullopt, std::nullopt, gs, 4,
-          1};
-  mx::array sb = Mxfp4ScaleBytes(GroupHeads(scale_map, gs));
-  if (perm.has_value()) values = TakeK(values, *perm);
-  // The E2M1 nibble order is MLX's: element i of a row occupies bits
-  // [4i, 4i+4) of the little-endian uint32 stream.
-  mx::array w = PackCodes(Mxfp4Codes(values), 4);
-  mx::eval(w, sb);
-  pk.w = Join(w, m);
-  pk.scales = Join(sb, m);
-  pk.perm = perm;
+  Pack pk{Join(Cat(ws), m), Join(Cat(sbs), m), std::nullopt, perm, gs, 4, 1};
   return pk;
 }
 
-// qmm.py `_build_affine_pack`.
-Pack BuildAffine(const QmmMatch& m, mx::array codes,
-                 std::optional<mx::array> scale_map,
-                 std::optional<mx::array> zero_map,
-                 std::optional<mx::array> recip_scale) {
+// qmm.py `_build_affine_pack`: verify and repack a `scale * (code - zero)`
+// weight, block at a time.
+Pack BuildAffine(const QmmMatch& m, RowSource& src) {
   // The code range first: the offset that makes the codes unsigned has to be
-  // one number for the whole weight.
-  mx::array lo_a = mx::min(codes, false);
-  mx::array hi_a = mx::max(codes, false);
-  mx::eval(lo_a, hi_a);
-  const int64_t lo = mx::astype(lo_a, mx::int32).item<int>();
-  const int64_t hi = mx::astype(hi_a, mx::int32).item<int>();
+  // one number for the whole weight, so the codes are walked twice -- free
+  // unblocked (`RowSource` memoizes the one evaluation), a second pass over
+  // the subtree when blocked, which is the price of not holding it.
+  int64_t lo = 0, hi = 0;
+  bool have_range = false;
+  for (auto [blo, bhi] : src.blocks()) {
+    mx::array codes = src.Rows(m.codes, blo, bhi);
+    mx::array lo_a = mx::min(codes, false);
+    mx::array hi_a = mx::max(codes, false);
+    mx::eval(lo_a, hi_a);
+    const int64_t clo = mx::astype(lo_a, mx::int32).item<int>();
+    const int64_t chi = mx::astype(hi_a, mx::int32).item<int>();
+    lo = have_range ? std::min(lo, clo) : clo;
+    hi = have_range ? std::max(hi, chi) : chi;
+    have_range = true;
+  }
   int64_t bits;
   if (hi - lo < 16) {
     bits = 4;
@@ -1098,7 +1618,7 @@ Pack BuildAffine(const QmmMatch& m, mx::array codes,
   std::optional<mx::array> zeros;
   int64_t gs = 0;
   if (m.recip) {
-    mx::array s = *recip_scale;
+    mx::array s = src.Whole(m.scale);
     // A reciprocal is rarely exact in bf16, so "auto" widens to f32 here.
     scale_dtype = s.dtype();
     std::vector<int64_t> dims = m.bcast_dims;
@@ -1132,37 +1652,52 @@ Pack BuildAffine(const QmmMatch& m, mx::array codes,
         scales, mx::Shape{static_cast<mx::ShapeElem>(m.N),
                           static_cast<mx::ShapeElem>(m.K / gs)});
   } else {
+    // Heads at the SMALLEST legal group size, per block; the group size the
+    // whole weight allows is then read off the heads, which are 32x smaller
+    // than the maps and can be held for every block at once.
     const int64_t g0 = kMinGroup;
-    mx::array smap = *scale_map;
-    if (!GroupConst(smap, g0) ||
-        (zero_map.has_value() && !GroupConst(*zero_map, g0))) {
-      // The groups may still be there, interleaved: recover the permutation
-      // that makes them contiguous and re-verify EXACTLY (the clustering is
-      // only a proposal -- the constancy check on the permuted maps is what
-      // the pack's exactness rests on).
-      std::vector<const mx::array*> maps{&smap};
-      if (zero_map.has_value()) maps.push_back(&*zero_map);
-      std::vector<int32_t> p;
-      std::string note;
-      if (Regroup(m.K, maps, &p)) {
-        perm = HostPerm(p);
-        // Rebind as each permuted copy lands: these are full weight size.
-        smap = TakeK(smap, *perm);
-        if (zero_map.has_value()) zero_map = TakeK(*zero_map, *perm);
-        note = " (even regrouped)";
-      }
+    std::vector<mx::array> sheads, zheads;
+    for (auto [blo, bhi] : src.blocks()) {
+      mx::array smap = src.Rows(m.scale, blo, bhi);
+      std::optional<mx::array> zmap;
+      if (m.zero != nullptr) zmap = src.Rows(m.zero, blo, bhi);
       if (!GroupConst(smap, g0) ||
-          (zero_map.has_value() && !GroupConst(*zero_map, g0)))
-        Bail(absl::StrCat("scales/zeros are not constant within any group",
-                          note));
+          (zmap.has_value() && !GroupConst(*zmap, g0))) {
+        if (src.blocked())
+          NoBlock(absl::StrFormat(
+              "scales/zeros are not constant within a group of %d", g0));
+        // The groups may still be there, interleaved: recover the permutation
+        // that makes them contiguous and re-verify EXACTLY (the clustering is
+        // only a proposal -- the constancy check on the permuted maps is what
+        // the pack's exactness rests on).
+        std::vector<const mx::array*> maps{&smap};
+        if (zmap.has_value()) maps.push_back(&*zmap);
+        std::vector<int32_t> p;
+        std::string note;
+        if (Regroup(m.K, maps, &p)) {
+          perm = HostPerm(p);
+          // Rebind as each permuted copy lands: these are full weight size,
+          // and holding the originals as well would raise the peak by one
+          // whole map each.
+          smap = TakeK(smap, *perm);
+          if (zmap.has_value()) zmap = TakeK(*zmap, *perm);
+          note = " (even regrouped)";
+        }
+        if (!GroupConst(smap, g0) ||
+            (zmap.has_value() && !GroupConst(*zmap, g0)))
+          Bail(absl::StrCat("scales/zeros are not constant within any group",
+                            note));
+      }
+      scale_dtype = smap.dtype();
+      sheads.push_back(GroupHeads(smap, g0));
+      if (zmap.has_value()) zheads.push_back(GroupHeads(*zmap, g0));
+      mx::eval(sheads.back());
+      if (!zheads.empty()) mx::eval(zheads.back());
+      src.Drop(m.scale);
+      src.Drop(m.zero);
     }
-    scale_dtype = smap.dtype();
-    scales = GroupHeads(smap, g0);
-    if (zero_map.has_value()) zeros = GroupHeads(*zero_map, g0);
-    mx::eval(scales);
-    if (zeros.has_value()) mx::eval(*zeros);
-    scale_map.reset();
-    zero_map.reset();
+    scales = Cat(sheads);
+    if (!zheads.empty()) zeros = Cat(zheads);
     gs = PickGroupHeads(m.K, scales, zeros.has_value() ? &*zeros : nullptr);
     if (gs == 0) Bail("scales/zeros are not constant within any group");
     if (gs != g0) {
@@ -1194,12 +1729,19 @@ Pack BuildAffine(const QmmMatch& m, mx::array codes,
     if (zeros.has_value()) mx::eval(*zeros);
   }
 
-  if (perm.has_value()) codes = TakeK(codes, *perm);
-  mx::array w = PackCodes(
-      mx::add(mx::astype(mx::contiguous(codes), mx::int32),
-              mx::array(static_cast<int>(offset), mx::int32)),
-      bits);
-  mx::eval(w);
+  std::vector<mx::array> ws;
+  for (auto [blo, bhi] : src.blocks()) {
+    {
+      mx::array codes = src.Rows(m.codes, blo, bhi);
+      if (perm.has_value()) codes = TakeK(codes, *perm);
+      ws.push_back(PackCodes(
+          mx::add(mx::astype(mx::contiguous(codes), mx::int32),
+                  mx::array(static_cast<int>(offset), mx::int32)),
+          bits));
+    }
+    src.Drop(m.codes);
+    mx::eval(ws.back());
+  }
   mx::array out_scales = mx::array(0.0f);
   mx::array out_biases = mx::array(0.0f);
   ScaleBias(scales, zeros.has_value() ? &*zeros : nullptr, offset, scale_dtype,
@@ -1207,9 +1749,448 @@ Pack BuildAffine(const QmmMatch& m, mx::array codes,
   // Materialize: a lazy packed weight would pin the whole reconstruction graph
   // (and its full-size intermediates) for the life of the cache.
   mx::eval(out_scales, out_biases);
-  Pack pk{Join(w, m), Join(out_scales, m), Join(out_biases, m), perm, gs, bits,
-          0};
+  Pack pk{Join(Cat(ws), m), Join(out_scales, m), Join(out_biases, m), perm, gs,
+          bits, 0};
   return pk;
+}
+
+// qmm.py `_build_pack`: verify and repack one match's weight, on the concrete
+// argument buffers.  A subtree the blocking cannot follow falls back to a
+// whole evaluation, where `blocks()` yields one block covering everything and
+// the two packers above are unchanged.
+Pack BuildPack(const QmmMatch& m, RowSource& src, bool* was_blocked) {
+  while (true) {
+    try {
+      NoCache no_cache;
+      Pack pk = m.mode == 1 ? BuildMxfp4(m, src) : BuildAffine(m, src);
+      *was_blocked = src.blocked();
+      return pk;
+    } catch (const NotBlockable& e) {
+      if (!src.blocked()) Bail(absl::StrCat("not blockable: ", e.why));
+      Debug(absl::StrCat(m.name, " packs from a whole evaluation (", e.why,
+                         ")"));
+      src.unblock();
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// the cross-executable build cache (qmm.py, same section)
+// --------------------------------------------------------------------------
+//
+// A pack is a deterministic pure function of exactly two things: the argument
+// buffers its reconstruction reads, and the reconstruction itself.  Two
+// EXECUTABLES over one model share the first and duplicate the second --
+// keras-hub compiles a separate generate program per sequence-length shape,
+// and each gets its own plan whose matches hold no packs, so every weight was
+// re-evaluated and re-verified from nothing (0.9 s x 94 packs on gpt-oss-20b,
+// once per executable shape, and a full pack set live per shape).
+//
+// Reuse is sound only when both halves are PROVABLY the same, so the key is a
+// canonical serialization of the reconstruction plus the identity of the
+// buffers it bottoms out on.  Anything the serialization cannot cover exactly
+// declines to be cached and is built exactly as before -- declining is free,
+// and it is the only thing standing between "we can prove it" and a wrong
+// weight.  Verification itself is never weakened: a miss runs the full build,
+// every element checked.
+
+// One attribute's COMPLETE text, or a decline (qmm.py `_attr_text`).  Complete
+// is the whole point.  A `dense_resource` prints its blob name and two modules
+// can bind one name to different bytes, so it can never stand in for its
+// contents; a big dense attribute could be printed in full, but reading it is
+// the cost the cache exists to avoid.
+std::string AttrText(mlir::Operation* o, llvm::StringRef name,
+                     mlir::Attribute attr) {
+  if (auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(attr)) {
+    // A splat carries one element however big its type says it is.
+    if (!dense.isSplat()) {
+      auto st = mlir::dyn_cast<mlir::ShapedType>(dense.getType());
+      const int64_t n = (st && st.hasStaticShape()) ? st.getNumElements() : -1;
+      if (n < 0 || n > kFpDenseElems)
+        NoFp(absl::StrCat(OpName(o), " carries ", n, " constant elements"));
+    }
+  } else if (OpName(o) == "stablehlo.constant") {
+    // An encoding whose size cannot be read off a DenseElementsAttr -- the
+    // size has to come off the result type, before anything asks for text.
+    const int64_t n = Prod(ShapeOf(o->getResult(0)));
+    if (n > kFpDenseElems)
+      NoFp(absl::StrCat(OpName(o), " carries ", n,
+                        " constant elements this reader cannot size"));
+  }
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  attr.print(os);
+  os.flush();
+  if (s.size() > kFpAttrChars)
+    NoFp(absl::StrCat(OpName(o), "'s ", name.str(), " prints ", s.size(),
+                      " characters"));
+  if (s.find("dense_resource<") != std::string::npos)
+    NoFp(absl::StrCat(OpName(o), "'s ", name.str(),
+                      " is a dense_resource (its contents are not in the IR)"));
+  return s;
+}
+
+// qmm.py `_Fingerprint`: a canonical serialization of what a pack gets built
+// from.  Deterministic by construction, and independent of everything that is
+// not the computation: values are named by the order THIS walk reaches them
+// (never by SSA name), operands in operand order, attributes sorted by name
+// and printed in full, callees serialized through their BODY -- jax renumbers
+// private helpers per program, so `@_take` and `@_take_0` have to fingerprint
+// identically when their bodies agree, and two modules that bind one name to
+// different bodies must not.
+class Fingerprint {
+ public:
+  Fingerprint(mlir::ModuleOp module, mlir::Block* main) : module_(module) {
+    for (mlir::BlockArgument a : main->getArguments())
+      main_args_[a] = static_cast<int>(a.getArgNumber());
+  }
+
+  std::string text() const { return parts_; }
+  const std::vector<int>& leaves() const { return leaves_; }
+  void Append(const std::string& s) { parts_ += s; }
+
+  // `v` and everything under it (the demand-driven half of the walk).
+  void Value(mlir::Value v) {
+    if (sealed_)
+      // A callee body is serialized ONCE and reused for every call of it, so
+      // it must not name anything from a caller.  Functions are isolated from
+      // above, so this cannot fire -- but a body that somehow did capture
+      // would otherwise be memoized with one caller's operands baked in.
+      NoFp("a callee body reads a value from its caller");
+    auto it = ids_.find(v);
+    if (it != ids_.end()) {
+      absl::StrAppend(&parts_, "#", it->second, ";");
+      return;
+    }
+    ids_[v] = static_cast<int>(ids_.size());
+    if (mlir::isa<mlir::BlockArgument>(v)) {
+      auto arg = main_args_.find(v);
+      if (arg == main_args_.end()) {
+        mlir::Value outer = Hoist(v);
+        if (outer == v) NoFp("an unbound block argument");
+        parts_ += "carry(";
+        Value(outer);
+        parts_ += ");";
+        return;
+      }
+      // Leaves are numbered by the walk, not by their argument position: two
+      // programs may take one model's weights in different orders, and the
+      // reconstruction is what has to match.
+      absl::StrAppend(&parts_, "leaf", leaves_.size(), ":", TypeText(v), ";");
+      leaves_.push_back(arg->second);
+      return;
+    }
+    mlir::Operation* o = Owner(v);
+    if (o == nullptr) NoFp("a value that is neither argument nor result");
+    absl::StrAppend(&parts_, "r", ResultNumber(v), "=");
+    Head(o);
+    parts_ += "(";
+    for (mlir::Value x : o->getOperands()) Value(x);
+    parts_ += ")";
+    llvm::DenseMap<mlir::Value, int> ids;
+    Regions(o, ids);
+  }
+
+  // `o`'s name, result types and attributes -- everything but operands.
+  void Head(mlir::Operation* o) {
+    absl::StrAppend(&parts_, OpName(o), "[");
+    for (mlir::Value r : o->getResults())
+      absl::StrAppend(&parts_, TypeText(r), ",");
+    parts_ += ":";
+    std::vector<std::pair<std::string, mlir::Attribute>> named;
+    for (mlir::NamedAttribute na : o->getAttrs())
+      named.emplace_back(na.getName().str(), na.getValue());
+    std::sort(named.begin(), named.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    const bool call = OpName(o) == "func.call";
+    for (const auto& [name, attr] : named) {
+      // The callee's BODY stands in for its name (see `Callee`); printing the
+      // symbol as well would make two copies of one helper fingerprint
+      // differently for no reason.
+      if (call && name == "callee") continue;
+      absl::StrAppend(&parts_, name, "=", AttrText(o, name, attr), ",");
+    }
+    parts_ += "]";
+  }
+
+  // `o`'s regions, walked top to bottom with their own numbering.  Reduce
+  // bodies and sort comparators live here; the prologue evaluates them, so
+  // what they compute is part of what the pack is.
+  void Regions(mlir::Operation* o, llvm::DenseMap<mlir::Value, int>& ids) {
+    if (OpName(o) == "func.call") parts_ += Callee(o);
+    for (mlir::Region& region : o->getRegions()) {
+      parts_ += "{";
+      for (mlir::Block& blk : region.getBlocks()) {
+        parts_ += "|";
+        for (mlir::BlockArgument a : blk.getArguments()) {
+          ids[a] = static_cast<int>(ids.size());
+          absl::StrAppend(&parts_, "p", ids[a], ";");
+        }
+        for (mlir::Operation& inner : blk) BodyOp(&inner, ids);
+      }
+      parts_ += "}";
+    }
+  }
+
+  // One op of a region or callee body, in source order.
+  void BodyOp(mlir::Operation* o, llvm::DenseMap<mlir::Value, int>& ids) {
+    Head(o);
+    parts_ += "(";
+    for (mlir::Value x : o->getOperands()) {
+      auto got = ids.find(x);
+      if (got == ids.end()) {
+        // A value the region captures from outside: name it in the walk that
+        // owns it, so one capture reads the same either way.
+        Value(x);
+      } else {
+        absl::StrAppend(&parts_, "%", got->second, ";");
+      }
+    }
+    parts_ += ")";
+    Regions(o, ids);
+    for (mlir::Value r : o->getResults()) ids[r] = static_cast<int>(ids.size());
+    parts_ += ";";
+  }
+
+  std::string Callee(mlir::Operation* o) {
+    auto sym = o->getAttrOfType<mlir::FlatSymbolRefAttr>("callee");
+    if (!sym) NoFp("a call with no resolvable callee");
+    const std::string name = sym.getValue().str();
+    auto got = callees_.find(name);
+    if (got != callees_.end()) {
+      if (got->second == kWalking)
+        NoFp(absl::StrCat("callee @", name, " is recursive"));
+      return got->second;
+    }
+    auto fn = module_.lookupSymbol<mlir::func::FuncOp>(sym.getValue());
+    if (!fn) NoFp(absl::StrCat("callee @", name, " is not in the module"));
+    callees_[name] = kWalking;
+    std::string outer = std::move(parts_);
+    const bool sealed = sealed_;
+    parts_.clear();
+    sealed_ = true;
+    std::string body;
+    try {
+      llvm::DenseMap<mlir::Value, int> ids;
+      Regions(fn.getOperation(), ids);
+      body = parts_;
+    } catch (...) {
+      parts_ = std::move(outer);
+      sealed_ = sealed;
+      callees_.erase(name);
+      throw;
+    }
+    parts_ = std::move(outer);
+    sealed_ = sealed;
+    callees_[name] = body;
+    return body;
+  }
+
+ private:
+  static std::string TypeText(mlir::Value v) {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    v.getType().print(os);
+    os.flush();
+    return s;
+  }
+  static int ResultNumber(mlir::Value v) {
+    auto r = mlir::dyn_cast<mlir::OpResult>(v);
+    return r ? static_cast<int>(r.getResultNumber()) : 0;
+  }
+
+  static constexpr const char* kWalking = "\x01walking";
+
+  mlir::ModuleOp module_;
+  llvm::DenseMap<mlir::Value, int> main_args_;
+  llvm::DenseMap<mlir::Value, int> ids_;
+  std::vector<int> leaves_;
+  std::map<std::string, std::string> callees_;
+  std::string parts_;
+  bool sealed_ = false;
+};
+
+// qmm.py `_fingerprint`: (serialization, leaf argument positions) for `m`'s
+// pack inputs.  What goes in is exactly what the pack build reads.  The
+// ACTIVATION side of the dot does not: `m.M`, `m.mshape` and `m.lperm`
+// describe the other operand, they are precisely what makes two executables of
+// one model differ, and no packed byte depends on them.
+bool FingerprintOf(const QmmMatch& m, const PackContext& ctx, std::string* text,
+                   std::vector<int>* leaves, std::string* why) {
+  try {
+    Fingerprint fp(ctx.module, ctx.main);
+    fp.Append("qmm1|");
+    absl::StrAppend(text, "");
+    std::string head = absl::StrCat(
+        m.mode, "|", m.K, "|", m.N, "|", absl::StrJoin(m.bshape, ","), "|",
+        absl::StrJoin(m.rshape, ","), "|", absl::StrJoin(m.rperm, ","), "|",
+        absl::StrJoin(m.nshape, ","), "|", m.recip ? 1 : 0, "|",
+        m.has_sub_range ? 1 : 0, "|", m.sub_lo, "|", m.sub_hi, "|",
+        absl::StrJoin(m.bcast_dims, ","), "|");
+    fp.Append(head);
+    for (mlir::Operation* o : m.post) {
+      // The shape ops between the reconstruction and the dot: their result
+      // shapes and permutations are read off the IR by `ToRows`.
+      fp.Append(absl::StrCat(absl::StrJoin(ShapeOf(o->getOperand(0)), ","),
+                             "->"));
+      fp.Head(o);
+      fp.Append("|");
+    }
+    fp.Append("codes:");
+    fp.Value(m.codes);
+    fp.Append("scale:");
+    fp.Value(m.scale);
+    if (m.zero != nullptr) {
+      fp.Append("zero:");
+      fp.Value(m.zero);
+    }
+    *text = fp.text();
+    *leaves = fp.leaves();
+    return true;
+  } catch (const NoFingerprint& e) {
+    *why = e.why;
+    return false;
+  } catch (const std::exception& e) {
+    *why = e.what();
+    return false;
+  }
+}
+
+// One built pack, and the identity of the buffers it was built from.
+//
+// Stage 1's entry is weak throughout -- a Python weakref hands the object
+// back, so an entry can keep neither the weights nor the pack alive.  MLX's
+// C++ array cannot be rebuilt from a weak handle, so the PACK is held
+// strongly here and the LEAVES weakly, through `data_shared_ptr`: an entry
+// whose source weight has been freed is swept, which is what happens when the
+// model is unloaded, and the bound below is what stops a config-sweeping
+// worker from growing this forever.
+//
+// The leaf identity is checked three ways on every hit.  `mx::array::id()` is
+// the address of a refcounted descriptor and CPython-style address recycling
+// applies to it exactly as it does in the Python (this project has twice
+// shipped a bug from a set keyed on an address alone), so the weak handle
+// proves the buffer is still alive, the data pointer proves it is the SAME
+// buffer, and the shape and dtype prove it is the same view of it.
+struct BuiltEntry {
+  struct Leaf {
+    std::uintptr_t id = 0;
+    std::weak_ptr<mx::array::Data> data;
+    const void* raw = nullptr;
+    std::vector<int64_t> shape;
+    uint32_t dtype = 0;
+  };
+  std::vector<Leaf> leaves;
+  std::optional<Pack> pack;
+  uint64_t serial = 0;
+};
+
+std::map<std::string, std::vector<BuiltEntry>>& BuiltCache() {
+  static auto* cache = new std::map<std::string, std::vector<BuiltEntry>>();
+  return *cache;
+}
+uint64_t g_built_serial = 0;
+PackStats g_pack_stats;
+// The cache and the counters are process-wide, and a pack wave normally runs
+// under the process-wide submission lock (metal_stream.h) -- but
+// METALJAX_CONCURRENT_EXECUTE=1 lifts that one, and a torn map would be a
+// crash rather than a slow program.  Held only around the map, never around a
+// build.
+std::mutex g_built_mu;
+
+bool LeafAlive(const BuiltEntry::Leaf& l) { return l.data.lock() != nullptr; }
+
+bool LeafMatches(const BuiltEntry::Leaf& l, const mx::array& a) {
+  if (l.id != a.id()) return false;
+  std::shared_ptr<mx::array::Data> live = l.data.lock();
+  if (live == nullptr || live.get() != l.raw) return false;
+  if (a.data_shared_ptr() == nullptr || a.data_shared_ptr().get() != l.raw)
+    return false;
+  if (l.shape != FromMxShape(a.shape())) return false;
+  return l.dtype == static_cast<uint32_t>(a.dtype().val());
+}
+
+int64_t CacheSize() {
+  int64_t n = 0;
+  for (const auto& [k, v] : BuiltCache()) n += static_cast<int64_t>(v.size());
+  return n;
+}
+
+// The pack this key was built for, or nothing.
+std::optional<Pack> CachedBuild(const std::string& key,
+                                const std::vector<mx::array>& leaves) {
+  if (kMaxBuilt <= 0) return std::nullopt;
+  std::lock_guard<std::mutex> lock(g_built_mu);
+  auto bucket = BuiltCache().find(key);
+  if (bucket == BuiltCache().end()) return std::nullopt;
+  for (BuiltEntry& e : bucket->second) {
+    if (e.leaves.size() != leaves.size()) continue;
+    bool same = true;
+    for (size_t i = 0; i < leaves.size() && same; i++)
+      same = LeafMatches(e.leaves[i], leaves[i]);
+    if (!same) continue;
+    e.serial = ++g_built_serial;
+    return e.pack;   // an optional<Pack>, which is what the caller wants
+  }
+  return std::nullopt;
+}
+
+void RememberBuild(const std::string& key, const std::vector<mx::array>& leaves,
+                   const Pack& pk) {
+  if (kMaxBuilt <= 0) return;
+  std::lock_guard<std::mutex> lock(g_built_mu);
+  BuiltEntry e;
+  e.leaves.reserve(leaves.size());
+  for (const mx::array& a : leaves) {
+    const std::shared_ptr<mx::array::Data>& data = a.data_shared_ptr();
+    // A leaf with no storage cannot be proven identical later; an argument of
+    // an execute always has some, so this is a decline and not a case.
+    if (data == nullptr) return;
+    BuiltEntry::Leaf l;
+    l.id = a.id();
+    l.data = data;
+    l.raw = data.get();
+    l.shape = FromMxShape(a.shape());
+    l.dtype = static_cast<uint32_t>(a.dtype().val());
+    e.leaves.push_back(std::move(l));
+  }
+  e.pack = pk;
+  e.serial = ++g_built_serial;
+  if (CacheSize() >= kMaxBuilt) {
+    // Dead entries first: a pack whose source weight is gone is stale, which
+    // is what an unloaded model looks like from here.
+    for (auto it = BuiltCache().begin(); it != BuiltCache().end();) {
+      auto& v = it->second;
+      v.erase(std::remove_if(v.begin(), v.end(),
+                             [](const BuiltEntry& x) {
+                               for (const auto& l : x.leaves)
+                                 if (!LeafAlive(l)) return true;
+                               return false;
+                             }),
+              v.end());
+      it = v.empty() ? BuiltCache().erase(it) : std::next(it);
+    }
+    // ...then the least recently used, one at a time: a bound that never
+    // clears the whole cache keeps a steady-state model's packs resident.
+    while (CacheSize() >= kMaxBuilt) {
+      auto oldest = BuiltCache().end();
+      size_t at = 0;
+      uint64_t best = UINT64_MAX;
+      for (auto it = BuiltCache().begin(); it != BuiltCache().end(); ++it) {
+        for (size_t i = 0; i < it->second.size(); i++) {
+          if (it->second[i].serial < best) {
+            best = it->second[i].serial;
+            oldest = it;
+            at = i;
+          }
+        }
+      }
+      if (oldest == BuiltCache().end()) break;
+      oldest->second.erase(oldest->second.begin() + at);
+      if (oldest->second.empty()) BuiltCache().erase(oldest);
+    }
+  }
+  BuiltCache()[key].push_back(std::move(e));
 }
 
 }  // namespace
@@ -1226,6 +2207,21 @@ bool QmmEnabled() {
 bool RecognizeEnabled() {
   static const bool on = !EnvOff("METALJAX_RECOGNIZE");
   return on;
+}
+
+const absl::flat_hash_set<std::string>& RowLocalOps() { return RowLocalNames(); }
+
+PackStats QmmPackStats() {
+  std::lock_guard<std::mutex> lock(g_built_mu);
+  PackStats out = g_pack_stats;
+  out.entries = CacheSize();
+  return out;
+}
+
+void ResetQmmPackStats() {
+  std::lock_guard<std::mutex> lock(g_built_mu);
+  g_pack_stats = PackStats{};
+  BuiltCache().clear();
 }
 
 mlir::Value HoistInvariant(mlir::Value v) { return Hoist(v); }
@@ -1300,31 +2296,58 @@ void AnalyzeQmm(mlir::func::FuncOp fn, const absl::flat_hash_set<int>& donated,
   plan->rebuild();
 }
 
-absl::Status BuildQmmPacks(RewritePlan* plan, const SubtreeEval& eval) {
+absl::Status BuildQmmPacks(RewritePlan* plan, const PackContext& ctx) {
   plan->packs.clear();
   absl::flat_hash_set<int> args;
+  // What this wave of packs CLAIMS, which is the figure a memory watchdog
+  // reads and the one row-blocking exists to bound.  It is measured from the
+  // plugin's own libmlx: `mlx.core` in the host process is a different
+  // runtime and its counters read zero here (the P16 campaign's note).
+  const size_t peak_before = mx::get_peak_memory();
+  mx::reset_peak_memory();
   for (auto& m : plan->qmm) {
     if (m->disabled) continue;
     try {
-      NoCache no_cache;
-      // The three operand subtrees, evaluated on this execute's buffers.  A
-      // recip match's scale is NOT weight-shaped -- the graph divides the
-      // OUTPUT by it -- so it is evaluated on its own.
-      std::vector<mlir::Value> want{m->codes};
-      if (!m->recip) want.push_back(m->scale);
-      if (m->zero != nullptr) want.push_back(m->zero);
-      if (m->recip) want.push_back(m->scale);
-      absl::StatusOr<std::vector<mx::array>> got = eval(want, {});
-      if (!got.ok()) Bail(std::string(got.status().message()));
-      size_t at = 0;
-      mx::array codes = ToRows((*got)[at++], *m);
-      std::optional<mx::array> scale_map, zero_map, recip_scale;
-      if (!m->recip) scale_map = ToRows((*got)[at++], *m);
-      if (m->zero != nullptr) zero_map = ToRows((*got)[at++], *m);
-      if (m->recip) recip_scale = (*got)[at++];
-      Pack pk = m->mode == 1
-                    ? BuildMxfp4(*m, *scale_map, codes)
-                    : BuildAffine(*m, codes, scale_map, zero_map, recip_scale);
+      // Has this very reconstruction, over these very buffers, been built
+      // already in this process?  Two executables of one model -- keras-hub's
+      // per-shape generate programs, a prefill and its decode loop -- ask the
+      // same question of the same weights, and answering it twice costs both
+      // the build and a second copy of the pack.
+      std::string key, why;
+      std::vector<int> positions;
+      std::vector<mx::array> leaves;
+      bool cacheable = kMaxBuilt > 0 &&
+                       FingerprintOf(*m, ctx, &key, &positions, &why);
+      if (cacheable) {
+        for (int i : positions) {
+          if (i < 0 || i >= static_cast<int>(ctx.args->size())) {
+            cacheable = false;
+            break;
+          }
+          leaves.push_back((*ctx.args)[i]);
+        }
+      } else if (kMaxBuilt > 0) {
+        g_pack_stats.build_declines++;
+        Debug(absl::StrCat(m->name, " is not build-cached (", why, ")"));
+      }
+      std::optional<Pack> hit =
+          cacheable ? CachedBuild(key, leaves) : std::nullopt;
+      const bool reused = hit.has_value();
+      int64_t blocks = 1;
+      if (reused) {
+        g_pack_stats.build_hits++;
+      } else {
+        // The operand subtrees, evaluated on this execute's buffers one row
+        // block at a time (qmm.py `_Source`).
+        RowSource src(*m, ctx);
+        bool was_blocked = false;
+        hit = BuildPack(*m, src, &was_blocked);
+        blocks = static_cast<int64_t>(src.blocks().size());
+        g_pack_stats.build_misses++;
+        (was_blocked ? g_pack_stats.blocked : g_pack_stats.whole)++;
+        if (cacheable) RememberBuild(key, leaves, *hit);
+      }
+      const Pack& pk = *hit;
       m->gs = pk.gs;
       m->bits = pk.bits;
       m->mode = pk.mode;
@@ -1336,10 +2359,13 @@ absl::Status BuildQmmPacks(RewritePlan* plan, const SubtreeEval& eval) {
       if (pk.perm.has_value()) plan->packs.push_back(*pk.perm);
       m->nvals = static_cast<int>(plan->packs.size()) - m->slot;
       for (int i : m->arg_indices) args.insert(i);
-      Debug(absl::StrFormat("packed %s mode=%s bits=%d group=%d%s",
-                            m->name, pk.mode == 1 ? "mxfp4" : "affine",
-                            pk.bits, pk.gs,
-                            pk.perm.has_value() ? " regrouped" : ""));
+      Debug(absl::StrFormat("%s %s mode=%s bits=%d group=%d%s%s",
+                            reused ? "reused" : "packed", m->name,
+                            pk.mode == 1 ? "mxfp4" : "affine", pk.bits, pk.gs,
+                            pk.perm.has_value() ? " regrouped" : "",
+                            reused ? "" : (blocks > 1
+                                ? absl::StrFormat(" in %d row blocks", blocks)
+                                : std::string(" whole"))));
     } catch (const Reject& e) {
       m->disabled = true;
       Debug(absl::StrCat(m->name, " falls back to the literal chain (",
@@ -1353,6 +2379,17 @@ absl::Status BuildQmmPacks(RewritePlan* plan, const SubtreeEval& eval) {
   plan->pack_args.assign(args.begin(), args.end());
   std::sort(plan->pack_args.begin(), plan->pack_args.end());
   plan->rebuild();
+  const size_t peak = mx::get_peak_memory();
+  if (peak > g_pack_stats.peak_bytes) g_pack_stats.peak_bytes = peak;
+  Debug(absl::StrFormat("pack wave peak %.3f GB", peak / 1e9));
+  // The process-wide high-water mark is a shared diagnostic; put back
+  // whichever of the two is higher, so measuring the pack wave does not lower
+  // what anything else reads.
+  if (peak_before > peak) {
+    mx::reset_peak_memory();
+    Debug(absl::StrFormat("(the process peak was %.3f GB before this wave)",
+                          peak_before / 1e9));
+  }
   // The reconstruction ran at full weight size; its intermediates are dead
   // now and Metal counts live buffers, not bytes.
   gc_collect();

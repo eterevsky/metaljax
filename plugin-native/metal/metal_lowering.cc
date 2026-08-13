@@ -1644,6 +1644,15 @@ class Lowering {
       mlir::Block& main, const std::vector<mlir::Value>& roots,
       const std::vector<mlir::Value>& bound);
 
+  // P19: the same cone, narrowed to `c` rows of the weight's leading axis
+  // (qmm.py `_Source`).  Every value of `blocked` is lowered as if that axis
+  // were `c` long, so the Program computes one BLOCK of the root from blocks
+  // of the arguments -- which is the whole memory saving: the reconstruction
+  // is several times the weight it packs, and it never has to exist at once.
+  absl::StatusOr<std::shared_ptr<Program>> LowerConeBlocked(
+      mlir::Block& main, const std::vector<mlir::Value>& roots,
+      const llvm::DenseSet<mlir::Value>& blocked, int64_t c);
+
  private:
   struct Pending {
     int op;
@@ -1898,6 +1907,17 @@ class Lowering {
   LowerContext* ctx_;
   llvm::DenseMap<mlir::Value, int> slots_;
   int nslots_ = 0;
+  // P19: the row-blocked prologue (qmm.py `_Source`).  While these are set,
+  // every value of `row_blocked_` is lowered as if its LEADING axis were
+  // `row_c_` rows rather than the extent the IR declares -- which is what
+  // `Dims` hands out and what every shape an attribute carries is derived
+  // from.  The set is the caller's (`RowSource` decides which values may be
+  // narrowed, by qmm.py's row-locality rules); nothing here re-derives it.
+  const llvm::DenseSet<mlir::Value>* row_blocked_ = nullptr;
+  int64_t row_c_ = 0;
+  bool Narrowed(mlir::Value v) const {
+    return row_blocked_ != nullptr && row_blocked_->contains(v);
+  }
   // The packed quantized weights, as slots of this frame: trailing arguments
   // of its Program, after the block's own and after the captures.  They are
   // arrays rather than SSA values, and they are INPUTS rather than constants
@@ -1961,6 +1981,14 @@ absl::StatusOr<std::vector<int64_t>> Lowering::Dims(mlir::Value v) {
   for (int64_t d : t.getShape()) {
     if (d < 0) return Decline("a dynamic dimension");
     dims.push_back(d);
+  }
+  // P19: a value the row-blocked prologue narrowed carries `row_c_` rows.
+  // This is the ONE place a declared shape enters a lowering, so overriding
+  // it here is what makes every derived shape -- a reshape's target, a
+  // broadcast's interim, a gather's batch shape -- describe the block.
+  if (Narrowed(v)) {
+    if (dims.empty()) return Decline("a rank-0 value in a row block");
+    dims[0] = row_c_;
   }
   return dims;
 }
@@ -2163,6 +2191,15 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerSlice(
                                sl.getStrides().end());
   if (starts.size() != limits.size() || starts.size() != strides.size())
     return Decline("slice attribute ranks disagree");
+  // P19: the one attribute that names the blocked axis by extent rather than
+  // by shape.  `RowSource` only narrows a slice that leaves the leading axis
+  // whole, and the same three conditions are re-asserted here: a slice that
+  // cut it would read the wrong rows of the block, silently.
+  if (Narrowed(op->getResult(0))) {
+    if (starts.empty() || starts[0] != 0 || strides[0] != 1)
+      return Decline("a row-blocked slice that cuts the blocked axis");
+    limits[0] = row_c_;
+  }
   std::vector<int64_t> attrs{static_cast<int64_t>(starts.size())};
   attrs.insert(attrs.end(), starts.begin(), starts.end());
   attrs.insert(attrs.end(), limits.begin(), limits.end());
@@ -5054,6 +5091,31 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   const llvm::StringRef ref = op->getName().getStringRef();
   const absl::string_view name = View(ref);
 
+  // P19: the row-blocked prologue's second lock.  `RowSource` decides which
+  // values may be narrowed and by which rule; this asserts the consequence
+  // in the file that does the emitting -- an op that READS a block must hand
+  // back a block, and only an op from the row-local set may be narrowed at
+  // all.  Both are already true of the set `RowSource` builds, and a
+  // disagreement between the two would otherwise be a silently wrong weight
+  // rather than a decline (the pack's exactness checks pass happily on
+  // whatever rows they are shown).
+  if (row_blocked_ != nullptr) {
+    bool reads = false, writes = false, all_written = true;
+    for (mlir::Value v : op->getOperands()) reads = reads || Narrowed(v);
+    for (mlir::Value r : op->getResults()) {
+      if (Narrowed(r)) {
+        writes = true;
+      } else {
+        all_written = false;
+      }
+    }
+    if (writes && !RowLocalOps().contains(name))
+      return Decline(absl::StrCat("a row-blocked ", name));
+    if (reads && (!writes || !all_written))
+      return Decline(absl::StrCat("a row block read by ", name,
+                                  ", which does not keep it"));
+  }
+
   // What each op DOES, per the recognizers' plan (M4; the Python engine asks
   // `metaljax.interpreter._rewrite_plan` the same question here).  An absorbed
   // op is not executed and gets no slot -- so no static last use can land on
@@ -5793,6 +5855,18 @@ absl::StatusOr<std::shared_ptr<Program>> Lowering::LowerCone(
   return built.program;
 }
 
+absl::StatusOr<std::shared_ptr<Program>> Lowering::LowerConeBlocked(
+    mlir::Block& main, const std::vector<mlir::Value>& roots,
+    const llvm::DenseSet<mlir::Value>& blocked, int64_t c) {
+  if (c <= 0) return Decline("a row block of no rows");
+  row_blocked_ = &blocked;
+  row_c_ = c;
+  absl::StatusOr<std::shared_ptr<Program>> out = LowerCone(main, roots, {});
+  row_blocked_ = nullptr;
+  row_c_ = 0;
+  return out;
+}
+
 absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
   if (fn.getBody().getBlocks().size() != 1)
     return Decline("a main function with several blocks");
@@ -6016,7 +6090,26 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
                      cone.LowerCone(block, roots, pinned));
     return prog->run(std::move(ins));
   };
-  absl::Status packed = BuildQmmPacks(&plan, eval);
+  // ...and the row-blocked form of the same thing (P19).  The LowerContext
+  // has to outlive the Program -- a tape holds arrays and integers, but the
+  // lowering that builds one reads the module the context names -- so the
+  // sub-contexts live in a list the builder owns for the whole pack wave.
+  std::vector<std::unique_ptr<LowerContext>> cone_ctxs;
+  BlockedConeBuilder blocked_cone =
+      [&](const std::vector<mlir::Value>& roots,
+          const llvm::DenseSet<mlir::Value>& blocked,
+          int64_t c) -> absl::StatusOr<std::shared_ptr<Program>> {
+    cone_ctxs.push_back(std::make_unique<LowerContext>(LowerContext{module}));
+    Lowering cone(cone_ctxs.back().get());
+    return cone.LowerConeBlocked(block, roots, blocked, c);
+  };
+  PackContext pctx;
+  pctx.main = &block;
+  pctx.args = &args;
+  pctx.module = module;
+  pctx.eval = eval;
+  pctx.blocked_cone = blocked_cone;
+  absl::Status packed = BuildQmmPacks(&plan, pctx);
   if (!packed.ok()) return packed;
   // ...and the router check, which is a value question too (moe.py's is in
   // the same eager prologue, for the same reason: it syncs with the host).

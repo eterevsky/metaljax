@@ -41,9 +41,11 @@ Licensed under the Apache License, Version 2.0.
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "mlx/mlx.h"
+#include "program.h"
 
 namespace metaljax {
 
@@ -275,6 +277,35 @@ using SubtreeEval = std::function<absl::StatusOr<std::vector<mx::array>>(
     const std::vector<mlir::Value>& roots,
     const std::vector<std::pair<mlir::Value, mx::array>>& bound)>;
 
+// P19: the same cone, NARROWED to one block of the weight's rows (qmm.py
+// `_Source`).  `blocked` names every value of the cone whose leading axis IS
+// the weight's row axis; the Program that comes back declares those values
+// with `c` rows instead of the full extent, so running it on @main's
+// arguments -- with every blocked ARGUMENT sliced to the same `c` rows --
+// computes exactly that slice of the root.  Which values may be blocked is
+// decided by the caller (`RowSource`, whose rules are qmm.py `_Source._op`'s);
+// this builder only follows the set it is handed.
+//
+// It hands back the Program rather than its outputs because one Program
+// serves every block of the same width: the blocks of a weight differ only in
+// which rows the leaf slices name.
+using BlockedConeBuilder =
+    std::function<absl::StatusOr<std::shared_ptr<Program>>(
+        const std::vector<mlir::Value>& roots,
+        const llvm::DenseSet<mlir::Value>& blocked, int64_t c)>;
+
+// Everything the pack build needs from the lowering that asked for it.
+struct PackContext {
+  // @main's single block, and this execute's buffers for its arguments.
+  mlir::Block* main = nullptr;
+  const std::vector<mx::array>* args = nullptr;
+  // The module, for the fingerprint's callee lookup (a call is serialized
+  // through its BODY: jax renumbers private helpers per program).
+  mlir::ModuleOp module;
+  SubtreeEval eval;
+  BlockedConeBuilder blocked_cone;
+};
+
 // Structural analysis of one module: never touches a value.  Fills `plan`
 // with the matches that are worth rewriting, in the order the walk found
 // them.  `donated` are the argument positions the caller may reuse -- a
@@ -305,7 +336,32 @@ absl::Status VerifyMoe(RewritePlan* plan, const SubtreeEval& eval);
 // weight fails any exactness check is DISABLED (its chain then lowers
 // literally) rather than packed approximately; `plan->packs` comes back
 // holding the arrays the tape's trailing inputs take.
-absl::Status BuildQmmPacks(RewritePlan* plan, const SubtreeEval& eval);
+absl::Status BuildQmmPacks(RewritePlan* plan, const PackContext& ctx);
+
+// The cross-executable build cache's counters (P19), for the tests: a pack is
+// a pure function of the reconstruction and the buffers it reads, so two
+// EXECUTABLES over one model share it.  `blocked` counts the weights that
+// packed one row block at a time and `whole` the ones that fell back.
+struct PackStats {
+  int64_t build_hits = 0;      // a pack another executable had already built
+  int64_t build_misses = 0;    // ...and one this process built here
+  int64_t build_declines = 0;  // a reconstruction the fingerprint cannot cover
+  int64_t blocked = 0;
+  int64_t whole = 0;
+  int64_t entries = 0;         // how many packs the cache holds right now
+  // The highest CLAIMED device memory any one pack wave reached, read from
+  // the plugin's own libmlx (the host process's `mlx.core` is a different
+  // runtime and reads zero).  This is the figure row-blocking bounds.
+  uint64_t peak_bytes = 0;
+};
+PackStats QmmPackStats();
+void ResetQmmPackStats();
+
+// P19: the ops a row-blocked prologue may narrow (qmm.py `_ROW_LOCAL` plus
+// the five whose row-locality is a rule about their dimension attributes).
+// The pack build decides which VALUES are narrowed; the lowering asserts
+// against this that nothing outside the set ever is.
+const absl::flat_hash_set<std::string>& RowLocalOps();
 
 // The environment knobs, read once (METALJAX_QMM, METALJAX_SDPA,
 // METALJAX_RECOGNIZE).

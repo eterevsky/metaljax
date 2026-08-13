@@ -27,6 +27,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 
 import ml_dtypes
 import numpy as np
@@ -2666,6 +2667,275 @@ def _declines():
 # memory.  Each returns (ok, detail).
 
 
+# --------------------------------------------------------------------------
+# P19: the row-blocked packer and the cross-executable build cache
+# --------------------------------------------------------------------------
+#
+# Both are memory disciplines over an answer that must not move, so all four
+# probes below are about SAMENESS and the plugin's own account of what it did.
+# They run in subprocesses because what they vary -- METALJAX_QMM_BLOCK,
+# METALJAX_QMM_BUILD_CACHE -- the dylib reads once, at load.
+#
+# The graphs are the two real reconstruction shapes: an MXFP4 weight whose
+# rows CAN be blocked (its canonical `[N, K]` layout needs no transpose, which
+# is the whole precondition -- gpt-oss-20b's projections are this shape), and
+# a keras sub-channel int4 weight whose `[K, N]` layout cannot be, so it packs
+# whole on both stacks and is here to prove the fallback is silent and exact.
+
+_P19_GRAPHS = r'''
+import os, sys
+import numpy as np
+import jax, jax.numpy as jnp
+
+E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                 -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], np.float32)
+_T = np.ldexp(np.ones(256), np.arange(256) - 127); _T[255] = np.nan
+SCALE_TABLE = _T.astype(np.float32)
+
+
+def mxfp4_weight(blocks, sb, k, dtype):
+    vt = jnp.asarray(E2M1, dtype=dtype)
+    st = jnp.asarray(SCALE_TABLE)
+    lead = tuple(blocks.shape[:-1])
+    lo = jnp.bitwise_and(blocks, jnp.uint8(0x0F))
+    hi = jnp.right_shift(blocks, jnp.uint8(4))
+    nib = jnp.reshape(jnp.stack([lo, hi], axis=-1), lead + (k,))
+    vals = jnp.take(vt, nib.astype(jnp.int32), axis=0)
+    scale = jnp.take(st, sb.astype(jnp.int32), axis=0)
+    w = jnp.reshape(vals, lead + (k // 32, 32)) * scale[..., None].astype(dtype)
+    return jnp.reshape(w, lead + (k,))
+
+
+def mxfp4(shape_nk, seed):
+    rng = np.random.RandomState(seed)
+    n, k = shape_nk[-2], shape_nk[-1]
+    lead = tuple(shape_nk[:-2])
+    codes = rng.randint(0, 16, size=lead + (n, k)).astype(np.uint8)
+    blocks = (codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8)
+    sb = rng.randint(118, 133, size=lead + (n, k // 32)).astype(np.uint8)
+    return blocks, sb
+
+
+def int4(rows, cols, block, seed):
+    rng = np.random.RandomState(seed)
+    q = rng.randint(-8, 8, size=(rows, cols)).astype(np.int8)
+    packed = ((q[:, 0::2] & 0x0F) | (q[:, 1::2] << 4)).astype(np.int8)
+    ng = rows // block
+    scale = (rng.rand(ng, cols).astype(np.float32) + 0.5) * 0.05
+    zero = rng.randint(-3, 4, size=(ng, cols)).astype(np.int8)
+    g_idx = (np.arange(rows) // block).astype(np.float32)
+    return packed, scale, zero, g_idx
+
+
+def dense_sub(packed, scale, zero, g_idx, x, columns):
+    lo = jnp.bitwise_and(packed, jnp.int8(0x0F))
+    lo = jnp.where(lo > 7, lo - 16, lo)
+    hi = jnp.right_shift(packed, jnp.int8(4))
+    w = jnp.reshape(jnp.stack([lo, hi], axis=-1),
+                    packed.shape[:-1] + (columns,))
+    g = g_idx.astype(jnp.int32)
+    return x @ ((w.astype(x.dtype) - jnp.take(zero, g, axis=0).astype(x.dtype))
+                * jnp.take(scale, g, axis=0))
+'''
+
+# Every quantized shape the plugin can pack, answered once.  The caller runs
+# this twice with different block sizes and compares the BYTES.
+_P19_ANSWERS = _P19_GRAPHS + r'''
+outs = []
+b, s = mxfp4((256, 256), 11)
+x = (np.random.RandomState(12).rand(6, 256).astype(np.float32) - 0.5) * 0.8
+outs.append(np.asarray(jax.jit(lambda b, s, a: jnp.einsum(
+    "th,nh->tn", a, mxfp4_weight(b, s, 256, a.dtype)))(b, s, x)))
+b, s = mxfp4((256, 256), 11)
+xb = x.astype(jnp.bfloat16)
+outs.append(np.asarray(jax.jit(lambda b, s, a: jnp.einsum(
+    "th,nh->tn", a, mxfp4_weight(b, s, 256, a.dtype)))(b, s, xb)
+    ).astype(np.float32))
+b, s = mxfp4((4, 64, 128), 13)
+xe = np.random.RandomState(14).rand(4, 3, 128).astype(np.float32) * 0.4
+outs.append(np.asarray(jax.jit(lambda b, s, a: jnp.einsum(
+    "etm,ehm->eth", a, mxfp4_weight(b, s, 128, a.dtype)))(b, s, xe)))
+p, sc, z, g = int4(256, 128, 128, 5)
+xi = np.random.RandomState(6).rand(4, 256).astype(np.float32) - 0.5
+outs.append(np.asarray(jax.jit(
+    lambda p, s, z, g, a: dense_sub(p, s, z, g, a, 128))(p, sc, z, g, xi)))
+# ...and one inside a decode loop, where the weight arrives as a loop-carried
+# block argument: the blocked walk and the fingerprint both have to follow it
+# out to the value the loop was handed (qmm.py `_hoist`).
+b, s = mxfp4((128, 128), 31)
+xl = np.random.RandomState(32).rand(2, 128).astype(np.float32) * 0.2
+
+
+def loop(b, s, x):
+    def body(c):
+        i, y = c
+        return i + 1, jnp.tanh(jnp.einsum(
+            "th,nh->tn", y, mxfp4_weight(b, s, 128, y.dtype)) * 0.3)
+    return jax.lax.while_loop(lambda c: c[0] < 3, body, (0, x))[1]
+
+
+outs.append(np.asarray(jax.jit(loop)(b, s, xl)))
+np.save(sys.argv[1], np.concatenate([o.ravel().view(np.uint8) for o in outs]))
+'''
+
+# Two executables over ONE weight set, then a third over another: what
+# keras-hub's per-sequence-length sampler does, and the reason the build cache
+# exists.
+_P19_CACHE = _P19_GRAPHS + r'''
+b, s = mxfp4((128, 128), 3)
+b, s = jax.device_put(b), jax.device_put(s)
+f = jax.jit(lambda b, s, a: jnp.einsum(
+    "th,nh->tn", a, mxfp4_weight(b, s, 128, a.dtype)))
+for t in (4, 7):
+    x = jax.device_put(np.random.RandomState(t).rand(t, 128).astype(np.float32))
+    print("[probe] T=%d %.6f" % (t, float(np.asarray(f(b, s, x)).sum())))
+b2, s2 = mxfp4((128, 128), 4)
+x = jax.device_put(np.random.RandomState(9).rand(5, 128).astype(np.float32))
+print("[probe] other %.6f" % float(np.asarray(f(b2, s2, x)).sum()))
+'''
+
+# A weight big enough that the whole reconstruction is worth measuring: 8192 x
+# 4096 MXFP4 values are 33.5 M elements, and jax's `take` wrapper alone carries
+# three int32 copies of the index tensor.  What the arms are compared on is the
+# plugin's own "pack wave peak", i.e. `mx::get_peak_memory()` inside the dylib
+# -- host RSS does not see a Metal allocation at all, and `mlx.core` in THIS
+# process is a different runtime whose counters read zero for the plugin.
+_P19_PEAK = _P19_GRAPHS + r'''
+b, s = mxfp4((8192, 4096), 21)
+x = np.random.RandomState(22).rand(2, 4096).astype(np.float32) * 0.1
+out = np.asarray(jax.jit(lambda b, s, a: jnp.einsum(
+    "th,nh->tn", a, mxfp4_weight(b, s, 4096, a.dtype)))(b, s, x))
+print("[probe] checksum %.6f" % float(out.sum()))
+'''
+
+
+def _p19_packing(subprocess, tempfile, pathlib):
+    """(label, check) pairs for the row-blocked packer and the build cache."""
+
+    def run(source, extra_env, *args):
+        env = dict(os.environ)
+        env["METALJAX_DEBUG"] = "1"
+        env.update(extra_env)
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(source)
+            script = fh.name
+        try:
+            return subprocess.run([sys.executable, script, *args], env=env,
+                                  capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(script)
+            except OSError:
+                pass
+
+    def packlog(proc):
+        return [ln.split("qmm: ", 1)[1]
+                for ln in (proc.stderr or "").splitlines()
+                if "-native] qmm: " in ln]
+
+    def blocked_answers_are_the_whole_ones():
+        """The pack is the same pack however many pieces it was built from.
+
+        Bit equality, not a tolerance: blocking changes WHEN the verification
+        sees a value and nothing about what is derived from it, so a single
+        differing bit would mean a block was read from the wrong rows.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            whole = str(pathlib.Path(tmp) / "whole.npy")
+            small = str(pathlib.Path(tmp) / "small.npy")
+            a = run(_P19_ANSWERS, {"METALJAX_QMM_BLOCK": str(1 << 30)}, whole)
+            if a.returncode:
+                return False, (a.stderr or a.stdout).strip()[-120:]
+            b = run(_P19_ANSWERS, {"METALJAX_QMM_BLOCK": "4096"}, small)
+            if b.returncode:
+                return False, (b.stderr or b.stdout).strip()[-120:]
+            if not np.array_equal(np.load(whole), np.load(small)):
+                return False, "a blocked pack computes different bytes"
+            # ...and the small-block arm really did block: three of the four
+            # weights are `[N, K]`-shaped and must report several blocks, the
+            # keras one cannot be blocked at all and must say so.
+            got = [ln for ln in packlog(b) if ln.startswith("packed ")]
+            many = [ln for ln in got if " row blocks" in ln]
+            if len(got) != 5 or len(many) != 4:
+                return False, f"{len(many)} of {len(got)} packs blocked"
+            if not any(ln.endswith(" whole") for ln in got):
+                return False, "the un-blockable weight did not pack whole"
+        return True, ""
+
+    def a_weight_packs_once_for_two_executables():
+        proc = run(_P19_CACHE, {})
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-120:]
+        log = packlog(proc)
+        built = [ln for ln in log if ln.startswith("packed ")]
+        reused = [ln for ln in log if ln.startswith("reused ")]
+        # Two executables over one weight set: one build, one reuse.  A third
+        # over DIFFERENT buffers must build again -- the cache is keyed on the
+        # buffers the reconstruction reads, not on the graph alone.
+        if len(built) != 2 or len(reused) != 1:
+            return False, f"{len(built)} built / {len(reused)} reused"
+        return True, ""
+
+    def the_cache_can_be_turned_off():
+        proc = run(_P19_CACHE, {"METALJAX_QMM_BUILD_CACHE": "0"})
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-120:]
+        log = packlog(proc)
+        if len([ln for ln in log if ln.startswith("reused ")]):
+            return False, "a pack was reused with the cache off"
+        if len([ln for ln in log if ln.startswith("packed ")]) != 3:
+            return False, "not every executable rebuilt"
+        return True, ""
+
+    def a_blocked_pack_bounds_its_peak():
+        """The point of the whole exercise, in the units a watchdog reads.
+
+        The same 8192x4096 MXFP4 weight packed whole and packed in blocks;
+        what must fall is the process's PEAK resident size, since MLX returns
+        a dead intermediate to its own cache and a watchdog counts it as
+        claimed either way (which is why the packer runs with that cache off).
+        """
+        whole = run(_P19_PEAK, {"METALJAX_QMM_BLOCK": str(1 << 30)})
+        if whole.returncode:
+            return False, (whole.stderr or whole.stdout).strip()[-120:]
+        small = run(_P19_PEAK, {"METALJAX_QMM_BLOCK": str(1 << 22)})
+        if small.returncode:
+            return False, (small.stderr or small.stdout).strip()[-120:]
+
+        def read(proc):
+            peak = None
+            for ln in (proc.stderr or "").splitlines():
+                if "qmm: pack wave peak " in ln:
+                    peak = float(ln.split("pack wave peak ")[1].split()[0])
+            checksum = None
+            for ln in proc.stdout.splitlines():
+                if ln.startswith("[probe] checksum "):
+                    checksum = float(ln.split()[2])
+            return peak, checksum
+
+        wg, wsum = read(whole)
+        sg, ssum = read(small)
+        if wg is None or sg is None:
+            return False, "no pack-wave peak reported"
+        if wsum != ssum:
+            return False, f"the two arms disagree ({wsum} vs {ssum})"
+        # The reconstruction is several times the packed weight and a block is
+        # a fraction of it, so the saving is most of a gigabyte; three quarters
+        # of the whole arm's peak is a bar a noisy allocator cannot cross by
+        # accident.
+        if not sg < wg * 0.75:
+            return False, f"peak {sg:.2f} GB blocked vs {wg:.2f} GB whole"
+        return True, f"ok ({sg:.2f} GB blocked vs {wg:.2f} GB whole)"
+
+    return [
+        ("blocked pack == whole pack", blocked_answers_are_the_whole_ones),
+        ("one pack for two executables", a_weight_packs_once_for_two_executables),
+        ("the build cache has an off switch", the_cache_can_be_turned_off),
+        ("a blocked pack bounds its peak", a_blocked_pack_bounds_its_peak),
+    ]
+
+
 def _p13_contracts(jax, jnp):
     import jax.experimental   # io_callback
 
@@ -3225,6 +3495,17 @@ def main():
             ok, detail = False, f"{type(exc).__name__}: " \
                                 f"{str(exc).splitlines()[0][:90]}"
         print(f"{label:<32} {'':>12}  {'ok' if ok else f'FAIL: {detail}'}")
+        if not ok:
+            failures.append(label)
+
+    for label, check in _p19_packing(subprocess, tempfile, pathlib):
+        try:
+            ok, detail = check()
+        except BaseException as exc:  # noqa: BLE001 - report and continue
+            ok, detail = False, f"{type(exc).__name__}: " \
+                                f"{str(exc).splitlines()[0][:90]}"
+        print(f"{label:<32} {'':>12}  "
+              f"{(detail or 'ok') if ok else f'FAIL: {detail}'}")
         if not ok:
             failures.append(label)
 

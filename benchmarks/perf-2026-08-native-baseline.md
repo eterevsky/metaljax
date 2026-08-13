@@ -163,13 +163,13 @@ artifacts under `~/.cache/metaljax-bench/logs/p18-relink/`). The ratio column is
 | 4 | gemma4-E2B bf16 | ms/tok | 27.5 | **27.2** (12 G) | 27.2 (12 G) | *not re-run* | — | was already exact parity |
 | 5 | Qwen3-8B bf16 | ms/tok | 57.8 | **58.2** (18 G) ᶜ | 61.5 (18 G) | **57.9** (18 G) | **0.99×** | ᶜ same-day control re-measure (P16 read 59.1 — the Stage 1 column is stable to 1.5 %) |
 | 6 | Llama-3.1-8B bf16 | ms/tok | 54.2 | **55.5** (18 G) | 57.6 (18 G) | **54.7** (18 G) | **0.99×** | |
-| 7 | gpt-oss-20b (MXFP4) | ms/tok | 22.2 | **21.9** (26 G) | 9497.6 (21 G) | **guard-killed** | — | the emits fire (94 qmm recognized, 47 gathered expert dispatches, 188 packs, MXFP4 group 32) but the pack BUILD blows the budget: killed at 46 G under 45, and at 62 G under 60. **Blocked on row-blocked packing + the cross-executable pack cache** |
+| 7 | gpt-oss-20b (MXFP4) | ms/tok | 22.2 | **21.9** (26 G) ᵖ | 9497.6 (21 G) | **guard-killed** → **25.3** (35 G) ᴾ¹⁹ | **1.16×** | P18 was killed at 46 G under 45 and 62 G under 60; **P19 UNBLOCKS IT** — 35 G peak at the historical 45 G budget, 128 tokens, four samples 25.3/25.5/25.3/25.3. ᵖ Stage 1 re-measured same-day and reproduced its anchor exactly |
 | 8 | Qwen3.6-35B-A3B | — | ✗ | *not run* | *not run* | *not run* | — | PAUSED, kernel-panic embargo (TASKS.md) |
 | 9 | R1-Distill-32B | ms/tok | 217.7 | **213.8** (67 G) | **PANIC #8** | *(main agent)* | — | native embargoed; the retry is the main agent's |
 | 10 | DeepSeek-V2-Lite | — | ✗ | *not run* | *not run* | *not run* | — | embargoed (maxtext 8B class) |
 | 11 | Qwen3-0.6B maxtext decode | ms/tok | 15.8 | **16.42** | 16.67 | *not re-run* | — | token stream diverges from Stage 1 at token ~3 (see incidents) |
 | 12 | Mixtral 8×7B | — | ✗ | *not run* | *not run* | *not run* | — | PAUSED, same wedge class as row 8 |
-| 13 | gemma4-E2B keras-int4 | ms/tok | 81.1 | **80.6** (peak 44 G) | 454.6 (44 G) | **249.0** (48 G) | **3.09×** | qmm fires on all 777 dots (group 64/128, regrouping engaged) and **prefill is already ahead of Stage 1** (218.3 vs 241.0); the residual is the decode loop running UNCOMPILED — see below. Greedy tokens 64/64 identical to Stage 1 |
+| 13 | gemma4-E2B keras-int4 | ms/tok | 81.1 | **80.6** (peak 44 G) | 454.6 (44 G) | **249.0** (48 G) → **275.6** (46 G) ᴾ¹⁹ | **3.42×** | qmm fires on all 777 dots (group 64/128, regrouping engaged) and **prefill is already ahead of Stage 1** (218.3 vs 241.0); the residual is the decode loop running UNCOMPILED — see below. Greedy tokens 64/64 identical to Stage 1. **P19 is timing-NEUTRAL here** (the P19-off control on the same binary reads 271.7, and P18's own byte-cap control read 274.6 — 249.0 was the low end of this row's spread); what P19 changes is the **steady state, 4.2 → 3.2 GB**, and 518 of the 777 pack builds |
 | 14 | maxtext qwix-int8 0.6B | ms/tok | 32.5 | **60.1** ⚠ | 62.1 | **56.8** | **0.95×** | ⚠ **Stage-1 regression vs anchor, 1.85×** (see below); same greedy text |
 | 15 | qwix-int8 Qwen3-8B | — | ✗ | *not run* | *not run* | *not run* | — | embargoed (MLX command-buffer bug) |
 | 16 | SigLIP 2 fwd b1 | ms | 82.9 | **85.8** (7.6 G) | 108.7 (11 G) | **96.9** (8.2 G) | **1.13×** | |
@@ -194,6 +194,58 @@ pack set per compiled shape live at once. Measured: a steady climb to 46 GB at
 the row's historical 45 GB budget, and an oscillating 49–62 GB plateau at 60.
 Stage 1 runs the same row at 25 GB. No further escalation was attempted — 62 GB
 is panic #7/#8 territory.
+
+> **UNBLOCKED 2026-08-13 (P19).** Both optimizations are ported
+> (`notes/cpp-p19-packing.md`) and the row completes at the historical 45 GB
+> budget: **35 GB peak, 25.3 ms/tok, 128 tokens** — 1.16× of Stage 1's 21.9,
+> inside the ~1.5× target and better than P17's micro proxy (1.55×). Raw cells:
+> `notes/data/p19-packing-models-2026-08-13.jsonl`.
+>
+> **Which of the two ports did it is not what was expected.** An ablation at the
+> same budget, one knob at a time:
+>
+> | configuration | peak | outcome |
+> |---|---:|---|
+> | both (P19 default) | **35 G** | ok, 25.3 ms/tok |
+> | cache off, blocking on | 46 G | **guard-killed** — P18's number to the gigabyte |
+> | blocking off, cache on | 36 G | ok, 25.5 ms/tok |
+> | neither (P17/P18) | 46 G / 62 G | guard-killed at both budgets |
+>
+> So the **build cache is the load-bearing fix** (46 → 36 GB: three executables
+> were each building their own ~10 GB pack set) and row-blocking is worth a
+> further gigabyte on top. P17's argument that "the tape already stages the
+> evaluation op by op with last-use pruning" was substantially right about the
+> per-weight TRANSIENT; what it did not cover was the same pack set built three
+> times over. Both are in, and only the pair clears the 45 GB line.
+>
+> Mechanism, from the run's own log: 94 packs built and **188 reused** (three
+> executables × 94 weights, a 100 % hit rate on the second and third), every one
+> of the 94 blocked (47 in 16 row blocks, 47 in 32), and the pack-wave peak
+> reported by the plugin's own libmlx is **33.9 GB for the first wave and 0.000
+> GB for the other two** — the reuse waves allocate nothing at all. (That 33.9
+> is a process-wide high-water mark, so it includes the resident model; the
+> flight-log footprint is the figure to compare across rows.)
+>
+> Row 7 does **not** have row 13's compile problem: `METALJAX_TRACE_BUDGET=1e7`
+> gives 25.3 ms/tok, the same number, with the compile decisions bit-identical
+> (16 compiles / 354 compiled calls either way). Its decode loop was already
+> compiling.
+>
+> Scrutiny: the greedy tokens diverge from Stage 1 at index 52 of 64. There is
+> no prior native token record for this row (P18 never completed it), so this is
+> a first observation rather than a change, and it is the same late-divergence
+> ladder class already carried for rows 3, 5 and 11.
+
+> **Row 13 (P19).** Peak barely moves — 48 → 46 GB — and the reason is worth
+> recording: that peak is the **keras streaming LOAD transient**, not the packs.
+> Stage 1's own is 44 GB on this row (see the regression section below), and the
+> plugin's pack wave peaks at 6.64 GB against a 46 GB flight peak. What P19 does
+> change here is the steady state, **4.2 → 3.2 GB**, and the work: **259 packs
+> built, 518 reused** (three executables × 259 weights, 0 fingerprint declines),
+> with the two reuse waves peaking at 0.000 GB. All 259 pack whole, on both
+> stacks — a keras `Dense`'s `[K, N]` weight needs a transpose to reach the
+> `[(B,) N, K]` matrix `quantized_matmul` wants, which is exactly the
+> precondition `_blocking` tests.
 
 **Row 13's residual 3.09× is the compile gate reading the UNFUSED IR.** The
 fused decode program reports `compiles=0 compiled_calls=0 serial_loops=1`: the
@@ -251,10 +303,13 @@ these rows:
    emits made cheap can still exceed `METALJAX_TRACE_BUDGET` and run
    uncompiled. Worth **2.9×** on row 13 (249.0 → 85.5 ms/tok with the budget
    lifted). Suspected on any emit row that lands short of parity.
-7. **Pack building has no memory discipline** — no row-blocked `_Source`
-   evaluation and no cross-executable build cache, which is what blocks row 7
-   (49–62 GB against Stage 1's 25 GB) and what makes row 13 peak at 48 GB for a
-   3 GB model.
+7. ~~**Pack building has no memory discipline**~~ — **CLOSED 2026-08-13 (P19)**.
+   Both are ported; row 7 completes at its historical 45 GB budget (35 GB peak,
+   25.3 ms/tok = 1.16× of Stage 1) and row 13's steady state drops 4.2 → 3.2 GB
+   with 518 of its 777 pack builds eliminated. The ablation above says the
+   **cache** was the load-bearing half. Row 13's 46 GB peak survives and is now
+   attributed: it is the keras streaming load transient, which Stage 1 shares
+   (44 GB), not the packs (6.6 GB).
 8. **Row 5's greedy tokens now diverge from Stage 1 at token 61 of 64**
    (they agreed before the sdpa emit) — the footnote-21 tie-flip class, but it
    is a *new* divergence introduced by fusion and should be walked down the
