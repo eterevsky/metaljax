@@ -1466,3 +1466,103 @@ one inside a decode loop; cross-executable reuse; the cache's off switch; and
 the pack-wave peak, 0.76 -> 0.13 GB on one 8192x4096 MXFP4 weight), `texmo_gate`
 **106 ok / 0 decline / 0 FAIL**, smoke, decline_census 35/35, ingest_test 8/8,
 coexist_test, `bazel test //...`, native wheel from a fresh 3.13 venv.
+
+## P20: the four named regressions (2026-08-13)
+
+Oleg's list, in order, with the raw runs under
+`~/.cache/metaljax-bench/logs/p20-regressions/` and the tables in
+`benchmarks/perf-2026-08-native-baseline.md`. Two are plugin bugs and are fixed
+here; one is a shared-runtime mechanism and is reported, not fixed; one was
+never a regression.
+
+**1. The compile gate read the unfused IR (P18 frontier item 6) — FIXED, and it
+was worth more than the diagnosis said.** `BlockCost`/`BlockBytes` in
+`metal_lowering.cc` now consult `ctx.plan`, which was already in scope and set
+before `Run`: an absorbed op is charged nothing and not recursed into, a qmm or
+moe root costs 2 units and an sdpa root 3 (the Python merges qmm and moe into
+one State and charges the pair 2), and a root's bytes are its own result plus
+what the emission really builds — `qmm.emit_bytes`'s one activation copy and
+`moe.emit_bytes`'s pair-space plan, both transliterated (`MoeEmitBytes`,
+`MoeNodeItemsize`, `MoeTrailingElems`). sdpa declares no `emit_bytes` in the
+Python either, and that is right: the [B,H,T,T] scores it absorbs are never
+written.
+
+Row 13 **275.6 -> 79.7 ms/tok** with **no env override** — past P18's
+`METALJAX_TRACE_BUDGET=1e7` proxy of 85.5, and past Stage 1 (0.99x of 80.6,
+0.98x of the anchor). The decode body compiles: `compiles=1 compiled_calls=127`
+where P18/P19 reported `0/0`. Greedy tokens 64/64 identical to the P19 run.
+
+Row 7 **25.3 -> 22.2** (1.01x of Stage 1's same-day 21.9, 1.00x of anchor),
+which P19 had explicitly cleared: its probe lifted the OP-COUNT budget only, and
+what moved here is the BYTE term (`by_bytes`, `kmax`, `BytesOk`). Its greedy
+tokens now diverge from the P19 native run at index 51 where P19 diverged from
+Stage 1 at 52 — carried to scrutiny: changing a compile decision changes fusion
+boundaries, so a late tie-flip is expected, but it is a change and belongs on
+the logit-delta ladder rather than in a footnote.
+
+**2. Row 18 (LoRA) was the output-copy rule ignoring donation — FIXED.** The
+lowering copied every output that may alias an argument. A keras LoRA training
+step **donates 2,255 of its 2,262 arguments** and threads the frozen parameters
+straight through, so it copied **1,952 outputs, ~10 GB per step**.
+`engine.py::_dealias` has always exempted donation ("aliasing is exactly what
+donation licenses"), and the plugin now does: an output whose every aliased
+argument is donated is exempt, and because donation is retractable per CALL the
+exempted outputs travel with the arguments they alias
+(`LoweredProgram::donated_output_aliases`) so `RunOnce` copies the ones a call
+takes back through `non_donatable_input_indices`. `Program::run`'s duplicate-
+output pass already handles two outputs that land on one array, dynamically.
+
+**656.3 -> 397.5 / 396.2 ms/step** (1.00x of Stage 1's 398.9 measured the same
+day, 0.98x of the 407 anchor), `0 output copies`, and the row's peak drops
+**55 -> 37 GB** — below Stage 1's own 56. What it was NOT, each measured: not
+the compile decisions (both stacks refuse this main with *identical* numbers,
+`cost=27308 bytes=40779.0MB` — an incidental cross-check of the item-1 fix), not
+sdpa (neither stack fuses attention here, which those equal costs prove), and
+not the flush clear (raising `METALJAX_FLUSH_CLEAR_MB` to 8 GB moves 597.1 ->
+593.1). The flush CADENCE is a separate ~1.13x on both stacks (native 597 ->
+501, Stage 1 399 -> 351 at `METALJAX_EAGER_FLUSH_MB=8192`) and is left alone.
+
+**3. Row 19 (maxtext train), the 2.17x shared drift — ROOT-CAUSED, reported.**
+The bisect is in the record: the same harness measured 440.0 on 2026-08-03 and
+964.2 on 2026-08-05 with losses identical to the last digit. On today's machine
+and today's (unchanged since 0.11.3) Stage 1 dylib, 0.11.2's `src/metaljax` on
+`PYTHONPATH` gives **448.2** against the current tree's **969.1** — so it is
+metaljax's own code; the harness, the maxtext venv and its checkout are all
+untouched since before the anchor.
+
+The cause is `4d34bff`'s cache clear on the eager flush
+(`METALJAX_FLUSH_CLEAR_MB`, default 2048). This program's `@main` is over the
+trace budget (`cost=24870 > 20000`, unchanged since 0.11.2), so it runs op by
+op with ~105 GB of traffic per step against a live set of a few hundred MB: **82
+flushes and 7 clears per step**, each clear returning MLX's whole pool to the OS
+so the next ~2 GB of allocations are cold. Stage 1 **478.8** and native
+**468.0** with the clear off; 446.2 with the flush off entirely. It is shared
+because `runtime/program.cc::eager_flush` is the transliteration of
+`interpreter._eager_flush` and both read the same budgets.
+
+NOT fixed, deliberately: the clear is a live memory bound (with it off, row 18
+blew an 81 GB peak through a 70 GB guard, and Stage 1 with the flush off was
+killed on trajectory at a projected 95 GB). The fix that keeps the bound without
+the cliff is `mx::set_cache_limit(flush_clear_bytes)` — MLX reclaims only the
+excess, on the next allocation, so the pool is bounded at every instant (tighter
+than clearing at flush points) and reuse below the limit survives. That is a
+change to the shared memory discipline and Stage 1's copy is frozen: Oleg's
+call, with a memory ladder behind it.
+
+**4. Row 14 (qwix-int8) was never regressed.** Standalone under the lock:
+**32.9** and **32.7** ms/tok against a 32.5 anchor. P16's 60.1 was measured 12
+minutes into a sequential campaign — the suite-context trap of CLAUDE.md item
+12, reaching the model harness. Native today is 35.0 (1.06x), and 32.1 with the
+flush clear lifted, so its residual is item 3's mechanism too.
+
+**Report hygiene.** Table 3 of the baseline now carries `S1/anchor` and
+`native/anchor` beside `native/S1`, and STATUS.md's native cells carry both
+ratios. Row 19 read "1.01x of Stage 1" through P16 and P18 while both stacks sat
+2.2x off the anchor; a same-day ratio cannot see a shared drift, and that is the
+column that was missing.
+
+**Battery** (final binary, both fixes): `execute_test` **524/524**,
+`texmo_gate` **106 ok / 0 decline / 0 FAIL**, `smoke_test`, and the rows touched
+re-measured on it (13: 79.7 twice; 7: 22.2; 18: 397.5/396.2). Not re-run and
+worth watching, since `cost` also sizes the loop flush period: rows 3, 5, 6, 16,
+17 were at parity before this change.

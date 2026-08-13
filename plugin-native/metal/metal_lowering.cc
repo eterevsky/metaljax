@@ -1225,6 +1225,109 @@ int64_t ScatterCost(LowerContext& ctx, mlir::Operation* op) {
   return std::max<int64_t>(n, 1) * body;
 }
 
+// --------------------------------------------------------------------------
+// the estimators' recognizer arm (ops/control.py `_block_cost` /
+// `_block_bytes`, the `skip`/`roots` half)
+// --------------------------------------------------------------------------
+//
+// A compile decision must be taken over the program that will RUN, and with a
+// plan in hand that is the rewritten one: an absorbed op never executes, and a
+// root is one fused kernel rather than the chain it replaces.  Charging the
+// literal IR is what kept the E2B-int4 decode body (777 quantized dots, ~83
+// dequant units each) over `METALJAX_TRACE_BUDGET`, so the loop ran op by op
+// and the row measured 3.1x of Stage 1 with every dot fused
+// (benchmarks/perf-2026-08-native-baseline.md, item 6).
+//
+// Both functions consult the plan only when there is one: phase 1 lowers with
+// `ctx.plan == nullptr` and is unchanged, and so are the prologue cones, which
+// must compute exactly the chain the emit absorbs.
+
+// `_block_cost`'s cost table: 2 for a quantized matmul or an expert gather
+// (they merge into one State in the Python, which charges the pair 2), 3 for a
+// fused attention.  0 = not a root.
+int64_t RootCostUnit(const RewritePlan& plan, mlir::Operation* op) {
+  if (plan.qmm_roots.count(op) || plan.moe_roots.count(op)) return 2;
+  if (plan.sdpa_roots.count(op)) return 3;
+  return 0;
+}
+
+// moe.py `_trailing`: the node's shape without its expert and token axes.
+int64_t MoeTrailingElems(const MoeNode& node) {
+  int64_t n = 1;
+  for (int i = 0; i < static_cast<int>(node.shape.size()); i++) {
+    if (i == node.ea || i == node.ta) continue;
+    n *= std::max<int64_t>(node.shape[i], 0);
+  }
+  return n;
+}
+
+// moe.py `_node_itemsize`: the element size of the array `emit` builds for
+// this node, following a view chain to whatever it views.
+int64_t MoeNodeItemsize(const MoeMatch& m, const MoeNode* node) {
+  for (int i = 0; i < 64 && node != nullptr; i++) {  // view chains are short
+    if (node->kind == MoeNode::kDot)
+      return static_cast<int64_t>(dtype_of(node->out_dtype).size());
+    if (node->kind == MoeNode::kView) {
+      if (node->src < 0 || node->src >= static_cast<int>(m.order.size())) break;
+      node = &m.order[node->src];
+      continue;
+    }
+    mlir::Value v;
+    if (node->kind == MoeNode::kExt)
+      v = node->op != nullptr ? node->op->getResult(0) : node->value;
+    else if (node->op != nullptr)
+      v = node->op->getResult(0);
+    if (!v) break;
+    auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+    if (!t) break;
+    std::optional<mx::Dtype> dt = MxDtypeOf(t.getElementType());
+    if (!dt.has_value()) break;
+    return static_cast<int64_t>(dt->size());
+  }
+  return 4;  // unknown: charge the widest ordinary element rather than none
+}
+
+// moe.py `emit_bytes`: every node of the plan becomes an array in PAIR space
+// (`P = T * K` rows, not the dense `E * T`), and the weighting and the
+// reduction over K follow it.  Loose in the safe direction -- MLX makes
+// several of these without copying -- because an estimate that reads high
+// only makes the gate fire early.
+int64_t MoeEmitBytes(const MoeMatch& m) {
+  int64_t total = 0;
+  for (const MoeNode& node : m.order) {
+    const int64_t lead = (node.ea >= 0 || node.ta >= 0) ? m.P : 1;
+    total += lead * MoeTrailingElems(node) * MoeNodeItemsize(m, &node);
+  }
+  if (m.out >= 0 && m.out < static_cast<int>(m.order.size())) {
+    const MoeNode& out = m.order[m.out];
+    total += m.P * MoeTrailingElems(out) *
+             static_cast<int64_t>(std::max(dtype_of(m.sum_dtype).size(),
+                                           dtype_of(m.out_dtype).size()));
+  }
+  return total;
+}
+
+// `_block_bytes`'s `extra`: what the emission in a root's place materializes
+// BEYOND the root's own declared result.
+//
+// qmm (qmm.py `emit_bytes`): one copy of the activation, which the emit may
+// transpose, cast and group-permute before handing it over.  The packed
+// weight is NOT counted -- the prologue owns it, it exists before the trace
+// begins and outlives it.
+//
+// sdpa declares no `emit_bytes` in the Python either, and that is right: the
+// whole point of the fused kernel is that the [B,H,T,T] scores it absorbs are
+// never written.
+int64_t RootExtraBytes(const RewritePlan& plan, mlir::Operation* op) {
+  auto q = plan.qmm_roots.find(op);
+  if (q != plan.qmm_roots.end() && q->second != nullptr)
+    return ValueBytes(q->second->lhs);
+  auto mo = plan.moe_roots.find(op);
+  if (mo != plan.moe_roots.end() && mo->second != nullptr)
+    return MoeEmitBytes(*mo->second);
+  return 0;
+}
+
 // ops/control.py `_block_cost`: the approximate op count of this block when
 // it is TRACED, loops unrolled.  It sizes the loop's flush period, so it is
 // a cadence number and a wrong one is a memory-pressure question rather than
@@ -1237,6 +1340,15 @@ int64_t BlockCost(LowerContext& ctx, mlir::Block& block) {
   ctx.cost[&block] = 1;   // break cycles defensively, as the Python does
   int64_t cost = 0;
   for (mlir::Operation& o : block) {
+    if (ctx.plan != nullptr) {
+      // Absorbed: never executed, so charged nothing and not recursed into.
+      if (ctx.plan->absorbed(&o)) continue;
+      const int64_t unit = RootCostUnit(*ctx.plan, &o);
+      if (unit != 0) {
+        cost += unit;   // the fused call, in place of the chain it replaces
+        continue;
+      }
+    }
     cost += 1;
     const llvm::StringRef n = o.getName().getStringRef();
     if (n == "stablehlo.while") {
@@ -1334,7 +1446,16 @@ int64_t BlockBytes(LowerContext& ctx, mlir::Block& block) {
   ctx.bytes[&block] = 0;   // break cycles defensively, as the Python does
   int64_t total = 0;
   for (mlir::Operation& o : block) {
-    total += OpBytes(&o);
+    // Absorbed ops materialize nothing; a root materializes its own result
+    // plus whatever the emission in its place builds.  As in the Python, a
+    // root then falls through to the region walk below -- a moe root is a
+    // reduce, and its combiner block is charged like any other.
+    if (ctx.plan != nullptr) {
+      if (ctx.plan->absorbed(&o)) continue;
+      total += OpBytes(&o) + RootExtraBytes(*ctx.plan, &o);
+    } else {
+      total += OpBytes(&o);
+    }
     const llvm::StringRef n = o.getName().getStringRef();
     if (n == "stablehlo.while") {
       std::optional<Counted> c = AnalyzeCounted(ctx, &o);
@@ -5931,10 +6052,36 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
   // exempts an output that syntactically names a block argument, because
   // engine.execute copies those on the way out whatever engine ran.  There is
   // no engine.execute here, so this plugin copies them itself.
+  //
+  // DONATION is the exemption, and it is the Python engine's too (`_dealias`
+  // skips an output whose input was donated: the caller has promised not to
+  // touch that buffer again, which is precisely what licenses the alias).
+  // Without it a training step pays a copy of every frozen parameter it
+  // threads through -- measured on the LoRA row: 1,952 of 2,256 outputs
+  // copied, ~10 GB per step, against 2,255 donated arguments.  The promise is
+  // retractable per call (`non_donatable_input_indices`), so the exempted
+  // outputs travel with the arguments they alias and `RunOnce` copies the
+  // ones a call takes back.  Two outputs that end up the same array are still
+  // separated by `Program::run`'s duplicate pass, which is dynamic.
+  const absl::flat_hash_set<int> donated_args(
+      lowered.donated_parameters.begin(), lowered.donated_parameters.end());
   std::vector<int> copies;
   for (size_t j = 0; j < built.outputs.size(); j++) {
-    if (const_view_.count(built.outputs[j]) ||
-        arg_alias_.count(built.outputs[j]))
+    if (const_view_.count(built.outputs[j])) {
+      copies.push_back(static_cast<int>(j));
+      continue;
+    }
+    auto alias = arg_alias_.find(built.outputs[j]);
+    if (alias == arg_alias_.end()) continue;
+    std::vector<int> args(alias->second.begin(), alias->second.end());
+    std::sort(args.begin(), args.end());
+    bool all_donated = !args.empty();
+    for (int a : args)
+      if (!donated_args.contains(a)) { all_donated = false; break; }
+    if (all_donated)
+      lowered.donated_output_aliases.emplace_back(static_cast<int>(j),
+                                                  std::move(args));
+    else
       copies.push_back(static_cast<int>(j));
   }
   lowered.num_copies = static_cast<int64_t>(copies.size());

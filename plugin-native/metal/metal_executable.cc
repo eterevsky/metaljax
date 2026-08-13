@@ -276,6 +276,25 @@ MetalLoadedExecutable::RunOnce(
     const std::vector<mx::array> kept =
         kVerifyCompile ? inputs : std::vector<mx::array>{};
     outs = tape->program->run(std::move(inputs));
+    // The half of the no-alias contract only a CALL can decide: an output the
+    // lowering left uncopied because every argument it aliases is donated has
+    // to be copied after all when this call takes the donation back
+    // (`non_donatable_input_indices`).  Nothing to walk on the usual path --
+    // jax passes the set empty, and a program that donates nothing has no
+    // exemptions at all.
+    if (!options.non_donatable_input_indices.empty()) {
+      for (const auto& ex : tape->donated_output_aliases) {
+        bool retracted = false;
+        for (int a : ex.second)
+          if (options.non_donatable_input_indices.contains(a)) {
+            retracted = true;
+            break;
+          }
+        if (retracted && ex.first >= 0 &&
+            static_cast<size_t>(ex.first) < outs.size())
+          outs[ex.first] = fresh_copy(outs[ex.first]);
+      }
+    }
     // P2 executes SYNCHRONOUSLY: correctness before pipelining.  Settling
     // here is what makes every buffer this returns honestly ready, and it is
     // the one thing to revisit first when the plugin is measured -- the Stage

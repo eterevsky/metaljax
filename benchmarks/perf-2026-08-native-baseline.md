@@ -6,6 +6,15 @@ trampoline, on the tree at 845ab89. Sequential throughout, machine lock held
 for every measured run, `guarded_run.sh` (precheck + `mem_guard.sh`) for every
 model row.*
 
+> **2026-08-13 update (P20).** The four named regressions, measured and
+> dispositioned: row 13 **275.6 → 79.7** ms/tok and row 7 **25.3 → 22.2** (the
+> fused compile gate now follows the rewrite plan), row 18 **656.3 → 397.5**
+> ms/step (donated pass-through outputs are no longer copied), row 19 root-caused
+> to the eager flush's cache clear (a SHARED mechanism, reported not fixed) and
+> row 14's "1.85× regression" retired as a suite-context measurement. Table 3
+> now carries **vs-anchor** ratio columns beside the same-day ones — row 19 read
+> "1.01× of Stage 1" for two passes while both stacks sat 2.2× off the anchor.
+>
 > **2026-08-12 update (P18, tree 8c61e72).** The exported-symbols relink is in
 > the tree as the default build and its validation was re-run for real; the
 > model rows were then re-measured with the P17 recognizer emits. Table 3 now
@@ -148,37 +157,44 @@ Headline metric per row as in STATUS.md (LLM = warm decode ms/token; vision =
 forward ms; diffusion = ms/step; training = ms/step). "peak" = guard flight-log
 footprint. Anchor column = `benchmarks/models.md` 0.11.3.
 
-Two native columns: **P16** is the baseline this campaign measured (no
-recognizer emits, no msl_scan, no exported-symbols relink) and **P18** is the
-same rows re-measured on 2026-08-12 after the P17 emits landed and the relink
-became the default build (`notes/data/p18-relink-models-2026-08-12.jsonl`;
-artifacts under `~/.cache/metaljax-bench/logs/p18-relink/`). The ratio column is
-**P18 / Stage 1 today**.
+Native columns by pass: **P16** is the baseline this campaign measured (no
+recognizer emits, no msl_scan, no exported-symbols relink); **P18** re-measured
+the rows on the P17 emits through the relinked plugin
+(`notes/data/p18-relink-models-2026-08-12.jsonl`); **P19** unblocked row 7; and
+**P20** (2026-08-13) is the regression campaign below — the fused compile gate,
+the donated-output copies, and the eager-flush cache clear.
 
-| # | model | metric | 0.11.3 anchor | Stage 1 today | native P16 | native P18 | P18/S1 | notes |
-|---|---|---|---|---:|---:|---:|---:|---|
-| 1 | gemma4-31B bf16 | ms/tok | 237.5 | **243.1** (peak 66 G) | 301.6 (67 G) | *not re-run* | — | dense decode; the sdpa emit now exists but this is a 66 G row |
-| 2 | gemma4-12B bf16 | ms/tok | 92.5 | **93.9** (29 G) | 98.8 (30 G) | *not re-run* | — | |
-| 3 | gemma4-26B-A4B (MoE) | ms/tok | 44.3 | **43.7** (53 G) | 300.5 (54 G) | **43.4** (53 G) | **0.99×** | the MoE expert-gather emit closes 6.88× to parity; greedy tokens 64/64 identical to Stage 1 |
-| 4 | gemma4-E2B bf16 | ms/tok | 27.5 | **27.2** (12 G) | 27.2 (12 G) | *not re-run* | — | was already exact parity |
-| 5 | Qwen3-8B bf16 | ms/tok | 57.8 | **58.2** (18 G) ᶜ | 61.5 (18 G) | **57.9** (18 G) | **0.99×** | ᶜ same-day control re-measure (P16 read 59.1 — the Stage 1 column is stable to 1.5 %) |
-| 6 | Llama-3.1-8B bf16 | ms/tok | 54.2 | **55.5** (18 G) | 57.6 (18 G) | **54.7** (18 G) | **0.99×** | |
-| 7 | gpt-oss-20b (MXFP4) | ms/tok | 22.2 | **21.9** (26 G) ᵖ | 9497.6 (21 G) | **guard-killed** → **25.3** (35 G) ᴾ¹⁹ | **1.16×** | P18 was killed at 46 G under 45 and 62 G under 60; **P19 UNBLOCKS IT** — 35 G peak at the historical 45 G budget, 128 tokens, four samples 25.3/25.5/25.3/25.3. ᵖ Stage 1 re-measured same-day and reproduced its anchor exactly |
-| 8 | Qwen3.6-35B-A3B | — | ✗ | *not run* | *not run* | *not run* | — | PAUSED, kernel-panic embargo (TASKS.md) |
-| 9 | R1-Distill-32B | ms/tok | 217.7 | **213.8** (67 G) | **PANIC #8** | *(main agent)* | — | native embargoed; the retry is the main agent's |
-| 10 | DeepSeek-V2-Lite | — | ✗ | *not run* | *not run* | *not run* | — | embargoed (maxtext 8B class) |
-| 11 | Qwen3-0.6B maxtext decode | ms/tok | 15.8 | **16.42** | 16.67 | *not re-run* | — | token stream diverges from Stage 1 at token ~3 (see incidents) |
-| 12 | Mixtral 8×7B | — | ✗ | *not run* | *not run* | *not run* | — | PAUSED, same wedge class as row 8 |
-| 13 | gemma4-E2B keras-int4 | ms/tok | 81.1 | **80.6** (peak 44 G) | 454.6 (44 G) | **249.0** (48 G) → **275.6** (46 G) ᴾ¹⁹ | **3.42×** | qmm fires on all 777 dots (group 64/128, regrouping engaged) and **prefill is already ahead of Stage 1** (218.3 vs 241.0); the residual is the decode loop running UNCOMPILED — see below. Greedy tokens 64/64 identical to Stage 1. **P19 is timing-NEUTRAL here** (the P19-off control on the same binary reads 271.7, and P18's own byte-cap control read 274.6 — 249.0 was the low end of this row's spread); what P19 changes is the **steady state, 4.2 → 3.2 GB**, and 518 of the 777 pack builds |
-| 14 | maxtext qwix-int8 0.6B | ms/tok | 32.5 | **60.1** ⚠ | 62.1 | **56.8** | **0.95×** | ⚠ **Stage-1 regression vs anchor, 1.85×** (see below); same greedy text |
-| 15 | qwix-int8 Qwen3-8B | — | ✗ | *not run* | *not run* | *not run* | — | embargoed (MLX command-buffer bug) |
-| 16 | SigLIP 2 fwd b1 | ms | 82.9 | **85.8** (7.6 G) | 108.7 (11 G) | **96.9** (8.2 G) | **1.13×** | |
-| 16b | SigLIP 2 fwd b32 | ms | — | **2501.6** | 4444.8 | **2400.5** | **0.96×** | the sdpa emit closes 1.78× and goes past Stage 1 |
-| 17 | SD 3.5 Large @1024² | ms/step | 5141 | **5107** (23 G) | 16016 (27 G) | **5781.6** (24 G) | **1.13×** | sdpa emit: 3.14× → 1.13×; real image (pixel_std 68.0) |
-| 17b | SD 3.5 Large @512² | ms/step | 1389 | **1520.7** (21 G) ᶜ | *not run* | **1234.8** (21 G) | **0.81×** | ᶜ measured today for this pairing. Native is 19 % **faster** than Stage 1 and 11 % faster than the 0.11.3 anchor; real images both (pixel_std 61.1 native / 77.5 Stage 1) |
-| 18 | LoRA E2B train | ms/step | 407 | **402.1** (56 G) | 656.3 (49 G) | *not re-run* | — | |
-| 19 | maxtext train 0.6B | ms/step | 440 | **956.5** ⚠ | 962.0 | *not re-run* | — | ⚠ **Stage-1 regression vs anchor, 2.17×**; losses bit-identical across stacks |
-| 20 | 235B-A22B 3-bit | — | ✗ | — | — | — | — | mlx-only row |
+**Two ratio columns, deliberately.** `native/S1` is same-day and answers "is the
+phase-2 plugin at parity with the trampoline"; `native/anchor` is against the
+0.11.3 release column and answers "is this row as fast as it ever was". A row
+where both stacks drifted together reads 1.00× in the first and shows the drift
+only in the second — which is exactly how row 19 hid a 2.2× for two passes.
+`S1/anchor` is the Stage 1 column's own drift, on the same principle.
+
+| # | model | metric | 0.11.3 anchor | Stage 1 today | S1/anchor | native (latest) | native/S1 | native/anchor | notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---|
+| 1 | gemma4-31B bf16 | ms/tok | 237.5 | **243.1** (peak 66 G) | 1.02× | 301.6 (67 G) ᴾ¹⁶ | 1.24× | 1.27× | dense decode; the sdpa emit exists since P17 but this is a 66 G row, not re-run |
+| 2 | gemma4-12B bf16 | ms/tok | 92.5 | **93.9** (29 G) | 1.02× | 98.8 (30 G) ᴾ¹⁶ | 1.05× | 1.07× | not re-run since P16 |
+| 3 | gemma4-26B-A4B (MoE) | ms/tok | 44.3 | **43.7** (53 G) | 0.99× | **43.4** (53 G) ᴾ¹⁸ | **0.99×** | **0.98×** | the MoE expert-gather emit closes 6.88× to parity; greedy tokens 64/64 identical to Stage 1 |
+| 4 | gemma4-E2B bf16 | ms/tok | 27.5 | **27.2** (12 G) | 0.99× | 27.2 (12 G) ᴾ¹⁶ | 1.00× | 0.99× | was already exact parity |
+| 5 | Qwen3-8B bf16 | ms/tok | 57.8 | **58.2** (18 G) ᶜ | 1.01× | **57.9** (18 G) ᴾ¹⁸ | **0.99×** | **1.00×** | ᶜ same-day control re-measure (P16 read 59.1 — the Stage 1 column is stable to 1.5 %) |
+| 6 | Llama-3.1-8B bf16 | ms/tok | 54.2 | **55.5** (18 G) | 1.02× | **54.7** (18 G) ᴾ¹⁸ | **0.99×** | **1.01×** | |
+| 7 | gpt-oss-20b (MXFP4) | ms/tok | 22.2 | **21.9** (26 G) ᵖ | 0.99× | **22.2** (34 G) ᴾ²⁰ | **1.01×** | **1.00×** | P16 9497.6 → P18 guard-killed → P19 25.3 (35 G) → **P20 22.2**: the fused compile gate was worth a further 1.16× here even though `METALJAX_TRACE_BUDGET=1e7` had said this row was not affected (it is the BYTE half that moved). ᵖ Stage 1 re-measured same-day, reproducing its anchor |
+| 8 | Qwen3.6-35B-A3B | — | ✗ | *not run* | — | *not run* | — | — | PAUSED, kernel-panic embargo (TASKS.md) |
+| 9 | R1-Distill-32B | ms/tok | 217.7 | **213.8** (67 G) | 0.98× | **214.4** (65.6 G) ᴾ¹⁹ | **1.00×** | **0.98×** | throttled load ladder (STATUS footnote 29) |
+| 10 | DeepSeek-V2-Lite | — | ✗ | *not run* | — | *not run* | — | — | embargoed (maxtext 8B class) |
+| 11 | Qwen3-0.6B maxtext decode | ms/tok | 15.8 | **16.42** | 1.04× | 16.67 ᴾ¹⁶ | 1.02× | 1.06× | token stream diverges from Stage 1 at token ~3 (see incidents) |
+| 12 | Mixtral 8×7B | — | ✗ | *not run* | — | *not run* | — | — | PAUSED, same wedge class as row 8 |
+| 13 | gemma4-E2B keras-int4 | ms/tok | 81.1 | **80.6** (peak 44 G) | 0.99× | **79.7** (49 G) ᴾ²⁰ | **0.99×** | **0.98×** | P16 454.6 → P18 275.6 → **P20 79.7**, and the whole 3.4× was the compile gate reading the UNFUSED IR: with cost and bytes following the rewrite plan the decode body compiles (`compiles=1 compiled_calls=127`, was `0/0`) with **no env override**. Two samples 79.7/79.7; greedy tokens 64/64 identical to the P19 run. Peak is the keras streaming LOAD transient (Stage 1's own is 44 G), not the packs |
+| 14 | maxtext qwix-int8 0.6B | ms/tok | 32.5 | **32.9 / 32.7** ᵈ | **1.01×** | **35.0** ᴾ²⁰ | 1.06× | 1.08× | ᵈ **the 1.85× "Stage-1 regression" does not exist** — re-measured standalone twice today, the row sits on its anchor. P16's 60.1 was taken 12 minutes into a sequential campaign; treat it as the suite-context trap (CLAUDE.md item 12). Native's residual 1.06× is the eager-flush cache clear: with `METALJAX_FLUSH_CLEAR_MB` lifted it reads **32.1** (0.98×) |
+| 15 | qwix-int8 Qwen3-8B | — | ✗ | *not run* | — | *not run* | — | — | embargoed (MLX command-buffer bug) |
+| 16 | SigLIP 2 fwd b1 | ms | 82.9 | **85.8** (7.6 G) | 1.03× | **87.9** (8.2 G) ᴾ²⁰ | **1.02×** | 1.06× | re-run on the P20 binary as the sdpa-row regression check: 96.9 → 87.9, so the compile-gate change helps here too rather than shifting a cadence |
+| 16b | SigLIP 2 fwd b32 | ms | — | **2501.6** | — | **2350.6** ᴾ²⁰ | **0.94×** | — | the sdpa emit closes 1.78× and goes past Stage 1; P18 read 2400.5 |
+| 17 | SD 3.5 Large @1024² | ms/step | 5141 | **5107** (23 G) | 0.99× | **5781.6** (24 G) ᴾ¹⁸ | **1.13×** | 1.12× | sdpa emit: 3.14× → 1.13×; real image (pixel_std 68.0) |
+| 17b | SD 3.5 Large @512² | ms/step | 1389 | **1520.7** (21 G) ᶜ | **1.09×** ⚠ | **1234.8** (21 G) ᴾ¹⁸ | **0.81×** | **0.89×** | ᶜ measured for this pairing. Native is 19 % faster than Stage 1 and 11 % faster than the anchor; the ⚠ is Stage 1's own 9 % drift, still unattributed |
+| 18 | LoRA E2B train | ms/step | 407 | **398.9** (56 G) ᶜ | 0.98× | **397.5 / 396.2** (37 G) ᴾ²⁰ | **1.00×** | **0.98×** | P16 656.3 → **P20 397.5**. The gap was **1,952 output copies of donated pass-through parameters** (~10 GB/step) plus the eager-flush cadence; the copy list now exempts donated aliases as `engine.py::_dealias` does — `0 output copies, 2255 donated` — and the row's peak drops 55 → 37 G, below Stage 1's own 56 |
+| 19 | maxtext train 0.6B | ms/step | 440 | **969.1** ⚠ | **2.20×** ⚠ | **1006.2** ᴾ²⁰ | 1.04× | **2.29×** ⚠ | **the shared drift, root-caused below**: the eager flush's `mx::clear_cache()`. Both stacks recover on the knob alone — Stage 1 **446.2**, native **468.0** — against a 0.11.2-source control of **448.2** on today's machine. Losses identical across every configuration |
+| 20 | 235B-A22B 3-bit | — | ✗ | — | — | — | — | — | mlx-only row |
 
 **Unmeasured**: rows 8/10/12/15 (pre-existing embargoes), row 9 native
 (embargoed; the retry is the main agent's), the P18 cells of rows 1/2/4/11/18/19
@@ -298,11 +314,30 @@ Items 2, 3 and 4 are **closed on the rows that could be re-run**: MoE 6.88× →
 whole texmo gap. Three new items join the list, all of them found by re-running
 these rows:
 
-6. **The fused lowering's compile decisions read the unfused IR** — `BlockCost` /
-   `BlockBytes` charge the ops a recognizer absorbs, so a decode body that the
-   emits made cheap can still exceed `METALJAX_TRACE_BUDGET` and run
-   uncompiled. Worth **2.9×** on row 13 (249.0 → 85.5 ms/tok with the budget
-   lifted). Suspected on any emit row that lands short of parity.
+6. ~~**The fused lowering's compile decisions read the unfused IR**~~ —
+   **CLOSED 2026-08-13 (P20)**. `BlockCost` and `BlockBytes` now consult
+   `ctx.plan` exactly as `ops/control.py`'s do: an absorbed op is charged
+   nothing and is not recursed into, a qmm or moe root costs 2 units and an
+   sdpa root 3, and a root's bytes are its own result plus what the emission
+   really builds (`qmm.emit_bytes`'s activation copy, `moe.emit_bytes`'s
+   pair-space plan; sdpa declares none, because the scores it absorbs are never
+   written). Row 13 **275.6 → 79.7 ms/tok** with no env override — past the
+   `METALJAX_TRACE_BUDGET=1e7` proxy (85.5) because the byte term moved too —
+   and row 7 **25.3 → 22.2**, which P19's budget probe had said was unaffected:
+   that probe only lifted the op-count budget. Rows 3/5/6/16/17 were at parity
+   already and are not re-measured; they are the ones to watch for a cadence
+   shift, since `cost` also sizes the loop flush period.
+
+9. **The static output-copy rule ignored donation** — **CLOSED 2026-08-13
+   (P20)**, worth **1.50×** on row 18. An output that may alias an argument was
+   copied even when that argument was DONATED, which is the one case where
+   aliasing is licensed (`engine.py::_dealias` has always exempted it). A LoRA
+   training step donates 2,255 of its 2,262 arguments and threads the frozen
+   parameters straight through: 1,952 copies, ~10 GB per step. Now `0 output
+   copies`, 656.3 → **397.5 ms/step** and peak 55 → 37 GB. Donation is
+   retractable per call, so the exempted outputs carry the arguments they alias
+   and `RunOnce` copies the ones a call takes back through
+   `non_donatable_input_indices`.
 7. ~~**Pack building has no memory discipline**~~ — **CLOSED 2026-08-13 (P19)**.
    Both are ported; row 7 completes at its historical 45 GB budget (35 GB peak,
    25.3 ms/tok = 1.16× of Stage 1) and row 13's steady state drops 4.2 → 3.2 GB
@@ -317,12 +352,62 @@ these rows:
 
 ---
 
-## Stage-1-vs-anchor regressions (flagged per the campaign's charter)
+## Stage-1-vs-anchor regressions — RESOLVED 2026-08-13 (P20)
 
-| row | anchor | today | ratio | attribution |
+*(Raw data: `~/.cache/metaljax-bench/logs/p20-regressions/`.)*
+
+| row | anchor | today | ratio | verdict |
 |---|---:|---:|---:|---|
-| 14, maxtext qwix-int8 0.6B | 32.5 | 60.1 | **1.85× slower** | `METALJAX_ENGINE=py` gives 42.3 → ~1.30× predates the tape, ~1.42× is the tape |
-| 19, maxtext train 0.6B | 440 | 956.5 | **2.17× slower** | `METALJAX_ENGINE=py` gives 1043 — **not** the tape; regression is older or environmental |
+| 14, maxtext qwix-int8 0.6B | 32.5 | **32.9 / 32.7** | **1.01×** | **NOT A REGRESSION.** Re-measured standalone twice under the lock: the row is on its anchor. The 60.1 reading was taken inside the P16 sequential campaign |
+| 19, maxtext train 0.6B | 440 | 969.1 | **2.20×** | **ROOT-CAUSED**: the eager flush's cache clear (`METALJAX_FLUSH_CLEAR_MB`, landed 4d34bff *after* the anchor was measured). Fires 7×/step here at ~77 ms each |
+
+**Row 19, the bisect.** The anchor and the regression are both in the record and
+one commit range apart: `final_run.jsonl.maxtext` of 2026-08-03 01:56 reads
+**440.0** and its 2026-08-05 14:31 successor **964.2**, same losses to the last
+digit (228.3945 → 87.0428), CPU 1402 → 1373. Today, on this machine and this
+tree, the 0.11.2 `src/metaljax` re-run through the unchanged Stage 1 dylib
+(`PYTHONPATH` shadowing the editable install) gives **448.2** against the
+current tree's **969.1** — so the variable is metaljax's own code, not the
+harness (untouched since 0.11.3), not the maxtext venv or checkout (both
+2026-08-02, verified by mtime), and not the machine.
+
+Inside that range the knobs answer it directly, all four measured today:
+
+| configuration | Stage 1 | native |
+|---|---:|---:|
+| shipped defaults | 969.1 | 1006.2 |
+| `METALJAX_FLUSH_CLEAR_MB=1e6` (flush, never clear) | **478.8** | **468.0** |
+| `METALJAX_EAGER_FLUSH_SYNC=0` (async flush, so no clear) | 529.1 | — |
+| `METALJAX_EAGER_FLUSH_MB=0` (no flush at all) | **446.2** | — |
+| `METALJAX_COMPILE_BYTES_MB=0` / `METALJAX_ENV_PRUNE=0` (controls) | 970.1 / 984.5 | — |
+
+**The mechanism.** This program's `@main` is over the trace budget (`cost=24870
+> 20000`, unchanged since 0.11.2), so it runs op by op — and its eager traffic
+is ~105 GB per step against a live set of a few hundred MB. The byte-denominated
+flush therefore fires **82 times per step**, and every hard flush that finds more
+than `METALJAX_FLUSH_CLEAR_MB` (2048) in MLX's buffer cache returns the whole
+pool to the OS: **7 clears per step**, after each of which the next ~2 GB of
+allocations are cold Metal buffers. 969 → 479 is those seven clears (~70 ms
+each); the remaining 479 → 446 is the blocking eval of the flushes themselves.
+
+It is **shared by construction**: `plugin-native/runtime/program.cc`'s
+`eager_flush` is the transliteration of `interpreter._eager_flush`, and both
+read the same environment budgets — which is why the native column read "1.01×
+of Stage 1" for two passes while both were 2.2× off the anchor.
+
+**Not fixed here, and why.** The clear is a real memory bound, not decoration:
+with it disabled the LoRA row (18) blew through a 70 GB guard at 81 GB, and the
+Stage 1 LoRA run with the flush off was killed on trajectory at a projected
+95 GB. The shape of a fix that keeps the bound without the cliff is
+`mx::set_cache_limit(flush_clear_bytes)` — MLX then reclaims only the EXCESS, on
+the next allocation, so the pool stays bounded *at every instant* (a tighter
+guarantee than clearing at flush points) while reuse below the limit survives.
+That is a change to the shared runtime's memory discipline; it wants Oleg's
+sign-off, a memory ladder of its own, and — for Stage 1, whose copy of
+`_eager_flush` is frozen — an explicit decision to reopen `src/`.
+
+Interim, for anyone measuring an eager-main row: `METALJAX_FLUSH_CLEAR_MB` is
+the knob, and the row's memory must be watched when it is lifted.
 
 Everything else is within ±4.5 % of its anchor (rows 1–6, 11, 13, 16, 17, 18),
 and the texmo top_confs sweep is 4.6 % *faster* than its anchor with a 0.986

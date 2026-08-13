@@ -70,6 +70,13 @@ struct LoweredProgram {
   // argument or a constant the Program owns (XLA's no-alias contract).
   int64_t num_entries = 0;
   int64_t num_copies = 0;
+  // The outputs the copy list EXEMPTS because every argument they may alias
+  // is donated (engine.py `_dealias`: "aliasing is exactly what donation
+  // licenses"), each with those arguments.  Donation is retractable per CALL
+  // through `non_donatable_input_indices`, and an output aliasing a retracted
+  // argument has to be copied after all -- which is `RunOnce`'s job, since
+  // only the call knows.  Empty on every program that donates nothing.
+  std::vector<std::pair<int, std::vector<int>>> donated_output_aliases;
   // Whether the whole tape is traced through mx::compile (the P5 decision;
   // while BODIES carry theirs in the entry's attrs instead).
   bool compiled = false;

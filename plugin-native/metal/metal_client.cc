@@ -490,10 +490,12 @@ MetalClient::CompileAndLoad(xla::MaybeOwningMlirModule module,
   if (kDebug) {
     std::fprintf(stderr,
                  "[metaljax-native] lowered %s: %lld entries, %zu args, "
-                 "%zu results, %lld output copies, compiled=%d\n",
+                 "%zu results, %lld output copies, %zu donated, "
+                 "compiled=%d\n",
                  name.c_str(), static_cast<long long>(lowered.num_entries),
                  lowered.parameters.size(), lowered.results.size(),
                  static_cast<long long>(lowered.num_copies),
+                 lowered.donated_parameters.size(),
                  static_cast<int>(lowered.compiled));
     std::fflush(stderr);
   }
