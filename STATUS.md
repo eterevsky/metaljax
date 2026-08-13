@@ -35,7 +35,7 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.7** (0.99× ²⁷) | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
 | 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **25.3** (1.16×, 35 GB ²⁸) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | not run (PAUSED ¹⁷) | **13.7** | — | — |
-| 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | ✗ **PANIC #8** ²⁵ (retry pending) | 131.8 | — | — |
+| 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | **214.4** (65.5 GB) ²⁹ | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | not run (embargo) | **10.6** | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | 16.67 (1.02×) ᴾ¹⁶ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | not run (PAUSED ¹⁷) | **52.8** (93.4 GB) | — | — |
@@ -279,6 +279,8 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
     Stage 1's load-phase cache-clear cadence. **Row 9 native is embargoed
     until that cadence lands**, and the campaign was halted here — rows
     marked "not run" above were never attempted.
+29. Row 9 native retry (2026-08-13): ladder-verified (16/31/65 GB rungs each within 2% of predicted peak), load throttled to 0.30 GB/s (BENCH_STREAM_THROTTLE_GBPS / MJ_INGEST_THROTTLE_GBPS -- the #4/#7/#8 wedge class is fill-rate-sensitive; the panicked run filled at 0.42, the surviving Stage 1 run at 0.35). decode 214.4 ms/tok = 1.003x Stage 1, tokens identical, peak RSS 65.6 GB, throttle_s 45.5, clears 16, machine clean after. Jsonl: r1-distill-32b-0813-020534.
+
 26. Rows 14 and 19 are **Stage-1 regressions against their own 0.11.3
     anchors**, independent of the plugin under test: row 14 32.5 → 60.1
     ms/tok (1.85×; `METALJAX_ENGINE=py` gives 42.3, so ~1.42× of it is the

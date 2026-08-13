@@ -40,6 +40,7 @@ import pathlib
 import struct
 import subprocess
 import sys
+import time
 
 _HERE = pathlib.Path(__file__).resolve().parent
 _DEFAULT_DYLIB = _HERE / "bazel-bin" / "metal" / "libmetal_pjrt_native.dylib"
@@ -163,6 +164,13 @@ def checkpoint(path):
 
     gb = float(1 << 30)
     cast = os.environ.get("MJ_INGEST_CAST") == "1"
+    # MJ_INGEST_THROTTLE_GBPS caps the CUMULATIVE fill rate (0 = off): the
+    # panic-#4/#7/#8 wedge class is rate-sensitive, and the row-9 ladder
+    # holds the load below the rate the surviving Stage 1 run filled at.
+    # Sleeps only when AHEAD of the budget line -- a slower load pays nothing.
+    throttle = float(os.environ.get("MJ_INGEST_THROTTLE_GBPS", "0"))
+    t0 = time.monotonic()
+    throttled_s = 0.0
     base_rss = _rss_gb()
     held = []
     moved = 0
@@ -171,6 +179,11 @@ def checkpoint(path):
     peak_cache = 0.0
     for shard in _shards(path):
         for name, array in _read_shard(shard):
+            if throttle:
+                ahead = moved / gb / throttle - (time.monotonic() - t0)
+                if ahead > 0:
+                    time.sleep(min(ahead, 1.0))
+                    throttled_s += min(ahead, 1.0)
             buf = jax.device_put(array)
             if cast:
                 buf = jnp.asarray(buf, jnp.float32).astype(array.dtype)
@@ -189,6 +202,9 @@ def checkpoint(path):
         "base_rss_gb": base_rss,
         "peak_rss_gb": peak_rss,
         "peak_cache_gb": peak_cache,
+        "throttle_gbps": throttle,
+        "throttled_s": throttled_s,
+        "wall_s": time.monotonic() - t0,
         "end_active_gb": mx.get_active_memory() / gb,
         "end_cache_gb": mx.get_cache_memory() / gb,
     }

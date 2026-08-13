@@ -381,6 +381,18 @@ def install_streaming_load(clear_every_gb=None):
         if _STREAM["assigned_gb"] >= _STREAM["_next_clear"]:
             _STREAM["_next_clear"] += _STREAM["_clear_gb"]
             _stream_clear()
+        if _STREAM["_throttle_gbps"]:
+            # Cap the CUMULATIVE fill rate: the panic-#4/#7/#8 wedge class is
+            # rate-sensitive (the #8 native load filled ~20% faster than the
+            # Stage 1 run that survived the same footprint), so the retry
+            # ladder holds the load below the survivor's rate rather than
+            # trusting any cache cadence. Sleeping only when AHEAD of the
+            # budget line keeps the wall cost zero for loads already slower.
+            ahead = (_STREAM["assigned_gb"] / _STREAM["_throttle_gbps"]
+                     - (time.monotonic() - _STREAM["_t0"]))
+            if ahead > 0:
+                time.sleep(min(ahead, 1.0))
+                _STREAM["throttle_s"] += min(ahead, 1.0)
         n = _STREAM["assigned"]
         if _STREAM["_sync_every"] and n % _STREAM["_sync_every"] == 0:
             _stream_sync()
@@ -404,6 +416,10 @@ def install_streaming_load(clear_every_gb=None):
     _STREAM["_next_clear"] = _STREAM["_clear_gb"]
     _STREAM["_mark_every"] = _int_env("BENCH_STREAM_MARK", 0)
     _STREAM["_sync_every"] = _int_env("BENCH_STREAM_SYNC", 0)
+    # BENCH_STREAM_THROTTLE_GBPS: cumulative fill-rate cap in GB/s, 0 = off.
+    _STREAM["_throttle_gbps"] = float(
+        os.environ.get("BENCH_STREAM_THROTTLE_GBPS", "0"))
+    _STREAM["throttle_s"] = 0.0
     _STREAM["_t0"] = time.monotonic()
     _STREAM["_mark_t"] = _STREAM["_t0"]
     _STREAM["_mark_gb"] = 0.0
