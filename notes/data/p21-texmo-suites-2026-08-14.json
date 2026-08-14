@@ -1,0 +1,456 @@
+{
+ "tree": "4d1e403 + UNCOMMITTED plugin-native msl port (see status)",
+ "date": "2026-08-14",
+ "status": {
+  "campaign": "HALTED after run 3 of 5",
+  "why": "the working tree's plugin-native lowering is not HEAD: metal_msl.{cc,h} + metal_msl_emit.cc are UNTRACKED and metal_lowering.cc/BUILD carry +506 uncommitted lines (an msl_scan port). Those sources were written at 14:45-14:50 and the dylib was RE-LINKED at 14:55:05, i.e. DURING this campaign; a concurrent plugin-native/texmo_gate.py GPU run started at 14:55:40 while the machine lock was held. The native column therefore measures a moving, uncommitted binary under concurrent load and runs 3 and 5 would not share a binary.",
+  "runs_completed": [
+   "topconfs-stage1-engine (163/163 checks ok)",
+   "suite106-stage1",
+   "suite106-native (WIP-msl dylib)"
+  ],
+  "runs_not_done": [
+   "topconfs-stage1-pjrt (partial, 45/163, killed)",
+   "topconfs-native-pjrt (never started)"
+  ],
+  "trustworthy": "the Stage 1 columns: run 1 reproduces P16's per-config numbers and its CPU control (0.985 vs P16's 0.986). The native suite106 column is PRELIMINARY.",
+  "lock": "/tmp/metaljax-bench.lock held 14:19:32-14:56, released on halt"
+ },
+ "suite106": {
+  "whole": {
+   "n": 106,
+   "geomean": 1.0267,
+   "median": 0.9998,
+   "min": 0.8731,
+   "max": 1.8524
+  },
+  "big": {
+   "n": 34,
+   "geomean": 1.0095,
+   "median": 1.0018,
+   "min": 0.8731,
+   "max": 1.2404
+  },
+  "mid": {
+   "n": 30,
+   "geomean": 0.987,
+   "median": 0.9939,
+   "min": 0.9088,
+   "max": 1.0157
+  },
+  "db": {
+   "n": 40,
+   "geomean": 1.0752,
+   "median": 1.0029,
+   "min": 0.9805,
+   "max": 1.8524
+  },
+  "synth": {
+   "n": 2,
+   "geomean": 0.9826,
+   "median": 0.9827,
+   "min": 0.9713,
+   "max": 0.994
+  },
+  "native_p16_over_today": {
+   "n": 106,
+   "geomean": 4.1129,
+   "median": 3.4092,
+   "min": 0.5788,
+   "max": 91.7095
+  },
+  "s1_p16_over_today": {
+   "n": 106,
+   "geomean": 0.9964,
+   "median": 1.0027,
+   "min": 0.8872,
+   "max": 1.0493
+  },
+  "native_wins": 54,
+  "within_1_2x": 98,
+  "over_10x": 0,
+  "errors": [],
+  "best_rows": [
+   [
+    "big07-b32l128",
+    "bytes.emb.512|dense.512.gelu-gru.512",
+    22.378,
+    19.538,
+    0.873
+   ],
+   [
+    "big11-b32l128",
+    "bytes.emb.512|gru.512-gru.512",
+    42.444,
+    37.314,
+    0.879
+   ],
+   [
+    "big10-b32l128",
+    "bits.4.oh+bp|gru.1024",
+    64.016,
+    56.748,
+    0.886
+   ],
+   [
+    "mid13-b64l128",
+    "bytes.emb.512|attn.512.8.64",
+    6.836,
+    6.213,
+    0.909
+   ],
+   [
+    "big13-b32l128",
+    "bytes|lstm.1024",
+    73.26,
+    66.907,
+    0.913
+   ],
+   [
+    "mid14-b16l256",
+    "bytes.emb.512|lrnn.512.2",
+    112.25,
+    103.289,
+    0.92
+   ],
+   [
+    "big09-b32l128",
+    "bytes.emb.1024|rnn.1024.tanh",
+    23.603,
+    21.745,
+    0.921
+   ],
+   [
+    "mid11-b64l128",
+    "bytes.emb.256|conv.4-gru.256",
+    9.096,
+    8.501,
+    0.935
+   ]
+  ],
+  "worst_rows": [
+   [
+    "db00-b16l128",
+    "bits.1+bp|",
+    0.144,
+    0.267,
+    1.85
+   ],
+   [
+    "db16-b256l512",
+    "bits.4.oh+bp|mgru.32-dense.64.gelu",
+    4.478,
+    8.255,
+    1.84
+   ],
+   [
+    "db17-b256l512",
+    "bits.4.oh+bp|gru.16-mgru.32-split.cat(dense.64.gelu, pass)",
+    7.285,
+    12.076,
+    1.66
+   ],
+   [
+    "db04-b128l128",
+    "tokens.32.fold.emb.1|split.add(dense.1.tanh, pass)",
+    0.299,
+    0.404,
+    1.35
+   ],
+   [
+    "db11-b256l512",
+    "bits.4.oh+bp|rnn.16.gelu-dense.8.gelu-rmsnorm",
+    2.179,
+    2.849,
+    1.31
+   ],
+   [
+    "db08-b4l1024",
+    "tokens.32.fold.oh|lrnn.4.4",
+    24.321,
+    30.254,
+    1.24
+   ],
+   [
+    "big16-b8l256",
+    "bytes.emb.1024|lstm.1024",
+    95.355,
+    118.28,
+    1.24
+   ],
+   [
+    "big15-b8l256",
+    "bytes.emb.1024|gru.1024",
+    79.605,
+    96.608,
+    1.21
+   ]
+  ],
+  "native_regressed_vs_p16": [
+   [
+    "db00-b16l128",
+    0.155,
+    0.267,
+    0.579
+   ],
+   [
+    "big09-b8l256",
+    26.068,
+    38.417,
+    0.679
+   ],
+   [
+    "big14-b32l128",
+    17.912,
+    24.687,
+    0.726
+   ],
+   [
+    "big16-b8l256",
+    85.826,
+    118.28,
+    0.726
+   ],
+   [
+    "db04-b128l128",
+    0.3,
+    0.404,
+    0.743
+   ],
+   [
+    "big16-b32l128",
+    61.443,
+    75.755,
+    0.811
+   ],
+   [
+    "big15-b8l256",
+    78.877,
+    96.608,
+    0.816
+   ],
+   [
+    "big14-b8l256",
+    10.607,
+    12.071,
+    0.879
+   ],
+   [
+    "big13-b8l256",
+    85.431,
+    96.807,
+    0.882
+   ],
+   [
+    "big12-b8l256",
+    5.24,
+    5.639,
+    0.929
+   ]
+  ],
+  "native_improved_most_vs_p16": [
+   [
+    "db02-b4l1024",
+    72.726,
+    0.793,
+    91.709
+   ],
+   [
+    "db03-b4l1024",
+    74.087,
+    0.819,
+    90.417
+   ],
+   [
+    "db13-b4l1024",
+    109.53,
+    1.872,
+    58.51
+   ],
+   [
+    "db14-b16l128",
+    32.346,
+    0.564,
+    57.31
+   ],
+   [
+    "db17-b4l1024",
+    305.708,
+    5.66,
+    54.015
+   ],
+   [
+    "db15-b16l128",
+    33.356,
+    0.63,
+    52.904
+   ]
+  ],
+  "s1_regressed_vs_p16": [
+   [
+    "mid14-b16l256",
+    99.584,
+    112.25,
+    0.887
+   ],
+   [
+    "big11-b32l128",
+    37.71,
+    42.444,
+    0.888
+   ]
+  ]
+ },
+ "topconfs": {
+  "whole": {},
+  "0-100": {},
+  "100-500": {},
+  "500-1500": {},
+  "1500+": {},
+  "native_p16_over_today": {},
+  "s1_p16_over_today": {
+   "n": 45,
+   "geomean": 1.0032,
+   "median": 1.0045,
+   "min": 0.9374,
+   "max": 1.0497
+  },
+  "anchor_over_s1_engine": {
+   "n": 163,
+   "geomean": 1.0563,
+   "median": 1.02,
+   "min": 0.9465,
+   "max": 1.1974
+  },
+  "cpu_anchor_over_today": {
+   "n": 163,
+   "geomean": 0.9845,
+   "median": 0.9852,
+   "min": 0.8689,
+   "max": 1.0354
+  },
+  "anchor_0-100": {
+   "n": 47,
+   "geomean": 1.0294,
+   "median": 1.0069,
+   "min": 0.9589,
+   "max": 1.1974
+  },
+  "anchor_100-500": {
+   "n": 61,
+   "geomean": 1.0662,
+   "median": 1.0789,
+   "min": 0.9956,
+   "max": 1.1412
+  },
+  "anchor_500-1500": {
+   "n": 29,
+   "geomean": 1.07,
+   "median": 1.1006,
+   "min": 0.9982,
+   "max": 1.1592
+  },
+  "anchor_1500+": {
+   "n": 26,
+   "geomean": 1.0675,
+   "median": 1.0557,
+   "min": 0.9465,
+   "max": 1.1556
+  },
+  "native_wins": 0,
+  "within_1_2x": 0,
+  "over_10x": 0,
+  "checks": {
+   "ok": 163
+  },
+  "s1_beats_cpu": 54,
+  "native_beats_cpu": 0,
+  "errors": [],
+  "best_rows": [],
+  "worst_rows": [],
+  "native_regressed_vs_p16": [],
+  "native_improved_most_vs_p16": [],
+  "s1_engine_worst_vs_anchor": [
+   [
+    "tc145-w1888",
+    0.946,
+    0.999,
+    0.947
+   ],
+   [
+    "tc010-w17",
+    0.608,
+    0.634,
+    0.959
+   ],
+   [
+    "tc008-w15",
+    0.482,
+    0.501,
+    0.963
+   ],
+   [
+    "tc012-w20",
+    0.565,
+    0.577,
+    0.98
+   ],
+   [
+    "tc001-w7",
+    0.631,
+    0.641,
+    0.985
+   ],
+   [
+    "tc044-w87",
+    5.518,
+    5.558,
+    0.993
+   ]
+  ],
+  "s1_engine_best_vs_anchor": [
+   [
+    "tc005-w12",
+    0.31,
+    0.259,
+    1.197
+   ],
+   [
+    "tc003-w10",
+    0.25,
+    0.21,
+    1.192
+   ],
+   [
+    "tc007-w14",
+    0.364,
+    0.307,
+    1.185
+   ],
+   [
+    "tc011-w18",
+    0.385,
+    0.326,
+    1.18
+   ],
+   [
+    "tc128-w1152",
+    0.678,
+    0.585,
+    1.159
+   ],
+   [
+    "tc161-w2784",
+    0.827,
+    0.715,
+    1.156
+   ]
+  ]
+ },
+ "wall_times": [
+  "topconfs-stage1-engine rc=0 elapsed=1118s",
+  "suite106-stage1 rc=0 elapsed=500s",
+  "suite106-native rc=0 elapsed=507s",
+  ""
+ ]
+}

@@ -484,3 +484,91 @@ venv. Perf neutrality was re-measured A/B/A against a kept copy of the pristine
 no-list dylib on the same five suite configs (relinked mean / pristine: 0.998,
 0.984, 0.976, 0.984, 1.001 — every delta inside the relinked passes' own 2.4 %
 spread). The wheel drops 42.2 MB → 11.8 MB with the dylib.
+
+---
+
+## P21 re-measurement (2026-08-14) — HALTED after 3 of 5 runs
+
+*Raw data: `~/.cache/metaljax-bench/logs/p21-texmo-suites/`; per-config table
+and aggregates: `notes/data/p21-texmo-suites-2026-08-14.{csv,json}`. Machine
+lock held 14:19:32–14:56, strictly sequential, same protocol and same runners as
+P16 (`scripts/bench_texmo_pjrt.py` at 64-step chunks for the native pairing,
+`scripts/texmo_topconfs.py` at 256 for the anchor-comparable Stage 1 column).
+The analysis reproduces every published P16 aggregate from P16's own artifacts
+before being applied to the new ones (4.238 vs 4.24, 36.459 vs 36.46, the four
+suite classes to three digits), so the two campaigns are computed identically.*
+
+**Why it halted.** The tree carried an **uncommitted `msl_scan` port of the
+native lowering**: `plugin-native/metal/metal_msl.{cc,h}` and
+`metal_msl_emit.cc` untracked, `metal_lowering.cc` + `BUILD` modified by 506
+lines over HEAD (4d1e403). Those sources were written at **14:45–14:50**, the
+dylib was **re-linked at 14:55:05**, and a concurrent
+`plugin-native/texmo_gate.py` GPU run started at **14:55:40** — all inside the
+campaign window. The native column was therefore measuring a *moving,
+uncommitted binary under concurrent load*, and runs 3 and 5 would not have
+shared a binary; the campaign was stopped rather than pair a 14:46 dylib against
+a 14:55 one. The Stage 1 stack is unaffected by any of it (frozen dylib, frozen
+`src/`), which is why its columns below are reported as measurements and the
+native column only as an observation.
+
+### Stage 1 — measured, and stable
+
+| comparison | n | geomean | reading |
+|---|---:|---:|---|
+| top_confs: 0.11.3 anchor / Stage 1 today (engine route, 256-step chunks) | 163 | **1.056** | today 5.6 % faster than the anchor (P16 read 1.046) |
+| — by weight class (0–100 / 100–500 / 500–1500 / 1500+) | 47/61/29/26 | 1.029 / 1.066 / 1.070 / 1.068 | |
+| jax-CPU control, anchor / today | 163 | 0.985 | machine 1.5 % slower — the same ambient P16 measured (0.986) |
+| suite-106: Stage 1 P16 / Stage 1 today (PJRT route) | 106 | 0.996 | no drift |
+
+Checks **163/163 ok, 0 FAIL, 0 error**. Configs beating jax-CPU: **54 of 163**
+(anchor 53, P16 54). Best vs anchor `tc005-w12` 1.197, worst `tc145-w1888`
+0.947 — the same worst row P16 found (−5.4 %), so it is a property, not noise.
+Two suite-106 rows sit 11 % under their P16 reading (`mid14-b16l256` 0.887,
+`big11-b32l128` 0.888) and nothing else is outside ±5 %. They were **not**
+re-run standalone: by the time the halt was called the machine had been taken
+by the concurrent gate work, and a standalone re-check is precisely what the
+suite-context trap (CLAUDE.md item 12) demands — it is owed before either is
+called a regression.
+
+### suite-106 native — PRELIMINARY (WIP binary), and the gap is essentially gone
+
+Same day, same route, same chunk length, 106/106 on both stacks, 0 errors.
+**Do not quote these as the native plugin's numbers**: they are the
+work-in-progress msl port as it stood at 14:46.
+
+| aggregate | n | native/Stage 1 (P16) | native/Stage 1 (today) |
+|---|---:|---:|---:|
+| whole suite, geomean | 106 | 4.24× | **1.027×** |
+| whole suite, median | 106 | 3.37× | **1.000×** |
+| `big` | 34 | 1.34× | 1.010× |
+| `mid` | 30 | 3.22× | **0.987×** |
+| `db` (msl territory) | 40 | 14.61× | **1.075×** |
+| `synth` | 2 | 1.52× | 0.983× |
+| rows where native is faster | 106 | 18 | **54** |
+| rows within 1.2× | 106 | 33 | **98** |
+| rows at or above 10× | 106 | 32 | **0** |
+
+Against P16's native column the geomean improvement is **4.11×** (median 3.41,
+best `db02-b4l1024` **91.7×**: 72.7 → 0.793 ms/step, which is Stage 1's 0.793 to
+three digits). Run wall time fell 995 s → 507 s for the same 106 configs.
+
+**Ten native rows are SLOWER than P16's native.** Eight are rows where the C++
+compile path had been at or *ahead* of Stage 1 and is not any more:
+`big09-b8l256` **0.679** (26.07 → 38.42 ms — P16's flagship 0.68× win now reads
+1.00× of Stage 1), `big14-b32l128` 0.726 (transformer d512, 0.82× → **1.12×**),
+`big16-b8l256` 0.726 (0.93× → **1.24×**), `big16-b32l128` 0.811,
+`big15-b8l256` 0.816, `big14-b8l256` 0.879, `big13-b8l256` 0.882,
+`big12-b8l256` 0.929 (0.96× → 1.00×). The other two were at parity in P16 and
+are now the suite's worst rows: `db00-b16l128` 0.579 (0.155 → 0.267 ms, 1.04× →
+**1.85×**) and `db04-b128l128` 0.743 (1.00× → 1.35×), both sub-0.5 ms
+dispatch-floor configs. The remaining worst native/Stage 1 rows today are
+`db16-b256l512` 1.84× and `db17-b256l512` 1.66×. All of this belongs to whoever
+owns the port; on a clean tree it is the first thing to re-check.
+
+### Not measured
+
+`topconfs-stage1-pjrt` (killed at 45 of 163) and `topconfs-native-pjrt` (never
+started), so **there is no top_confs native/Stage 1 geomean for this date**. The
+pairing needs an exclusive machine and a frozen native dylib — a copy under a
+different name is enough, `jax_plugins/metal` identifies a plugin by its exports
+for exactly this reason.
