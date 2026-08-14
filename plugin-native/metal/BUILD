@@ -92,6 +92,29 @@ cc_library(
     ],
 )
 
+# msl_scan's planning half (M5b): the loop-body analysis, the mode choice and
+# the three MSL emitters.  The LAUNCH half is //runtime's `MslPlan`, which is
+# shared with Stage 1 -- this library only produces the recipe it parses.
+cc_library(
+    name = "metal_msl",
+    srcs = [
+        "metal_msl.cc",
+        "metal_msl_emit.cc",
+    ],
+    hdrs = ["metal_msl.h"],
+    deps = [
+        ":metal_dtypes",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "//runtime",
+        "@stablehlo//:stablehlo_ops",
+    ],
+)
+
 # StableHLO -> the executor's tape.  Depends on the runtime (for the opcode
 # and dtype registries and the Program itself) and on the StableHLO dialect,
 # and on no part of the plugin shell: a lowering is a pure function of the
@@ -102,6 +125,7 @@ cc_library(
     hdrs = ["metal_lowering.h"],
     deps = [
         ":metal_dtypes",
+        ":metal_msl",
         ":metal_names",
         ":metal_recognize",
         "@com_google_absl//absl/container:flat_hash_map",

@@ -598,6 +598,11 @@ class Program {
   void settle_msl(const std::vector<mx::array>& inputs,
                   std::vector<mx::array>& outs);
 
+  // ...and, when a SECOND kernel fails on the very run that was recovering
+  // from the first, retire every plan this program holds: with no Python
+  // engine underneath, that is what makes the ladder terminate (msl.cc).
+  void disable_msl_deep();
+
   // Whether anything in this program (or its regions) calls back into
   // Python. Structure, not policy -- read off the tape, like reads_host.
   bool has_host() const;

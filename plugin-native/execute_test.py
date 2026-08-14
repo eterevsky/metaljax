@@ -104,6 +104,91 @@ def _switch_case(i, x):
     return tuple(jax.lax.switch(i[k], branches, x) for k in range(5))
 
 
+# --------------------------------------------------------------------------
+# msl_scan cases (P21)
+# --------------------------------------------------------------------------
+#
+# One counted loop per generated-kernel MODE, plus the AD-generated backward
+# passes -- which is where loop fission runs (hidden per-step stacks out of the
+# kernel, one batched matmul after it).  Written as functions rather than
+# lambdas so the body reads like the cell it is.
+
+
+def _msl_mingru(h0, xs, wz, wh):
+    """A pure elementwise cell: `scalar` (affine) mode, one thread per lane."""
+    import jax
+    import jax.numpy as jnp
+
+    def step(h, x):
+        z = jax.nn.sigmoid(x * wz)
+        h = z * h + (1.0 - z) * jnp.tanh(x * wh)
+        return h, h
+    return jax.lax.scan(step, h0, xs)
+
+
+def _msl_mingru_grad(h0, xs, wz, wh):
+    """...and its backward pass, whose loop runs in reverse (idx a = -1)."""
+    import jax
+    import jax.numpy as jnp
+
+    def loss(wz, wh):
+        _, hs = _msl_mingru(h0, xs, wz, wh)
+        return jnp.sum(hs * hs * 0.5)
+    return jax.grad(loss, argnums=(0, 1))(wz, wh)
+
+
+def _msl_rnn(h0, xs, w):
+    """A matvec cell.  Narrow: `vector` mode holds the feature dim in
+    registers and unrolls the matvec in lane."""
+    import jax
+    import jax.numpy as jnp
+
+    def step(h, x):
+        h = jnp.tanh(x + h @ w)
+        return h, h
+    return jax.lax.scan(step, h0, xs)
+
+
+def _msl_rnn_grad(h0, xs, w):
+    """The weight gradient: a cross-lane dot per step, which cannot run per
+    lane -- the kernel stacks its operands and one batched matmul finishes the
+    job (msl_scan's loop fission)."""
+    import jax
+    import jax.numpy as jnp
+
+    def loss(w):
+        _, hs = _msl_rnn(h0, xs, w)
+        return jnp.sum(hs * hs * 0.5)
+    return jax.grad(loss)(w)
+
+
+def _msl_gru(h0, xs, wz, wr, wn):
+    """Three gates over one state width: the coop-over-vector flip of 0.4.3
+    (square dots, F >= 8) picks threadgroup mode for this."""
+    import jax
+    import jax.numpy as jnp
+
+    def step(h, x):
+        z = jax.nn.sigmoid(x + h @ wz)
+        r = jax.nn.sigmoid(x + h @ wr)
+        n = jnp.tanh(x + (r * h) @ wn)
+        h = (1.0 - z) * n + z * h
+        return h, h
+    return jax.lax.scan(step, h0, xs)
+
+
+def _msl_nested(h0, xs, w):
+    """A statically-counted inner loop inside the scan: the analyzer unrolls
+    it symbolically (trip <= 64) rather than declining."""
+    import jax
+    import jax.numpy as jnp
+
+    def outer(h, x):
+        h = jax.lax.fori_loop(0, 3, lambda i, c: jnp.tanh(c * 0.9 + x @ w), h)
+        return h, h
+    return jax.lax.scan(outer, h0, xs)
+
+
 def _cases():
     import jax
     import jax.numpy as jnp
@@ -398,6 +483,37 @@ def _cases():
         ("counted loop unrolled into a compiled main",
          lambda x: jax.lax.fori_loop(0, 6, lambda i, c: jnp.sin(c) + 0.25, x),
          [_rand((16,), 55)], *F32),
+
+        # msl_scan (P21).  Every one of these takes a GENERATED METAL KERNEL
+        # in place of the loop: the mode census below asserts that all three
+        # emitters really run, and the "msl kernels" section re-runs them with
+        # METALJAX_MSL=0 so the kernel is compared with the interpreted loop
+        # as well as with the CPU.
+        ("msl affine cell (mingru)", _msl_mingru,
+         [_rand((4, 16), 60), _rand((24, 4, 16), 61), _rand((16,), 62),
+          _rand((16,), 63)], *F32),
+        ("msl affine cell, backward", _msl_mingru_grad,
+         [_rand((4, 16), 64), _rand((24, 4, 16), 65), _rand((16,), 66),
+          _rand((16,), 67)], *DOT),
+        ("msl vector matvec cell", _msl_rnn,
+         [_rand((4, 4), 68), _rand((16, 4, 4), 69),
+          _rand((4, 4), 70) * f(0.3)], *DOT),
+        ("msl vector cell, weight grad", _msl_rnn_grad,
+         [_rand((4, 4), 71), _rand((16, 4, 4), 72),
+          _rand((4, 4), 73) * f(0.3)], *DOT),
+        ("msl coop matvec cell", _msl_rnn,
+         [_rand((8, 64), 74), _rand((12, 8, 64), 75),
+          _rand((64, 64), 76) * f(0.1)], *DOT),
+        ("msl coop cell, weight grad", _msl_rnn_grad,
+         [_rand((8, 32), 77), _rand((12, 8, 32), 78),
+          _rand((32, 32), 79) * f(0.1)], *DOT),
+        ("msl gru cell (coop flip)", _msl_gru,
+         [_rand((8, 16), 80), _rand((12, 8, 16), 81),
+          _rand((16, 16), 82) * f(0.2), _rand((16, 16), 83) * f(0.2),
+          _rand((16, 16), 84) * f(0.2)], *DOT),
+        ("msl nested unrolled loop", _msl_nested,
+         [_rand((4, 8), 85), _rand((10, 4, 8), 86),
+          _rand((8, 8), 87) * f(0.2)], *DOT),
         # The same decision, one size up: 200 iterations still fit the OP
         # budget, so the lowering calls the body traceable and compiles main
         # around it -- and the executor then refuses to unroll more than 64
@@ -3302,9 +3418,118 @@ def read_reference(path, index):
             for j in range(n)]
 
 
+def _p21_msl(subprocess, pathlib, re):
+    """The msl_scan contracts: which emitters really run, and the knob.
+
+    The three modes exist because they are three different lane geometries,
+    and a port that quietly stopped picking one would show up nowhere else --
+    every case would still be right, just slower.  So the census is a test:
+    the plugin's own narration, read out of a child run with METALJAX_DEBUG.
+    """
+
+    def modes_are_covered():
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        proc = subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).resolve()),
+             "--msl-modes"], env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout).splitlines()[-1][:80]
+        modes = re.findall(r"msl_scan: compiled plan .*?mode=(\w+)",
+                           proc.stderr)
+        seen = sorted(set(modes))
+        missing = {"scalar", "vector", "coop"} - set(seen)
+        if missing:
+            return False, f"no plan in {sorted(missing)} mode (saw {seen})"
+        return True, f"{len(modes)} kernels: {', '.join(seen)}"
+
+    def the_kill_switch_kills():
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        child["METALJAX_MSL"] = "0"
+        proc = subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).resolve()),
+             "--msl-modes"], env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout).splitlines()[-1][:80]
+        n = len(re.findall(r"msl_scan: compiled plan", proc.stderr))
+        return n == 0, f"{n} kernels with METALJAX_MSL=0"
+
+    return [("msl covers its three modes", modes_are_covered),
+            ("METALJAX_MSL=0 builds no kernel", the_kill_switch_kills)]
+
+
+def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
+    """Re-run every case through the SAME dylib under `env_extra` and compare.
+
+    The child writes its answers with `--eager-arm` (the entry point is the
+    plugin arm generally: what changes between the two callers is the
+    environment the dylib reads at load).  Bit-identity is reported, not
+    demanded: a compile decision or a generated kernel changes which MLX
+    kernels run, and the bar is each case's own CPU tolerance.
+    """
+    print(f"\n{title}")
+    print("-" * 62)
+    path = ref_path.with_name(ref_path.name.replace("reference",
+                                                    "arm-" + tag))
+    child = dict(os.environ)
+    child.update(env_extra)
+    proc = subprocess.run(
+        [sys.executable, str(pathlib.Path(__file__).resolve()), "--eager-arm",
+         str(path)],
+        env=child, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stdout + proc.stderr)
+        print(f"{'the arm':<32} {'-':>12}  FAIL: the child failed")
+        failures.append(tag)
+        return
+    arm = np.load(path)
+    inexact, bad = [], []
+    for i, (name, _fn, _args, rtol, atol) in enumerate(_cases()):
+        if i not in compiled_arm:
+            continue
+        got = compiled_arm[i]
+        want = [(str(arm[f"k{i}_{j}"]), arm[f"v{i}_{j}"])
+                for j in range(int(arm[f"n{i}"]))]
+        identical = len(got) == len(want) and all(
+            gk == wk and ga.shape == wa.shape and
+            (np.array_equal(ga, wa) or
+             (gk in "fc" and
+              np.array_equal(np.isnan(ga), np.isnan(wa)) and
+              np.array_equal(ga[~np.isnan(ga)], wa[~np.isnan(wa)])))
+            for (gk, ga), (wk, wa) in zip(got, want))
+        if identical:
+            continue
+        ok, detail = _compare(name, [ga for _k, ga in got], want, rtol, atol)
+        inexact.append(f"{name} ({detail:.1e})" if ok else name)
+        if not ok:
+            bad.append(f"{name}: {detail}")
+    n = len(compiled_arm)
+    label = f"{n - len(inexact)} of {n} bit-identical"
+    if bad:
+        print(f"{label:<32} {'-':>12}  FAIL: {'; '.join(bad[:3])}")
+        failures.append(tag)
+    else:
+        print(f"{label:<32} {'':>12}  ok"
+              + (f" (within tolerance: {', '.join(inexact)})"
+                 if inexact else ""))
+    path.unlink(missing_ok=True)
+
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--reference":
         write_reference(sys.argv[2])
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--msl-modes":
+        # The mode census: run the msl cases through the plugin with
+        # METALJAX_DEBUG on, so the parent can read which emitters really ran
+        # out of the plugin's own narration.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        for name, fn, args, _rtol, _atol in _cases():
+            if name.startswith("msl "):
+                jax.jit(fn)(*args)
         return 0
     if len(sys.argv) > 2 and sys.argv[1] == "--eager-arm":
         os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
@@ -3365,52 +3590,30 @@ def main():
     # CPU tolerance.  Most are bit-identical; the ones that are not are named,
     # because a fused kernel evaluating a transcendental differently is a fact
     # about MLX worth seeing rather than a threshold to hide.
-    print("\neager vs compiled (METALJAX_COMPILE=0 in a child)")
-    print("-" * 62)
-    eager_path = ref_path.with_name(ref_path.name.replace("reference", "eager"))
-    eager_child = dict(os.environ)
-    eager_child["METALJAX_COMPILE"] = "0"
-    eager_proc = subprocess.run(
-        [sys.executable, str(pathlib.Path(__file__).resolve()), "--eager-arm",
-         str(eager_path)],
-        env=eager_child, capture_output=True, text=True)
-    if eager_proc.returncode != 0:
-        sys.stderr.write(eager_proc.stdout + eager_proc.stderr)
-        print(f"{'the eager arm':<32} {'-':>12}  FAIL: the child failed")
-        failures.append("eager arm")
-    else:
-        eager = np.load(eager_path)
-        inexact, bad = [], []
-        for i, (name, _fn, _args, rtol, atol) in enumerate(_cases()):
-            if i not in compiled_arm:
-                continue
-            got = compiled_arm[i]
-            want = [(str(eager[f"k{i}_{j}"]), eager[f"v{i}_{j}"])
-                    for j in range(int(eager[f"n{i}"]))]
-            identical = len(got) == len(want) and all(
-                gk == wk and ga.shape == wa.shape and
-                (np.array_equal(ga, wa) or
-                 (gk in "fc" and
-                  np.array_equal(np.isnan(ga), np.isnan(wa)) and
-                  np.array_equal(ga[~np.isnan(ga)], wa[~np.isnan(wa)])))
-                for (gk, ga), (wk, wa) in zip(got, want))
-            if identical:
-                continue
-            ok, detail = _compare(name, [ga for _k, ga in got], want,
-                                  rtol, atol)
-            inexact.append(f"{name} ({detail:.1e})" if ok else name)
-            if not ok:
-                bad.append(f"{name}: {detail}")
-        n = len(compiled_arm)
-        label = f"{n - len(inexact)} of {n} bit-identical"
-        if bad:
-            print(f"{label:<32} {'-':>12}  FAIL: {'; '.join(bad[:3])}")
-            failures.append("eager vs compiled")
-        else:
-            print(f"{label:<32} {'':>12}  ok"
-                  + (f" (within tolerance: {', '.join(inexact)})"
-                     if inexact else ""))
-        eager_path.unlink(missing_ok=True)
+    _arm_section("eager vs compiled (METALJAX_COMPILE=0 in a child)",
+                 {"METALJAX_COMPILE": "0"}, "eager-vs-compiled",
+                 ref_path, compiled_arm, failures)
+
+    # The same shape for the generated kernels: with METALJAX_MSL=0 not one
+    # loop takes a kernel, so the child computes every msl case through the
+    # INTERPRETED loop the entry still carries.  A kernel accumulates a dot in
+    # its own order, so bit-identity is reported rather than demanded and the
+    # bar is each case's own CPU tolerance -- but a case that takes no kernel
+    # must be identical, which is what makes the count mean something.
+    _arm_section("msl kernels vs the interpreted loop "
+                 "(METALJAX_MSL=0 in a child)",
+                 {"METALJAX_MSL": "0"}, "msl-off", ref_path, compiled_arm,
+                 failures)
+
+    # ...and the recovery: with every generated source made invalid, Metal
+    # rejects the kernel at its first EVAL and the executor must retire the
+    # plan and run the interpreted loop in the same call (`Program::run_msl`,
+    # `Program::settle_msl`).  Every case, not just the msl ones: what is
+    # being proved is that a build failure costs an answer nowhere.
+    _arm_section("a rejected kernel falls back to the loop "
+                 "(METALJAX_MSL_FORCE_BUILD_FAIL=1 in a child)",
+                 {"METALJAX_MSL_FORCE_BUILD_FAIL": "1"}, "msl-build-failure",
+                 ref_path, compiled_arm, failures)
 
     print("\nhand-written StableHLO (the same text through both clients)")
     print("-" * 62)
@@ -3498,7 +3701,8 @@ def main():
         if not ok:
             failures.append(label)
 
-    for label, check in _p19_packing(subprocess, tempfile, pathlib):
+    for label, check in (_p19_packing(subprocess, tempfile, pathlib)
+                         + _p21_msl(subprocess, pathlib, __import__("re"))):
         try:
             ok, detail = check()
         except BaseException as exc:  # noqa: BLE001 - report and continue

@@ -1566,3 +1566,50 @@ column that was missing.
 re-measured on it (13: 79.7 twice; 7: 22.2; 18: 397.5/396.2). Not re-run and
 worth watching, since `cost` also sizes the loop flush period: rows 3, 5, 6, 16,
 17 were at parity before this change.
+
+## P21: msl_scan, natively (2026-08-14, notes/cpp-p21-msl.md)
+
+Item 1 of the P16 frontier, the last and largest: the generated persistent
+kernels. All three modes at once -- `scalar` (affine), `vector` (in-lane
+matvecs + loop fission) and `coop` (threadgroup per batch element) -- because
+they are one recognizer with three emitters. `metal_msl.{h,cc}` +
+`metal_msl_emit.cc` are `src/metaljax/msl_scan.py` transliterated; the LAUNCH
+half is M5b's `runtime/msl.cc`, which has executed these plans since May.
+`LowerMslPlan` is `tape.py::_lower_msl`, and `MslPlanFor` is the one cache the
+cost walk (8 units for a planned loop), `WhileTraceable` (planned = traceable)
+and `LowerWhile` all ask, exactly as `ops/control._msl_plan_for` is in Stage 1.
+
+**The census is identical to Stage 1's, plan for plan and decline for decline**
+over the whole 106-configuration suite: 146 coop / 52 vector / 12 scalar, and
+136 declines whose reasons match one for one (104 `stablehlo.gather`, 18 the
+coop work cap, ...). Two recognizers agreeing about every loop in 106 real
+training chunks is the evidence the port is faithful.
+
+Measured standalone, same binary, `METALJAX_MSL` flipped (ms/step of one 8-step
+chunk): `db02-b4l1024` 588 -> **8.0** (73x), `db11-b64l256` 231 -> **7.0**
+(33x), and **nothing** on the rows that take no kernel (`db00` 1.73 -> 1.76,
+`big14` 143.2 -> 143.5, `big16` 480.8 -> 483.5, `db04` 4.03 -> 3.97) -- compile
+time included. One row LOSES: `big09-b8l256` (`rnn.1024`) 202 -> 308, because
+its single 1024x1024 dot is 1.05M elements, under `METALJAX_MSL_COOP_CAP`'s
+2.2M, and per-threadgroup weight re-streaming loses to the compiled matmul at
+that width. `METALJAX_MSL_COOP_CAP=1000000` returns it to 201.6; not applied,
+because it would put the native census out of step with Stage 1's -- a policy
+question rather than a port decision (CLAUDE.md item 12e already says F=1024
+loses).
+
+One runtime fix rode with it, and it is phase-2-specific: `settle_msl`'s
+recovery assumed a second kernel failure could hand the program to the Python
+engine. It cannot here, and the second failure is reachable (a retired kernel
+runs its body, whose own loop then hands back a second unproven plan). The
+ladder is bounded now -- second failure retires every plan in the program
+(`disable_msl_deep`) and reruns once. Found by the new
+`METALJAX_MSL_FORCE_BUILD_FAIL` arm of `execute_test`.
+
+Battery: `execute_test` 524 -> **534** checks (8 msl cases, 2 msl contracts,
+and two whole-suite arms: `METALJAX_MSL=0` -- 466 of 469 bit-identical, the
+three that differ being exactly the fissioned weight-gradient rows -- and
+`METALJAX_MSL_FORCE_BUILD_FAIL=1`, the recovery ladder end to end);
+`texmo_gate` **106 ok / 0 decline / 0 FAIL** twice on the final binary;
+`smoke_test`; `decline_census` 35 of 35; `bazel test //...`. One flake seen on
+an earlier binary (`big10-b8l256`, `inf` in-suite, passes standalone 3/3,
+builds no msl plan at all) is P4's recorded lottery for that row's class.

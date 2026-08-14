@@ -464,31 +464,55 @@ void Program::run_msl(const Entry& e,
 void Program::settle_msl(const std::vector<mx::array>& inputs,
                          std::vector<mx::array>& outs) {
   if (t_msl_pending.empty()) return;
-  std::exception_ptr err;
-  try {
-    mx::eval(outs);
-    for (MslPlan* p : t_msl_pending) p->validate();
+  // Bounded, and it has to be: the rerun can REACH a plan the first attempt
+  // never launched. A loop whose kernel is retired runs its body instead, and
+  // the body may hold a loop of its own -- so a nested scan hands back a
+  // second unproven plan on the very run that was recovering from the first
+  // (P21: found by METALJAX_MSL_FORCE_BUILD_FAIL over execute_test's "msl
+  // nested unrolled loop"). Stage 1 answered this by disabling the whole
+  // persistent-kernel path for the program and letting the interpreter run it
+  // (engine.execute's `_no_msl`); with no Python engine underneath, the same
+  // answer is: retire EVERY plan this program holds and run it once more,
+  // after which no kernel can fail because none is left.
+  for (int round = 0; !t_msl_pending.empty(); round++) {
+    std::exception_ptr err;
+    try {
+      mx::eval(outs);
+      for (MslPlan* p : t_msl_pending) p->validate();
+      t_msl_pending.clear();
+      return;
+    } catch (const std::exception&) {
+      err = std::current_exception();
+    }
+    for (MslPlan* p : t_msl_pending) p->kill();
+    g_stats.msl_failures++;
     t_msl_pending.clear();
-    return;
-  } catch (const std::exception&) {
-    err = std::current_exception();
+    // A rerun repeats whatever the first attempt already did to the world, so
+    // a program holding a host call keeps the failure.
+    if (has_host() || round >= 1) {
+      if (has_host() || round >= 2) std::rethrow_exception(err);
+      // Second failure: no more one-plan-at-a-time recovery.
+      debug_print("a second msl_scan kernel failed to build; retiring every "
+                  "kernel in this program");
+      disable_msl_deep();
+    } else {
+      debug_print("a traced msl_scan kernel failed to build; dropping it and "
+                  "rerunning the program");
+    }
+    drop_compiled_deep();
+    gc_collect();
+    mx::clear_cache();
+    outs = run_recovering(inputs);
   }
-  for (MslPlan* p : t_msl_pending) p->kill();
-  g_stats.msl_failures++;
-  t_msl_pending.clear();
-  if (has_host()) std::rethrow_exception(err);
-  debug_print("a traced msl_scan kernel failed to build; dropping it and "
-              "rerunning the program");
-  drop_compiled_deep();
-  gc_collect();
-  mx::clear_cache();
-  outs = run_recovering(inputs);
-  // A second failure is not this milestone's business: the caller retires
-  // the tape and the Python engine takes the program back.
-  if (!t_msl_pending.empty()) {
-    mx::eval(outs);
-    for (MslPlan* p : t_msl_pending) p->validate();
-    t_msl_pending.clear();
+}
+
+// Every generated kernel this program (or any region of it) holds, retired.
+// The entries fall back to the interpreted loops they carry alongside, which
+// is what makes the recovery above terminate.
+void Program::disable_msl_deep() {
+  for (Entry& e : ops_) {
+    if (e.msl) e.msl->kill();
+    for (const auto& r : e.regions) r->disable_msl_deep();
   }
 }
 

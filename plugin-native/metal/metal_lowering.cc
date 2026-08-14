@@ -34,6 +34,7 @@ Licensed under the Apache License, Version 2.0.
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 #include "metal/metal_dtypes.h"
+#include "metal/metal_msl.h"
 #include "metal/metal_names.h"
 #include "metal/metal_recognize.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -45,6 +46,7 @@ Licensed under the Apache License, Version 2.0.
 #include "mlir/IR/Region.h"
 #include "mlir/IR/Value.h"
 #include "mlx/mlx.h"
+#include "msl.h"
 #include "program.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "xla/shape_util.h"
@@ -884,6 +886,14 @@ struct LowerContext {
   // interp._bytes_gated: blocks the byte gate has already reported. A RECORD,
   // not an authority -- the decision depends on how many copies are asked for.
   absl::flat_hash_set<mlir::Block*> gated;
+  // interp._msl_cache, keyed by (body block, trip, start) exactly as the
+  // Python one is.  Building a plan generates a Metal kernel, and the three
+  // callers that ask -- the cost walk, the traceability question and the
+  // lowering itself -- must get the SAME answer or the compile decisions and
+  // the tape would disagree about what this loop is.
+  std::map<std::tuple<mlir::Block*, int64_t, int64_t>,
+           std::shared_ptr<MslPlanned>>
+      msl;
 };
 
 // interpreter.free_values: the SSA values used inside `block` but defined
@@ -1108,6 +1118,71 @@ std::optional<Counted> AnalyzeCounted(LowerContext& ctx, mlir::Operation* op) {
 
   ctx.counted[&cond] = result;
   return result;
+}
+
+// ops/control.py `_msl_plan_for`: build (and cache) an msl_scan plan for a
+// statically-counted loop, or nullptr.  Asked by the cost walk, by the
+// traceability question and by the lowering -- the same three callers the
+// Python has, through the same cache, because a loop that takes a kernel on
+// one engine and an interpreted loop on the other would compute its carries by
+// different arithmetic.
+std::shared_ptr<MslPlanned> MslPlanFor(LowerContext& ctx,
+                                       mlir::Operation* op) {
+  if (!MslEnabled()) return nullptr;
+  std::optional<Counted> counted = AnalyzeCounted(ctx, op);
+  if (!counted.has_value() || counted->kind != Counted::kStatic) return nullptr;
+  const int64_t k = counted->k;
+  std::optional<int64_t> start = StaticStart(op, k);
+  if (!start.has_value()) return nullptr;
+  const int64_t trip = counted->n - *start;
+  if (trip <= 0) return nullptr;
+  mlir::Block& body = op->getRegion(1).front();
+  const auto key = std::make_tuple(&body, trip, *start);
+  auto cached = ctx.msl.find(key);
+  if (cached != ctx.msl.end()) return cached->second;
+  // Ordered-effect carries are not kernel-representable, and the analyzer
+  // would raise deep inside on the non-tensor type.
+  for (mlir::BlockArgument a : body.getArguments()) {
+    if (IsToken(a)) {
+      ctx.msl[key] = nullptr;
+      return nullptr;
+    }
+  }
+  MslEnv env;
+  env.module = ctx.module;
+  env.counted = [&ctx](mlir::Operation* inner)
+      -> std::optional<std::pair<int64_t, int64_t>> {
+    std::optional<Counted> c = AnalyzeCounted(ctx, inner);
+    if (!c.has_value() || c->kind != Counted::kStatic) return std::nullopt;
+    return std::make_pair(c->k, c->n);
+  };
+  env.static_start = [](mlir::Operation* inner, int64_t kk) {
+    return StaticStart(inner, kk);
+  };
+  // `_try_hoist`'s `o.name not in REGISTRY`: only an op this engine can run
+  // may be lifted out of the body and evaluated per call.
+  env.op_supported = [](llvm::StringRef name) {
+    return OpcodeTable().contains(std::string(name));
+  };
+  std::string why;
+  std::shared_ptr<MslPlanned> plan =
+      BuildMslPlan(env, body, k, trip, *start, &why);
+  if (MslDebug()) {
+    if (plan == nullptr) {
+      std::fprintf(stderr, "[metaljax] msl_scan: not eligible (%s)\n",
+                   why.c_str());
+    } else {
+      std::fprintf(stderr,
+                   "[metaljax] msl_scan: compiled plan trip=%lld mode=%s "
+                   "lanes=%lld states=%zu stacked=%zu packed=%lld\n",
+                   static_cast<long long>(plan->trip), plan->mode.c_str(),
+                   static_cast<long long>(plan->N), plan->state_pos.size(),
+                   plan->stacked_pos.size(),
+                   static_cast<long long>(plan->num_packed));
+    }
+  }
+  ctx.msl[key] = plan;
+  return plan;
 }
 
 // ops/gather.py `_scatter_combiner`: which `.at[]` method the update
@@ -1352,6 +1427,10 @@ int64_t BlockCost(LowerContext& ctx, mlir::Block& block) {
     cost += 1;
     const llvm::StringRef n = o.getName().getStringRef();
     if (n == "stablehlo.while") {
+      if (MslPlanFor(ctx, &o) != nullptr) {
+        cost += 8;   // a single generated kernel
+        continue;
+      }
       std::optional<Counted> c = AnalyzeCounted(ctx, &o);
       // Unknown trip counts must be PESSIMISTIC: a dynamic-bound 2048-step
       // loop once cost-counted as one body, so the enclosing block passed the
@@ -1616,14 +1695,18 @@ bool BlockIsPure(LowerContext& ctx, mlir::Block& block) {
 // enough for both budgets.  It is what lets the purity analysis see through a
 // small counted loop, so a main holding one is still compiled whole.
 //
-// (`_msl_plan_for`'s early yes has no analogue: this plugin generates no
-// kernels, which is the neutral answer the Python gives with METALJAX_MSL=0.)
+// A loop with an msl plan is traceable outright: it IS one kernel call, and
+// the kernel traces into an enclosing graph like any other primitive.
 bool WhileTraceable(LowerContext& ctx, mlir::Operation* op) {
   if (op->getNumRegions() < 2 || op->getRegion(1).empty()) return false;
   mlir::Block& body = op->getRegion(1).front();
   auto cached = ctx.traceable.find(&body);
   if (cached != ctx.traceable.end()) return cached->second;
   ctx.traceable[&body] = false;   // break recursion
+  if (MslPlanFor(ctx, op) != nullptr) {
+    ctx.traceable[&body] = true;
+    return true;
+  }
   bool ok = false;
   std::optional<Counted> c = AnalyzeCounted(ctx, op);
   if (c.has_value() && c->kind == Counted::kStatic) {
@@ -1796,6 +1879,10 @@ class Lowering {
     // -1.  Set by `RegridOf` from the RESULT's element type, so a handler
     // never has to know that its result may live on a grid.
     int64_t regrid = -1;
+    // M5b: the generated persistent kernel a counted loop was planned into,
+    // which is what makes this entry a `kMslScan` rather than a `kWhile`.
+    // Last, so every aggregate initialization above stays as it was.
+    std::shared_ptr<MslPlan> msl;
   };
 
   // One block lowered into THIS frame: the block's own arguments first, then
@@ -1847,6 +1934,25 @@ class Lowering {
   absl::Status LowerControl(mlir::Operation* op);
   absl::Status LowerWhile(mlir::Operation* op);
   absl::Status LowerBranch(mlir::Operation* op);
+
+  // M5b: a counted loop msl_scan planned into one generated Metal kernel, as
+  // the launch recipe `runtime/msl.cc` parses -- the transliteration of
+  // src/metaljax/tape.py's `_lower_msl`, whose comments are the spec.  The
+  // extra input slots are the arrays the kernel reads (carries of this loop
+  // and values of this frame), and the taints are what the kernel alone
+  // implies about the carries when the interpreted fallback did not lower.
+  struct MslLowered {
+    std::shared_ptr<MslPlan> plan;
+    std::vector<int> ins;
+    std::vector<Taint> taints;
+  };
+  absl::StatusOr<MslLowered> LowerMslPlan(mlir::Operation* op,
+                                          const MslPlanned& plan);
+  // The slot holding `v` here, lowering its defining op into this frame when
+  // it has none (`_msl_value_slot`: a loop-invariant op the analyzer hoisted
+  // out of the body is evaluated ahead of the loop, by the ordinary
+  // handlers).
+  absl::StatusOr<int> MslValueSlot(mlir::Value v);
 
   // Splice a single-block callee's ops into this tape (tape.py `_inline`).
   absl::Status Inline(mlir::Operation* op, llvm::StringRef callee_attr);
@@ -4958,12 +5064,41 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
   if (static_cast<int64_t>(op->getNumResults()) != ncarry)
     return Decline("while result count mismatch");
 
-  ASSIGN_OR_RETURN(Region cond, LowerRegion(cond_block));
-  if (cond.outputs.size() != 1)
-    return Decline("while cond does not return one value");
-  ASSIGN_OR_RETURN(Region body, LowerRegion(body_block));
-  if (static_cast<int64_t>(body.outputs.size()) != ncarry)
-    return Decline("while body result count mismatch");
+  // M5b: a loop msl_scan planned into one generated kernel takes the kernel
+  // here, and the question is asked through the SAME `MslPlanFor` the cost
+  // walk and the traceability question ask, so the three can never disagree
+  // about what this loop is.
+  std::shared_ptr<MslPlanned> plan = MslPlanFor(*ctx_, op);
+
+  // The loop op by op, as regions.  With an msl plan these are the FALLBACK:
+  // the kernel is what runs, and the interpreted loop is what the executor
+  // retires to if Metal's shader compiler rejects the generated source.  A
+  // body outside this lowering's op set is no reason to lose the kernel, so
+  // with a plan the regions are optional -- without them a build failure
+  // hands the whole program back, which `Program::run_msl` does by rethrowing.
+  Region cond, body;
+  bool have_regions = false;
+  {
+    absl::StatusOr<Region> c = LowerRegion(cond_block);
+    absl::StatusOr<Region> b =
+        c.ok() && c->outputs.size() == 1 ? LowerRegion(body_block) : c;
+    if (c.ok() && b.ok() && c->outputs.size() == 1 &&
+        static_cast<int64_t>(b->outputs.size()) == ncarry) {
+      cond = *std::move(c);
+      body = *std::move(b);
+      have_regions = true;
+    } else if (plan == nullptr) {
+      if (!c.ok()) return c.status();
+      if (c->outputs.size() != 1)
+        return Decline("while cond does not return one value");
+      if (!b.ok()) return b.status();
+      return Decline("while body result count mismatch");
+    } else if (kDumpTape || MslDebug()) {
+      std::fprintf(stderr,
+                   "[metaljax] msl_scan loop lowered without an interpreted "
+                   "fallback\n");
+    }
+  }
 
   // Where the trip count comes from, if this is the counted loop jax emits:
   // 0 a static N, 1 the carry at index `bound`, 2 the cond capture at index
@@ -5028,7 +5163,7 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
   int64_t body_compile_max = 0;
   if (kCompileEnabled && kBodyCompile && pure)
     body_compile_max = std::max<int64_t>(0, std::min(by_cost, by_bytes));
-  if (body_compile_max > 0) {
+  if (body_compile_max > 0 && have_regions) {
     std::vector<int> anchors = UnderivedOutputs(body_block, body.free);
     if (kDumpTape) {
       body.dump.compile = true;
@@ -5060,6 +5195,20 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
   body_parents.insert(body_parents.end(), body.caps.begin(), body.caps.end());
   ins.insert(ins.end(), cond.caps.begin(), cond.caps.end());
   ins.insert(ins.end(), body.caps.begin(), body.caps.end());
+  // The kernel's own inputs ride after the loop's: the arrays it reads are the
+  // loop's carries and values from the enclosing scope, which are slots here
+  // like any other.  Built BEFORE the results are bound, because a hoisted
+  // source lowers its defining op into this frame ahead of the loop.
+  MslLowered lowered;
+  if (plan != nullptr) {
+    absl::StatusOr<MslLowered> m = LowerMslPlan(op, *plan);
+    // A plan the launch recipe cannot express declines the whole PROGRAM
+    // rather than running the loop op by op: both the cost walk and this
+    // lowering already treated it as one kernel.
+    if (!m.ok()) return m.status();
+    lowered = *std::move(m);
+    ins.insert(ins.end(), lowered.ins.begin(), lowered.ins.end());
+  }
   std::vector<int> outs;
   for (mlir::Value r : op->getResults()) outs.push_back(Bind(r));
 
@@ -5074,7 +5223,12 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
     if (start.has_value()) static_trip = std::max<int64_t>(bound - *start, 0);
   }
   for (int64_t j = 0; j < ncarry; j++) {
-    Taint t = MapTaint(body.taints[static_cast<size_t>(j)], body_parents);
+    // With no interpreted fallback the kernel is the only thing that runs, and
+    // the only carry it can hand back untouched is one it classified as
+    // pass-through (`LowerMslPlan`).
+    Taint t = have_regions
+                  ? MapTaint(body.taints[static_cast<size_t>(j)], body_parents)
+                  : lowered.taints[static_cast<size_t>(j)];
     const int init = body_parents[static_cast<size_t>(j)];
     if (static_trip.has_value() && *static_trip == 0) {
       t = TaintOf(init);            // the body never runs
@@ -5086,13 +5240,327 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
     ApplyTaint(outs[static_cast<size_t>(j)], t);
   }
 
-  ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.while"));
-  std::vector<std::shared_ptr<Program>> regions{cond.program, body.program};
+  ASSIGN_OR_RETURN(int opcode, Opcode(plan == nullptr ? "stablehlo.while"
+                                                      : "metaljax.msl_scan"));
+  std::vector<std::shared_ptr<Program>> regions;
   std::vector<DumpNode> dumps;
-  if (kDumpTape) dumps = {cond.dump, body.dump};
+  if (have_regions) {
+    regions = {cond.program, body.program};
+    if (kDumpTape) dumps = {cond.dump, body.dump};
+  }
   Emit(opcode, std::move(ins), std::move(outs), std::move(attrs), std::nullopt,
        ResultBytes(op), std::move(regions), std::move(dumps));
+  entries_.back().msl = std::move(lowered.plan);
   return absl::OkStatus();
+}
+
+// --------------------------------------------------------------------------
+// msl_scan plans (M5b), as src/metaljax/tape.py's `_lower_msl` writes them
+// --------------------------------------------------------------------------
+//
+// `Plan.run`, resolved statically: its `bufs` loop becomes a list of slots
+// (one per plan source) plus a weight-normalization recipe per source; its
+// `feed` becomes the unpacked-source list and the per-dtype pools of the
+// 0.4.3 input packing, in the order the kernel's `input_names` names; and its
+// `vals` assembly becomes four static lists (pass-through carries, affine
+// counters, stacked outputs, final states) plus the accumulator recipes of
+// loop fission, encoded as little trees.
+
+namespace {
+
+// A length-prefixed vector, the shape runtime/program.h's `Cursor` reads.
+void MslVec(std::vector<int64_t>* out, const std::vector<int64_t>& xs) {
+  out->push_back(static_cast<int64_t>(xs.size()));
+  out->insert(out->end(), xs.begin(), xs.end());
+}
+
+// The tape's dtype code for one of msl_scan's dtype NAMES.
+std::optional<int> DtypeCodeOfName(const std::string& name) {
+  static const auto* codes = [] {
+    auto* m = new absl::flat_hash_map<std::string, int>();
+    for (const std::pair<std::string, int>& kv : dtype_codes())
+      m->emplace(kv.first, kv.second);
+    return m;
+  }();
+  auto it = codes->find(name);
+  if (it == codes->end()) return std::nullopt;
+  return it->second;
+}
+
+}  // namespace
+
+absl::StatusOr<int> Lowering::MslValueSlot(mlir::Value v) {
+  auto it = slots_.find(v);
+  if (it != slots_.end()) return it->second;
+  // `Plan.run`'s `hoisted` reads the value out of the enclosing environment
+  // when it is bound there, and otherwise RE-EVALUATES its defining op with
+  // the ordinary handlers -- which is what happens to a loop-invariant op the
+  // analyzer lifted out of the body.  Transliterated here by lowering that op
+  // into this frame, ahead of the loop: the same ops on the same arrays, in
+  // the same order.
+  mlir::Operation* op = v.getDefiningOp();
+  if (op == nullptr) return Decline("msl: source is defined outside the block");
+  if (op->getNumRegions() != 0)
+    return Decline(absl::StrCat("msl: hoisted op ",
+                                View(op->getName().getStringRef()),
+                                " carries a region"));
+  for (mlir::Value x : op->getOperands()) {
+    absl::StatusOr<int> s = MslValueSlot(x);
+    if (!s.ok()) return s.status();
+  }
+  RETURN_IF_ERROR(LowerOp(op));
+  auto got = slots_.find(v);
+  if (got == slots_.end()) return Decline("msl: hoisted op bound no slot");
+  return got->second;
+}
+
+absl::StatusOr<Lowering::MslLowered> Lowering::LowerMslPlan(
+    mlir::Operation* op, const MslPlanned& plan) {
+  if (MslVolatileIsTmap()) {
+    // The table-driven loop counter binds an extra input the plan builds per
+    // call.  A retest knob, never the shipped path.
+    return Decline("msl: METALJAX_MSL_VOLATILE=tmap");
+  }
+  if (plan.mode != "scalar" && plan.mode != "vector" && plan.mode != "coop")
+    return Decline(absl::StrCat("msl: mode ", plan.mode));
+
+  MslLowered out;
+  const int64_t ncarry = static_cast<int64_t>(op->getNumOperands());
+  std::vector<int> carries;
+  for (mlir::Value v : op->getOperands()) {
+    ASSIGN_OR_RETURN(int s, Slot(v));
+    carries.push_back(s);
+  }
+
+  // Sources, in the plan's own order: the sids the generated source, the
+  // packing groups and the weight norms are all keyed by.  Accumulator recipes
+  // may name a buffer the kernel itself never reads (a stacked input consumed
+  // whole, post-kernel); those append after.
+  std::vector<int>& slots = out.ins;
+  std::map<std::string, int> seen;
+  absl::Status failure = absl::OkStatus();
+  auto key_of = [](const MslSrc& src) {
+    return src.kind == SrcKind::kCarry
+               ? absl::StrCat("carry|", src.carry)
+               : absl::StrCat("value|",
+                              reinterpret_cast<uintptr_t>(
+                                  src.value.getAsOpaquePointer()));
+  };
+  auto slot_of = [&](const MslSrc& src) -> int {
+    if (src.kind == SrcKind::kCarry) {
+      if (src.carry < 0 || src.carry >= ncarry) {
+        failure = Decline("msl: source carry out of range");
+        return 0;
+      }
+      return carries[static_cast<size_t>(src.carry)];
+    }
+    absl::StatusOr<int> s = MslValueSlot(src.value);
+    if (!s.ok()) {
+      failure = s.status();
+      return 0;
+    }
+    return *s;
+  };
+  for (const MslSrc& src : plan.sources) {
+    seen.emplace(key_of(src), static_cast<int>(slots.size()));
+    slots.push_back(slot_of(src));
+    if (!failure.ok()) return failure;
+  }
+  auto source_index = [&](const MslSrc& src) -> int {
+    const std::string k = key_of(src);
+    auto got = seen.find(k);
+    if (got != seen.end()) return got->second;
+    const int id = static_cast<int>(slots.size());
+    seen[k] = id;
+    slots.push_back(slot_of(src));
+    return id;
+  };
+
+  // `Plan.run`'s output_shapes / output_dtypes, in binding order.
+  std::vector<std::vector<int>> out_shapes;
+  std::vector<int> out_dtypes;
+  auto push_out = [&](const MslShape& shape, const std::string& dtype) {
+    out_shapes.push_back(std::vector<int>(shape.begin(), shape.end()));
+    std::optional<int> code = DtypeCodeOfName(dtype);
+    if (!code.has_value()) {
+      failure = Decline(absl::StrCat("msl: output dtype ", dtype));
+      out_dtypes.push_back(0);
+      return;
+    }
+    out_dtypes.push_back(*code);
+  };
+  for (int pos : plan.stacked_pos)
+    push_out(plan.arg_shapes[pos], plan.arg_dtypes[pos]);
+  for (const MslShape& h : plan.hidden_shapes) {
+    MslShape shape{plan.trip};
+    shape.insert(shape.end(), h.begin(), h.end());
+    push_out(shape, "f32");
+  }
+  for (int pos : plan.state_pos)
+    push_out(plan.arg_shapes[pos], plan.arg_dtypes[pos]);
+  if (!failure.ok()) return failure;
+
+  // Every carry position must be produced by exactly one rule: the kernel
+  // writes the states and the stacked outputs, the post-kernel arithmetic does
+  // the counters and the accumulators, and a pass-through carry is handed back
+  // as it came.  A position claimed twice (or not at all) would silently take
+  // whichever rule ran last.
+  std::vector<int> covered(plan.passthrough);
+  for (const auto& c : plan.counters) covered.push_back(c.first);
+  covered.insert(covered.end(), plan.stacked_pos.begin(),
+                 plan.stacked_pos.end());
+  covered.insert(covered.end(), plan.state_pos.begin(), plan.state_pos.end());
+  for (const auto& a : plan.acc_plans) covered.push_back(a.first);
+  std::sort(covered.begin(), covered.end());
+  if (static_cast<int64_t>(covered.size()) != ncarry) {
+    return Decline("msl: carries are not covered exactly once");
+  }
+  for (int64_t j = 0; j < ncarry; j++)
+    if (covered[static_cast<size_t>(j)] != j)
+      return Decline("msl: carries are not covered exactly once");
+
+  // One accumulator node as a little tree.  kinds: 0 a hidden per-step stack
+  // (a kernel output), 1 a slice of a device buffer, 2 a post-kernel sum, 3 a
+  // post-kernel batched matmul.
+  std::function<void(const MslAccSpec&, std::vector<int64_t>*)> spec =
+      [&](const MslAccSpec& s, std::vector<int64_t>* dst) {
+        switch (s.kind) {
+          case 0:
+            dst->push_back(0);
+            dst->push_back(s.hidden);
+            break;
+          case 1: {
+            if (s.a != 1 && s.a != -1) {
+              failure = Decline("msl: accumulator buffer with a non-unit "
+                                "stride");
+              return;
+            }
+            dst->push_back(1);
+            dst->push_back(source_index(s.source));
+            dst->push_back(s.a);
+            dst->push_back(s.b);
+            MslVec(dst, s.shape);
+            break;
+          }
+          case 2:
+            dst->push_back(2);
+            spec(s.kids[0], dst);
+            MslVec(dst, s.dims);
+            MslVec(dst, s.perm);
+            MslVec(dst, s.shape);
+            break;
+          case 3: {
+            if (s.dims4.size() != 4) {
+              failure = Decline("msl: accumulator dot without four dim lists");
+              return;
+            }
+            dst->push_back(3);
+            spec(s.kids[0], dst);
+            spec(s.kids[1], dst);
+            for (const auto& d : s.dims4) MslVec(dst, d);
+            MslVec(dst, s.perm);
+            MslVec(dst, s.lshape);
+            MslVec(dst, s.rshape);
+            break;
+          }
+          default:
+            failure = Decline(absl::StrCat("msl: accumulator node ", s.kind));
+        }
+      };
+
+  // The accumulator recipes go FIRST, because encoding one may name a buffer
+  // the kernel itself never reads and so APPEND a source -- and the source
+  // count, the weight norms and the pack groups are all written against the
+  // final list.
+  std::vector<int64_t> acc;
+  for (const auto& a : plan.acc_plans) {
+    acc.push_back(a.first);
+    acc.push_back(static_cast<int64_t>(a.second.size()));
+    for (const MslAccSpec& s : a.second) {
+      spec(s, &acc);
+      if (!failure.ok()) return failure;
+    }
+  }
+  if (!failure.ok()) return failure;
+
+  const int64_t tg = plan.mode == "coop" ? plan.F : std::min<int64_t>(plan.N,
+                                                                     256);
+  std::vector<int64_t> layout{plan.N,
+                              tg,
+                              plan.trip,
+                              plan.start,
+                              static_cast<int64_t>(slots.size()),
+                              static_cast<int64_t>(plan.hidden_shapes.size()),
+                              ncarry};
+  for (size_t sid = 0; sid < slots.size(); sid++) {
+    auto norm = sid < plan.sources.size()
+                    ? plan.weight_norms.find(static_cast<int>(sid))
+                    : plan.weight_norms.end();
+    if (norm == plan.weight_norms.end()) {
+      layout.push_back(0);
+      continue;
+    }
+    layout.push_back(1);
+    MslVec(&layout, norm->second.shape);
+    MslVec(&layout, norm->second.strides);
+    layout.push_back(norm->second.offset);
+    MslVec(&layout, norm->second.perm);
+  }
+  MslVec(&layout, std::vector<int64_t>(plan.unpacked.begin(),
+                                       plan.unpacked.end()));
+  layout.push_back(static_cast<int64_t>(plan.pack_groups.size()));
+  for (const MslPackGroup& g : plan.pack_groups) {
+    std::optional<int> code = DtypeCodeOfName(g.dtype);
+    if (!code.has_value())
+      return Decline(absl::StrCat("msl: pack dtype ", g.dtype));
+    layout.push_back(*code);
+    MslVec(&layout, std::vector<int64_t>(g.sids.begin(), g.sids.end()));
+  }
+  MslVec(&layout,
+         std::vector<int64_t>(plan.state_pos.begin(), plan.state_pos.end()));
+  MslVec(&layout, std::vector<int64_t>(plan.stacked_pos.begin(),
+                                       plan.stacked_pos.end()));
+  MslVec(&layout, std::vector<int64_t>(plan.passthrough.begin(),
+                                       plan.passthrough.end()));
+  layout.push_back(static_cast<int64_t>(plan.counters.size()));
+  for (const auto& c : plan.counters) {
+    layout.push_back(c.first);
+    layout.push_back(c.second);
+  }
+  layout.push_back(static_cast<int64_t>(plan.acc_plans.size()));
+  layout.insert(layout.end(), acc.begin(), acc.end());
+
+  std::vector<std::string> names_in, names_out;
+  for (int i : plan.unpacked) names_in.push_back(absl::StrCat("inp", i));
+  for (const MslPackGroup& g : plan.pack_groups) names_in.push_back(g.name);
+  for (size_t j = 0; j < plan.state_pos.size(); j++)
+    names_in.push_back(absl::StrCat("init", j));
+  for (size_t q = 0; q < plan.stacked_pos.size(); q++)
+    names_out.push_back(absl::StrCat("out", q));
+  for (const std::string& nm : plan.hidden_names) names_out.push_back(nm);
+  for (size_t j = 0; j < plan.state_pos.size(); j++)
+    names_out.push_back(absl::StrCat("fin", j));
+
+  try {
+    out.plan = std::make_shared<MslPlan>(plan.kernel_name, plan.source,
+                                         kMslKernelHeader, names_in, names_out,
+                                         out_shapes, out_dtypes, layout);
+  } catch (const std::exception& e) {
+    // The recipe parser's own checks (source counts, carry indices, the output
+    // count) -- a layout this lowering got wrong is a decline, never a plan
+    // that reads whatever is next in memory.
+    return Decline(absl::StrCat("msl: ", e.what()));
+  }
+
+  // Only a pass-through carry can be the very array an input holds; every
+  // other position is a kernel output or post-kernel arithmetic.
+  const std::set<int> through(plan.passthrough.begin(), plan.passthrough.end());
+  for (int64_t j = 0; j < ncarry; j++) {
+    out.taints.push_back(through.count(static_cast<int>(j)) != 0
+                             ? TaintOf(carries[static_cast<size_t>(j)])
+                             : Taint{});
+  }
+  return out;
 }
 
 // stablehlo.if / stablehlo.case.  The branch blocks take no arguments (every
@@ -5848,7 +6316,7 @@ absl::StatusOr<Lowering::Built> Lowering::Finish(
           e.region_dumps});
     }
     built.program->add(e.op, e.ins, e.outs, e.attrs, e.payload, drops[i],
-                       e.regions, e.bytes, e.fattrs, nullptr, e.host,
+                       e.regions, e.bytes, e.fattrs, e.msl, e.host,
                        e.regrid);
   }
   // A region Program never needs output copies: its results are a loop's
