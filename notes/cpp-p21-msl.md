@@ -209,9 +209,17 @@ retest knob and never the shipped path.
 
 ## Open, for scrutiny
 
-* `big09`-class rows: the coop cap admits a square F=1024 cell that loses to
+* ~~`big09`-class rows: the coop cap admits a square F=1024 cell that loses to
   the compiled matmul (above). One env knob away, one row measured, Oleg's
-  call.
+  call.~~ **RESOLVED 2026-08-15 (P22, `notes/cpp-p22-release.md`)** — and not
+  by the knob that was proposed. Lowering `METALJAX_MSL_COOP_CAP` to 1e6 takes
+  coop away from **22 of 106** configurations to fix 2, and costs up to
+  **1.73x** (`mgru.512`) on the rows it hits; the loss mechanism is the
+  per-lane re-streaming of weights, which scales with the FEATURE width, not
+  with total work. A width cap (`METALJAX_MSL_COOP_MAX_F`, default 1024)
+  changes exactly the two `big09` rows — census-verified, 4 plans of 210 —
+  and is worth 1.52x on `big09-b8l256`. It is the phase-2 lowering's first
+  deliberate divergence from `msl_scan.py`; `=0` restores Stage 1's policy.
 * The suite-context trap (CLAUDE.md item 12) now has ~200 more Metal kernels to
   work with: sub-millisecond rows measured late in a 106-configuration sweep
   should be re-measured standalone before a regression is believed. `db00` and

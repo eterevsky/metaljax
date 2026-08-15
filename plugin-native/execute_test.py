@@ -3455,8 +3455,58 @@ def _p21_msl(subprocess, pathlib, re):
         n = len(re.findall(r"msl_scan: compiled plan", proc.stderr))
         return n == 0, f"{n} kernels with METALJAX_MSL=0"
 
+    def the_width_cap_holds():
+        """P22's deliberate divergence from `msl_scan.py`: a coop plan is
+        refused at state width F >= 1024 even when its total dot work is
+        under `METALJAX_MSL_COOP_CAP`.
+
+        Stage 1 has the work cap only, and a square `rnn.1024` cell slips
+        under it (1.05M elems/step) to run 1.5x SLOWER than the compiled
+        matmul -- the re-streaming that cap is about is per FEATURE width,
+        not per total.  Both halves are pinned here: the cap fires by
+        default, `METALJAX_MSL_COOP_MAX_F=0` restores Stage 1's policy, and
+        the two paths agree on the answer.
+        """
+        def run(env_extra):
+            child = dict(os.environ)
+            child["METALJAX_DEBUG"] = "1"
+            child.update(env_extra)
+            proc = subprocess.run(
+                [sys.executable, str(pathlib.Path(__file__).resolve()),
+                 "--msl-wide-coop"], env=child, capture_output=True, text=True)
+            if proc.returncode != 0:
+                return None, None, (proc.stderr or proc.stdout
+                                    ).splitlines()[-1][:80]
+            plans = len(re.findall(r"msl_scan: compiled plan", proc.stderr))
+            declines = re.findall(r"not eligible \(coop: state width F=(\d+)",
+                                  proc.stderr)
+            out = re.search(r"WIDE COOP CHECKSUM ([-\d.e+]+)", proc.stdout)
+            return (plans, declines, out.group(1) if out else None), proc, None
+
+        gated, _, err = run({})
+        if err: return False, err
+        stage1, _, err = run({"METALJAX_MSL_COOP_MAX_F": "0"})
+        if err: return False, err
+        if gated[0] != 0 or not gated[1]:
+            return False, (f"default built {gated[0]} plan(s) at F=1024 "
+                           f"(declines seen: {gated[1]})")
+        if stage1[0] == 0:
+            return False, "COOP_MAX_F=0 did not restore the coop plan"
+        d = abs(float(gated[2]) - float(stage1[2]))
+        rel = d / max(abs(float(stage1[2])), 1e-30)
+        # A sum over 12,288 elements, so the bar is loose on purpose: the two
+        # paths contract in different orders (the same reason the three
+        # fissioned weight-gradient rows are not bit-identical either), and
+        # the summation amplifies it.  Measured 9.1e-06; the bar is here to
+        # catch a WRONG fallback, not to pin an accumulation order.
+        if rel > 1e-4:
+            return False, f"gated vs Stage-1-policy answers differ by {rel:.2e}"
+        return True, (f"F=1024 declined by width (was {stage1[0]} coop plan), "
+                      f"answers agree to {rel:.1e}")
+
     return [("msl covers its three modes", modes_are_covered),
-            ("METALJAX_MSL=0 builds no kernel", the_kill_switch_kills)]
+            ("METALJAX_MSL=0 builds no kernel", the_kill_switch_kills),
+            ("msl coop width cap (F>=1024)", the_width_cap_holds)]
 
 
 def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
@@ -3530,6 +3580,20 @@ def main():
         for name, fn, args, _rtol, _atol in _cases():
             if name.startswith("msl "):
                 jax.jit(fn)(*args)
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--msl-wide-coop":
+        # One square matvec cell at the width the P22 cap is about (F=1024,
+        # 1.05M dot elems/step -- under METALJAX_MSL_COOP_CAP, which is why
+        # Stage 1 takes it).  The parent reads the plan census out of the
+        # narration and the checksum out of stdout.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        h0 = _rand((2, 1024), 921) * np.float32(0.1)
+        xs = _rand((6, 2, 1024), 922) * np.float32(0.1)
+        w = _rand((1024, 1024), 923) * np.float32(0.02)
+        _, hs = jax.jit(_msl_rnn)(h0, xs, w)
+        print(f"WIDE COOP CHECKSUM {float(np.asarray(hs).sum()):.9e}")
         return 0
     if len(sys.argv) > 2 and sys.argv[1] == "--eager-arm":
         os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))

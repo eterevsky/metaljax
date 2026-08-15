@@ -572,3 +572,112 @@ started), so **there is no top_confs native/Stage 1 geomean for this date**. The
 pairing needs an exclusive machine and a frozen native dylib — a copy under a
 different name is enough, `jax_plugins/metal` identifies a plugin by its exports
 for exactly this reason.
+
+---
+
+# THE RELEASE TABLE — P22, 2026-08-15
+
+*The measurement the parity claim rests on. One machine-lock hold,
+**22:41:34–23:33:37**, strictly sequential, nothing else on the machine, and
+the native arms run a **frozen copy** of the dylib
+(`~/.cache/metaljax-bench/frozen-release-208ca0d1.dylib`, sha256
+`208ca0d1…558d61`; tree 915d7e3 + the P22 coop width cap) so no rebuild can
+move the binary under the campaign. Raw data
+`~/.cache/metaljax-bench/logs/p22-release-measure/`, per-config table and
+aggregates `notes/data/p22-release-measure-2026-08-15.{csv,json}`, narrative
+`notes/cpp-p22-release.md`. The analysis reproduces every published P16
+aggregate from P16's own artifacts before being applied to the new ones
+(4.2377 vs 4.24, 36.459 vs 36.46, the four suite classes to three digits).*
+
+## Table 4 — top_confs (163): the pairing that had never completed
+
+| aggregate | n | value |
+|---|---:|---:|
+| **native (PJRT route) / Stage 1 (engine route — the anchor's own)** | 163 | **0.998** geomean, 0.998 median |
+| native (PJRT) / Stage 1 (PJRT — same route) | 163 | **1.001** geomean, 1.000 median |
+| — by weight class (0–100 / 100–500 / 500–1500 / 1500+) | 47/61/29/26 | 0.999 / 0.998 / 1.008 / 1.003 |
+| **route factor measured today** (Stage 1 engine / Stage 1 PJRT) | 163 | **1.002** (P16 measured 1.009) |
+| Stage 1 (engine) vs the 0.11.3 anchor | 163 | **1.071× faster** |
+| **native vs the 0.11.3 anchor** | 163 | **1.073× faster** |
+| jax-CPU control, anchor / today | 163 | 0.990 (machine 1 % slower — ambient) |
+| **configurations beating jax-CPU** | 163 | **native 59** · Stage 1 55 (engine) / 59 (PJRT) · anchor 53 |
+| distribution | 163 | **163 within 1.2×, 0 above**; native faster on **101** |
+
+Checks on the engine-route run: **163/163 ok, 0 FAIL, 0 error**. Worst rows
+either way: `tc029-w47` **0.892** (native ahead), `tc000-w5` **1.079** (native
+behind — 0.159 → 0.172 ms/step, the smallest configuration in the suite).
+
+**P16's item 1 is closed.** `msl_scan` on the native lowering was a 36.46×
+geomean and cost every one of the configurations where metaljax beats jax-CPU
+(native won 0 of 163). It is now 0.998× and native wins **59**, which is more
+than Stage 1 wins on the anchor's route. Both stacks are 7 % faster than the
+0.11.3 anchor against a 0.990 CPU control, so that drift is shared and real.
+
+## Table 5 — texmo 106-config suite
+
+| aggregate | n | native/Stage 1 (P22) | P16 | P21 (WIP binary) |
+|---|---:|---:|---:|---:|
+| whole suite, geomean | 106 | **1.011** | 4.24× | 1.027 |
+| whole suite, median | 106 | **1.000** | 3.37× | 1.000 |
+| `big` (gru/lstm 512–1024, transformer) | 34 | 1.004 | 1.34× | 1.010 |
+| `mid` | 30 | 0.998 | 3.22× | 0.987 |
+| `db` (small recurrent — msl territory) | 40 | 1.030 | 14.61× | 1.075 |
+| `synth` | 2 | 0.950 | 1.52× | 0.983 |
+| rows within 1.2× | 106 | **103** | 33 | 98 |
+| rows at or above 10× | 106 | **0** | 32 | 0 |
+| rows where native is faster | 106 | **52** | 18 | 54 |
+
+Stage 1's own column is stable on the same route: **1.007** vs P16, **1.010**
+vs P21. Both stacks: 106 ok, 0 error.
+
+## Every anomaly re-run standalone — and five of nine were the suite itself
+
+Each row outside ±10 % was re-measured standalone (one process per arm, stacks
+interleaved, frozen dylib) *before* being reported:
+
+| config | in-suite ratio | standalone S1 | standalone native | standalone ratio | verdict |
+|---|---:|---:|---:|---:|---|
+| `db16-b256l512` | 1.777 | 4.472 | 7.935 | **1.774** | REAL |
+| `db17-b256l512` | 1.599 | 7.281 | 11.618 | **1.596** | REAL |
+| `db11-b256l512` | 1.313 | 2.180 | 2.859 | **1.311** | REAL |
+| `big09-b8l256` | 0.666 | 38.346 | 25.378 | **0.662** | REAL (the P22 width cap) |
+| `big14-b32l128` | 1.198 | 17.463 | 17.456 | **1.000** | in-suite artifact |
+| `big12-b8l256` | 1.159 | 5.191 | 5.180 | **0.998** | in-suite artifact |
+| `big07-b8l256` | 1.132 | 33.021 | 33.139 | **1.004** | in-suite artifact |
+| `big00-b32l128` | 0.807 | 10.248 | 10.189 | **0.994** | in-suite artifact |
+| `mid11-b64l128` | 0.884 | 8.527 | 8.561 | **1.004** | in-suite artifact |
+
+The five artifacts corroborate independently: they are exactly the rows whose
+*Stage 1* column moved against P16 (`big00-b32l128` +20 %, `mid11-b64l128`
++15 %, `big14-b32l128` −18 %) while their standalone numbers sit on their P16
+values — and they cut both ways, two of them flattering native. Substituting
+the nine standalone numbers moves the suite geomean 1.011 → **1.010** (median
+0.9999, native faster on 53 of 106).
+
+## The one qualifier on the parity claim
+
+**Three `db*-b256l512` rows are genuinely slower natively** — `db16` 1.77×,
+`db17` 1.60×, `db11` 1.31× — reproducible standalone on the frozen binary, and
+P21's preliminary column saw the same two rows (1.84×, 1.66×). Ruled out, each
+measured: it is not the surrounding graph (`METALJAX_MSL=0` puts the stacks
+level — `db16` 83.99 vs 83.82, `db11` 60.21 vs 59.02, so the entire gap is on
+the msl path), not the plans (identical narration: `db16` two coop plans
+`trip=512 lanes=8192 stacked=1/8`, `db11` `lanes=4096 stacked=1/7`, same
+kernel names hence the same MLX library), not the flush cadence
+(`EAGER_FLUSH_MB=1e6`: 7.94 → 7.18 native, Stage 1 unmoved) and not the
+compile budget (`TRACE_BUDGET=1e5`: neither moves). **Identical kernels,
+dispatched differently** — the per-call launch work in `runtime/msl.cc` (the
+weight-normalization recipe and the input pooling) is where to look. The
+pocket is the largest `db` shapes only: `db11-b64l256`, the same spec smaller,
+is at exact parity (0.633 vs 0.633).
+
+Three rows of 106, none in `top_confs`, against a suite geomean of 1.011 and a
+median of 1.000 — it qualifies the claim, it does not overturn it.
+
+## Not measured in this campaign
+
+The **model rows** (Table 3) were not re-run: nothing in P22 touches their
+paths (the coop width cap is a texmo-recurrent-cell decision, and no model row
+builds an msl plan), and they were last measured at P20. The Stage-1-vs-anchor
+regression on row 19 (the shared eager-flush cache clear) is unchanged and
+still awaiting Oleg's call on `mx::set_cache_limit`.

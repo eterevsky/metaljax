@@ -1605,6 +1605,9 @@ ladder is bounded now -- second failure retires every plan in the program
 (`disable_msl_deep`) and reruns once. Found by the new
 `METALJAX_MSL_FORCE_BUILD_FAIL` arm of `execute_test`.
 
+**RESOLVED in P22**: not by the work cap. See the P22 entry below --
+`METALJAX_MSL_COOP_MAX_F`, a width cap, changes exactly these two rows.
+
 Battery: `execute_test` 524 -> **534** checks (8 msl cases, 2 msl contracts,
 and two whole-suite arms: `METALJAX_MSL=0` -- 466 of 469 bit-identical, the
 three that differ being exactly the fissioned weight-gradient rows -- and
@@ -1613,3 +1616,81 @@ three that differ being exactly the fissioned weight-gradient rows -- and
 `smoke_test`; `decline_census` 35 of 35; `bazel test //...`. One flake seen on
 an earlier binary (`big10-b8l256`, `inf` in-suite, passes standalone 3/3,
 builds no msl plan at all) is P4's recorded lottery for that row's class.
+
+## P22: the coop width cap + THE RELEASE MEASUREMENT (2026-08-15,
+## notes/cpp-p22-release.md)
+
+**Part 1 -- the phase-2 lowering's first deliberate divergence from
+`msl_scan.py`.** P21 left `big09`'s `rnn.1024` open: its single 1024x1024 dot
+is 1.05M elems/step, under `METALJAX_MSL_COOP_CAP`'s 2.2M, so coop takes it and
+loses 1.5x to the compiled matmul; `COOP_CAP=1e6` fixed the row and the
+question was what else it costs. **It costs a great deal.** The census (every
+coop candidate narrates its work before the cap decision) says a 1e6 cap takes
+coop away from **22 of 106** configurations to fix 2, and the stopwatch says
+what that is worth: `mgru.512` **1.73x**, `gru.512` 1.08-1.39x, `lstm.512`
+1.15x, `gru.512-gru.512` 1.16x. CLAUDE.md item 12e's "lstm.512 ties" was a
+vector-vs-coop comparison, not coop-vs-no-kernel.
+
+The cap that costs nothing is on the WIDTH, because the loss mechanism is
+per-lane weight re-streaming and that scales with F, not with total work: at
+F=1024 a square cell loses at 1.05M elements, at F=512 the same 1.05M wins.
+`METALJAX_MSL_COOP_MAX_F` (default **1024**, `0` restores Stage 1's policy)
+declines coop at F >= 1024 when the plan has any dot. **Collateral proven, not
+argued**: re-running the census on the new binary and diffing plan for plan,
+**2 of 106 configurations change (4 plans of 210)** and every other decline
+reason is identical -- by construction, since every other F>=1024 cell in
+reach (`gru.1024` 3.1M, `lstm.1024` 4.2M/11.5M) is already over the work cap.
+Worth **1.52x** on `big09-b8l256` (38.40 -> 25.32 ms/step) and 1.03x on
+`big09-b32l128`; every other row in the nine-configuration collateral set is
+within noise. `top_confs` cannot be reached at all: coop work is bounded by
+the cell's weight count and the largest of the 163 models has 1,888 weights.
+
+**Part 2 -- the release measurement.** One lock hold 22:41:34-23:33:37,
+strictly sequential, nothing else on the machine, native arms on a FROZEN copy
+of the dylib (`frozen-release-208ca0d1`, sha256 `208ca0d1...558d61`) so P21's
+halt cannot repeat. Five runs, all complete: suite-106 both stacks (488/489 s),
+top_confs Stage 1 on the anchor's engine route (1104 s, **163/163 ok, 0 FAIL**),
+top_confs native on the PJRT route (507 s) -- **the pairing that had never
+completed** -- and a top_confs Stage 1 PJRT run (503 s) so the campaign
+measures its own route factor. The analysis reproduces every published P16
+aggregate from P16's artifacts before being applied to the new ones.
+
+| | n | P22 | P16 |
+|---|---:|---:|---:|
+| top_confs native / Stage 1 (engine route) | 163 | **0.998** | 36.46x |
+| top_confs native / Stage 1 (same PJRT route) | 163 | **1.001** | — |
+| route factor today (engine/PJRT) | 163 | **1.002** | 1.009 |
+| top_confs Stage 1 / anchor, native / anchor | 163 | **1.071 / 1.073 faster** | 1.046 / — |
+| top_confs beating jax-CPU | 163 | **native 59**, S1 55 | native 0, S1 54 |
+| suite-106 native / Stage 1 (geomean / median) | 106 | **1.011 / 1.000** | 4.24 / 3.37 |
+| suite-106 rows within 1.2x / at or above 10x | 106 | **103 / 0** | 33 / 32 |
+
+**Five of nine in-suite anomalies were the suite itself.** Every row outside
++/-10 % was re-measured standalone before being reported, and
+`big14-b32l128` (1.198 -> 1.000), `big12-b8l256`, `big07-b8l256`,
+`big00-b32l128` (0.807 -> 0.994) and `mid11-b64l128` are Stage-1-side
+in-suite variance -- the same rows whose Stage 1 column moved +-15-20 %
+against P16 while their standalone numbers sit on their P16 values. They cut
+both ways; two flattered native. CLAUDE.md item 12's trap is the majority of
+the outliers, not a footnote.
+
+**The one qualifier on the parity claim**: three `db*-b256l512` rows are
+genuinely slower natively (`db16` **1.77x**, `db17` 1.60x, `db11` 1.31x),
+reproducible standalone, and P21's preliminary column saw the same two. Ruled
+out, each measured: not the surrounding graph (`METALJAX_MSL=0` levels the
+stacks -- 83.99 vs 83.82 on `db16` -- so the whole gap is on the msl path),
+not the plans (identical narration: mode, lanes, trip, stacked, and the same
+kernel name hence the same MLX library), not the flush cadence, not the
+compile budget. **Identical kernels, dispatched differently** -- the per-call
+launch work in `runtime/msl.cc` (weight normalization, input pooling) is where
+to look. Narrow pocket: the largest `db` shapes only; `db11-b64l256` is at
+exact parity.
+
+Battery: `execute_test` 534 -> **535**, the delta verified as exactly one
+check row against the pre-change file on the same binary (a new contract pins
+the width cap: an
+F=1024 cell must build no coop plan and narrate the width decline by default,
+must build one under `COOP_MAX_F=0`, and the two answers must agree),
+`texmo_gate` **106 ok / 0 decline / 0 FAIL / 0 error**, census diff 2
+configurations. Model rows not re-run: nothing in P22 touches their paths (no
+model row builds an msl plan).

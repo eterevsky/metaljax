@@ -65,6 +65,8 @@ struct MslFlags {
   bool debug = false;
   int64_t reg_limit = 16;
   int64_t coop_cap = 2200000;
+  // A phase-2 divergence from msl_scan.py, measured: see the width cap below.
+  int64_t coop_max_f = 1024;
   bool coop_pref = true;
   int64_t coop_pref_min_f = 8;
   bool inlane_dots = true;
@@ -105,6 +107,7 @@ const MslFlags& Flags() {
     out->debug = dbg != nullptr && std::strcmp(dbg, "1") == 0;
     out->reg_limit = EnvInt("METALJAX_MSL_REG", 16);
     out->coop_cap = EnvInt("METALJAX_MSL_COOP_CAP", 2200000);
+    out->coop_max_f = EnvInt("METALJAX_MSL_COOP_MAX_F", 1024);
     out->coop_pref = EnvFlag("METALJAX_MSL_COOP_PREF", true);
     out->coop_pref_min_f = EnvInt("METALJAX_MSL_COOP_MIN_F", 8);
     out->inlane_dots = EnvFlag("METALJAX_MSL_INLANE", true);
@@ -2609,6 +2612,22 @@ MslPlanned::MslPlanned(const MslEnv& env, mlir::Block& body,
     if (work > Flags().coop_cap)
       MslDecline(absl::StrCat("coop: dot work ", work, " elems/step > ",
                               Flags().coop_cap, " (matmul path wins)"));
+    // ... and the traffic is denominated in the FEATURE width, not in the
+    // total: each threadgroup re-streams F elements of every weight row it
+    // touches, so a square cell at F=1024 loses to the compiled matmul even
+    // when its total work is under the cap.  `rnn.1024` (1.05M elems/step, so
+    // admitted by the cap Stage 1 tuned on gru/lstm.1024 at 3.1M and 11.5M) is
+    // 1.50x SLOWER as a kernel; measured 2026-08-15, notes/cpp-p22-release.md.
+    // This width cap is a deliberate DIVERGENCE from msl_scan.py, which has
+    // the work cap only: lowering the work cap instead would take coop away
+    // from 22 suite configurations to fix 2, and costs up to 1.73x on the
+    // gru/mgru/lstm.512 rows it would hit.  METALJAX_MSL_COOP_MAX_F=0 restores
+    // Stage 1's policy exactly.
+    // Gated on there BEING a dot: with no weights to re-stream a wide
+    // elementwise cell has none of the cost this cap is about.
+    if (!dots.empty() && Flags().coop_max_f > 0 && F >= Flags().coop_max_f)
+      MslDecline(absl::StrCat("coop: state width F=", F, " >= ",
+                              Flags().coop_max_f, " (matmul path wins)"));
   }
 
   // ---- lane space
