@@ -2167,14 +2167,24 @@ class Lowering {
   // of a transformer shares one causal mask and building it costs a full
   // [.., .., Tq, Tk] tensor, so the sharing is the whole point (Stage 1 keeps
   // the same cache in its `env`, keyed the same way).
+  //
+  // Keyed by the base's SLOT, not by its `mlir::Value`.  Inside one frame the
+  // two agree for every value lowered once -- but a callee is INLINED, and one
+  // reached from two call sites lowers its block twice, binding its arguments
+  // to a different slot each time.  With attentions rooted inside callees
+  // recognized (P26), keying by the IR value would hand the second inlining
+  // the mask the FIRST call site's argument built: `attn(q, k, v, mask_a)` and
+  // `attn(q, k, v, mask_b)` through one helper are the same `mlir::Value` and
+  // two different arrays.  The slot is what the emission actually reads, so it
+  // is what decides whether two attentions share a mask; where a value lowers
+  // once this is the old key exactly.
   struct MaskKey {
-    mlir::Value base;
+    int base;
     int kind;
     double konst, mul;
     int dtype;
     bool operator<(const MaskKey& o) const {
-      if (base.getAsOpaquePointer() != o.base.getAsOpaquePointer())
-        return base.getAsOpaquePointer() < o.base.getAsOpaquePointer();
+      if (base != o.base) return base < o.base;
       if (kind != o.kind) return kind < o.kind;
       if (konst != o.konst) return konst < o.konst;
       if (mul != o.mul) return mul < o.mul;
@@ -5183,6 +5193,29 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
     body.program->set_compile(true, std::move(anchors), body_compile_max);
   }
 
+  // The gate's own inputs, under METALJAX_DEBUG.  A body that misses the
+  // budget replays nothing and dispatches every entry of every iteration, and
+  // until P26 the only way to see WHICH of the two budgets refused it was to
+  // reconstruct the cost from an enclosing program's -- the 31B decode body
+  // was 388 units over a 20000 budget and cost 46.8 ms/token for it.  Two
+  // integers say it directly.  Diagnostic only: nothing here decides anything.
+  if (kDebug) {
+    std::fprintf(stderr,
+                 "[metaljax-native] while gate: cost=%lld bytes=%lldMB "
+                 "budget=%lld by_cost=%lld by_bytes=%lld pure=%d "
+                 "body_compile=%lld chunkable=%lld kmax=%lld period=%lld\n",
+                 static_cast<long long>(cost),
+                 static_cast<long long>(BlockBytes(*ctx_, body_block) >> 20),
+                 static_cast<long long>(kTraceBudget),
+                 static_cast<long long>(by_cost),
+                 static_cast<long long>(by_bytes), pure ? 1 : 0,
+                 static_cast<long long>(body_compile_max),
+                 static_cast<long long>(chunkable),
+                 static_cast<long long>(kmax),
+                 static_cast<long long>(period));
+    std::fflush(stderr);
+  }
+
   std::vector<int64_t> attrs{ncarry,
                              static_cast<int64_t>(cond.caps.size()),
                              static_cast<int64_t>(body.caps.size()),
@@ -6041,11 +6074,10 @@ absl::Status Lowering::LowerSdpa(mlir::Operation* op, const SdpaMatch& m) {
     if (m.mask_kind != 0 && m.mask_kind != 1)
       return Decline("an attention mask this tape cannot spell");
     RETURN_IF_ERROR(CheckValue(m.mask_base));
-    const MaskKey key{m.mask_base, m.mask_kind, m.mask_const, m.mask_mul,
-                      m.dtype};
+    ASSIGN_OR_RETURN(int base, Slot(m.mask_base));
+    const MaskKey key{base, m.mask_kind, m.mask_const, m.mask_mul, m.dtype};
     auto hit = masks_.find(key);
     if (hit == masks_.end()) {
-      ASSIGN_OR_RETURN(int base, Slot(m.mask_base));
       const int s = nslots_++;
       ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.sdpa.mask"));
       EmitF(opcode, {base}, {s},

@@ -14,6 +14,8 @@
 
 #include <cstdio>
 
+#include <mlx/allocator.h>   // trim_cache pokes the allocator directly
+
 namespace metaljax {
 
 namespace {
@@ -62,6 +64,43 @@ void flush_eval(const std::vector<mx::array>& arrays, bool hard) {
   gc_collect();
   mx::clear_cache();
   mx::eval(arrays);
+}
+
+// Bound MLX's buffer pool to `bytes` WITHOUT dumping it (P25).
+//
+// `mx::clear_cache()` returns the WHOLE pool to the OS, so the allocations
+// that follow are cold Metal buffers; on an eager program whose traffic
+// dwarfs its live set that cost the maxtext training row ~70 ms per clear,
+// 7 clears a step. What is wanted at the same point is a trim: reclaim the
+// excess, keep the rest reusable.
+//
+// MLX has no "trim to N" call -- it has a cache LIMIT, and reclaims down to
+// it "on the next allocation" (mlx/memory.h). So the trim is: set the limit,
+// poke the allocator, put the limit back. The poke is an allocator call and
+// not a kernel (microseconds, and it takes the mutex the reclaim needs
+// anyway); the limit is restored immediately, which is what keeps this a
+// property of the FLUSH POINT rather than a global bound on every path --
+// the global variant was measured and it costs 2.35x on a compiled decode
+// row (see config.cc).
+//
+// That a ONE-BYTE allocation is enough to make MLX reclaim is a contract, not
+// an assumption: `execute_test`'s "the pool stays under its bound" holds the
+// pool at 255 MB of a 256 MB watermark through 552 flushes and 18 GB of
+// traffic, and reads 4025 MB with the trim disabled. If MLX ever routes small
+// allocations past the reclaim, that test says so.
+//
+// Concurrency (METALJAX_CONCURRENT_EXECUTE=1 only): another thread
+// allocating inside this window sees the temporary limit and does the same
+// reclaim, which is the reclaim we asked for; another thread's `NoCache`
+// (metal_qmm.cc) overlapping it can end up restored one step late, and it
+// restores itself on scope exit either way. Both are benign, and both are
+// serialized away in every other configuration by the submission lock.
+void trim_cache(int64_t bytes) {
+  if (bytes < 0) return;
+  const size_t prev = mx::set_cache_limit(static_cast<size_t>(bytes));
+  mx::allocator::Buffer poke = mx::allocator::malloc(1);
+  mx::allocator::free(poke);
+  mx::set_cache_limit(prev);
 }
 
 // ops.control._loop_flush: a sync point inside a loop. Evaluates pending

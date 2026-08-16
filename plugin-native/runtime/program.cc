@@ -32,14 +32,49 @@ void eager_flush(const std::vector<std::optional<mx::array>>& env) {
   const bool hard = g_cfg.flush_sync_every > 0 &&
                     g_stats.flushes % g_cfg.flush_sync_every == 0;
   flush_eval(live, hard);
-  // "Frees" into MLX's CACHE, whose byte bound is the memory limit -- so
-  // an eager phase whose traffic is many times its live set claims the
-  // traffic. Return it to the OS past the configured watermark.
-  if (hard && g_cfg.flush_clear_bytes >= 0 &&
-      static_cast<int64_t>(mx::get_cache_memory()) > g_cfg.flush_clear_bytes) {
-    g_stats.cache_clears++;
-    mx::clear_cache();
+  // "Frees" into MLX's CACHE, whose own limit is MLX's memory limit -- so an
+  // eager phase whose traffic is many times its live set claims the traffic
+  // unless something bounds the pool here. Something does, at exactly the
+  // cadence it always did: past the watermark, TRIM the pool back to it.
+  //
+  // This used to be `mx::clear_cache()`, which returns the WHOLE pool to the
+  // OS: 7 dumps a step at ~70 ms each on the maxtext training row, 2.2x
+  // against its anchor (STATUS row 19 / P20). `trim_cache` reclaims the
+  // excess and leaves the rest reusable, which is worth 1.10x on that row
+  // and nothing anywhere else -- see notes/cpp-p25-cache-limit.md for what
+  // the remaining 1.85x is (the watermark itself) and for why the bound is
+  // NOT set globally at client construction (1.64x on a compiled decode
+  // row).
+  int64_t cache_before = 0;
+  bool trimmed = false;
+  if (hard && g_cfg.flush_clear_bytes >= 0) {
+    cache_before = static_cast<int64_t>(mx::get_cache_memory());
+    if (cache_before > g_cfg.flush_clear_bytes) {
+      g_stats.cache_trims++;
+      trim_cache(g_cfg.flush_clear_bytes);
+      trimmed = true;
+    }
   }
+  // METALJAX_MEMDBG: the eager path's meter, and the one the memory ladder
+  // reads. It has to come from INSIDE the dylib because a flush point is
+  // reachable from nowhere else: an embedder can only sample BETWEEN
+  // executes, and this program spends its whole life inside one. (An
+  // embedder's `mlx.core` does read the same counters -- one libmlx image is
+  // loaded, shared by the plugin and the extension -- but it never gets to
+  // look while a bound is being tested.) `cache=` is the pool as the flush
+  // leaves it; `was=` what it held before the trim.
+  if (g_cfg.memdbg && hard)
+    debug_line("[metaljax-mem] flush #" + std::to_string(g_stats.flushes) +
+               ": active=" + std::to_string(mx::get_active_memory() >> 20) +
+               "MB cache=" + std::to_string(mx::get_cache_memory() >> 20) +
+               "MB" +
+               (trimmed ? " (was " + std::to_string(cache_before >> 20) + "MB)"
+                        : "") +
+               " bound=" +
+               std::to_string(g_cfg.flush_clear_bytes < 0
+                                  ? -1
+                                  : (g_cfg.flush_clear_bytes >> 20)) +
+               "MB");
 }
 
 }  // namespace

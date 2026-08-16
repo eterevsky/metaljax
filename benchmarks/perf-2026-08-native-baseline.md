@@ -211,7 +211,7 @@ only in the second — which is exactly how row 19 hid a 2.2× for two passes.
 | 17 | SD 3.5 Large @1024² | ms/step | 5141 | **5107** (23 G) | 0.99× | **5781.6** (24 G) ᴾ¹⁸ | **1.13×** | 1.12× | sdpa emit: 3.14× → 1.13×; real image (pixel_std 68.0) |
 | 17b | SD 3.5 Large @512² | ms/step | 1389 | **1520.7** (21 G) ᶜ | **1.09×** ⚠ | **1234.8** (21 G) ᴾ¹⁸ | **0.81×** | **0.89×** | ᶜ measured for this pairing. Native is 19 % faster than Stage 1 and 11 % faster than the anchor; the ⚠ is Stage 1's own 9 % drift, still unattributed |
 | 18 | LoRA E2B train | ms/step | 407 | **398.9** (56 G) ᶜ | 0.98× | **397.5 / 396.2** (37 G) ᴾ²⁰ | **1.00×** | **0.98×** | P16 656.3 → **P20 397.5**. The gap was **1,952 output copies of donated pass-through parameters** (~10 GB/step) plus the eager-flush cadence; the copy list now exempts donated aliases as `engine.py::_dealias` does — `0 output copies, 2255 donated` — and the row's peak drops 55 → 37 G, below Stage 1's own 56 |
-| 19 | maxtext train 0.6B | ms/step | 440 | **969.1** ⚠ | **2.20×** ⚠ | **1006.2** ᴾ²⁰ | 1.04× | **2.29×** ⚠ | **the shared drift, root-caused below**: the eager flush's `mx::clear_cache()`. Both stacks recover on the knob alone — Stage 1 **446.2**, native **468.0** — against a 0.11.2-source control of **448.2** on today's machine. Losses identical across every configuration |
+| 19 | maxtext train 0.6B | ms/step | 440 | **969.1** ⚠ | **2.20×** ⚠ | **833.9** ᴾ²⁵ | **0.86×** | 1.90× ⚠ | **P20's shared drift, half-fixed natively in P25**: the eager flush trims MLX's pool instead of dumping it (975.4 → 833.9 against a same-day RC control, 1.17×). The rest is the WATERMARK, not the dumping — 685.6 at 8 GB, 464.1 at 32 GB, 461.7 unbounded, and 32 GB is where row 18 blows its 70 GB guard. Stage 1 still dumps (frozen), which is what the 0.86× same-day ratio now measures |
 | 20 | 235B-A22B 3-bit | — | ✗ | — | — | — | — | — | mlx-only row |
 
 **Unmeasured**: rows 8/10/12/15 (pre-existing embargoes), row 9 native
@@ -814,3 +814,49 @@ against P22's is exactly that row plus the plugin path), `texmo_gate`
 **106 ok / 0 decline / 0 FAIL / 0 error** twice, `smoke_test` passed,
 `bazel test //…` passed, and the whole-suite plan census **identical to P22's,
 568 narration lines in the same order**.
+
+---
+
+# P25 ADDENDUM — the eager flush stops dumping the pool (2026-08-16)
+
+*Full write-up: `notes/cpp-p25-cache-limit.md`. Data:
+`~/.cache/metaljax-bench/logs/p25-cache-limit/`. Binary under measurement:
+`frozen-p25c.dylib`, sha256 `516e4b43…`, byte-identical to a `bazel build` of
+the tree.*
+
+P20 root-caused row 19's 2.2× to `mx::clear_cache()` at the eager flush and
+proposed `mx::set_cache_limit`. Both shapes were built and measured. **The
+literal one — a global cache limit at plugin init — is rejected**: it bounds
+paths that never reach a flush and were never bounded, and a compiled decode
+step whose transients exceed the bound then re-allocates from the OS every step
+(row 13: **190.0 vs 80.7 ms/tok**, 2.35×; suite-106 geomean 1.0420 vs P23's
+1.0050, `mid` class +11.8%; and one run of that binary died on a GPU address
+fault). **What ships is the trim at the same cadence the clear had**
+(`runtime.cc::trim_cache`): set the limit, poke the allocator, restore.
+
+| row / gate | shipped dump (RC, same day) | **P25 trim** | note |
+|---|---:|---:|---|
+| 19, maxtext train, ms/step | 975.4 | **833.9** | 1.17×; peaks 21 / 20 GB |
+| 18, LoRA train, ms/step | 400.0 | **394.0** | peak is a LOAD transient, 37-56 GB on both binaries |
+| 13, E2B keras-int4, ms/tok | 80.7 | **80.8 / 80.9** | parity — the point of not bounding globally |
+| texmo suite-106 native/Stage 1 | 1.0050 ᴾ²³ | **0.9685** | 106/106 within 1.2×, 81 native-faster; `big` class 1.0107 → 0.9296 |
+| …native arm vs P23's native arm | — | **0.9882** | against a Stage-1 control reading 1.0254 of P23's (the machine is ~2.5% slower today) |
+
+**The watermark is the rest of row 19**, and it is a memory trade, measured on
+the two rows that care (`METALJAX_FLUSH_CLEAR_MB`, ms/step and peak footprint):
+
+| watermark | row 19 | row 19 peak | row 18 | row 18 peak |
+|---:|---:|---:|---:|---:|
+| 512 | 1067.0 | 20 GB | — | — |
+| **2048 (shipped)** | **833.9** | 21 GB | **395.6** | **39 GB** |
+| 8192 | 685.6 | 25 GB | 364.5 | 57 GB |
+| 32768 | 464.1 | 39 GB | — | **guard-killed, 68 GB** |
+| unbounded | 461.7 | 39 GB | — | (P20: 81 GB) |
+
+Battery on the shipped binary: `execute_test` all cases match CPU (plus four
+new P25 contracts — the pool holds at 255 MB over 552 flushes with a 256 MB
+watermark, median 228 MB cached, 4025 MB with the trim off, and the 20k-
+iteration loop still clears on its own count cadence), `ingest_test` 0 failed,
+`smoke_test`, `bazel test //…`, and `texmo_gate` 105 ok / 1 FAIL —
+`mid03-b64l128`, P23's documented flake for that config, 3/3 ok standalone on
+this binary and 3/3 on the RC one.

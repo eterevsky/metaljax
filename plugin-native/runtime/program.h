@@ -180,7 +180,11 @@ mx::array csqrt(const mx::array& z);
 struct Config {
   int64_t eager_flush_bytes = 1024LL << 20;   // METALJAX_EAGER_FLUSH_MB
   int64_t flush_sync_every = 1;               // METALJAX_EAGER_FLUSH_SYNC
-  int64_t flush_clear_bytes = 2048LL << 20;   // METALJAX_FLUSH_CLEAR_MB
+  // METALJAX_FLUSH_CLEAR_MB: the watermark an eager flush TRIMS MLX's buffer
+  // pool back to (P25: it used to dump the pool instead -- see
+  // `program.cc::eager_flush` and `runtime.cc::trim_cache`). Negative
+  // disables the trim, i.e. lets the pool grow to MLX's own cache limit.
+  int64_t flush_clear_bytes = 2048LL << 20;
   int64_t loop_clear_cost = 500000;           // METALJAX_LOOP_CLEAR_COST
   int64_t ingest_clear_bytes = 8LL << 30;     // METALJAX_INGEST_CLEAR_MB
   int64_t while_pipeline = 1;                 // METALJAX_WHILE_PIPELINE
@@ -199,7 +203,9 @@ void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
 
 struct Stats {
   int64_t flushes = 0;         // eager byte-denominated sync points
-  int64_t cache_clears = 0;    // ...that returned cache memory to the OS
+  int64_t cache_trims = 0;     // ...that trimmed the pool back to its bound
+                               // (the excess only -- P25; this used to be
+                               // `cache_clears`, a whole-pool dump)
   int64_t loop_flushes = 0;    // loop sync points
   int64_t loop_clears = 0;     // ...that cleared on the op-unit cadence
   int64_t ingest_bytes = 0;    // device bytes taken in by transfers
@@ -235,6 +241,7 @@ bool is_resource_limit(const std::exception& e);
 // cycles to break.
 extern std::function<void()> g_gc_hook;
 void gc_collect();                              // host.cc: runs the hook
+void trim_cache(int64_t bytes);   // bound MLX's pool without dumping it
 void debug_line(const std::string& line);
 void debug_print(const std::string& msg);
 void flush_eval(const std::vector<mx::array>& arrays, bool hard);

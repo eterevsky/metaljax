@@ -184,6 +184,22 @@ void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
   g_cfg.while_pipeline = while_pipeline;
   g_cfg.debug = debug;
   g_cfg.memdbg = memdbg;
+
+  // NOT DONE HERE, and measured (P25, notes/cpp-p25-cache-limit.md):
+  // `mx::set_cache_limit(flush_clear_bytes)` at client construction -- a
+  // GLOBAL pool bound -- is the shape the P20 root cause proposed, and it
+  // costs more than it buys. It bounds every path, including the ones that
+  // never reach an eager flush and were never bounded before: the E2B
+  // keras-int4 decode row went **80.7 -> 190.0 ms/tok (2.35x)** under a
+  // 2 GB global limit, because a compiled decode step whose transients
+  // exceed the bound then re-allocates from the OS on every step (and the
+  // texmo suite's `mid` class went with it, +11.8%). It bought 1.10x on the
+  // row it was aimed at, where the trim below buys 1.17x.
+  //
+  // What ships instead is the same trim at the SAME cadence the clear had:
+  // `program.cc::eager_flush` -> `trim_cache`, which bounds the pool where
+  // an eager phase would otherwise claim its whole traffic and leaves every
+  // other path exactly as it was.
 }
 
 }  // namespace metaljax

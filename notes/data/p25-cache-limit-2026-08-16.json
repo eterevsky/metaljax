@@ -1,0 +1,189 @@
+{
+ "validation_p23_geomean": 1.005,
+ "binaries": {
+  "scoped_trim": "frozen-p25c.dylib sha256 516e4b43\u2026",
+  "global_limit": "frozen-p25b.dylib sha256 a1ae46ce\u2026",
+  "control": "frozen-rc-ed355691.dylib (P23)"
+ },
+ "suite106": {
+  "scoped_trim": {
+   "classes": {
+    "whole": {
+     "n": 106,
+     "geomean": 0.9685,
+     "median": 0.9904,
+     "min": 0.682,
+     "max": 1.0787
+    },
+    "big": {
+     "n": 34,
+     "geomean": 0.9296,
+     "median": 0.9974,
+     "min": 0.682,
+     "max": 1.0787
+    },
+    "mid": {
+     "n": 30,
+     "geomean": 0.9848,
+     "median": 0.989,
+     "min": 0.8721,
+     "max": 1.0153
+    },
+    "db": {
+     "n": 40,
+     "geomean": 0.9911,
+     "median": 0.9918,
+     "min": 0.9585,
+     "max": 1.0193
+    },
+    "synth": {
+     "n": 2,
+     "geomean": 0.9538,
+     "median": 0.954,
+     "min": 0.9336,
+     "max": 0.9744
+    }
+   },
+   "bands": {
+    "within_1.2x": 106,
+    "native_faster": 81
+   },
+   "native_vs_p23_native": {
+    "n": 106,
+    "geomean": 0.9882,
+    "median": 1.0012,
+    "min": 0.763,
+    "max": 1.0474
+   },
+   "stage1_vs_p23_stage1": {
+    "n": 106,
+    "geomean": 1.0254,
+    "median": 1.0113,
+    "min": 0.8599,
+    "max": 1.2304
+   }
+  },
+  "global_limit": {
+   "classes": {
+    "whole": {
+     "n": 106,
+     "geomean": 1.042,
+     "median": 1.0034,
+     "min": 0.6598,
+     "max": 1.8598
+    },
+    "big": {
+     "n": 34,
+     "geomean": 0.9994,
+     "median": 0.9961,
+     "min": 0.6598,
+     "max": 1.5216
+    },
+    "mid": {
+     "n": 30,
+     "geomean": 1.1175,
+     "median": 1.0167,
+     "min": 0.9223,
+     "max": 1.8598
+    },
+    "db": {
+     "n": 40,
+     "geomean": 1.0251,
+     "median": 1.002,
+     "min": 0.89,
+     "max": 1.5022
+    },
+    "synth": {
+     "n": 2,
+     "geomean": 1.026,
+     "median": 1.026,
+     "min": 1.0179,
+     "max": 1.0342
+    }
+   },
+   "bands": {
+    "within_1.2x": 93,
+    "native_faster": 36
+   },
+   "native_vs_p23_native": {
+    "n": 106,
+    "geomean": 1.0588,
+    "median": 1.0171,
+    "min": 0.7974,
+    "max": 1.8889
+   },
+   "stage1_vs_p23_stage1": {
+    "n": 106,
+    "geomean": 1.0212,
+    "median": 1.0155,
+    "min": 0.8694,
+    "max": 1.1645
+   }
+  }
+ },
+ "model_rows": {
+  "row19_maxtext_train_ms_step": {
+   "rc_dump_same_day": 975.4,
+   "scoped_trim": 833.9,
+   "global_limit": 866.9,
+   "rc_dump_run2": 950.1,
+   "anchor": 440,
+   "peaks_gb": {
+    "rc": 21,
+    "scoped": 20
+   }
+  },
+  "row18_lora_ms_step": {
+   "rc_dump_same_day": 400.0,
+   "scoped_trim": 394.0,
+   "global_limit": 411.3,
+   "peak_gb_note": "load transient, 37-56 GB across runs on BOTH binaries"
+  },
+  "row13_e2b_int4_ms_tok": {
+   "rc_dump": 80.7,
+   "scoped_trim": [
+    80.8,
+    80.9,
+    82.1
+   ],
+   "global_limit": [
+    190.0,
+    201.9
+   ],
+   "global_limit_third_run": "GPU address fault"
+  }
+ },
+ "watermark_sweep": {
+  "row19_ms_step": {
+   "512": 1067.0,
+   "2048": 833.9,
+   "8192": 685.6,
+   "32768": 464.1,
+   "unbounded": 461.7
+  },
+  "row19_trims_per_step": {
+   "512": "29-30",
+   "2048": "15-16",
+   "8192": "5-9",
+   "32768": 0,
+   "unbounded": 0
+  },
+  "row19_peak_gb": {
+   "512": 20,
+   "2048": 21,
+   "8192": 25,
+   "32768": 39,
+   "unbounded": 39
+  },
+  "row18_ms_step": {
+   "2048": 395.6,
+   "8192": 364.5,
+   "32768": "guard-killed"
+  },
+  "row18_peak_gb": {
+   "2048": 39,
+   "8192": 57,
+   "32768": 68
+  }
+ }
+}

@@ -2140,6 +2140,41 @@ def _recognizer_cases():
     out.append(("sdpa additive mask",
                 lambda a, b, c, m: attn_additive(a, b, c, m, 0.25),
                 [q, k, v, _rand((2, 4, 8, 8), 36) * 0.1], *DOT))
+
+    # P26: the same attention, rooted WHOLLY inside a `func.call` callee --
+    # gemma-lib's sampler and maxtext both put a decode step there, and jax
+    # gives that shape to any loop whose body calls a named function (a
+    # `fori_loop` over `attn(...)` lowers to `func.call @attn` inside the while
+    # body, non-inlined jit or not).  The recognizer walked @main and its
+    # regions only, so a 60-layer decode step fused nothing and dispatched op
+    # by op, per token.
+    def attn_in_callee(q, k, v):
+        step = jax.jit(lambda a: attn(a, k, v, 0.25), inline=False)
+        return jax.lax.fori_loop(0, 3, lambda i, c: step(c), q)
+
+    q = _rand((2, 8, 4, 16), 40) * 0.5
+    k = _rand((2, 8, 4, 16), 41) * 0.5
+    v = _rand((2, 8, 4, 16), 42) * 0.5
+    out.append(("sdpa inside a callee", attn_in_callee, [q, k, v], *DOT))
+
+    # ...and the hazard that scoping brings with it: ONE callee, two call
+    # sites, two different masks.  Inlining lowers the callee's block twice and
+    # binds its arguments to a different slot each time, so a mask cache keyed
+    # by the IR value would hand the second attention the first one's mask --
+    # the same answer everywhere except where the two masks differ.  Keyed by
+    # the base's slot, the two are two entries.
+    def attn_two_masks(q, k, v, m1, m2):
+        one = jax.jit(lambda a, m: attn_additive(a, k, v, m, 0.25),
+                      inline=False)
+        return jax.lax.fori_loop(0, 2,
+                                 lambda i, c: one(c, m1) + one(c, m2), q)
+
+    q = _rand((2, 4, 8, 16), 43) * 0.5
+    k = _rand((2, 4, 8, 16), 44) * 0.5
+    v = _rand((2, 4, 8, 16), 45) * 0.5
+    out.append(("sdpa two masks through one callee", attn_two_masks,
+                [q, k, v, _rand((2, 4, 8, 8), 46) * 0.1,
+                 _rand((2, 4, 8, 8), 47) * 0.1 - 3.0], *DOT))
     return out
 
 
@@ -3052,6 +3087,373 @@ def _p19_packing(subprocess, tempfile, pathlib):
     ]
 
 
+# --------------------------------------------------------------------------
+# P25: the eager flush trims MLX's pool instead of dumping it
+# --------------------------------------------------------------------------
+#
+# A hard flush that finds MLX's pool over `METALJAX_FLUSH_CLEAR_MB` used to
+# DUMP it (`mx::clear_cache()`); it TRIMS it back to the watermark now
+# (`runtime.cc::trim_cache`).  What has to be shown is that the swap kept the
+# BOUND -- the clear was never decoration, it is what stops an eager program
+# whose traffic dwarfs its live set from claiming the traffic -- so the arms
+# below run one such program and read the pool out of the DYLIB's own meter
+# (`METALJAX_MEMDBG`, runtime/program.cc's flush line), which is the only
+# reading taken at a flush point at all.
+#
+# The program is eager by construction (`METALJAX_COMPILE=0`, the same arm
+# P3/P4 use) with a 64 MB flush budget so the sync points really fall inside
+# it, and every intermediate it produces is a DIFFERENT SIZE -- which is what
+# makes a pool grow at all.  MLX reuses a cached buffer only for a request
+# within `min(2 * size, size + 2 * page)` of it (mlx/backend/common/
+# buffer_cache.h `reuse_from_cache`), i.e. essentially an exact match at these
+# widths, so 64 distinct 16-80 MB results per call accumulate ~3 GB of freed
+# buffers -- the synthetic shape of what a real over-budget main (maxtext's
+# training step: ~105 GB of traffic, hundreds of distinct shapes, a few
+# hundred MB live) does to the cache.  A constant-shape chain would prove
+# nothing: every free would be reused exactly and no pool would ever grow.
+
+_P25_TRAFFIC = r'''
+import os, sys
+import numpy as np
+import jax, jax.numpy as jnp
+
+BASE = 4 * 1024 * 1024       # 16 MB of f32
+STEP = 256 * 1024            # ...growing by 1 MB per op
+ROUNDS, DEPTH = 3, 64
+
+
+def chain(x):
+    acc = jnp.float32(0)
+    for i in range(DEPTH):
+        y = x[:BASE + i * STEP] * jnp.float32(1.0000001) + jnp.float32(0.5)
+        acc = acc + jnp.sum(y)   # a scalar carry: the live set stays flat
+    return acc
+
+
+n = BASE + DEPTH * STEP
+x = jax.device_put(np.random.RandomState(7).rand(n).astype(np.float32))
+f = jax.jit(chain)
+total = 0.0
+for _ in range(ROUNDS):
+    total += float(np.asarray(f(x)))
+print("[probe] checksum %.6f" % total)
+print("[probe] traffic_gb %.2f" % (
+    ROUNDS * 2 * sum(BASE + i * STEP for i in range(DEPTH)) * 4 / (1 << 30)))
+'''
+
+# The loop discipline, on the row that exists to exercise it (the differential
+# suite's "long counted loop"): a tiny body, run tens of thousands of times.
+# What keeps Metal's live-buffer COUNT bounded there is the op-unit loop-clear
+# cadence (`METALJAX_LOOP_CLEAR_COST`), which is NOT what the pool bound
+# replaces -- a byte limit says nothing about a count -- so this arm is here to
+# prove that swapping the flush clear left it alone.  The loop is forced onto
+# the interpreted path (no compiled chunks, no generated kernel), because that
+# is the arm the cadence exists for; the shipped paths run the same loop in the
+# differential suite above.
+_P25_LONGLOOP = r'''
+import os
+import numpy as np
+import jax
+
+n = int(os.environ.get("MJ_P25_ITERS", "20000"))
+out = float(np.asarray(jax.jit(
+    lambda x: jax.lax.fori_loop(0, n, lambda i, c: c + 1.0, x))(
+        np.float32(0.0))))
+print("[probe] loop %.1f of %d" % (out, n))
+'''
+
+
+def _p25_cache_limit(subprocess, tempfile, pathlib, re):
+    """(label, check) pairs for the pool bound that replaced the flush clear."""
+
+    def run(source, extra_env):
+        env = dict(os.environ)
+        env["METALJAX_DEBUG"] = "1"
+        env["METALJAX_MEMDBG"] = "1"
+        env.update(extra_env)
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(source)
+            script = fh.name
+        try:
+            return subprocess.run([sys.executable, script], env=env,
+                                  capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(script)
+            except OSError:
+                pass
+
+    # "... active=123MB cache=45MB (was 678MB) bound=256MB" -- the `(was ...)`
+    # half is there only when that flush trimmed.
+    _FLUSH = re.compile(r"\[metaljax-mem\] flush #\d+: active=(\d+)MB "
+                        r"cache=(\d+)MB(?: \(was (\d+)MB\))? bound=(-?\d+)MB")
+
+    def traffic(bound_mb):
+        """One eager traffic run; returns (proc, cache samples MB, checksum).
+
+        The meter lines come out of `debug_line`, which writes to STDOUT (the
+        per-execute `[metaljax-native]` stats line is the one on stderr), so
+        both streams are searched rather than the wrong one guessed at.
+        """
+        proc = run(_P25_TRAFFIC, {"METALJAX_COMPILE": "0",
+                                  "METALJAX_EAGER_FLUSH_MB": "64",
+                                  "METALJAX_FLUSH_CLEAR_MB": str(bound_mb)})
+        caches = [int(m.group(2)) for m in
+                  _FLUSH.finditer((proc.stdout or "") + (proc.stderr or ""))]
+        checksum = None
+        for ln in proc.stdout.splitlines():
+            if ln.startswith("[probe] checksum "):
+                checksum = ln.split()[2]
+        return proc, caches, checksum
+
+    state = {}
+
+    def the_pool_stays_under_its_bound():
+        """~18 GB of eager traffic, and the cache never passes 256 MB.
+
+        The trim happens at the NEXT allocation, so a reading can sit one
+        allocation over the line -- 80 MB at the widest here, and 128 MB of
+        slack covers it.  What the bound is really being separated from is
+        the traffic: an unbounded pool reads gigabytes (the arm below).
+        """
+        proc, caches, checksum = traffic(256)
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-140:]
+        state["bounded"] = (caches, checksum)
+        if len(caches) < 20:
+            return False, (f"only {len(caches)} hard flushes narrated; last "
+                           f"output: {(proc.stdout or '').strip()[-90:]!r}")
+        if max(caches) > 256 + 128:
+            return False, f"peak cache {max(caches)} MB over a 256 MB bound"
+        return True, (f"ok (peak {max(caches)} MB cached over "
+                      f"{len(caches)} flushes)")
+
+    def the_bound_is_not_a_dump():
+        """...and the buffers UNDER the bound survive to be reused.
+
+        This is the whole difference between a limit and a clear, and the
+        2.2x on the maxtext training row: after a dump every allocation is a
+        cold Metal buffer.  A pool that is being trimmed rather than emptied
+        sits NEAR its bound, so the median flush must find real memory
+        cached.
+        """
+        caches = state.get("bounded", ([], None))[0]
+        if not caches:
+            return False, "the bounded arm did not run"
+        mid = sorted(caches)[len(caches) // 2]
+        if mid <= 0:
+            return False, "the pool is empty at half the flushes (a dump)"
+        return True, f"ok (median {mid} MB cached, bound 256 MB)"
+
+    def the_bound_is_what_bounds_it():
+        """The control: with no limit, the same program's pool runs away.
+
+        `METALJAX_FLUSH_CLEAR_MB=-1` leaves MLX's default cache limit (its
+        memory limit) alone.  If the bounded arm above were bounded by
+        something else -- the flush itself, the allocator's own pressure
+        rules -- this arm would read the same numbers.
+        """
+        proc, caches, checksum = traffic(-1)
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-140:]
+        if not caches:
+            return False, "no flushes narrated"
+        bounded, bsum = state.get("bounded", ([], None))
+        if checksum != bsum:
+            return False, f"the arms disagree ({checksum} vs {bsum})"
+        if max(caches) <= 2 * max(bounded or [0]):
+            return False, (f"unbounded peak {max(caches)} MB vs bounded "
+                           f"{max(bounded or [0])} MB")
+        return True, (f"ok (unbounded peak {max(caches)} MB vs bounded "
+                      f"{max(bounded or [0])} MB)")
+
+    def a_long_loop_still_clears_on_the_count_cadence():
+        """20k interpreted iterations: the op-unit cadence, bound or no bound.
+
+        Read out of the plugin's own stats line -- the loop clears must fire
+        and no execute may have needed a buffer-limit recovery, which is the
+        live-buffer COUNT staying bounded stated in the only terms a caller
+        can see.  `METALJAX_LOOP_CLEAR_COST` is turned down to 1000 op units
+        so the cadence is crossed in seconds rather than in the half-million
+        units the shipped default spends (this loop's body is worth ~2).
+        """
+        proc = run(_P25_LONGLOOP, {"METALJAX_FLUSH_CLEAR_MB": "256",
+                                   "METALJAX_COMPILE": "0",
+                                   "METALJAX_MSL": "0",
+                                   "METALJAX_LOOP_CLEAR_COST": "1000",
+                                   "MJ_P25_ITERS": "20000"})
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-140:]
+        if "[probe] loop 20000.0 of 20000" not in proc.stdout:
+            return False, f"wrong answer: {proc.stdout.strip()[-80:]}"
+        stats = [ln for ln in (proc.stderr or "").splitlines()
+                 if "[metaljax-native] " in ln and "loop_flushes=" in ln]
+        if not stats:
+            return False, "no stats line"
+        clears = retries = 0
+        for ln in stats:
+            m = re.search(r"loop_flushes=(\d+)\(\+clear (\d+)\).*?"
+                          r"limit_retries=(\d+)", ln)
+            if m:
+                clears += int(m.group(2))
+                retries += int(m.group(3))
+        if clears < 1:
+            return False, "the loop-clear cadence never fired"
+        if retries:
+            return False, f"{retries} buffer-limit recoveries"
+        return True, f"ok ({clears} loop clears, 0 recoveries)"
+
+    return [
+        ("the pool stays under its bound", the_pool_stays_under_its_bound),
+        ("the bound is a trim, not a dump", the_bound_is_not_a_dump),
+        ("the bound is what bounds it", the_bound_is_what_bounds_it),
+        ("a long loop clears on its own cadence",
+         a_long_loop_still_clears_on_the_count_cadence),
+    ]
+
+
+# P26: an attention rooted inside a `func.call` callee, in a DYNAMICALLY
+# bounded loop -- the shape gemma-lib's sampler and maxtext both emit, and the
+# one jax gives any loop whose body calls a named function.  Two layers inside
+# the callee, so the recognizer's count means something.
+_P26_CALLEE = r'''
+import numpy as np, jax, jax.numpy as jnp
+
+def attn(q, k, v):
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) * 0.25
+    return jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(logits, -1), v)
+
+def run(q, k1, v1, k2, v2, n):
+    # A while body with a PYTHON body inlines; the callee comes from the jit
+    # inside it, which is how the gemma sampler's decode step gets its own
+    # `@closed_call` (`moe.py::analyze`'s docstring names the same asymmetry).
+    block = jax.jit(lambda c: attn(attn(c, k1, v1), k2, v2), inline=False)
+    return jax.lax.while_loop(
+        lambda s: s[0] < n, lambda s: (s[0] + 1, block(s[1])), (0, q))[1]
+
+rng = np.random.RandomState(26)
+a = [rng.rand(2, 8, 4, 16).astype(np.float32) * 0.5 for _ in range(5)]
+print(f"[probe] checksum {float(np.asarray(jax.jit(run)(*a, 3)).sum()):.9e}")
+'''
+
+
+def _p26_callee_sdpa(subprocess, tempfile, pathlib, re):
+    """(label, check) pairs for the callee-scoped attention recognizer.
+
+    Two things need proving that no answer can show.  That an attention living
+    wholly inside a callee is FOUND -- an unfused one computes the same thing,
+    only slower, so the numeric rows pass either way.  And that finding it
+    moves the COMPILE GATE, which is the whole of P26: `by_cost =
+    METALJAX_TRACE_BUDGET / BlockCost(body)` is integer division, so the 31B
+    decode body, 388 units over the budget without the discount its 60
+    attentions are worth, replayed nothing and dispatched ~20000 tape entries
+    per token for it.
+
+    Neither check hard-codes a cost.  Both arms are the same binary and the
+    same program under `METALJAX_SDPA=1/0`, and the budget the second one
+    tests with is derived from the two costs the runs themselves narrate.
+    """
+
+    def run(extra_env):
+        env = dict(os.environ)
+        env["METALJAX_DEBUG"] = "1"
+        env.update(extra_env)
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(_P26_CALLEE)
+            script = fh.name
+        try:
+            return subprocess.run([sys.executable, script], env=env,
+                                  capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(script)
+            except OSError:
+                pass
+
+    _FUSED = re.compile(r"sdpa: (\d+) fused attention\(s\) recognized")
+    # The gate's own line: the two integers the decision is made of, for the
+    # one `stablehlo.while` this program has.  The LAST one is the one that
+    # matters -- a recognized program is lowered TWICE (P17's two-phase
+    # compile: a plain tape at `CompileAndLoad`, then a fused one at the first
+    # execute, which is the tape that runs), so the first line is always the
+    # undiscounted cost even in the fused arm.
+    _GATE = re.compile(r"while gate: cost=(\d+) .*? body_compile=(\d+)")
+
+    def arm(extra_env):
+        proc = run(extra_env)
+        err = proc.stderr or ""
+        gates = [(int(m.group(1)), int(m.group(2)))
+                 for m in _GATE.finditer(err)]
+        return proc, {
+            "fused": sum(int(m.group(1)) for m in _FUSED.finditer(err)),
+            "cost": gates[-1][0] if gates else 0,
+            "compile": gates[-1][1] if gates else 0,
+            "gates": gates,
+            "sum": next((float(ln.split()[2])
+                         for ln in proc.stdout.splitlines()
+                         if ln.startswith("[probe] checksum ")), None),
+        }
+
+    def same(a, b):
+        """The fused attention is a different KERNEL, not a different
+        function: it may not be bit-identical to the literal chain (it is not
+        -- ~6e-8 relative here), so the arms are compared the way every other
+        row in this file is, against a tolerance."""
+        if a is None or b is None:
+            return False
+        return abs(a - b) <= 1e-5 * max(abs(a), abs(b), 1.0)
+
+    state = {}
+
+    def the_callee_rooted_attention_is_found():
+        on_proc, on = arm({})
+        off_proc, off = arm({"METALJAX_SDPA": "0"})
+        if on_proc.returncode or off_proc.returncode:
+            return False, ((on_proc.stderr or off_proc.stderr)
+                           or "").strip()[-140:]
+        state["on"], state["off"] = on, off
+        if not same(on["sum"], off["sum"]):
+            return False, f"answers differ: {on['sum']} vs {off['sum']}"
+        if off["fused"]:
+            return False, f"{off['fused']} fused with METALJAX_SDPA=0"
+        return on["fused"] == 2, (f"{on['fused']} fused (want 2), 0 with "
+                                  f"METALJAX_SDPA=0, answers agree")
+
+    def the_discount_reaches_the_compile_gate():
+        on, off = state.get("on"), state.get("off")
+        if on is None or off is None:
+            return False, "the run above did not complete"
+        if not on["cost"] or not off["cost"]:
+            return False, "no `while gate` line narrated"
+        if on["cost"] >= off["cost"]:
+            return False, (f"the fused body costs {on['cost']}, the unfused "
+                           f"{off['cost']} -- no discount")
+        # A budget strictly between the two costs: the fused body clears it
+        # (by_cost >= 1), the unfused one does not (by_cost == 0).  Nothing
+        # else about the two runs differs.
+        budget = (on["cost"] + off["cost"]) // 2
+        env = {"METALJAX_TRACE_BUDGET": str(budget)}
+        gated_proc, gated = arm(env)
+        ungated_proc, ungated = arm(dict(env, METALJAX_SDPA="0"))
+        if gated_proc.returncode or ungated_proc.returncode:
+            return False, ((gated_proc.stderr or ungated_proc.stderr)
+                           or "").strip()[-140:]
+        if not same(gated["sum"], ungated["sum"]):
+            return False, (f"the gate changed the answer: {gated['sum']} vs "
+                           f"{ungated['sum']}")
+        ok = gated["compile"] > 0 and ungated["compile"] == 0
+        return ok, (f"cost {on['cost']} fused / {off['cost']} unfused; at "
+                    f"budget {budget} body_compile="
+                    f"{gated['compile']} / {ungated['compile']}")
+
+    return [("an attention in a callee fuses",
+             the_callee_rooted_attention_is_found),
+            ("the callee discount moves the gate",
+             the_discount_reaches_the_compile_gate)]
+
+
 def _p13_contracts(jax, jnp):
     import jax.experimental   # io_callback
 
@@ -3833,7 +4235,11 @@ def main():
             failures.append(label)
 
     for label, check in (_p19_packing(subprocess, tempfile, pathlib)
-                         + _p21_msl(subprocess, pathlib, __import__("re"))):
+                         + _p21_msl(subprocess, pathlib, __import__("re"))
+                         + _p25_cache_limit(subprocess, tempfile, pathlib,
+                                            __import__("re"))
+                         + _p26_callee_sdpa(subprocess, tempfile, pathlib,
+                                            __import__("re"))):
         try:
             ok, detail = check()
         except BaseException as exc:  # noqa: BLE001 - report and continue

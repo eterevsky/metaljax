@@ -1,0 +1,143 @@
+{
+ "gemma4-12b-bf16-metaljax-p26b-0816-120500": {
+  "decode_ms_tok": 93.9,
+  "error": null,
+  "fused_attentions": [
+   8,
+   48
+  ],
+  "load_s": 41.9,
+  "mem_gb": 23.8,
+  "out_tokens": 128,
+  "prefill_ms": 734.9,
+  "sample_loop_last": "[metaljax-native] jit__sample_loop: flushes=1(+trim 1) loop_flushes=128(+clear 4) ingest=0MB(+clear 0) limit_retries=0 serial_loops=1 pipelined_loops=0 pipelined_steps=0 compiles=0 compiled_calls=128 unrolls=0 drops=0/0",
+  "token_first_diff_vs_stage1": null,
+  "tokens_compared": 64,
+  "vs_stage1_decode": 1.0011,
+  "while_gates": [
+   {
+    "body_compile": 1,
+    "budget": 20000,
+    "by_bytes": 21,
+    "by_cost": 1,
+    "bytes_mb": 3031,
+    "cost": 16306,
+    "pure": 1
+   },
+   {
+    "body_compile": 1,
+    "budget": 20000,
+    "by_bytes": 21,
+    "by_cost": 1,
+    "bytes_mb": 3010,
+    "cost": 15130,
+    "pure": 1
+   }
+  ]
+ },
+ "gemma4-31b-bf16-metaljax-p25only-0816-120140": {
+  "decode_ms_tok": 270.8,
+  "error": null,
+  "fused_attentions": [],
+  "load_s": 91.44,
+  "mem_gb": 0.0,
+  "out_tokens": 128,
+  "prefill_ms": 2334.0,
+  "sample_loop_last": "[metaljax-native] jit__sample_loop: flushes=257(+trim 129) loop_flushes=128(+clear 5) ingest=0MB(+clear 0) limit_retries=0 serial_loops=1 pipelined_loops=0 pipelined_steps=0 compiles=0 compiled_calls=0 unrolls=0 drops=0/0",
+  "token_first_diff_vs_stage1": 34,
+  "tokens_compared": 64,
+  "vs_stage1_decode": 1.1172,
+  "while_gates": []
+ },
+ "gemma4-31b-bf16-metaljax-p26b-0816-115758": {
+  "decode_ms_tok": 239.8,
+  "error": null,
+  "fused_attentions": [
+   60
+  ],
+  "load_s": 114.6,
+  "mem_gb": 0.0,
+  "out_tokens": 128,
+  "prefill_ms": 2311.8,
+  "sample_loop_last": "[metaljax-native] jit__sample_loop: flushes=1(+trim 1) loop_flushes=128(+clear 5) ingest=0MB(+clear 0) limit_retries=0 serial_loops=1 pipelined_loops=0 pipelined_steps=0 compiles=0 compiled_calls=128 unrolls=0 drops=0/0",
+  "token_first_diff_vs_stage1": null,
+  "tokens_compared": 64,
+  "vs_stage1_decode": 0.9893,
+  "while_gates": [
+   {
+    "body_compile": 0,
+    "budget": 20000,
+    "by_bytes": 11,
+    "by_cost": 0,
+    "bytes_mb": 5509,
+    "cost": 20388,
+    "pure": 1
+   },
+   {
+    "body_compile": 1,
+    "budget": 20000,
+    "by_bytes": 12,
+    "by_cost": 1,
+    "bytes_mb": 5454,
+    "cost": 18888,
+    "pure": 1
+   }
+  ]
+ },
+ "gemma4-31b-bf16-mlx-mlxlm-0816-120909": {
+  "decode_ms_tok": 131.8,
+  "error": null,
+  "fused_attentions": [],
+  "load_s": 3.44,
+  "mem_gb": 58.3,
+  "out_tokens": 127,
+  "prefill_ms": 570.7,
+  "sample_loop_last": null,
+  "token_first_diff_vs_stage1": 0,
+  "tokens_compared": 64,
+  "vs_stage1_decode": 0.5437,
+  "while_gates": []
+ },
+ "gemma4-e2b-bf16-metaljax-p26b-0816-120653": {
+  "decode_ms_tok": 27.2,
+  "error": null,
+  "fused_attentions": [],
+  "load_s": 20.16,
+  "mem_gb": 10.2,
+  "out_tokens": 90,
+  "prefill_ms": 19.2,
+  "sample_loop_last": null,
+  "token_first_diff_vs_stage1": null,
+  "tokens_compared": 64,
+  "vs_stage1_decode": 1.0074,
+  "while_gates": [
+   {
+    "body_compile": 1,
+    "budget": 20000,
+    "by_bytes": 76,
+    "by_cost": 1,
+    "bytes_mb": 852,
+    "cost": 12847,
+    "pure": 1
+   },
+   {
+    "body_compile": 1,
+    "budget": 20000,
+    "by_bytes": 77,
+    "by_cost": 1,
+    "bytes_mb": 846,
+    "cost": 12847,
+    "pure": 1
+   },
+   {
+    "body_compile": 1,
+    "budget": 20000,
+    "by_bytes": 67,
+    "by_cost": 1,
+    "bytes_mb": 972,
+    "cost": 12847,
+    "pure": 1
+   }
+  ]
+ }
+}

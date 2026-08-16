@@ -32,7 +32,7 @@ notes/data/. Append a column per release / major optimization.*
 | 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 |
 | 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 |
 | 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 394.7 |
-| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 1006.2 |
+| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 833.9 ᴾ²⁵ |
 | 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ |
 
 Notes:
@@ -79,12 +79,20 @@ Notes:
   Rows 8/10/12/15 stay
   ✗ under the same embargoes as the metaljax column (kernel-panic /
   MLX command-buffer classes); row 20 is mlx-only and has never run on
-  either metaljax stack. **Row 19's 1006.2 carries a known, shared,
-  unfixed regression**: both stacks read ~2.2× their 0.11.3 anchor here
-  because of the eager flush's `mx::clear_cache()` (root-caused, not
-  the plugin under test — both recover to ~470 on the
-  `METALJAX_FLUSH_CLEAR_MB` knob; `mx::set_cache_limit` is the
-  candidate fix and awaits Oleg's sign-off). Rows 5 and 7's timings are
+  either metaljax stack. **Row 19 = P25 (2026-08-16), 1006.2 → 833.9**:
+  the eager flush now TRIMS MLX's buffer pool back to
+  `METALJAX_FLUSH_CLEAR_MB` instead of dumping the whole pool to the OS
+  (`runtime.cc::trim_cache`; notes/cpp-p25-cache-limit.md). Measured in
+  one hold beside a same-day control on the RC binary, which reads
+  **975.4** — so the mechanism is worth 1.17× and the cell's remaining
+  1.9× of the 440 anchor is the WATERMARK, not the dumping: the same row
+  reads 685.6 at an 8 GB watermark and 464.1 at 32 GB, and 32 GB is where
+  the LoRA row (18) blows through its 70 GB guard. The default is left at
+  2048 MB, which is strictly better than the shipped dump at the same
+  peak (20-21 GB here); raising it is Oleg's call off that table.
+  **Stage 1 still dumps** — its copies of the flush are frozen, so the
+  backport is a separate decision and any same-day native/Stage-1 ratio
+  on an eager-main row now has this in it. Rows 5 and 7's timings are
   reproducible to ±1%, but their greedy-token streams are not: the
   fused-attention recognizer emits are run-to-run nondeterministic
   (RC gate 1 finding, `METALJAX_RECOGNIZE=0` restores determinism) —

@@ -87,6 +87,12 @@ because one causal mask is shared by every layer and building it costs a full
 Not ported: `_all_blocks`, i.e. an attention rooted WHOLLY inside a `func.call`
 callee is not a candidate (chains that merely pass through a call are).
 
+> **SUPERSEDED 2026-08-16 (P26b, `notes/cpp-p26b-callee-sdpa.md`).** `_all_blocks`
+> IS ported now, because that omission was the whole of the gemma4-31B decode
+> gap: the gemma-lib sampler puts its decode step in a callee, so the native
+> lowering fused 0 of 60 attentions, missed the trace budget by 388 units and
+> dispatched the body op by op — 301.6 vs 242.4 ms/token.
+
 ## moe
 
 The call-frame machinery (`_Scope.deref`), `_peel`, the router proof

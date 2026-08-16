@@ -1760,3 +1760,64 @@ six of this campaign's seven were the suite itself.
 
 Frozen RC binary: `~/.cache/metaljax-bench/frozen-rc-ed355691.dylib`, sha256
 `ed355691…94a16` (tree d70499b + this fix).
+
+## P25: the eager flush trims instead of dumping (2026-08-16,
+## notes/cpp-p25-cache-limit.md)
+
+P20's last open item, approved by Oleg. A hard eager flush that found MLX's
+buffer cache over `METALJAX_FLUSH_CLEAR_MB` (2048) called `mx::clear_cache()`
+-- the whole pool to the OS, 7 times a step on maxtext's training row at ~70 ms
+each. It TRIMS to the watermark now (`runtime.cc::trim_cache`: set the cache
+limit, poke the allocator with one byte so MLX reclaims the excess "on the next
+allocation", restore the limit). Same variable, same cadence, same programs;
+`flushes=N(+clear M)` in the stats line is now `(+trim M)`, and
+`METALJAX_MEMDBG` prints the pool at every hard flush -- the meter the ladder
+is argued on, since a flush point is reachable from nowhere outside the dylib.
+
+**The approved shape was the GLOBAL one -- `mx::set_cache_limit` at plugin
+init -- and it was measured and rejected.** A global bound also bounds the
+paths that never reach a flush and were never bounded: a compiled decode step
+whose transients exceed it re-allocates from the OS every step. Row 13
+(E2B keras-int4) **190.0 vs 80.7 ms/tok, 2.35x**, in a clean interleaved
+position; suite-106 geomean **1.0420** against P23's 1.0050 with the `mid`
+class at 1.1175; and one repetition of that arm died on a **GPU address
+fault**, which is the hazard an allocation-time reclaim has and a flush-point
+reclaim does not. Binary kept (`frozen-p25b.dylib`) if it wants re-running.
+
+| | shipped dump (same-day RC) | **P25 trim** |
+|---|---:|---:|
+| row 19, maxtext train, ms/step | 975.4 | **833.9** (1.17x; peaks 21 / 20 GB) |
+| row 18, LoRA train, ms/step | 400.0 | **394.0** |
+| row 13, E2B int4, ms/tok | 80.7 | **80.8 / 80.9** |
+| suite-106 native/Stage 1 | 1.0050 (P23) | **0.9685**, 106/106 within 1.2x |
+| suite-106 `big` class | 1.0107 (P23) | **0.9296** |
+| native arm vs P23's native arm | -- | **0.9882** (Stage-1 control: 1.0254) |
+
+**The other 1.9x of row 19 is the WATERMARK, not the dumping**, and it is a
+memory trade: 512 -> 1067.0 ms, 2048 -> 833.9 (21 GB), 8192 -> 685.6 (25 GB),
+32768 -> 464.1 (39 GB), unbounded -> 461.7. The 32 GB setting reaches the 440
+anchor and is exactly where row 18 blows through its 70 GB guard (68 GB, killed;
+P20 measured 81 GB unbounded). Left at 2048, which beats the dump everywhere at
+the same peak. Raising it is one variable and Oleg's call.
+
+Ladder (run before any timing counted): four new `execute_test` contracts --
+the pool holds at 255 MB over 552 hard flushes at a 256 MB watermark, the
+median flush still finds 228 MB cached (a dump leaves 0), the same program runs
+to 4025 MB with the trim off, and 20k interpreted loop iterations still clear
+on the op-unit COUNT cadence (104 clears, 0 recoveries); `ingest_test` 8/8;
+row 18's peak 39 GB at the shipped watermark. Row 18's peak is a LOAD transient
+-- 37/38/39/43/56 GB across today's runs on BOTH binaries, always at sample ~10
+of ~60.
+
+Battery: `execute_test` all cases match CPU, `ingest_test` 0 failed,
+`smoke_test`, `bazel test //...`, `texmo_gate` 105 ok + 1 FAIL
+(`mid03-b64l128`, P23's documented flake for that config -- 3/3 ok standalone
+on this binary and 3/3 on the RC one). Shipped binary
+`~/.cache/metaljax-bench/logs/p25-cache-limit/frozen-p25c.dylib`, sha256
+`516e4b43…`.
+
+**Stage 1 is untouched and still dumps** (`src/metaljax/interpreter.py:776`,
+`native/program.cc:38`, both frozen): the backport is three edits and a battery
+re-run, and it is Oleg's decision. Until it lands, every same-day
+native/Stage-1 ratio on an eager-main row carries this difference -- which is
+what the 0.86x on row 19 above now measures.

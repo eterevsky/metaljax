@@ -78,12 +78,15 @@ const bool kVerifyDump =
 
 std::string StatsDelta(const Stats& before, const Stats& after) {
   return absl::StrFormat(
-      "flushes=%d(+clear %d) loop_flushes=%d(+clear %d) ingest=%dMB(+clear %d) "
+      // `trim` is how many hard flushes trimmed MLX's pool back to
+      // `METALJAX_FLUSH_CLEAR_MB` -- the excess only, where this used to
+      // read `clear` and dump the whole pool (P25).
+      "flushes=%d(+trim %d) loop_flushes=%d(+clear %d) ingest=%dMB(+clear %d) "
       "limit_retries=%d "
       "serial_loops=%d pipelined_loops=%d pipelined_steps=%d "
       "compiles=%d compiled_calls=%d unrolls=%d drops=%d/%d",
       after.flushes - before.flushes,
-      after.cache_clears - before.cache_clears,
+      after.cache_trims - before.cache_trims,
       after.loop_flushes - before.loop_flushes,
       after.loop_clears - before.loop_clears,
       // Not this execute's work -- transfers happen BETWEEN executes -- but

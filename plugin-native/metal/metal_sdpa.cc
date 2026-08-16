@@ -1752,6 +1752,28 @@ bool SdpaEnabled() {
   return on;
 }
 
+// sdpa.py `_all_blocks`: every block of every function in the module.
+//
+// Attention does not have to sit in @main.  The gemma-lib sampler and maxtext
+// both put a whole decode step inside a private `@closed_call` a `func.call`
+// reaches (a `fori_loop` over a non-inlined jit lowers exactly that way), and
+// an attention rooted wholly inside such a callee was invisible to the walk
+// that only looked at @main and its nested regions -- P26 measured the cost:
+// zero of the 31B's 60 decode attentions fused where Stage 1 fused all 60, and
+// the 1500 units of BlockCost that discount is worth are what put that body
+// 388 units OVER the trace budget, so it dispatched op by op, per token.
+//
+// Rewriting inside a callee is safe for the same reason Stage 1 gives: the
+// rewrite is a pure function of the IR and carries no per-call-site state, and
+// `Lowering::Inline` seeds the callee's block arguments with the call's
+// operand slots, which is all the emission ever reads.  Two call sites of one
+// callee therefore emit two fused attentions over their own operands.
+//
+// Only sdpa widens.  qmm and moe deliberately keep the @main-rooted walk their
+// Stage 1 counterparts have (`qmm.py`/`moe.py` both walk
+// `_walk_blocks(interp._main_block())`): what the two stacks must agree on
+// above all is the set of matches, because BlockCost is computed from it and
+// the compile decision is computed from that.
 void AnalyzeSdpa(mlir::func::FuncOp fn, RewritePlan* plan) {
   if (!SdpaEnabled()) return;
   if (fn.getBody().getBlocks().size() != 1) return;
@@ -1775,7 +1797,7 @@ void AnalyzeSdpa(mlir::func::FuncOp fn, RewritePlan* plan) {
   }
 
   std::vector<std::unique_ptr<SdpaMatch>> cands;
-  WalkBlocks(main, [&](mlir::Block& block) {
+  const std::function<void(mlir::Block&)> scan = [&](mlir::Block& block) {
     for (mlir::Operation& op : block) {
       if (OpName(&op) != "stablehlo.dot_general") continue;
       std::unique_ptr<SdpaMatch> mm;
@@ -1793,7 +1815,14 @@ void AnalyzeSdpa(mlir::func::FuncOp fn, RewritePlan* plan) {
       if (overlap) continue;
       cands.push_back(std::move(mm));
     }
-  });
+  };
+  if (module) {
+    for (mlir::func::FuncOp f : module.getOps<mlir::func::FuncOp>())
+      for (mlir::Region& r : f->getRegions())
+        for (mlir::Block& b : r.getBlocks()) WalkBlocks(b, scan);
+  } else {
+    WalkBlocks(main, scan);   // a detached function: itself and nothing else
+  }
   if (cands.empty()) return;
 
   // A candidate absorbed by another one cannot also be a root.

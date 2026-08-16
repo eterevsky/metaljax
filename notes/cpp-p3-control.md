@@ -127,10 +127,15 @@ parses them once:
 |---|---:|---|
 | `METALJAX_EAGER_FLUSH_MB` | 1024 | `interpreter.FLUSH_MB` |
 | `METALJAX_EAGER_FLUSH_SYNC` | 1 | `interpreter._FLUSH_SYNC_EVERY` |
-| `METALJAX_FLUSH_CLEAR_MB` | 2048 | `interpreter._FLUSH_CLEAR_BYTES` |
+| `METALJAX_FLUSH_CLEAR_MB` ᴾ²⁵ | 2048 | `interpreter._FLUSH_CLEAR_BYTES` |
 | `METALJAX_LOOP_CLEAR_COST` | 500000 | `ops/control._LOOP_CLEAR_COST` |
 | `METALJAX_WHILE_PIPELINE` | 1 | `ops/control._WHILE_PIPELINE` |
 | `METALJAX_DEBUG`, `METALJAX_MEMDBG` | off | both |
+
+ᴾ²⁵ the two stacks no longer SPEND `METALJAX_FLUSH_CLEAR_MB` the same way:
+this plugin trims MLX's pool back to it at a hard flush, Stage 1 (frozen) still
+dumps the whole pool. Same variable, same trigger, different reclaim —
+notes/cpp-p25-cache-limit.md.
 
 P2's reason for not doing this was that a second reader would be a second
 opinion on numbers the MLX command-buffer lottery is pinned to. That reason
