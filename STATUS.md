@@ -33,17 +33,17 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 
 | # | benchmark | jax CPU | metaljax | metaljax-native ²⁴ ³⁰ | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|---|
-| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | 301.6 (1.24× S1 / 1.27× anchor) ᴾ¹⁶ | 137 | 148.7 | 111.2 ²⁰ |
-| 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | 98.8 (1.05× S1 / 1.07× anchor) ᴾ¹⁶ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
+| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | 301.6 (1.24× S1 / 1.27× anchor) ᴾ²⁴ ³¹ | 137 | 148.7 | 111.2 ²⁰ |
+| 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | **98.6** (1.05× S1 / 1.07× anchor) ᴾ²⁴ ³¹ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
 | 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **43.4** (0.99× S1 / 0.98× anchor ²⁷) | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
-| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | 27.2 (1.00× S1 / 0.99× anchor) ᴾ¹⁶ | 10.5 ¹⁵ | — | — |
+| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | **27.0** (1.00× S1 / 0.98× anchor) ᴾ²⁴ ³¹ | 10.5 ¹⁵ | — | — |
 | 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.9** (0.99× S1 / 1.00× anchor ²⁷) | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
 | 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.7** (0.99× S1 / 1.01× anchor ²⁷) | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
 | 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **22.2** (1.01× S1 / 1.00× anchor ³⁰, 34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | not run (PAUSED ¹⁷) | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | **214.4** (1.00× S1 / 0.98× anchor) ²⁹ | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | not run (embargo) | **10.6** | — | — |
-| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | 16.67 (1.02× S1 / 1.06× anchor) ᴾ¹⁶ | — | — | — |
+| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | **16.63** (1.02× S1 / 1.05× anchor) ᴾ²⁴ ³¹ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | not run (PAUSED ¹⁷) | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **79.7** (0.99× S1 / 0.98× anchor ³⁰) | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **35.0** (1.06× S1 / 1.08× anchor ³⁰) | — | — | — |
@@ -401,6 +401,33 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
     (d) **Row 14 was never regressed**: standalone re-measurement gives 32.9 and
     32.7 against a 32.5 anchor. The 60.1 came 12 minutes into P16's sequential
     campaign — the suite-context trap of item 12, in the model harness.
+
+31. **P24: the four ᴾ¹⁶ cells re-measured on the RC binary** (2026-08-16, raw
+    `notes/data/p24-stale-rows-2026-08-16.{json,csv}`, logs
+    `~/.cache/metaljax-bench/logs/p24-stale-rows/`, verdicts appended to
+    `notes/rc-gates-2026-08-16.md` as the gate-1 scope correction). Rows 1, 2, 4
+    and 11 were the last cells carried at their P16 value — measured before the
+    P17 emits, the P18 relink and the P19/P20/P23 fixes — and their Stage-1
+    controls were P16-era too, so both sides of every ratio were stale. Each row
+    re-run Stage-1-control-first then native on the frozen RC dylib
+    (`ed355691…94a16`, hash-verified against this tree's `bazel-bin`), one
+    guarded process per row at its historical budget.
+    **Native 301.6 / 98.6 / 27.0 / 16.63** against P16's 301.6 / 98.8 / 27.2 /
+    16.67; **Stage 1 242.4 / 93.8 / 27.0 / 16.39** against 243.1 / 93.9 / 27.2 /
+    16.42 — all eight inside 0.7 %, no cell moved, peaks on their recorded
+    values (67 / 30 / 12 / 16 GB), 0 msl plans on all four.
+    Two findings the pass settles: **row 1 takes no sdpa emit at all** (0
+    recognized, `METALJAX_DEBUG=1`), so its 1.24× is the plain lowering and not a
+    missing fusion, while row 2 *does* take 8 fused attentions and lands on its
+    pre-emit number — sdpa is timing-neutral on T=1 gemma-lib decode. And the
+    token divergence on rows 1/11 is **reproducible** (byte-identical to their
+    P16 native streams; rows 2/4 are token-identical to Stage 1), i.e. distinct
+    from the fused-path nondeterminism of rows 5/7.
+    Guard note: row 1's load crest now sits at the old `GUARD_RSS_GB=110` cap —
+    the first attempt was killed at rss 110.47 and the row was re-run at 115
+    with the footprint (80) and system (100) budgets unchanged; measured crest
+    113.8 / 113.6 GB, machine at 74–75 GB, crest collapses as the mmap'd
+    checkpoint pages are released.
 
 ## Bug ledger (found by this suite)
 

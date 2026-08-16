@@ -1,0 +1,5 @@
+row,spec,metric,anchor_0113,stage1_p16,stage1_today,native_p16_cell,native_today,native_over_stage1_today,native_over_anchor,stage1_over_anchor,native_today_over_p16_cell,peak_fp_stage1_gb,peak_fp_native_gb
+1,gemma4-31b-bf16,ms/tok,237.5,243.1,242.4,301.6,301.6,1.244,1.27,1.021,1.0,66.0,67.0
+2,gemma4-12b-bf16,ms/tok,92.5,93.9,93.8,98.8,98.6,1.051,1.066,1.014,0.998,29.0,30.0
+4,gemma4-e2b-bf16,ms/tok,27.5,27.2,27.0,27.2,27.0,1.0,0.982,0.982,0.993,12.0,12.0
+11,qwen3-06b-maxtext,ms/tok,15.8,16.42,16.39,16.67,16.63,1.015,1.053,1.037,0.998,14.0,16.0

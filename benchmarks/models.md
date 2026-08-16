@@ -9,16 +9,16 @@ notes/data/. Append a column per release / major optimization.*
 | # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 |
 |---|---|---:|---:|---:|---:|
 | 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 98.8 |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 98.6 |
 | 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 |
-| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.2 |
+| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 |
 | 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 |
 | 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 |
 | 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 |
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 |
 | 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ |
-| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.67 |
+| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ |
 | 13 | E2B keras-int4 | 340 | 336 | 81.1 | 79.7 |
 | 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 |
@@ -54,12 +54,23 @@ Notes:
   benchmarks/perf-2026-08-native-baseline.md's Table 3 and
   notes/rc-gates-2026-08-16.md, no new numbers invented for this column.
   Latest pass per row: P18 (rows 3, 6, 17), P19 (row 9, footnote 29 in
-  STATUS.md), P20 (rows 13, 14, 16, 19), and the 2026-08-16 RC
+  STATUS.md), P20 (rows 13, 14, 16, 19), the 2026-08-16 RC
   spot-check (rows 5, 7, 18 — 58.1/22.0/394.7, each within ±1% of its
   P18/P20 cell; `METALJAX_DEBUG=1` confirmed 0 msl_scan plans on all
-  three). Rows 1, 2, 4, 11 are still carried at their P16 value (no
-  recognizer emits fired, not re-measured since 2026-08-12) — read
-  those four as a ceiling, not a current number. Rows 8/10/12/15 stay
+  three), and **P24, the same day** (rows 1, 2, 4, 11 — the four cells
+  that had been carried at their P16 value since 2026-08-12). P24
+  re-measured all four on the RC binary with a same-day Stage-1 control
+  each, since their Stage-1 numbers were P16-era too:
+  **301.6 / 98.6 / 27.0 / 16.63** against P16's 301.6 / 98.8 / 27.2 /
+  16.67 — every cell reproduced inside 0.7 %, so the ceiling caveat is
+  withdrawn and these are current numbers, not upper bounds.
+  Their same-day Stage-1 controls read 242.4 / 93.8 / 27.0 / 16.39, so
+  the native/Stage-1 ratios are 1.24 / 1.05 / 1.00 / 1.02 — unchanged
+  from P16, and the row-1 gap is *not* an sdpa miss: on the 31B row the
+  recognizer never fires (0 sdpa emits, 0 msl plans), while on the 12B
+  row it does (8 fused attentions) and the timing is P16's to 0.2 %.
+  Data: `notes/data/p24-stale-rows-2026-08-16.{json,csv}`.
+  Rows 8/10/12/15 stay
   ✗ under the same embargoes as the metaljax column (kernel-panic /
   MLX command-buffer classes); row 20 is mlx-only and has never run on
   either metaljax stack. **Row 19's 1006.2 carries a known, shared,
@@ -72,6 +83,13 @@ Notes:
   fused-attention recognizer emits are run-to-run nondeterministic
   (RC gate 1 finding, `METALJAX_RECOGNIZE=0` restores determinism) —
   the numbers above are timing only, not a token-identity claim.
+  That nondeterminism does **not** extend to the four P24 rows: rows 2
+  and 4 are token-identical to Stage 1 *and* to their P16 runs (64/64),
+  and rows 1 and 11, which diverge from Stage 1 (at token 34 and token
+  ~3), reproduce their own P16 native stream exactly — four days apart
+  for row 1, and twice in a row for row 11. Row 1 takes no sdpa emit at
+  all, so its divergence is the plain lowering's arithmetic order, not
+  the fused path.
 - Comparison stacks (2026-08-03, versions in
   scripts/model_bench/versions.lock.md — re-measure alongside major
   metaljax changes): mlx-lm 12B 58.3 / 31B 137 / MoE 17.0 / gpt-oss

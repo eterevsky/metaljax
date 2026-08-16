@@ -6,6 +6,24 @@ trampoline, on the tree at 845ab89. Sequential throughout, machine lock held
 for every measured run, `guarded_run.sh` (precheck + `mem_guard.sh`) for every
 model row.*
 
+> **2026-08-16 update (P24) — the last four P16 cells are closed.** Rows
+> **1, 2, 4, 11** of Table 3 (the only ones still carrying a P16 native number,
+> and whose Stage-1 columns were P16-era too) were re-measured on the frozen RC
+> binary `frozen-rc-ed355691.dylib` — hash-verified byte-identical to this
+> tree's `plugin-native/bazel-bin` build — with a fresh same-day Stage-1 control
+> for each: native **301.6 / 98.6 / 27.0 / 16.63** ms/tok against P16's
+> **301.6 / 98.8 / 27.2 / 16.67**, Stage 1 **242.4 / 93.8 / 27.0 / 16.39**
+> against **243.1 / 93.9 / 27.2 / 16.42**. Every one of the eight numbers
+> reproduces inside 0.7 %, so **no cell moved and no regression appeared**;
+> ᴾ¹⁶ becomes ᴾ²⁴ and the "read these as a ceiling" caveat in
+> `benchmarks/models.md` is withdrawn. Two things the re-measure settles rather
+> than assumes: row 1's 1.24× is **not** a missing sdpa emit (the recognizer
+> fires 0 times there, while row 2 takes 8 fused attentions and is timing-neutral
+> with them), and rows 1/11's token divergence from Stage 1 is **deterministic** —
+> both reproduce their own P16 native streams exactly, unlike rows 5/7. Raw:
+> `notes/data/p24-stale-rows-2026-08-16.{json,csv}`,
+> `~/.cache/metaljax-bench/logs/p24-stale-rows/`.
+>
 > **2026-08-13 update (P20).** The four named regressions, measured and
 > dispositioned: row 13 **275.6 → 79.7** ms/tok and row 7 **25.3 → 22.2** (the
 > fused compile gate now follows the rewrite plan), row 18 **656.3 → 397.5**
@@ -173,17 +191,17 @@ only in the second — which is exactly how row 19 hid a 2.2× for two passes.
 
 | # | model | metric | 0.11.3 anchor | Stage 1 today | S1/anchor | native (latest) | native/S1 | native/anchor | notes |
 |---|---|---|---|---:|---:|---:|---:|---:|---|
-| 1 | gemma4-31B bf16 | ms/tok | 237.5 | **243.1** (peak 66 G) | 1.02× | 301.6 (67 G) ᴾ¹⁶ | 1.24× | 1.27× | dense decode; the sdpa emit exists since P17 but this is a 66 G row, not re-run |
-| 2 | gemma4-12B bf16 | ms/tok | 92.5 | **93.9** (29 G) | 1.02× | 98.8 (30 G) ᴾ¹⁶ | 1.05× | 1.07× | not re-run since P16 |
+| 1 | gemma4-31B bf16 | ms/tok | 237.5 | **242.4** (peak 66 G) | 1.02× | **301.6** (67 G) ᴾ²⁴ | **1.24×** | **1.27×** | dense decode. P24 re-measured both stacks: native lands on its P16 cell **to the digit** and Stage 1 within 0.3 % (243.1 → 242.4). The gap is *not* a missing sdpa emit — on this row the recognizer fires **0** times (and 0 msl plans); it is the plain lowering |
+| 2 | gemma4-12B bf16 | ms/tok | 92.5 | **93.8** (29 G) | 1.01× | **98.6** (30 G) ᴾ²⁴ | **1.05×** | 1.07× | P24: both stacks reproduce P16 inside 0.2 % (93.9 / 98.8). Here the sdpa emit **does** fire (8 fused attentions) and is timing-neutral — the P16 no-emit number and today's with-emit number are the same row |
 | 3 | gemma4-26B-A4B (MoE) | ms/tok | 44.3 | **43.7** (53 G) | 0.99× | **43.4** (53 G) ᴾ¹⁸ | **0.99×** | **0.98×** | the MoE expert-gather emit closes 6.88× to parity; greedy tokens 64/64 identical to Stage 1 |
-| 4 | gemma4-E2B bf16 | ms/tok | 27.5 | **27.2** (12 G) | 0.99× | 27.2 (12 G) ᴾ¹⁶ | 1.00× | 0.99× | was already exact parity |
+| 4 | gemma4-E2B bf16 | ms/tok | 27.5 | **27.0** (12 G) | 0.98× | **27.0** (12 G) ᴾ²⁴ | **1.00×** | **0.98×** | was already exact parity, and still is: P24 measured both stacks at 27.0 on the same peak (12 G), tokens 64/64 identical to each other and to both P16 runs |
 | 5 | Qwen3-8B bf16 | ms/tok | 57.8 | **58.2** (18 G) ᶜ | 1.01× | **57.9** (18 G) ᴾ¹⁸ | **0.99×** | **1.00×** | ᶜ same-day control re-measure (P16 read 59.1 — the Stage 1 column is stable to 1.5 %) |
 | 6 | Llama-3.1-8B bf16 | ms/tok | 54.2 | **55.5** (18 G) | 1.02× | **54.7** (18 G) ᴾ¹⁸ | **0.99×** | **1.01×** | |
 | 7 | gpt-oss-20b (MXFP4) | ms/tok | 22.2 | **21.9** (26 G) ᵖ | 0.99× | **22.2** (34 G) ᴾ²⁰ | **1.01×** | **1.00×** | P16 9497.6 → P18 guard-killed → P19 25.3 (35 G) → **P20 22.2**: the fused compile gate was worth a further 1.16× here even though `METALJAX_TRACE_BUDGET=1e7` had said this row was not affected (it is the BYTE half that moved). ᵖ Stage 1 re-measured same-day, reproducing its anchor |
 | 8 | Qwen3.6-35B-A3B | — | ✗ | *not run* | — | *not run* | — | — | PAUSED, kernel-panic embargo (TASKS.md) |
 | 9 | R1-Distill-32B | ms/tok | 217.7 | **213.8** (67 G) | 0.98× | **214.4** (65.6 G) ᴾ¹⁹ | **1.00×** | **0.98×** | throttled load ladder (STATUS footnote 29) |
 | 10 | DeepSeek-V2-Lite | — | ✗ | *not run* | — | *not run* | — | — | embargoed (maxtext 8B class) |
-| 11 | Qwen3-0.6B maxtext decode | ms/tok | 15.8 | **16.42** | 1.04× | 16.67 ᴾ¹⁶ | 1.02× | 1.06× | token stream diverges from Stage 1 at token ~3 (see incidents) |
+| 11 | Qwen3-0.6B maxtext decode | ms/tok | 15.8 | **16.39 / 15.99** | 1.04× | **16.63 / 16.86** ᴾ²⁴ | **1.02×** | 1.05× | two samples per stack (P24; the 16.86 carried `METALJAX_DEBUG=1`). Native reproduces its P16 cell inside 0.3 %. The token stream still diverges from Stage 1 at token ~3 — and it is **reproducible**: both P24 native runs are byte-identical to the P16 native text, both Stage-1 runs to the P16 Stage-1 text |
 | 12 | Mixtral 8×7B | — | ✗ | *not run* | — | *not run* | — | — | PAUSED, same wedge class as row 8 |
 | 13 | gemma4-E2B keras-int4 | ms/tok | 81.1 | **80.6** (peak 44 G) | 0.99× | **79.7** (49 G) ᴾ²⁰ | **0.99×** | **0.98×** | P16 454.6 → P18 275.6 → **P20 79.7**, and the whole 3.4× was the compile gate reading the UNFUSED IR: with cost and bytes following the rewrite plan the decode body compiles (`compiles=1 compiled_calls=127`, was `0/0`) with **no env override**. Two samples 79.7/79.7; greedy tokens 64/64 identical to the P19 run. Peak is the keras streaming LOAD transient (Stage 1's own is 44 G), not the packs |
 | 14 | maxtext qwix-int8 0.6B | ms/tok | 32.5 | **32.9 / 32.7** ᵈ | **1.01×** | **35.0** ᴾ²⁰ | 1.06× | 1.08× | ᵈ **the 1.85× "Stage-1 regression" does not exist** — re-measured standalone twice today, the row sits on its anchor. P16's 60.1 was taken 12 minutes into a sequential campaign; treat it as the suite-context trap (CLAUDE.md item 12). Native's residual 1.06× is the eager-flush cache clear: with `METALJAX_FLUSH_CLEAR_MB` lifted it reads **32.1** (0.98×) |
@@ -197,9 +215,11 @@ only in the second — which is exactly how row 19 hid a 2.2× for two passes.
 | 20 | 235B-A22B 3-bit | — | ✗ | — | — | — | — | — | mlx-only row |
 
 **Unmeasured**: rows 8/10/12/15 (pre-existing embargoes), row 9 native
-(embargoed; the retry is the main agent's), the P18 cells of rows 1/2/4/11/18/19
-(not re-run — 1/2/18 are 30–67 GB rows and 4/11/19 were already at parity), and
-CPU-column re-measurements (not in scope — anchors used).
+(embargoed; the retry is the main agent's), and CPU-column re-measurements (not
+in scope — anchors used). Rows 1/2/4/11 were the P16 leftovers of this list
+until **P24 (2026-08-16)** closed them on the RC binary — table above, raw data
+`notes/data/p24-stale-rows-2026-08-16.{json,csv}`, logs
+`~/.cache/metaljax-bench/logs/p24-stale-rows/`. Rows 18/19 were closed by P20.
 
 ### The one blocked row, and the one gap the emits did not close
 
