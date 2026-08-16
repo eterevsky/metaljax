@@ -15,7 +15,7 @@ notes/data/. Append a column per release / major optimization.*
 | # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 |
 |---|---|---:|---:|---:|---:|
 | 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 98.6 |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ |
 | 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 |
 | 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 |
 | 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 |
@@ -26,13 +26,13 @@ notes/data/. Append a column per release / major optimization.*
 | 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ |
 | 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ |
-| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 79.7 |
+| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ |
 | 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 |
 | 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ |
 | 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 |
 | 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 |
-| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 394.7 |
-| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 833.9 ᴾ²⁵ |
+| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ |
+| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ |
 | 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ |
 
 Notes:
@@ -90,6 +90,27 @@ Notes:
   the LoRA row (18) blows through its 70 GB guard. The default is left at
   2048 MB, which is strictly better than the shipped dump at the same
   peak (20-21 GB here); raising it is Oleg's call off that table.
+  **Rows 2/13/18/19 = P27 (2026-08-16), and they retire that table**
+  (notes/cpp-p27-flush-pressure.md): the watermark is no longer one number
+  for every program, because the LoRA row's blowout turned out not to be a
+  pool. Measured with a footprint meter inside the dylib, its live set goes
+  19.6 → 46.5 GB in about a second during the keras build/convert phase —
+  identically on both binaries — and the watermark decides only how much
+  DEAD pool is standing beside that spike (1.5 GB at 2048, 16.2 at 32768,
+  which is the whole difference between 48.5 and 63.2 GB of footprint).
+  So the cap moves to 32768 and two rules spend it: a program must have
+  taken 8 hard flushes to count as an eager main, and even then the pool may
+  claim only what a 48 GB (3/8 of RAM) footprint target has left after its
+  own live set. P25's 2048 is the FLOOR under both, so nothing is trimmed
+  harder than it was. **Row 19 833.9 → 469.7** (five runs 460-478, peak
+  25 GB under a 48 GB budget, against 811.6 for the same binary with the
+  policy off) and **row 18 394.7 → 360.2** (five runs, peak unchanged: its
+  meter reads 56.7-57.5 GB either way). Rows 13 and 2 are the controls —
+  80.3 vs 80.2 and 92.9 vs 93.2 with the policy off, peaks unmoved — and
+  row 2's distance from its 98.6 P24 cell is the tree, not this policy.
+  Suite-106 same-binary policy-on/off geomean **0.9983** over 106,
+  `texmo_gate` 106/106 three times, 0 buffer-limit recoveries in a
+  106-config sweep on either policy.
   **Stage 1 still dumps** — its copies of the flush are frozen, so the
   backport is a separate decision and any same-day native/Stage-1 ratio
   on an eager-main row now has this in it. Rows 5 and 7's timings are

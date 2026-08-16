@@ -3313,6 +3313,229 @@ def _p25_cache_limit(subprocess, tempfile, pathlib, re):
     ]
 
 
+# --------------------------------------------------------------------------
+# P27: the watermark is not one number
+# --------------------------------------------------------------------------
+#
+# P25's watermark had to be one value for every program, and the sweep found
+# no value that worked: the maxtext training row needs a ~26 GB pool to reach
+# its anchor, and handing that to every program guard-kills the LoRA row's
+# load.  `runtime.cc::flush_bound` now decides per flush, from two things --
+# whether the program has flushed enough times to BE an eager main
+# (METALJAX_FLUSH_MAIN_FLUSHES), and whether the process footprint has room
+# for the pool (METALJAX_FLUSH_FOOTPRINT_MB) -- with P25's shipped watermark
+# as the floor under both.
+#
+# The arms below run P25's traffic program (one program, ~550 hard flushes,
+# every intermediate a different size: an eager main by construction) and read
+# the dylib's own meter, which now prints the `bound=` it chose, the `foot=`
+# it chose it from and the program's own flush count `n=`.  Each arm turns
+# exactly one of the three rules off, so a failure names which one broke.
+def _p27_flush_pressure(subprocess, tempfile, pathlib, re):
+    """(label, check) pairs for the footprint-aware flush bound."""
+
+    _METER = re.compile(
+        r"\[metaljax-mem\] flush #\d+: active=(\d+)MB cache=(\d+)MB"
+        r"(?: \(was (\d+)MB\))? bound=(-?\d+)MB foot=(-?\d+)MB "
+        r"cap=(-?\d+)MB n=(\d+)")
+
+    def traffic(**extra):
+        """One eager-traffic run; returns (proc, meter rows, checksum)."""
+        env = dict(os.environ)
+        env["METALJAX_DEBUG"] = "1"
+        env["METALJAX_MEMDBG"] = "1"
+        env["METALJAX_COMPILE"] = "0"
+        env["METALJAX_EAGER_FLUSH_MB"] = "64"
+        env.update({k: str(v) for k, v in extra.items()})
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(_P25_TRAFFIC)
+            script = fh.name
+        try:
+            proc = subprocess.run([sys.executable, script], env=env,
+                                  capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(script)
+            except OSError:
+                pass
+        rows = [tuple(int(g) if g else 0 for g in m.groups())
+                for m in _METER.finditer((proc.stdout or "") +
+                                         (proc.stderr or ""))]
+        checksum = None
+        for ln in (proc.stdout or "").splitlines():
+            if ln.startswith("[probe] checksum "):
+                checksum = ln.split()[2]
+        return proc, rows, checksum
+
+    # cap 4096 / floor 256: far enough apart that "which rule chose this
+    # bound" is legible in the meter, and both under any machine's footprint.
+    CAP, FLOOR, GATE = 4096, 256, 8
+    state = {}
+
+    def an_eager_main_earns_the_pool():
+        """A program that keeps flushing is allowed past the floor.
+
+        With the footprint target out of the way (a target no machine can
+        reach), the only rule left is the main gate: the first `GATE` hard
+        flushes of the program's life are bounded at the FLOOR, everything
+        after at the CAP, and the pool really does grow past the floor -- the
+        1.10x P25 measured on the maxtext row is exactly this pool surviving.
+        """
+        proc, rows, checksum = traffic(
+            METALJAX_FLUSH_CLEAR_MB=CAP, METALJAX_FLUSH_FLOOR_MB=FLOOR,
+            METALJAX_FLUSH_MAIN_FLUSHES=GATE,
+            METALJAX_FLUSH_FOOTPRINT_MB=1 << 22)
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-140:]
+        state["main"] = (rows, checksum)
+        if len(rows) < 20:
+            return False, f"only {len(rows)} hard flushes narrated"
+        # `n` counts this flush, and the gate opens ON the `GATE`-th one.
+        early = [r for r in rows if r[6] < GATE]
+        late = [r for r in rows if r[6] >= GATE]
+        if not early or not late:
+            return False, f"{len(early)} early / {len(late)} late flushes"
+        if any(r[3] != FLOOR for r in early):
+            return False, (f"a flush inside the gate was bounded at "
+                           f"{max(r[3] for r in early)} MB, not the floor")
+        if any(r[3] != CAP for r in late):
+            return False, (f"a flush past the gate was bounded at "
+                           f"{min(r[3] for r in late)} MB, not the cap")
+        peak = max(r[1] for r in rows)
+        if peak <= FLOOR + 128:
+            return False, f"the pool never grew past the floor ({peak} MB)"
+        if peak > CAP + 128:
+            return False, f"peak cache {peak} MB over a {CAP} MB cap"
+        return True, (f"ok (bound {FLOOR}->{CAP} MB at flush {GATE}, peak "
+                      f"{peak} MB cached)")
+
+    def the_gate_is_what_grants_it():
+        """The control: a program that never becomes a main never gets it.
+
+        Same run, same answers, with the gate set past any flush count this
+        program can reach -- so every bound is the floor and the pool stays
+        there.  This is the LOAD phase's arm: thousands of small programs,
+        one or two flushes each, none of which may leave a 16 GB pool
+        standing where a live-set spike is about to land (P27's row 18).
+        """
+        proc, rows, checksum = traffic(
+            METALJAX_FLUSH_CLEAR_MB=CAP, METALJAX_FLUSH_FLOOR_MB=FLOOR,
+            METALJAX_FLUSH_MAIN_FLUSHES=1 << 30,
+            METALJAX_FLUSH_FOOTPRINT_MB=1 << 22)
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-140:]
+        if not rows:
+            return False, "no flushes narrated"
+        want = state.get("main", ([], None))[1]
+        if checksum != want:
+            return False, f"the arms disagree ({checksum} vs {want})"
+        if any(r[3] != FLOOR for r in rows):
+            return False, (f"bound reached {max(r[3] for r in rows)} MB with "
+                           f"the gate closed")
+        peak = max(r[1] for r in rows)
+        if peak > FLOOR + 128:
+            return False, f"peak cache {peak} MB over the {FLOOR} MB floor"
+        return True, f"ok (every bound {FLOOR} MB, peak {peak} MB cached)"
+
+    def the_footprint_target_takes_it_back():
+        """...and so does the footprint, for a main that has spent it.
+
+        A target of one megabyte is the arithmetic limit of "this process has
+        no room": the room term goes negative at every flush, and the bound
+        collapses to the floor for a program the gate has already let
+        through.  That is the rule that keeps a 65 GB checkpoint stream, or a
+        model whose live set is already the whole target, from being handed a
+        32 GB pool because it happened to flush a lot.
+        """
+        proc, rows, checksum = traffic(
+            METALJAX_FLUSH_CLEAR_MB=CAP, METALJAX_FLUSH_FLOOR_MB=FLOOR,
+            METALJAX_FLUSH_MAIN_FLUSHES=GATE,
+            METALJAX_FLUSH_FOOTPRINT_MB=1)
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-140:]
+        if not rows:
+            return False, "no flushes narrated"
+        want = state.get("main", ([], None))[1]
+        if checksum != want:
+            return False, f"the arms disagree ({checksum} vs {want})"
+        late = [r for r in rows if r[6] >= GATE]
+        if not late:
+            return False, "the gate was never crossed"
+        if any(r[3] != FLOOR for r in late):
+            return False, (f"bound reached {max(r[3] for r in late)} MB with "
+                           f"no footprint to spare")
+        peak = max(r[1] for r in rows)
+        if peak > FLOOR + 128:
+            return False, f"peak cache {peak} MB over the {FLOOR} MB floor"
+        return True, f"ok (every bound {FLOOR} MB, peak {peak} MB cached)"
+
+    def the_bound_is_the_target_minus_the_live_set():
+        """The formula itself, on an arm where all three terms bind.
+
+        A target a little above the program's own live set puts the bound
+        strictly between the floor and the cap, where it must track
+        `target - (foot - cache)` flush by flush -- which is the claim that
+        the process footprint (not MLX's accounting, and not a constant) is
+        what the pool is being charged against.  Slack: `foot` and `cache`
+        are read after the trim this line describes, the bound before it, and
+        the two differ by whatever was freed in between.
+        """
+        # The live set this program actually has, read off the arm that was
+        # allowed to keep everything, plus a gigabyte of room -- so the arm
+        # lands between the clamps on any machine rather than at a constant
+        # that happens to work on this one.
+        main_rows = state.get("main", ([], None))[0]
+        if not main_rows:
+            return False, "the main arm did not run"
+        lives = sorted(r[4] - r[1] for r in main_rows)
+        target = lives[len(lives) // 2] + 1024
+        proc, rows, checksum = traffic(
+            METALJAX_FLUSH_CLEAR_MB=CAP, METALJAX_FLUSH_FLOOR_MB=FLOOR,
+            METALJAX_FLUSH_MAIN_FLUSHES=GATE,
+            METALJAX_FLUSH_FOOTPRINT_MB=target)
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-140:]
+        want = state.get("main", ([], None))[1]
+        if checksum != want:
+            return False, f"the arms disagree ({checksum} vs {want})"
+        late = [r for r in rows if r[6] >= GATE and not r[2]]
+        if len(late) < 10:
+            return False, f"only {len(late)} untrimmed flushes past the gate"
+        worst, worst_row = 0, None
+        for active, cache, _was, bound, foot, _cap, _n in late:
+            want_bound = min(CAP, max(FLOOR, target - (foot - cache)))
+            if abs(want_bound - bound) > worst:
+                worst, worst_row = abs(want_bound - bound), (bound, want_bound,
+                                                             foot, cache)
+        if worst > 128:
+            return False, (f"bound {worst_row[0]} MB where the footprint says "
+                           f"{worst_row[1]} MB (foot {worst_row[2]}, cache "
+                           f"{worst_row[3]})")
+        # The arm proves nothing unless the footprint term is what is
+        # actually choosing the bound on a fair share of the flushes: a run
+        # that sat on a clamp throughout would satisfy the identity above
+        # trivially.  (Individual flushes DO clamp -- this program's live set
+        # swings by more than the gigabyte of room the target leaves.)
+        inside = [r for r in late if FLOOR < r[3] < CAP]
+        if len(inside) < len(late) // 4:
+            span = (min(r[3] for r in late), max(r[3] for r in late))
+            return False, (f"only {len(inside)} of {len(late)} bounds left "
+                           f"their clamps ({span[0]}-{span[1]} MB)")
+        span = (min(r[3] for r in inside), max(r[3] for r in inside))
+        return True, (f"ok (bound {span[0]}-{span[1]} MB on {len(inside)} of "
+                      f"{len(late)} flushes, worst {worst} MB off)")
+
+    return [
+        ("an eager main earns the pool", an_eager_main_earns_the_pool),
+        ("the gate is what grants it", the_gate_is_what_grants_it),
+        ("the footprint target takes it back",
+         the_footprint_target_takes_it_back),
+        ("the bound is the target minus live",
+         the_bound_is_the_target_minus_the_live_set),
+    ]
+
+
 # P26: an attention rooted inside a `func.call` callee, in a DYNAMICALLY
 # bounded loop -- the shape gemma-lib's sampler and maxtext both emit, and the
 # one jax gives any loop whose body calls a named function.  Two layers inside
@@ -4238,6 +4461,8 @@ def main():
                          + _p21_msl(subprocess, pathlib, __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))
+                         + _p27_flush_pressure(subprocess, tempfile, pathlib,
+                                               __import__("re"))
                          + _p26_callee_sdpa(subprocess, tempfile, pathlib,
                                             __import__("re"))):
         try:

@@ -34,7 +34,7 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | # | benchmark | jax CPU | metaljax | metaljax-native ²⁴ ³⁰ | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|---|
 | 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | 301.6 (1.24× S1 / 1.27× anchor) ᴾ²⁴ ³¹ | 137 | 148.7 | 111.2 ²⁰ |
-| 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | **98.6** (1.05× S1 / 1.07× anchor) ᴾ²⁴ ³¹ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
+| 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | **92.9** (1.00× anchor ³²) ᴾ²⁷ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
 | 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **43.4** (0.99× S1 / 0.98× anchor ²⁷) | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
 | 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | **27.0** (1.00× S1 / 0.98× anchor) ᴾ²⁴ ³¹ | 10.5 ¹⁵ | — | — |
 | 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.9** (0.99× S1 / 1.00× anchor ²⁷) | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
@@ -45,13 +45,13 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | not run (embargo) | **10.6** | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | **16.63** (1.02× S1 / 1.05× anchor) ᴾ²⁴ ³¹ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | not run (PAUSED ¹⁷) | **52.8** (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **79.7** (0.99× S1 / 0.98× anchor ³⁰) | — | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **80.3** (0.99× anchor ³²) ᴾ²⁷ | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **35.0** (1.06× S1 / 1.08× anchor ³⁰) | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ MLX command-buffer bug ⁸ | not run (embargo) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | **87.9** (1.02× S1 / 1.06× anchor ³⁰; b32 0.94×) | — | 29.8 (b32: 591) | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512², 5141 @1024² ⁹ | **1234.8** @512² (0.81× S1 / 0.89× anchor), **5781.6** @1024² (1.13× S1 / 1.12× anchor) ²⁷ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
-| 18 | LoRA E2B train (ms/step) | 2048 | **407** | **397.5** (1.00× S1 / 0.98× anchor ³⁰) | — | 135.6 ¹⁰ | — |
-| 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | 1006.2 (1.04× S1 / **2.29× anchor** ³⁰) | — | — | — |
+| 18 | LoRA E2B train (ms/step) | 2048 | **407** | **360.2** (0.89× anchor ³²) ᴾ²⁷ | — | 135.6 ¹⁰ | — |
+| 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | **469.7** (1.07× anchor ³²) ᴾ²⁷ | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | — | **28.0** (102.9 GB, load 12 s) | — | — |
 
 **Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
@@ -428,6 +428,47 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
     with the footprint (80) and system (100) budgets unchanged; measured crest
     113.8 / 113.6 GB, machine at 74–75 GB, crest collapses as the mmap'd
     checkpoint pages are released.
+32. **P25 + P27: the eager flush's pool, and the watermark that is not one
+    number** (2026-08-16, `notes/cpp-p25-cache-limit.md`,
+    `notes/cpp-p27-flush-pressure.md`; raw
+    `~/.cache/metaljax-bench/logs/p27-flush-pressure/`, aggregates
+    `notes/data/p27-flush-pressure-2026-08-16.{json,csv}`).
+    P25 replaced the flush-point `mx::clear_cache()` (a whole-pool dump, 7 a
+    step at ~70 ms on row 19) with a TRIM back to `METALJAX_FLUSH_CLEAR_MB`,
+    worth 1.17× there, and measured what the watermark itself is worth: row 19
+    reaches its anchor only at 32 GB, where row 18 was guard-killed at 68.
+    **P27 measured that conflict instead of trading it off**, with the process
+    footprint (`task_info(TASK_VM_INFO)` — `mem_guard.sh`'s own metric) added
+    to the flush meter: **row 18's blowout is a LIVE-SET spike**, 19.6 → 37.5
+    → 46.5 GB in three flushes during keras build/convert, identical on both
+    binaries, and the watermark only decides how much dead pool stands beside
+    it. So `runtime.cc::flush_bound` now decides per flush — cap 32768, but
+    only for a program that has taken 8 hard flushes (an eager MAIN reusing a
+    pool, not a load filling one), and only up to what a 48 GB footprint
+    target has left after that program's own live set; P25's 2048 is the FLOOR
+    under both, so nothing is trimmed harder than it was.
+    Cells: **row 19 1006.2 → 469.7** ms/step (five runs 460-478, peak 25 GB
+    under its 48 GB budget), **row 18 397.5 → 360.2** (five runs, peak
+    unchanged — 56.7-57.5 GB on the dylib's own meter with the policy either
+    way, where the guard's 2 Hz sampling had reported 37-56), **row 13 80.3**
+    and **row 2 92.9**, both controls.
+    Ratios here are vs the 0.11.3 anchor and vs the SAME BINARY with the
+    policy off (`METALJAX_FLUSH_CLEAR_MB=2048 METALJAX_FLUSH_FOOTPRINT_MB=0`),
+    which is the only single-variable control for a policy change: 811.6 /
+    389.0 / 80.2 / 93.2 against the four cells above. No same-day Stage-1
+    control was taken for these rows — Stage 1's copy of the flush is frozen
+    and still dumps, so its ratio on an eager-main row measures that, not this
+    (footnote 30c); the suite pair covers the stack comparison.
+    Suite-106 same-binary policy-on/off geomean **0.9983** (106 rows, median
+    1.0001; `big` 0.9836), `texmo_gate` 106/106 three times, `execute_test`
+    (P25's four contracts + P27's four), `ingest_test` 8/8, `bazel test`, and
+    a buffer-COUNT probe — 0 buffer-limit recoveries in a 106-config sweep on
+    either policy, which is the hazard raising a BYTE bound could have created
+    (CLAUDE.md item 11a).
+    Trap this pass adds to the ledger: **the guard's flight log is not a peak
+    meter**. Row 18's true peak was 56.7 GB all along, on the shipped binary,
+    sampled as 39-43 by a 2 Hz watchdog — a memory argument made from flight
+    logs alone can be wrong by 17 GB.
 
 ## Bug ledger (found by this suite)
 

@@ -173,12 +173,16 @@ std::vector<std::pair<std::string, int>> opcodes() {
 // truth per number: a second env-var reader here would be a second opinion,
 // and these are values the command-buffer lottery is pinned to.
 void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
-               int64_t flush_clear_bytes, int64_t loop_clear_cost,
-               int64_t ingest_clear_bytes, int64_t while_pipeline, bool debug,
-               bool memdbg) {
+               int64_t flush_clear_bytes, int64_t flush_footprint_bytes,
+               int64_t flush_floor_bytes, int64_t flush_main_flushes,
+               int64_t loop_clear_cost, int64_t ingest_clear_bytes,
+               int64_t while_pipeline, bool debug, bool memdbg) {
   g_cfg.eager_flush_bytes = eager_flush_bytes;
   g_cfg.flush_sync_every = flush_sync_every;
   g_cfg.flush_clear_bytes = flush_clear_bytes;
+  g_cfg.flush_footprint_bytes = flush_footprint_bytes;
+  g_cfg.flush_floor_bytes = flush_floor_bytes;
+  g_cfg.flush_main_flushes = flush_main_flushes;
   g_cfg.loop_clear_cost = loop_clear_cost;
   g_cfg.ingest_clear_bytes = ingest_clear_bytes;
   g_cfg.while_pipeline = while_pipeline;
@@ -200,6 +204,18 @@ void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
   // `program.cc::eager_flush` -> `trim_cache`, which bounds the pool where
   // an eager phase would otherwise claim its whole traffic and leaves every
   // other path exactly as it was.
+  //
+  // NOR IS THE WATERMARK ONE NUMBER (P27, notes/cpp-p27-flush-pressure.md).
+  // P25's sweep left a straight memory-for-speed trade with no setting that
+  // satisfied both ends: the maxtext training row reaches its anchor only at
+  // a 32 GB pool, and handing that watermark to every program guard-kills
+  // the LoRA row during its load. `runtime.cc::flush_bound` resolves it by
+  // asking two questions the watermark alone could not -- whether the flush
+  // belongs to an eager MAIN (`flush_main_flushes`, a program that has
+  // flushed enough times to be reusing a pool rather than filling one), and
+  // whether the process has the FOOTPRINT to spare (`flush_footprint_bytes`)
+  // -- with P25's shipped 2048 MB as the floor under both, which is why all
+  // four numbers arrive here rather than one.
 }
 
 }  // namespace metaljax

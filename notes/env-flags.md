@@ -12,7 +12,13 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 | `METALJAX_COMPILE` | `1` | debug-bisect | =0 disables mx.compile everywhere |
 | `METALJAX_COMPILE_OPTIONS` | `` | user knob | =ignore skips XLA compile-option validation |
 | `METALJAX_DEBUG` | `` | debug-bisect | =1 logs loop/compile/msl decisions |
+| `METALJAX_EAGER_FLUSH_MB` | `1024` | user knob | eager sync point every N megabytes of estimated result data |
+| `METALJAX_EAGER_FLUSH_SYNC` | `1` | user knob | every Nth eager flush is a blocking one (the others `async_eval`) |
 | `METALJAX_F64` | `error` | user knob | f64 policy: unset=strict (compute errors), downcast=f32 emulation |
+| `METALJAX_FLUSH_CLEAR_MB` | `32768` | user knob | CAP on the pool an eager flush may leave cached; -1 disables the trim (P25 shipped this at 2048 as a fixed watermark; P27 made it a cap) |
+| `METALJAX_FLUSH_FLOOR_MB` | `2048` | user knob | plugin-native only: watermark a flush falls back to when neither rule below grants more — P25's shipped value, i.e. the no-regression floor |
+| `METALJAX_FLUSH_FOOTPRINT_MB` | `3/8 of RAM` | user knob | plugin-native only: process footprint an eager main's pool is trimmed to stay under (48 GB on a 128 GB machine); 0 disables the pressure rule |
+| `METALJAX_FLUSH_MAIN_FLUSHES` | `8` | user knob | plugin-native only: hard flushes a program must have taken before it counts as an eager MAIN and may pass the floor; 0 grants it from the first flush |
 | `METALJAX_INGEST_CLEAR_MB` | `8192` | user knob | plugin-native only: reclamation cadence of the host->device TRANSFER path, in megabytes ingested (0 disables); a model load reaches no other sync point |
 | `METALJAX_LOOP_CLEAR_COST` | `500000` | user knob | cache-clear cadence in loop op-units (default 500000) |
 | `METALJAX_MATMUL_PRECISION` | `highest` | user knob | default=MLX default arch; unset picks the accurate g16g matmul path |

@@ -12,7 +12,11 @@
 #include <string>
 #include <vector>
 
+#include <algorithm>
 #include <cstdio>
+
+#include <mach/mach.h>       // phys_footprint: the guard's own metric
+#include <mach/task_info.h>
 
 #include <mlx/allocator.h>   // trim_cache pokes the allocator directly
 
@@ -101,6 +105,106 @@ void trim_cache(int64_t bytes) {
   mx::allocator::Buffer poke = mx::allocator::malloc(1);
   mx::allocator::free(poke);
   mx::set_cache_limit(prev);
+}
+
+// This process's PHYSICAL FOOTPRINT, or -1 if the kernel will not say.
+//
+// Deliberately the SAME metric the bench guard kills on
+// (scripts/model_bench/mem_guard.sh samples `top -l 1 -o mem`, whose MEM
+// column is this field) and therefore the metric every budget in STATUS.md
+// is written in. It counts the wired Metal buffers MLX holds -- active AND
+// cached, since a cached buffer is still an allocation the OS has handed
+// out -- plus everything else the process owns; it does NOT count the
+// mapped, clean checkpoint pages a streaming load reads through (those are
+// RSS, which the guard caps separately).
+//
+// Two alternatives were rejected. `mx::get_active_memory()` sees only what
+// MLX allocated, and the transfer path adopts its staging blocks through
+// MLX's alien-buffer constructor (notes/ingest-cadence-2026-08-12.md §3), so
+// a 10 GB checkpoint can be resident with MLX reporting almost none of it --
+// exactly the phase where the bound has to be tight. `hw.memsize` minus free
+// pages is the machine's number, not the process's, and would make one
+// benchmark's discipline depend on another process's residency.
+//
+// task_info(TASK_VM_INFO) is a Mach call into the task's own accounting, a
+// few microseconds, and it runs at most once per hard flush.
+int64_t phys_footprint() {
+  task_vm_info_data_t info;
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  const kern_return_t rc =
+      task_info(mach_task_self(), TASK_VM_INFO,
+                reinterpret_cast<task_info_t>(&info), &count);
+  if (rc != KERN_SUCCESS || count < TASK_VM_INFO_REV1_COUNT) return -1;
+  return static_cast<int64_t>(info.phys_footprint);
+}
+
+// How much MLX may keep cached at THIS flush point (P27,
+// notes/cpp-p27-flush-pressure.md).
+//
+// P25 left ONE watermark doing two jobs, and its sweep showed them pulling
+// apart: the maxtext training row reaches its 0.11.3 anchor only with a
+// ~26 GB pool (464 ms/step against 834 at 2 GB -- its step is ~105 GB of
+// eager traffic over an 18 GB live set, so every megabyte the pool keeps is
+// a Metal buffer it does not re-allocate from the OS), while handing that
+// same watermark to every program guard-kills the LoRA row at 68 GB.
+//
+// WHAT THE LoRA ROW ACTUALLY DOES, measured with this file's meter: its
+// blowout is not a pool at all. Somewhere in the keras build/convert phase
+// its LIVE set goes 19.6 -> 37.5 -> 46.5 GB in three flushes (about a
+// second), and the watermark decides only how much DEAD pool is standing
+// beside that spike when it lands: 1.5 GB at P25's shipped 2048 (peak
+// footprint 48.5 GB, survives) against 16.2 GB at 32768 (63.2 GB and rising
+// when the guard fired). The pool it is standing on is genuinely being
+// reused up to that point -- active and cache trade places while the
+// footprint sits flat at 16.8 GB for 250 flushes -- so nothing about that
+// phase looks wrong until the spike arrives, and no watermark that is high
+// enough for the training row is low enough to make the spike safe.
+//
+// So the bound is not one number. Two things decide it:
+//
+//  1. WHOSE FLUSH IT IS. Only a program that has already taken
+//     `flush_main_flushes` hard flushes -- an eager MAIN, whose traffic
+//     dwarfs its live set and which therefore reuses a pool -- is allowed
+//     past the floor at all. maxtext's training step qualifies inside its
+//     first call (410 hard flushes per step). A program that has just
+//     started does not, and on the LoRA row that is the load's own
+//     protection: measured, the spike lands inside a program on its
+//     SEVENTH flush, so the pool beside it is 1.5 GB rather than 16.2.
+//  2. WHAT IT WOULD COST. Even for a main, the pool may claim only what the
+//     footprint target has left after the program's own live set is paid
+//     for:
+//
+//         bound = clamp(footprint_target - (footprint - cache), floor, cap)
+//
+//     `footprint - cache` rather than `footprint`, because the cache is what
+//     this function is about to bound: charging a program for the pool it is
+//     being asked to shrink makes the bound collapse the moment it is
+//     granted (the first big bound would be the last one).
+//
+// Neither rule subsumes the other, and the LoRA row needs both within four
+// flushes: rule 1 keeps the pool small where the spike lands, and rule 2 is
+// what catches the same program two flushes later, when it IS past the gate
+// and its live set has reached 38 GB -- the bound it gets there is 11.1 GB,
+// then 2.2, and the 19.5 GB the spike frees is returned rather than held.
+//
+// The floor -- P25's shipped 2048 MB -- is the no-regression anchor: it is
+// what every program got before, so no program can be trimmed HARDER than it
+// was, and both rules above can only ever hand memory back.
+//
+// The floor is clamped by the cap, not the other way round, so a caller that
+// asks for a SMALL cap still gets it: `execute_test`'s "the pool stays under
+// its bound" runs at 256 MB and must stay there.
+int64_t flush_bound(int64_t cache_now, int64_t program_flushes) {
+  const int64_t cap = g_cfg.flush_clear_bytes;
+  if (cap < 0) return cap;                     // METALJAX_FLUSH_CLEAR_MB=-1
+  const int64_t floor = std::min(g_cfg.flush_floor_bytes, cap);
+  if (program_flushes < g_cfg.flush_main_flushes) return floor;
+  if (g_cfg.flush_footprint_bytes <= 0) return cap;   // pressure half off
+  const int64_t foot = phys_footprint();
+  if (foot < 0) return floor;   // no reading: the conservative half of P25
+  const int64_t live = std::max<int64_t>(foot - cache_now, 0);
+  const int64_t room = g_cfg.flush_footprint_bytes - live;
+  return std::min(cap, std::max(floor, room));
 }
 
 // ops.control._loop_flush: a sync point inside a loop. Evaluates pending

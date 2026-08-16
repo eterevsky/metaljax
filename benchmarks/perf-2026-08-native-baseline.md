@@ -6,6 +6,26 @@ trampoline, on the tree at 845ab89. Sequential throughout, machine lock held
 for every measured run, `guarded_run.sh` (precheck + `mem_guard.sh`) for every
 model row.*
 
+> **2026-08-16 update (P27) — the eager flush's watermark stops being one
+> number, and rows 19/18 move with it.** P25 had shipped the flush-point TRIM
+> (dump → trim, 1.17× on row 19) and left the watermark itself as a
+> memory-for-speed table with no good row: 32 GB is where row 19 reaches its
+> anchor and where row 18 was guard-killed at 68. P27 measured that conflict
+> rather than trading it off — the flush meter now prints the process
+> FOOTPRINT (`task_info(TASK_VM_INFO)`, `mem_guard.sh`'s own metric) — and
+> **row 18's blowout is a live-set spike (19.6 → 46.5 GB in a second, during
+> keras build/convert, identical on both binaries)**, not a pool; the
+> watermark only decides how much dead pool stands beside it. `flush_bound`
+> now spends a 32768 cap only on programs that have taken 8 hard flushes (an
+> eager MAIN reusing a pool) and only up to what a 48 GB footprint target has
+> left after their own live set, with P25's 2048 as the floor under both.
+> **Row 19 1006.2 → 469.7 ms/step** (five runs, peak 25 GB / 48 budget),
+> **row 18 397.5 → 360.2** (five runs, peak unchanged at 56.7-57.5 GB on the
+> meter), rows 13/2 flat as controls (80.3 / 92.9). Suite-106 same-binary
+> policy-on/off **0.9983** over 106 rows, gate 106/106 ×3, 0 buffer-limit
+> recoveries in a 106-config sweep. Details and the three conditions
+> Oleg set: `notes/cpp-p27-flush-pressure.md`.
+>
 > **2026-08-16 update (P24) — the last four P16 cells are closed.** Rows
 > **1, 2, 4, 11** of Table 3 (the only ones still carrying a P16 native number,
 > and whose Stage-1 columns were P16-era too) were re-measured on the frozen RC

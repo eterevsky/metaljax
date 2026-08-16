@@ -139,6 +139,16 @@ machine.
 measured, at the same memory. Raising it is a one-variable decision with the
 table above; it is Oleg's, not this pass's.
 
+> **Superseded by P27** (notes/cpp-p27-flush-pressure.md, same day). The
+> watermark is no longer one number: the cap moves to 32768 and two rules
+> decide how much of it a given flush may spend, with the 2048 above as the
+> floor under both. What made that possible was measuring row 18's blowout
+> instead of inferring it — it is a LIVE-SET spike (19.6 → 46.5 GB in a
+> second, identical on both binaries), not a pool, and the watermark only
+> decides how much dead pool is standing beside it. Row 19 now reads
+> **460.0** ms/step at a 25 GB peak and row 18 **360.7** at its historical
+> peak, so the trade this table describes is not the one that shipped.
+
 ## No-regression battery (shipped configuration, `frozen-p25c.dylib`, sha256 `516e4b43…`)
 
 | gate | result |

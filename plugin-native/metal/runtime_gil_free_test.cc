@@ -161,7 +161,10 @@ int main() {
   // will use.
   metaljax::configure(/*eager_flush_bytes=*/1024LL << 20,
                       /*flush_sync_every=*/1,
-                      /*flush_clear_bytes=*/2048LL << 20,
+                      /*flush_clear_bytes=*/32768LL << 20,
+                      /*flush_footprint_bytes=*/49152LL << 20,
+                      /*flush_floor_bytes=*/2048LL << 20,
+                      /*flush_main_flushes=*/8,
                       /*loop_clear_cost=*/500000,
                       /*ingest_clear_bytes=*/8LL << 30, /*while_pipeline=*/1,
                       /*debug=*/false, /*memdbg=*/false);

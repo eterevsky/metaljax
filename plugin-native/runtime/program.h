@@ -180,11 +180,28 @@ mx::array csqrt(const mx::array& z);
 struct Config {
   int64_t eager_flush_bytes = 1024LL << 20;   // METALJAX_EAGER_FLUSH_MB
   int64_t flush_sync_every = 1;               // METALJAX_EAGER_FLUSH_SYNC
-  // METALJAX_FLUSH_CLEAR_MB: the watermark an eager flush TRIMS MLX's buffer
-  // pool back to (P25: it used to dump the pool instead -- see
+  // METALJAX_FLUSH_CLEAR_MB: the CAP on the watermark an eager flush TRIMS
+  // MLX's buffer pool back to (P25: it used to dump the pool instead -- see
   // `program.cc::eager_flush` and `runtime.cc::trim_cache`). Negative
   // disables the trim, i.e. lets the pool grow to MLX's own cache limit.
-  int64_t flush_clear_bytes = 2048LL << 20;
+  // What the flush actually trims to is `runtime.cc::flush_bound`, which
+  // spends this cap only where the process has the room for it (P27).
+  int64_t flush_clear_bytes = 32768LL << 20;
+  // METALJAX_FLUSH_FOOTPRINT_MB / METALJAX_FLUSH_FLOOR_MB: the two halves of
+  // that "room". The footprint target is the whole-process footprint the
+  // eager path aims to stay under -- the same number the bench guard reads
+  // and every budget in STATUS.md is written in -- and the floor is the
+  // watermark it falls back to when a program's own live set has already
+  // spent it (2048 MB: what P25 shipped for every program, so no program can
+  // be trimmed harder than it was). 0 in the target disables the pressure
+  // half, leaving the fixed watermark P25 shipped.
+  int64_t flush_footprint_bytes = 49152LL << 20;
+  int64_t flush_floor_bytes = 2048LL << 20;
+  // METALJAX_FLUSH_MAIN_FLUSHES: how many hard flushes a program must have
+  // taken before it is treated as an eager MAIN and allowed past the floor
+  // at all (`runtime.cc::flush_bound`). 0 gives every program the pressure
+  // rule from its first flush.
+  int64_t flush_main_flushes = 8;
   int64_t loop_clear_cost = 500000;           // METALJAX_LOOP_CLEAR_COST
   int64_t ingest_clear_bytes = 8LL << 30;     // METALJAX_INGEST_CLEAR_MB
   int64_t while_pipeline = 1;                 // METALJAX_WHILE_PIPELINE
@@ -197,9 +214,10 @@ struct Config {
 extern Config g_cfg;
 
 void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
-               int64_t flush_clear_bytes, int64_t loop_clear_cost,
-               int64_t ingest_clear_bytes, int64_t while_pipeline, bool debug,
-               bool memdbg);
+               int64_t flush_clear_bytes, int64_t flush_footprint_bytes,
+               int64_t flush_floor_bytes, int64_t flush_main_flushes,
+               int64_t loop_clear_cost, int64_t ingest_clear_bytes,
+               int64_t while_pipeline, bool debug, bool memdbg);
 
 struct Stats {
   int64_t flushes = 0;         // eager byte-denominated sync points
@@ -242,6 +260,10 @@ bool is_resource_limit(const std::exception& e);
 extern std::function<void()> g_gc_hook;
 void gc_collect();                              // host.cc: runs the hook
 void trim_cache(int64_t bytes);   // bound MLX's pool without dumping it
+int64_t phys_footprint();         // this process's footprint, or -1
+// What a flush may leave cached: `cache_now` is the pool it found,
+// `program_flushes` how many hard flushes the program it is inside has taken.
+int64_t flush_bound(int64_t cache_now, int64_t program_flushes);
 void debug_line(const std::string& line);
 void debug_print(const std::string& msg);
 void flush_eval(const std::vector<mx::array>& arrays, bool hard);
@@ -647,6 +669,16 @@ class Program {
   bool compile_disabled_ = false;
   bool compile_probe_ = true;   // settle the first compiled call (run_recovering)
   bool no_chunk_ = false;
+  // P27: how many HARD eager flushes this program has taken in its life --
+  // the one thing a flush point knows about the program it is inside, and
+  // what separates an eager MAIN (maxtext's training step: one call, hundreds
+  // of flushes, a live set a fraction of its traffic) from the small
+  // one-flush programs a model load is thousands of. `flush_bound` spends the
+  // big watermark only on the former; see runtime.cc. Counted per PROGRAM
+  // rather than per call, so a main pays the introductory trims once rather
+  // than at every step. Racy under METALJAX_CONCURRENT_EXECUTE in exactly the
+  // way `g_stats` is, and as harmlessly: the count decides a watermark.
+  int64_t flushes_ = 0;
   mutable int reads_host_ = -1;   // lazily derived, never un-derived
   int64_t max_repeat_ = 1;
   std::vector<int> anchors_;

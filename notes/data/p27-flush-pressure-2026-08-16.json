@@ -1,0 +1,366 @@
+{
+ "policy": {
+  "cap_mb": 32768,
+  "footprint_target_mb": 49152,
+  "floor_mb": 2048,
+  "main_flushes": 8,
+  "footprint_target_note": "3/8 of hw.memsize (128 GB machine)"
+ },
+ "binaries": {
+  "p27": "frozen-p27b.dylib == frozen-p27c.dylib, sha256 aa7bc0b6...",
+  "shipped_p25": "frozen-p25c.dylib sha256 516e4b43..."
+ },
+ "suite106": {
+  "p27_over_p25semantics_same_binary": {
+   "classes": {
+    "whole": {
+     "n": 106,
+     "geomean": 0.9983,
+     "median": 1.0001,
+     "min": 0.8892,
+     "max": 1.1251
+    },
+    "big": {
+     "n": 34,
+     "geomean": 0.9836,
+     "median": 0.9989,
+     "min": 0.8892,
+     "max": 1.0089
+    },
+    "mid": {
+     "n": 30,
+     "geomean": 1.0092,
+     "median": 1.0003,
+     "min": 0.9909,
+     "max": 1.1251
+    },
+    "db": {
+     "n": 40,
+     "geomean": 1.002,
+     "median": 1.0007,
+     "min": 0.9951,
+     "max": 1.0169
+    },
+    "synth": {
+     "n": 2,
+     "geomean": 1.0153,
+     "median": 1.0153,
+     "min": 1.0124,
+     "max": 1.0183
+    }
+   },
+   "worst": [
+    [
+     "mid11-b64l128",
+     1.1251,
+     8.6695,
+     9.7537
+    ],
+    [
+     "mid13-b64l128",
+     1.0891,
+     6.2322,
+     6.7874
+    ],
+    [
+     "mid13-b16l256",
+     1.0327,
+     4.086,
+     4.2198
+    ],
+    [
+     "mid14-b16l256",
+     1.0284,
+     95.2109,
+     97.9155
+    ],
+    [
+     "synth-matlstm-b",
+     1.0183,
+     52.5131,
+     53.4751
+    ],
+    [
+     "db02-b4l1024",
+     1.0169,
+     0.7864,
+     0.7997
+    ],
+    [
+     "db04-b16l128",
+     1.0159,
+     0.2206,
+     0.2241
+    ],
+    [
+     "synth-matlstm-a",
+     1.0124,
+     15.4907,
+     15.6821
+    ]
+   ],
+   "best": [
+    [
+     "big12-b8l256",
+     0.8892,
+     5.8336,
+     5.1873
+    ],
+    [
+     "big14-b32l128",
+     0.9021,
+     22.4212,
+     20.2267
+    ],
+    [
+     "big15-b32l128",
+     0.9194,
+     63.8831,
+     58.7349
+    ],
+    [
+     "big13-b8l256",
+     0.9465,
+     87.9793,
+     83.2742
+    ],
+    [
+     "big13-b32l128",
+     0.9481,
+     59.4829,
+     56.3976
+    ],
+    [
+     "big14-b8l256",
+     0.955,
+     12.0603,
+     11.5171
+    ],
+    [
+     "big16-b8l256",
+     0.9688,
+     91.5918,
+     88.7346
+    ],
+    [
+     "big15-b8l256",
+     0.9791,
+     79.943,
+     78.269
+    ]
+   ]
+  },
+  "p27_over_stage1": {
+   "classes": {
+    "whole": {
+     "n": 106,
+     "geomean": 0.9893,
+     "median": 1.0013,
+     "min": 0.6658,
+     "max": 1.1498
+    },
+    "big": {
+     "n": 34,
+     "geomean": 0.9587,
+     "median": 0.9997,
+     "min": 0.6658,
+     "max": 1.1498
+    },
+    "mid": {
+     "n": 30,
+     "geomean": 1.0032,
+     "median": 1.002,
+     "min": 0.8752,
+     "max": 1.1462
+    },
+    "db": {
+     "n": 40,
+     "geomean": 1.0029,
+     "median": 1.002,
+     "min": 0.9927,
+     "max": 1.0266
+    },
+    "synth": {
+     "n": 2,
+     "geomean": 1.042,
+     "median": 1.042,
+     "min": 1.0346,
+     "max": 1.0494
+    }
+   },
+   "bands": {
+    "within_1.2x": 106,
+    "native_faster": 38
+   }
+  },
+  "p25semantics_over_stage1": {
+   "classes": {
+    "whole": {
+     "n": 106,
+     "geomean": 0.991,
+     "median": 1.0006,
+     "min": 0.6647,
+     "max": 1.2745
+    },
+    "big": {
+     "n": 34,
+     "geomean": 0.9746,
+     "median": 1.0009,
+     "min": 0.6647,
+     "max": 1.2745
+    },
+    "mid": {
+     "n": 30,
+     "geomean": 0.994,
+     "median": 1.0005,
+     "min": 0.8787,
+     "max": 1.0216
+    },
+    "db": {
+     "n": 40,
+     "geomean": 1.001,
+     "median": 1.0002,
+     "min": 0.9913,
+     "max": 1.0166
+    },
+    "synth": {
+     "n": 2,
+     "geomean": 1.0262,
+     "median": 1.0263,
+     "min": 1.016,
+     "max": 1.0366
+    }
+   }
+  },
+  "p25_day_pair_geomean": 0.9685,
+  "native_p27_over_native_p25": {
+   "n": 106,
+   "geomean": 1.001,
+   "median": 0.9994,
+   "min": 0.9668,
+   "max": 1.1242
+  },
+  "stage1_today_over_stage1_p25": {
+   "n": 106,
+   "geomean": 0.9799,
+   "median": 0.9909,
+   "min": 0.8138,
+   "max": 1.1533
+  }
+ },
+ "model_rows": {
+  "row19_maxtext_train_ms_step": {
+   "p27": [
+    460.0,
+    468.7,
+    469.7,
+    470.2,
+    478.1
+   ],
+   "p27_median": 469.7,
+   "p25semantics_same_binary": 811.6,
+   "shipped_p25_binary": 833.9,
+   "fixed_watermark_32768": 465.9,
+   "anchor": 440,
+   "peak_gb": {
+    "p27": [
+     25,
+     25,
+     25,
+     26,
+     25
+    ],
+    "p25semantics": 16,
+    "fixed_32768": 39
+   },
+   "budget_gb": 48
+  },
+  "row18_lora_ms_step": {
+   "p27": [
+    360.7,
+    360.0,
+    360.2,
+    358.3,
+    360.2
+   ],
+   "p27_median": 360.2,
+   "p25semantics_same_binary": 389.0,
+   "shipped_p25_binary": 394.0,
+   "guard_peak_gb": {
+    "p27": [
+     56,
+     55,
+     56,
+     56,
+     56
+    ],
+    "p25semantics": 39
+   },
+   "meter_peak_mb": {
+    "p27": [
+     57479,
+     56712,
+     57480,
+     57479
+    ],
+    "p25semantics": 56711
+   },
+   "budget_gb": 70
+  },
+  "row13_e2b_int4_ms_tok": {
+   "p27": 80.3,
+   "p25semantics_same_binary": 80.2,
+   "shipped_p25_binary": 81.3,
+   "peak_gb": 48,
+   "budget_gb": 70
+  },
+  "row2_gemma4_12b_ms_tok": {
+   "p27": 92.9,
+   "p25semantics_same_binary": 93.2,
+   "peak_gb": 30,
+   "budget_gb": 45
+  }
+ },
+ "gates": {
+  "texmo_gate": "106 ok / 0 FAIL of 106 (x3 runs)",
+  "execute_test": "pass (P25 4 + P27 4 contracts)",
+  "ingest_test": "0 failed of 8",
+  "smoke_test": "pass",
+  "bazel_test": "pass",
+  "buffer_limit_recoveries_in_106_config_sweep": {
+   "p27": 0,
+   "p25semantics": 0
+  }
+ },
+ "standalone_outliers": {
+  "note": "suite-context trap: these disagree with the suite in direction",
+  "big14-b32l128": {
+   "p27": [
+    22.06,
+    24.49,
+    21.87,
+    20.85
+   ],
+   "p25sem": [
+    19.72,
+    20.84,
+    20.81,
+    20.97
+   ],
+   "in_suite_p27_over_ctl": 0.902
+  },
+  "big11-b32l128": {
+   "p27": 41.35,
+   "p25sem": 40.7
+  },
+  "big16-b32l128": {
+   "p27": 66.73,
+   "p25sem": 71.16
+  },
+  "mid11-b64l128": {
+   "p27": 9.7,
+   "p25sem": 9.45,
+   "in_suite_p27_over_ctl": 1.125
+  }
+ }
+}

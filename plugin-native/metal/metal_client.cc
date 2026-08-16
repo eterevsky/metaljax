@@ -17,6 +17,8 @@ Licensed under the Apache License, Version 2.0.
 #include <utility>
 #include <vector>
 
+#include <sys/sysctl.h>   // hw.memsize: the footprint target's denominator
+
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -151,13 +153,48 @@ bool EnvFlag(const char* name) {
   return true;
 }();
 
+// The default footprint target: the share of THIS machine's memory an eager
+// MAIN may push the process to before its buffer pool is trimmed (P27,
+// notes/cpp-p27-flush-pressure.md).  A fraction rather than a constant
+// because the number it qualifies is a footprint, which only means anything
+// against the memory the machine has -- 3/8 of 128 GB = 48 GB here, which is
+// what the ladder was measured at: the maxtext training row's ~26 GB pool
+// sits inside it with its 18.6 GB live set (bound 29 GB, 0 trims, 464
+// ms/step), and it leaves 22 GB of headroom under that row's own 70 GB-class
+// guards for the load transients no flush cadence controls.
+// METALJAX_FLUSH_FOOTPRINT_MB overrides it; 0 disables the pressure half,
+// leaving the main gate and the cap.
+int64_t DefaultFootprintMb() {
+  uint64_t mem = 0;
+  size_t len = sizeof(mem);
+  if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) != 0 || mem == 0)
+    return 49152;                       // 48 GB: the 128 GB machine's share
+  return static_cast<int64_t>((mem >> 20) * 3 / 8);
+}
+
 void ConfigureFromEnv() {
   const int64_t flush_mb = EnvInt("METALJAX_EAGER_FLUSH_MB", 1024);
   configure(
       /*eager_flush_bytes=*/std::max<int64_t>(flush_mb, 0) * (int64_t{1} << 20),
       /*flush_sync_every=*/EnvInt("METALJAX_EAGER_FLUSH_SYNC", 1),
-      /*flush_clear_bytes=*/EnvInt("METALJAX_FLUSH_CLEAR_MB", 2048) *
+      // The CAP on the flush-point trim, and the three numbers that decide
+      // how much of it a given flush may spend (runtime.cc `flush_bound`).
+      // P25 shipped the cap alone at 2048 MB and measured what the rest of
+      // the range is worth: 32768 is where the maxtext training row reaches
+      // its 0.11.3 anchor (464 vs 834 ms/step), and the other two are what
+      // make it safe to raise -- the LoRA row, which guard-killed at 68 GB
+      // when 32768 was handed to every program, keeps the 2048 MB floor
+      // through its load, because the load's flushes belong to programs that
+      // never become eager mains and because its live set has spent the
+      // footprint target by the time they would.
+      /*flush_clear_bytes=*/EnvInt("METALJAX_FLUSH_CLEAR_MB", 32768) *
           (int64_t{1} << 20),
+      /*flush_footprint_bytes=*/
+      EnvInt("METALJAX_FLUSH_FOOTPRINT_MB", DefaultFootprintMb()) *
+          (int64_t{1} << 20),
+      /*flush_floor_bytes=*/EnvInt("METALJAX_FLUSH_FLOOR_MB", 2048) *
+          (int64_t{1} << 20),
+      /*flush_main_flushes=*/EnvInt("METALJAX_FLUSH_MAIN_FLUSHES", 8),
       /*loop_clear_cost=*/EnvInt("METALJAX_LOOP_CLEAR_COST", 500000),
       // METALJAX_INGEST_CLEAR_MB is this plugin's own (there is no Stage 1
       // module to copy it from): the reclamation cadence of the TRANSFER
