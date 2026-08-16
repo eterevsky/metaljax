@@ -1,5 +1,11 @@
 # Model benchmark suite — tracking over time
 
+> Convention (Oleg, 2026-08-16): the rightmost column always tracks
+> **HEAD** — updated opportunistically whenever a row is measured, no
+> forced re-runs; missing or semi-stale cells are acceptable and marked.
+> Release columns are frozen snapshots and follow release rule 1
+> (CLAUDE.md): every release cell must come from the release binary.
+
 *One column per tracked run of the model suite (scripts/model_bench/).
 Cells: metaljax warm decode ms/token (or the row's noted metric);
 ✗ = blocked, with the measured reason in STATUS.md footnotes at that
