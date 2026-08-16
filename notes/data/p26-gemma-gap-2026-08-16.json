@@ -1,0 +1,315 @@
+{
+  "pass": "P26 — gemma4 native decode gap (release hold): mechanism",
+  "date": "2026-08-16",
+  "tree": "7f44d7b",
+  "rc_dylib_sha256": "ed3556914c038fc8d859bb8e89688976183b7814e8db641748438eb690194a16",
+  "source_of_the_derivation": [
+    "No new GPU time was needed to find the mechanism: the P24 native runs already carried METALJAX_DEBUG=1, so the compile-gate decisions and the per-program counters are in their logs.",
+    "~/.cache/metaljax-bench/logs/p24-stale-rows/gemma4-{31b,12b,e2b}-bf16-rc-native-0816-*.log",
+    "extractor: ~/.cache/metaljax-bench/logs/p26-gemma-gap/p26_extract.py"
+  ],
+  "mechanism": {
+    "one_line": "The gemma-lib decode step is the body of one dynamic while loop, and that body's compile gate is `by_cost = METALJAX_TRACE_BUDGET / BlockCost(body)` — integer division, so a body one unit over the budget gets ZERO and never compiles. Stage 1's sdpa recognizer fuses all 60 of the 31B's attention layers and its body costs 18888; the native recognizer, which analyses @main only, fuses none and the same body costs 20388 — 388 over the 20000 budget. So the native decode dispatches ~20388 tape entries per token instead of replaying one compiled graph, and pays a full mx::clear_cache() per token on top. Row 2 has the identical recognizer divergence and is unharmed only because 16306 is still 23 % under the budget: that is why the gap looks like it scales with model size.",
+    "gate_native": "plugin-native/metal/metal_lowering.cc:5150  const int64_t by_cost = kTraceBudget / std::max<int64_t>(cost, 1);",
+    "gate_stage1": "src/metaljax/tape.py:801  by_cost = control._TRACE_BUDGET // max(cost, 1)",
+    "budget": 20000,
+    "budget_env": "METALJAX_TRACE_BUDGET",
+    "note_both_stacks_share_the_formula": true,
+    "confirmed_by": "One environment variable on the same frozen RC binary, METALJAX_TRACE_BUDGET=21000, forces the compile without the fusion and moves row 1 from 301.6 to 254.8 ms/tok — 1.244x -> 1.051x of Stage 1, exactly row 2's ratio, with the counters flipping from 0 compiled calls / 257 flushes / 129 clears to 128 / 1 / 1."
+  },
+  "body_cost_derivation": {
+    "how": "Neither stack prints a while body's cost, but it prints the sampler main's, and a dynamic-bound while is charged trip=1024 x body (the pessimistic trip both stacks use). The decomposition is EXACT, not fitted: main_cost = 55 + 1024 * body_cost for both rows, with the same 55-unit loop overhead.",
+    "rows": {
+      "gemma4-31B": {
+        "sample_loop_main_cost": 20877367,
+        "loop_overhead": 55,
+        "body_cost": 20388,
+        "by_cost": 0,
+        "body_compiles": false
+      },
+      "gemma4-12B": {
+        "sample_loop_main_cost": 16697399,
+        "loop_overhead": 55,
+        "body_cost": 16306,
+        "by_cost": 1,
+        "body_compiles": true
+      }
+    }
+  },
+  "which_of_the_two_budgets_refuses_it": {
+    "note": "body_compile_max = min(by_cost, by_bytes). Isolating them shows this is NOT P23's byte gate and NOT P20's item 6 (a mischarge the plan should have discounted) — it is the op-count budget alone, acting on an honest count.",
+    "gemma4-31B": {
+      "body_cost": 20388,
+      "by_cost_at_20000": 0,
+      "by_cost_at_21000": 1,
+      "body_bytes_mb": 5567.2,
+      "by_bytes_at_65536MB": 11,
+      "body_compile_max": 0,
+      "refused_by": "cost"
+    },
+    "gemma4-12B": {
+      "body_cost": 16306,
+      "by_cost_at_20000": 1,
+      "body_bytes_mb": 3053.6,
+      "by_bytes_at_65536MB": 21,
+      "body_compile_max": 1,
+      "refused_by": null
+    },
+    "is_the_count_an_overcharge": "No. 339.8 units/layer on BOTH rows, and the 31B genuinely has 60 layers. Unlike row 13 (E2B-int4, P20) where the gate was reading a dequant chain the qmm emit absorbs, there is nothing here to discount away.",
+    "is_the_budget_itself_tight": "Its stated rationale (metal_lowering.cc:789, control.py:150) is the Metal live-buffer limit of ~499k; 20000 sits ~25x under that, and so does 20388."
+  },
+  "the_gap_scales_with_depth_because_cost_is_linear_in_depth": {
+    "gemma4-31B": {
+      "layers": 60,
+      "body_cost": 20388,
+      "cost_per_layer": 339.8,
+      "weight_args_per_layer": 16.0,
+      "tape_entries_per_layer": 316.1
+    },
+    "gemma4-12B": {
+      "layers": 48,
+      "body_cost": 16306,
+      "cost_per_layer": 339.7,
+      "weight_args_per_layer": 16.0,
+      "tape_entries_per_layer": 315.1
+    },
+    "layer_count_evidence": "jit_init_cache results 240 vs 192 (4 cache tensors/layer); jit___call args 965 vs 773 (16 weight args/layer); moe candidate rejections 421 vs 337 (7 rank>=3 reduces/layer). All three give 60 and 48.",
+    "max_layers_that_fit_under_the_budget": 58.9,
+    "gemma4-31B_overshoot_units": 388,
+    "gemma4-31B_overshoot_fraction": 0.0194,
+    "gemma4-12B_headroom_fraction": 0.227
+  },
+  "counters_that_confirm_it": {
+    "source": "per-program stats lines, P24 native runs. The counters reset per execute and there are three executes, one per sampler.chat: warmup (8 tokens), prefill (1), decode (128). Quoted below is the decode execute.",
+    "per_decode_token": {
+      "gemma4-31B": {
+        "compiled_replays": 0.0,
+        "eager_flushes": 2.008,
+        "mx_clear_cache": 1.008,
+        "loop_syncs": 1.0
+      },
+      "gemma4-12B": {
+        "compiled_replays": 1.0,
+        "eager_flushes": 0.0,
+        "mx_clear_cache": 0.031,
+        "loop_syncs": 1.0
+      },
+      "reading": "One compiled graph replay per token on the 12B with no eager flush at all (a compiled body never flushes inside itself); on the 31B, zero replays, two blocking eager flushes and one full return of the MLX buffer pool to the OS, every token."
+    },
+    "the_12B_body_traces_once_and_is_reused": "its first execute (the 8-token warmup) reports compiles=1 compiled_calls=8, and the two later chats report compiles=0 with compiled_calls=1 and 128 — the trace is built once and replayed 137 times.",
+    "gemma4-31B_jit__sample_loop": {
+      "flushes": 257,
+      "flush_cache_clears": 129,
+      "loop_flushes": 128,
+      "loop_cache_clears": 5,
+      "compiles": 0,
+      "compiled_calls": 0,
+      "serial_loops": 1
+    },
+    "gemma4-12B_jit__sample_loop": {
+      "flushes": 1,
+      "flush_cache_clears": 1,
+      "loop_flushes": 128,
+      "loop_cache_clears": 4,
+      "compiles": 0,
+      "compiled_calls": 128,
+      "serial_loops": 1
+    },
+    "reading": "128 compiled replays on the 12B against 0 on the 31B, and on the 31B ~2 eager flushes and ONE mx::clear_cache() per decode token (the RC binary's eager_flush returns the whole pool to the OS past METALJAX_FLUSH_CLEAR_MB=2048). A compiled body never flushes inside itself, which is why the 12B's count is 1 for the whole decode.",
+    "prefill_falls_off_the_same_cliff": {
+      "jit___call_cost_31B": 20839,
+      "compiled_31B": 0,
+      "jit___call_cost_12B": 16625,
+      "compiled_12B": 1,
+      "corroboration": "31B prefill ratio 2372.5/1906.5 = 1.2444 and decode ratio 301.6/242.4 = 1.2442 — the same multiplicative mechanism on two independent measurements of the same transformer step."
+    }
+  },
+  "hypotheses_ruled_out_with_evidence": {
+    "output_copies_of_the_KV_cache": "jit__sample_loop reports 246 output copies (31B) / 198 (12B), 0 donated — but it is executed 3 times in the whole run (once per sampler.chat), not once per token. The 128 tokens happen INSIDE one execute. Copies do not scale per token and are not in decode_ms_tok.",
+    "per_token_host_round_trips_or_transfers": "ingest=0MB on both rows through decode; one executable per chat, not per token; both rows run the decode loop serial_loops=1 with loop_flushes=128, i.e. the SAME two host round trips per token. Equal on both stacks, so not the differentiator.",
+    "sdpa": "SUPERSEDED by the measurement — see ROOT_CAUSE_measured. The pre-run arithmetic was right that the FUSION is timing-neutral at T=1 (P24, row 2) and wrong to conclude sdpa was not the cause: the recognizer's cost DISCOUNT is exactly what keeps Stage 1's body under the budget (1500 units on the 31B, 25.0 per attention, against 1112 units of headroom). The pre-run estimate of >=18 attentions needed was correct; the assumption that native could only ever find ~10 was not — Stage 1 finds all 60.",
+    "msl_scan": "0 msl plans on all three rows (P24 gate-1 requirement, verified there).",
+    "e2b_is_not_the_control_it_looks_like": "manifest.json puts gemma4-e2b-bf16 on the keras_lm path, NOT gemma-lib. It is at parity for the same reason anyway: its body costs 12852 units, comfortably under the budget."
+  },
+  "why_the_two_stacks_can_differ_at_all": {
+    "same_formula_same_budget": "Both stacks compute by_cost the same way from the same budget, so a divergence can only come from a different BlockCost — i.e. from a recognizer discount one stack takes and the other does not.",
+    "known_divergence": "Stage 1's sdpa analyses every function in the module (src/metaljax/sdpa.py::_all_blocks); the native one walks only @main and its nested regions (plugin-native/metal/metal_sdpa.cc::AnalyzeSdpa). This is the documented 'not ported by design: an sdpa or moe root living wholly inside a callee' (rc-gates-2026-08-16.md, known-and-accepted 2).",
+    "status": "OPEN — needs the Stage-1 side of the gate measured (queued as P26 R1/R3)."
+  },
+  "decomposition_of_the_gap": {
+    "method": "Decode on these rows is memory-bandwidth bound, so a stack that is doing the SAME kind of work on both rows must scale with model bytes. The 31B/12B byte ratio is 62.6/23.9 = 2.619.",
+    "stage1_decode_time_ratio_31B_over_12B": 2.584,
+    "stage1_as_multiple_of_the_byte_ratio": 0.987,
+    "native_decode_time_ratio_31B_over_12B": 3.059,
+    "native_as_multiple_of_the_byte_ratio": 1.168,
+    "reading": "Stage 1's 31B sits exactly on the bandwidth line (0.99x); the native 31B carries a 17 % excess that its own 12B does not. The excess is confined to the row whose body fell off the gate.",
+    "predicted_31B_if_the_body_compiled_ms_tok": 254.8,
+    "prediction_basis": "Stage 1's 242.4 x the 12B's own same-day native/Stage-1 ratio of 1.051 — i.e. assume the 31B would carry exactly the baseline native overhead the 12B does.",
+    "gap_total_ms_tok": 59.2,
+    "gap_attributable_to_the_compile_cliff_ms_tok": 46.8,
+    "gap_attributable_fraction": 0.79,
+    "residual_ms_tok": 12.4,
+    "residual_reading": "the same 1.051x baseline the 12B shows with both stacks compiled — not specific to this row",
+    "within_the_46_8_ms_two_costs_not_yet_split": [
+      "op-by-op dispatch of ~20388 tape entries per token instead of one compiled replay (no kernel fusion, per-entry executor work)",
+      "~2 eager flushes per token, one of which returns the whole MLX buffer pool to the OS (mx::clear_cache), measured at ~70 ms/clear on a different row in P20 — this half is what P25's in-flight change removes"
+    ],
+    "12B_gap_ms_tok": 4.8,
+    "12B_reading": "both stacks compile the 12B body, so its 1.051x is the native stack's baseline overhead on this route and is NOT the same phenomenon."
+  },
+  "why_extending_sdpa_would_not_fix_it": {
+    "status": "WRONG, and retracted — kept because the reasoning error is instructive.",
+    "what_was_argued": "That the body gate reads an unfused count, inferred from the two rows' decode bodies having the same cost per layer (339.7 vs 339.8) even though the 12B 'fires 8 attentions'.",
+    "why_it_was_wrong": "The premise was right and the conclusion inverted. Both decode bodies really do carry no discount — because NATIVE fuses zero attentions in either decode body; the 12B's 8 are in its prefill program. So the equality showed the divergence rather than ruling it out. Stage 1's own narration settles it: 48 and 60 fused attentions in those same two bodies."
+  },
+  "R2_the_fix_probe_CONFIRMED": {
+    "what": "The SAME frozen RC binary (ed355691...94a16), one environment variable, nothing rebuilt: METALJAX_TRACE_BUDGET=21000.",
+    "artifact": "~/.cache/metaljax-bench/logs/p26-gemma-gap/gemma4-31b-bf16-native-tb21000-0816-105301.{jsonl,log,flight.log}",
+    "protocol": "machine lock held (acquired after 760 s of waiting for the P25 campaign), settle + precheck claimed=10G swap=0G, guard budget 80 G / GUARD_RSS_GB=115 / system 100, one process, METALJAX_DEBUG=1.",
+    "decode_ms_tok": {
+      "default_budget": 301.6,
+      "budget_21000": 254.8,
+      "stage1": 242.4,
+      "anchor_0_11_3": 237.5
+    },
+    "ratios": {
+      "default_over_stage1": 1.244,
+      "fixed_over_stage1": 1.051,
+      "fixed_over_anchor": 1.073,
+      "the_12B_ratio_for_comparison": 1.051
+    },
+    "prefill_ms": {
+      "default_budget": 2372.5,
+      "budget_21000": 2007.7,
+      "stage1": 1906.5,
+      "ratio_default": 1.244,
+      "ratio_fixed": 1.053
+    },
+    "counters_flipped_exactly_as_predicted": {
+      "before": "jit__sample_loop: flushes=257(+clear 129) loop_flushes=128(+clear 5) compiles=0 compiled_calls=0",
+      "after": "jit__sample_loop: flushes=1(+clear 1) loop_flushes=128(+clear 5) compiles=0 compiled_calls=128"
+    },
+    "memory": {
+      "peak_footprint_gb": 68.0,
+      "baseline_peak_gb": 67.0,
+      "peak_rss_gb": 112.55,
+      "rss_cap_gb": 115,
+      "reading": "compiling the body costs 1 GB of footprint on this row — it holds one iteration's intermediates instead of flushing inside it. Well inside the row's budget."
+    },
+    "the_prediction_was_exact": "Before the run, 254.8 ms/tok was predicted as Stage 1's 242.4 x the 12B's own native/Stage-1 ratio of 1.051. Measured: 254.8. Both the decode and the prefill collapse from 1.244x to the 12B's 1.05x, i.e. the row stops being special.",
+    "so_the_decomposition_is_measured_not_inferred": {
+      "total_gap_ms_tok": 59.2,
+      "the_compile_cliff": 46.8,
+      "residual_baseline": 12.4,
+      "cliff_share": 0.79
+    }
+  },
+  "ROOT_CAUSE_measured": {
+    "what_stage1_sees_that_native_does_not": "Stage 1's sdpa recognizer fuses EVERY attention layer in the gemma-lib decode body; the native one fuses none of them. Measured, both rows, from the stacks' own narration:",
+    "gemma4-31B_decode_body": {
+      "stage1_fused_attentions": 60,
+      "native_fused_attentions": 0,
+      "stage1_body_cost": 18888,
+      "native_body_cost": 20388,
+      "discount_units": 1500,
+      "units_per_attention": 25.0,
+      "stage1_by_cost": 1,
+      "native_by_cost": 0,
+      "stage1_headroom_under_budget": 1112,
+      "reading": "Stage 1 clears the 20000 budget by 5.9 % and ONLY because of that discount; without it, it too would be 388 units over."
+    },
+    "gemma4-12B_decode_body": {
+      "stage1_fused_attentions": 48,
+      "native_fused_attentions": 0,
+      "stage1_body_cost": 15130,
+      "native_body_cost": 16306,
+      "discount_units": 1176,
+      "units_per_attention": 24.5,
+      "stage1_by_cost": 1,
+      "native_by_cost": 1,
+      "reading": "the same divergence, but harmless: the unfused 16306 is still 22.7 % under the budget, which is why row 2 is only 1.05x."
+    },
+    "correction_to_the_briefing": "The '8 fused attentions on the 12B, 0 on the 31B' asymmetry is not what it looked like. Stage 1's narration shows the 12B's 8 are a Q=256 program (prefill, B1N16Q256K256D512) — the DECODE body (B1N8Q2K1024D256) is 48 on Stage 1 and 0 on native. So native fuses ZERO attentions in the decode body of BOTH rows; the rows differ only in whether the resulting cost clears the budget.",
+    "why_native_finds_none": "The fused lowering analyses @main only — metal_lowering.cc:6684-6689 calls AnalyzeQmm/AnalyzeMoe/AnalyzeSdpa on `main` and nothing else, while Stage 1's sdpa.analyze walks _all_blocks (every function in the module). This is the documented 'not ported by design: an sdpa or moe root living wholly inside a callee' (rc-gates-2026-08-16.md, known-and-accepted 2). The gemma-lib sampler puts its decode step inside a callee."
+  },
+  "measured_arms": {
+    "protocol": "machine lock per run, settle + precheck, guard 80 G / GUARD_RSS_GB=115 / system 100 (45 G for the 12B), one process per arm, METALJAX_DEBUG=1 throughout, native arms on the frozen RC dylib ed355691...94a16 (hash re-verified before the runs). Logs ~/.cache/metaljax-bench/logs/p26-gemma-gap/.",
+    "row1_ladder": [
+      {
+        "arm": "Stage 1",
+        "decode_ms_tok": 242.4,
+        "vs_stage1": 1.0,
+        "source": "P24, clean"
+      },
+      {
+        "arm": "native, shipped defaults",
+        "decode_ms_tok": 301.6,
+        "vs_stage1": 1.244,
+        "source": "P24, same binary, same METALJAX_DEBUG=1"
+      },
+      {
+        "arm": "native, METALJAX_FLUSH_CLEAR_MB=1000000 (clear off)",
+        "decode_ms_tok": 266.9,
+        "vs_stage1": 1.101,
+        "source": "P26 R4",
+        "counters": "flushes=257(+clear 0) compiled_calls=0"
+      },
+      {
+        "arm": "native, METALJAX_TRACE_BUDGET=21000 (body compiles)",
+        "decode_ms_tok": 254.8,
+        "vs_stage1": 1.051,
+        "vs_anchor": 1.073,
+        "source": "P26 R2",
+        "counters": "flushes=1(+clear 1) compiled_calls=128"
+      }
+    ],
+    "split_of_the_59_2_ms_per_token": {
+      "per_token_mx_clear_cache": 34.7,
+      "op_by_op_dispatch_of_the_body": 12.1,
+      "baseline_native_overhead_same_as_row_2": 12.4,
+      "note": "The first two exist only because the body did not compile: a compiled body never flushes inside itself, so it never reaches the clear. The third is the 1.051x row 2 shows with both stacks compiled."
+    },
+    "memory": {
+      "native_default_peak_gb": 67.0,
+      "native_budget21000_peak_gb": 68.0,
+      "native_noclear_peak_gb": 68.0,
+      "stage1_peak_gb": 66.0,
+      "guard_budget_gb": 80,
+      "peak_rss_gb_max": 112.71,
+      "rss_cap_gb": 115,
+      "reading": "compiling the body costs +1 GB; disabling the clear costs +1 GB. Neither approached the guard."
+    },
+    "caveat_on_the_stage1_arms": "R1/R3 (Stage 1, DEBUG=1, run back-to-back behind other 60 GB rows) read 97.2 and 255.6 against P24's clean 93.8 and 242.4 — 3.6 % and 5.4 % high, the suite-context trap plus the debug narration. Their VALUE here is the narration (sdpa counts and costs), not the timing; every ratio above uses P24's clean Stage-1 cells. The native arms are like-for-like with P24's 301.6: same binary, same debug setting, same guard, same protocol."
+  },
+  "queued_measurements": {
+    "status": "ALL FOUR RAN — see measured_arms. R1 Stage-1 12B, R2 native 31B budget 21000, R3 Stage-1 31B, R4 native 31B clear off.",
+    "protocol": "~/.cache/metaljax-bench/logs/p26-gemma-gap/p26_run.sh — lock FIRST then settle (a precheck before the lock only reads the other campaign's working set), never removes a lock that looks stale, GUARD_RSS_GB=115 / footprint 80 / system 100 for row 1 per P24."
+  },
+  "why_this_is_not_a_contained_fix": {
+    "the_knob_is_shared_by_construction": "METALJAX_TRACE_BUDGET is read identically by both stacks (src/metaljax/ops/control.py:155 and plugin-native/metal/metal_lowering.cc:801), and engine.py:455 records why: the compile decision is what the two engines must agree on above all. Raising it in plugin-native alone would make the native lowering take a compile decision Stage 1 refuses on the same program — a divergence the tape diff exists to catch.",
+    "and_src_is_frozen_this_era": "A correct fix therefore edits src/metaljax/ops/control.py as well, which this era's rules freeze. So the default cannot be changed here; it is Oleg's call.",
+    "zero_code_mitigation_that_keeps_the_stacks_in_agreement": "METALJAX_TRACE_BUDGET=21000 in the environment — a documented user knob (notes/env-flags.md), read by both stacks, no rebuild. The smallest round value clearing both the 20388-unit decode body and the 20839-unit prefill call.",
+    "options_for_Oleg": [
+      "Do nothing: ship 0.11.4 with row 1 at 301.6 and the mechanism documented; the row is 1.27x of the 0.11.3 anchor and this is why.",
+      "Document the knob in the release notes for models deeper than ~58 layers on this route. Row 1 is the whole published exposure today: the gemma-lib sampler is what puts an entire transformer step inside ONE dynamic while body, so it is the route where a per-layer cost of 340 units meets a 20000-unit ceiling. Row 9 (R1-Distill-32B) is deeper still at 64 layers and sits at 0.98x of its anchor, because manifest.json puts it on the keras_lm path, whose decode is a sequence of small executables rather than one big body.",
+      "Raise the default in BOTH stacks (reopens src/). The stated rationale for 20000 — the ~499k Metal live-buffer limit — has ~25x headroom, but the budget also sizes the eager flush cadence, so it wants a memory ladder of its own.",
+      "Soften the cliff rather than move it: `by_cost = budget / cost` going to 0 costs the body its compile AND its chunked replay at once, so a body 2 % over the line falls all the way to op-by-op. Nothing intermediate exists."
+    ]
+  },
+  "interaction_with_the_concurrent_P25_work": {
+    "what": "P25's uncommitted plugin-native/runtime/program.cc replaces the eager flush's mx::clear_cache() with a cache-limit bound set once at client construction.",
+    "why_it_matters_here": "On row 1 that clear fires ~once per decode token (129 clears / 128 tokens) purely BECAUSE the body is uncompiled; on row 2 it fires once for the whole decode. So P25's change removes one of the two per-token costs on row 1 without touching the root cause (the body still dispatches ~20388 tape entries per token instead of replaying one compiled graph).",
+    "consequence": "Row 1 should be re-measured after P25 lands, independently of this finding — the 301.6 cell was taken on a binary that clears the pool once per token on this row."
+  },
+  "token_streams": {
+    "measured": "greedy token ids, 64 compared, all against P24's clean Stage-1 run",
+    "results": {
+      "Stage 1 P24 vs Stage 1 today (R3, debug)": "identical",
+      "native default (P24)": "diverges at 34",
+      "native TRACE_BUDGET=21000 (R2, body compiled)": "diverges at 34",
+      "native FLUSH_CLEAR off (R4)": "diverges at 34"
+    },
+    "reading": "All three native arms diverge from Stage 1 at the SAME index and agree with each other, so row 1's token divergence is NOT the compile decision — forcing the body to compile does not move it. It is the recognizer divergence itself: native computes attention unfused in every arm while Stage 1 fuses all 60. That matches P24's observation that row 1's divergence is reproducible (unlike rows 5/7, where the fused path is nondeterministic run to run) — here it is the UNFUSED path that is stable.",
+    "consequence_for_the_root_fix": "If the callee-aware recognizer were ported, row 1's native stream should become Stage-1-identical (as rows 2 and 4 already are). That is a clean acceptance criterion for the fix, and also a warning: it changes the published stream for this row."
+  }
+}
