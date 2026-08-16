@@ -674,6 +674,19 @@ is at exact parity (0.633 vs 0.633).
 Three rows of 106, none in `top_confs`, against a suite geomean of 1.011 and a
 median of 1.000 — it qualifies the claim, it does not overturn it.
 
+> **RESOLVED 2026-08-16 (P23, `notes/cpp-p23-dispatch.md`) — and it was not
+> the launch.** Nothing in `runtime/msl.cc` changed. `BlockBytes` (the byte
+> estimate every compile decision reads) was ported without
+> `_block_bytes`' msl case, so a loop that became one generated kernel was
+> charged `trip × body` instead of its outputs: `db16-b256l512`'s step
+> estimate came out at **163 GB instead of 2.05 GB**, over
+> `METALJAX_COMPILE_BYTES_MB`, which took away the loop body's compile AND
+> the chunked replay and left every training step to be dispatched op by op
+> — with 128 blocking eager flushes per chunk. One line
+> (`if (MslPlanFor(ctx, &o) != nullptr) continue;`) puts the native estimate
+> on Stage 1's number exactly (134,234.4 MB, digit for digit) and the three
+> rows at **0.998 / 0.999 / 0.985**. The census is unchanged, plan for plan.
+
 ## Not measured in this campaign
 
 The **model rows** (Table 3) were not re-run: nothing in P22 touches their
@@ -681,3 +694,103 @@ paths (the coop width cap is a texmo-recurrent-cell decision, and no model row
 builds an msl plan), and they were last measured at P20. The Stage-1-vs-anchor
 regression on row 19 (the shared eager-flush cache clear) is unchanged and
 still awaiting Oleg's call on `mx::set_cache_limit`.
+
+---
+
+# THE RC TABLE — P23, 2026-08-16
+
+*P22's one qualifier, closed. Machine lock held for every run, one process per
+arm, `scripts/bench_texmo_pjrt.py` (PJRT route, 64-step chunks) on both stacks,
+native arms on the frozen release candidate
+`~/.cache/metaljax-bench/frozen-rc-ed355691.dylib` (sha256 `ed355691…94a16`;
+tree d70499b + the P23 byte-gate fix, `plugin-native/metal/metal_lowering.cc`).
+Raw data `~/.cache/metaljax-bench/logs/p23-dispatch/`, aggregates
+`notes/data/p23-dispatch-2026-08-16.{csv,json}`, narrative
+`notes/cpp-p23-dispatch.md`. The analysis reproduces P22's published
+aggregates from P22's own artifacts before it is applied to the new ones
+(1.0111 whole, 1.0043 / 0.9979 / 1.0301 / 0.950 by class, top_confs 1.0007).*
+
+**What changed in the binary**: `BlockBytes` was charging a loop that became one
+generated msl kernel `trip × body` instead of its outputs (`_block_bytes`' msl
+case, present in `BlockCost` since P21 and missing here). On the biggest `db`
+shapes that put the per-step estimate at 163 GB instead of 2.05 GB — over
+`METALJAX_COMPILE_BYTES_MB` — so the loop body's compile and the chunked replay
+were both refused and each training step was dispatched op by op, with 128
+blocking eager flushes per chunk. Nothing in `runtime/msl.cc` changed; the
+plans and the kernels always were identical.
+
+## Table 6 — the three qualifier rows (standalone, arms interleaved)
+
+| config | Stage 1 | P22 native | **RC native** | P22 ratio | **RC ratio** |
+|---|---:|---:|---:|---:|---:|
+| `db16-b256l512` | 4.475 | 7.942 | **4.466** | 1.774 | **0.998** |
+| `db17-b256l512` | 7.287 | 11.614 | **7.280** | 1.594 | **0.999** |
+| `db11-b256l512` | 2.180 | 2.850 | **2.147** | 1.307 | **0.985** |
+| `db11-b64l256` (control) | 0.634 | 0.634 | 0.634 | 1.000 | 1.001 |
+| `db02-b4l1024` (control) | 0.782 | 0.798 | 0.793 | 1.021 | 1.015 |
+
+Where the 3.45 ms/step went, all four arms the same program (the first three on
+P22's *released* binary, one environment variable apart): shipped **7.923** →
+`EAGER_FLUSH_MB=0` **7.185** (the flushes: 0.74 ms) → `COMPILE_BYTES_MB=1048576`
+**4.469** (the gate raised past the inflated estimate — the fix, by knob) →
+RC binary **4.464**, Stage 1 **4.471**. The remaining 2.71 ms is op-by-op
+dispatch of ~611 ops per step (≈4.4 µs each) instead of one compiled replay
+per 16 steps.
+
+## Table 7 — texmo 106-config suite
+
+| aggregate | n | **P23 (RC)** | P22 | P16 |
+|---|---:|---:|---:|---:|
+| whole suite, geomean | 106 | **1.0050** | 1.011 | 4.24× |
+| whole suite, median | 106 | **1.0012** | 1.000 | 3.37× |
+| `big` | 34 | 1.0107 | 1.004 | 1.34× |
+| `mid` | 30 | 1.0033 | 0.998 | 3.22× |
+| **`db` (msl territory)** | 40 | **1.0013** | 1.030 | 14.61× |
+| `synth` | 2 | 1.0062 | 0.950 | 1.52× |
+| **rows within 1.2×** | 106 | **106** | 103 | 33 |
+| rows at or above 10× | 106 | **0** | 0 | 32 |
+| rows where native is faster | 106 | 42 | 52 | 18 |
+
+Every row outside ±10 % was re-measured standalone before being reported, and
+**six of seven were the suite itself** (`big11-b32l128` 1.178 → 1.000,
+`big14-b32l128` 1.143 → 0.998, `big14-b8l256` 1.105 → 0.998, `big16-b32l128`
+1.105 → 1.000, `big12-b32l128` 0.874 → 1.001, `big09-b32l128` 0.873 → 0.963);
+the seventh is `big09-b8l256` 0.660, P22's width-cap win. Substituting them:
+geomean **1.0024**, median 1.0009, native faster on 43.
+
+## Table 8 — top_confs (163), same PJRT route
+
+| aggregate | n | **P23 (RC)** | P22 |
+|---|---:|---:|---:|
+| native / Stage 1 (same route) | 163 | **1.0016** geomean, 1.001 median | 1.001 |
+| rows within 1.2× | 163 | **163** | 163 |
+| rows where native is faster | 163 | 63 | — |
+| configurations beating jax-CPU | 163 | native **58**, Stage 1 59 | native 59 |
+| **native arm vs P22's native arm** | 163 | **0.9999** | — |
+| Stage 1 arm vs P22's Stage 1 arm | 163 | 1.0008 | — |
+
+`top_confs` does not move, and should not: no configuration in it is large
+enough for the overcharge to cross the gate. One row outside ±10 %
+(`tc009-w16` 0.888) and it is in native's favour.
+
+## The measurement lesson: a gate run poisons the suite that follows it
+
+The suite pair was measured twice. The first pair ran straight after a 263 s
+`texmo_gate` in the same hold and came back at geomean **1.047 with 21 rows
+outside ±10 %** — all `l128` (large-batch) rows, **7 of the 11 worst building
+no msl plan at all**, i.e. on tapes byte-identical to P22's. The Stage 1 arm of
+that hold was inflated too (0.9725 against P22, worst row 0.72), just less,
+because it ran second. Re-run in a hold of its own with a settle and nothing
+before it, every one of those rows returns to its P22 value (`big12-b32l128`
+16.31 → 9.93 vs 9.74; `big16-b32l128` 88.28 → 67.09 vs 66.76). Both pairs are
+kept; the clean pair is this table. **Future release measurements: the suite
+first, the gate afterwards.**
+
+## Battery (frozen RC binary)
+
+`execute_test` **536 of 536** (P22's 535 plus one new contract — `msl loop
+charged as one kernel`, 3.1 MB planned vs 290.1 MB interpreted; the log diff
+against P22's is exactly that row plus the plugin path), `texmo_gate`
+**106 ok / 0 decline / 0 FAIL / 0 error** twice, `smoke_test` passed,
+`bazel test //…` passed, and the whole-suite plan census **identical to P22's,
+568 narration lines in the same order**.

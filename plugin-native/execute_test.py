@@ -3504,9 +3504,62 @@ def _p21_msl(subprocess, pathlib, re):
         return True, (f"F=1024 declined by width (was {stage1[0]} coop plan), "
                       f"answers agree to {rel:.1e}")
 
+    def a_planned_loop_is_charged_as_one_kernel():
+        """P23: the byte estimate the COMPILE decisions are made on must
+        notice the kernel.
+
+        `ops/control._block_bytes` charges a loop that became one generated
+        msl kernel its OUTPUTS only -- the per-timestep state lives in
+        registers, not in buffers -- while an interpreted loop is charged
+        trip x body.  The port had that case in `BlockCost` and not in
+        `BlockBytes`, so a planned loop was charged as if it ran: on
+        `db16-b256l512` the step estimate came out at 163 GB instead of 2 GB,
+        over `METALJAX_COMPILE_BYTES_MB`, which took away the body compile
+        AND the chunked replay and left every step to be dispatched op by op
+        (1.77x slower than Stage 1, with identical kernels -- P23).
+
+        No correctness test can see this: every answer stays right.  What is
+        pinned here is the MECHANISM rather than a threshold -- the same
+        program, planned and unplanned, must not be charged the same bytes.
+        """
+        def probe(env_extra):
+            child = dict(os.environ)
+            child["METALJAX_DEBUG"] = "1"
+            child.update(env_extra)
+            proc = subprocess.run(
+                [sys.executable, str(pathlib.Path(__file__).resolve()),
+                 "--msl-bytes"], env=child, capture_output=True, text=True)
+            if proc.returncode != 0:
+                return None, None, (proc.stderr or proc.stdout
+                                    ).splitlines()[-1][:80]
+            mb = [float(x) for x in re.findall(
+                r"main: pure=\d+ cost=\d+ bytes=([\d.]+)MB", proc.stderr)]
+            plans = len(re.findall(r"msl_scan: compiled plan", proc.stderr))
+            if not mb:
+                return None, None, "no byte narration"
+            return max(mb), plans, None
+
+        on, plans_on, err = probe({})
+        if err: return False, err
+        off, plans_off, err = probe({"METALJAX_MSL": "0"})
+        if err: return False, err
+        if plans_on < 1:
+            return False, "no kernel planned for the probe program"
+        if plans_off != 0:
+            return False, f"METALJAX_MSL=0 still planned {plans_off}"
+        # The probe cell is ~13 arrays of body traffic per step against one
+        # stacked output, so the honest estimate is several times smaller.
+        # The bug made the two arms report the SAME number.
+        if not (on * 3 <= off):
+            return False, (f"planned {on:.1f} MB vs interpreted {off:.1f} MB "
+                           "-- the byte gate does not see the kernel")
+        return True, f"{on:.1f} MB planned vs {off:.1f} MB interpreted"
+
     return [("msl covers its three modes", modes_are_covered),
             ("METALJAX_MSL=0 builds no kernel", the_kill_switch_kills),
-            ("msl coop width cap (F>=1024)", the_width_cap_holds)]
+            ("msl coop width cap (F>=1024)", the_width_cap_holds),
+            ("msl loop charged as one kernel",
+             a_planned_loop_is_charged_as_one_kernel)]
 
 
 def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
@@ -3594,6 +3647,20 @@ def main():
         w = _rand((1024, 1024), 923) * np.float32(0.02)
         _, hs = jax.jit(_msl_rnn)(h0, xs, w)
         print(f"WIDE COOP CHECKSUM {float(np.asarray(hs).sum()):.9e}")
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--msl-bytes":
+        # P23: one gru cell fat enough that its body traffic dwarfs its
+        # stacked output, planned into a kernel by default and interpreted
+        # under METALJAX_MSL=0.  The parent reads the byte estimate the
+        # compile decisions are made on out of the narration.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        f32 = np.float32
+        h0 = _rand((32, 64), 931) * f32(0.1)
+        xs = _rand((128, 32, 64), 932) * f32(0.1)
+        ws = [_rand((64, 64), 933 + i) * f32(0.1) for i in range(3)]
+        jax.jit(_msl_gru)(h0, xs, *ws)
         return 0
     if len(sys.argv) > 2 and sys.argv[1] == "--eager-arm":
         os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))

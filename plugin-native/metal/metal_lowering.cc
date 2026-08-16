@@ -1537,6 +1537,16 @@ int64_t BlockBytes(LowerContext& ctx, mlir::Block& block) {
     }
     const llvm::StringRef n = o.getName().getStringRef();
     if (n == "stablehlo.while") {
+      // A loop that became one generated msl kernel is charged its OUTPUTS
+      // only -- its per-timestep state lives in REGISTERS, not in buffers, so
+      // the trip x body charge below would invent the very memory msl_scan
+      // exists to avoid materializing.  `_block_bytes`' `continue`, and the
+      // exact counterpart of `BlockCost`'s "cost += 8" above: the two walks
+      // must agree about what a planned loop is, or the compile decisions
+      // they feed disagree about the same program (P23 -- omitting this made
+      // db16-b256l512's step estimate 163 GB instead of 2 GB, which took the
+      // body compile away and left every step to be dispatched op by op).
+      if (MslPlanFor(ctx, &o) != nullptr) continue;
       std::optional<Counted> c = AnalyzeCounted(ctx, &o);
       int64_t trip = 1024;
       if (c.has_value() && c->kind == Counted::kStatic) {

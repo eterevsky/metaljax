@@ -1694,3 +1694,69 @@ must build one under `COOP_MAX_F=0`, and the two answers must agree),
 `texmo_gate` **106 ok / 0 decline / 0 FAIL / 0 error**, census diff 2
 configurations. Model rows not re-run: nothing in P22 touches their paths (no
 model row builds an msl plan).
+
+## P23: the qualifier, closed — a planned loop the byte gate could not see
+## (2026-08-16, notes/cpp-p23-dispatch.md)
+
+P22's parity claim carried one qualifier: three `db*-b256l512` rows at
+**1.77 / 1.60 / 1.31x**, with identical plans, identical kernels and
+`METALJAX_MSL=0` levelling the stacks — so "the launch, not the plan", and
+`runtime/msl.cc`'s per-call work was the named suspect. **It was neither.**
+Nothing in `runtime/msl.cc` changed.
+
+`ops/control._block_bytes` charges a `stablehlo.while` that became one
+generated msl kernel **its outputs only** ("its per-timestep state lives in
+registers, not in buffers"); `BlockCost` has the same case (`cost += 8`) and
+P21 ported that one, while `BlockBytes` was ported without it and charged a
+planned loop `trip x body` — the traffic of a loop that does not run. On
+`db16-b256l512` that made the per-step estimate **163 GB instead of 2.05 GB**,
+over `METALJAX_COMPILE_BYTES_MB` (64 GB), which is read by three decisions at
+once: the loop body's compile (`by_bytes` -> 0), the chunked replay
+(`BytesChunks` -> K=1) and the whole-main compile. So every training step ran
+op by op, with the byte-denominated eager flush firing on the same inflated
+numbers — 128 blocking `mx::eval` per chunk. The fix is one line in
+`BlockBytes`: `if (MslPlanFor(ctx, &o) != nullptr) continue;`, after which the
+native estimate is Stage 1's number **exactly** (134,234.4 MB, digit for
+digit), flushes are 0 and the chunk replays 4 compiled calls of K=16.
+
+**Found by diffing narration, not by profiling.** P22's own probe logs had it:
+`cost` agreed to the unit (39113 — the walk WITH the msl case) while `bytes`
+was 80x apart (the walk without), and the native line said in the same breath
+`compiles=0 compiled_calls=0 flushes=128`. Lesson for a transliteration
+project: diff what the two engines SAY about a program before profiling what
+they do.
+
+**The cost, split** (`db16-b256l512`, ms/step, all on P22's *released* binary
+bar the last two): shipped **7.923** -> `EAGER_FLUSH_MB=0` **7.185** (the
+flushes, 0.74 ms) -> `COMPILE_BYTES_MB=1048576` **4.469** (the gate raised past
+the inflated estimate: the fix reproduced by knob, on unmodified code) -> P23
+binary **4.464**, Stage 1 **4.471**. The remaining 2.71 ms was op-by-op
+dispatch of ~611 ops per step, ~4.4 us each.
+
+| | P22 | **P23 (RC)** |
+|---|---:|---:|
+| `db16` / `db17` / `db11-b256l512`, standalone | 1.774 / 1.594 / 1.307 | **0.998 / 0.999 / 0.985** |
+| suite-106 geomean (median) | 1.011 (1.000) | **1.0050 (1.0012)** |
+| suite-106 `db` class | 1.030 | **1.0013** |
+| suite-106 rows within 1.2x | 103 | **106 of 106** |
+| top_confs, same PJRT route | 1.001 | **1.0016** (native arm vs P22's: 0.9999) |
+| `execute_test` | 535 | **536** |
+
+The census is **EMPTY**: 568 narration lines identical in content and order,
+142 coop / 52 vector / 12 scalar and every decline reason — as it must be,
+since the change is to a compile decision and nothing else. Gate 106/106 twice
+on the fixed code (one flake attributed: `mid03-b16l256` is a sensitivity
+lottery row, 3/3 standalone on BOTH binaries). New contract `msl loop charged
+as one kernel` pins the mechanism no correctness test can see — the same cell
+planned vs `METALJAX_MSL=0`, 3.1 MB against 290.1 MB.
+
+**Measurement protocol, changed.** The suite pair was measured twice: the first
+ran straight after a 263 s `texmo_gate` in the same hold and came back at
+geomean 1.047 with 21 rows outside +-10 %, all large-batch `l128` rows, **7 of
+the 11 worst building no msl plan at all** (byte-identical tapes). Re-run in a
+hold of its own, every one returns to its P22 value. From here: the suite
+first, the gate afterwards, and every outlier standalone before it is named —
+six of this campaign's seven were the suite itself.
+
+Frozen RC binary: `~/.cache/metaljax-bench/frozen-rc-ed355691.dylib`, sha256
+`ed355691…94a16` (tree d70499b + this fix).

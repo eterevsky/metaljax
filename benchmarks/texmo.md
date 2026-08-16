@@ -13,6 +13,7 @@ run that gates a release or an optimization.*
 | 2026-08-05 | 0.11.3 release gate | 1.002³ | 0.98 | 0.66 | 0.77 | 0.83 | 163/163 | notes/data/texmo-topconfs-2026-08-05.jsonl |
 | 2026-08-15 | P22 release measurement, Stage 1 (engine route) | 1.071⁴ | 0.97 | 0.58 | 0.66 | 0.72 | 163/163 | ~/.cache/metaljax-bench/logs/p22-release-measure/topconfs-stage1-engine.jsonl |
 | 2026-08-15 | **P22, phase-2 native plugin** (PJRT route, frozen dylib) | 1.002⁵ | 0.97 | 0.58 | 0.65 | 0.71 | texmo_gate 106/106 | notes/data/p22-release-measure-2026-08-15.{csv,json} |
+| 2026-08-16 | **P23 RC, native** (PJRT route, `frozen-rc-ed355691`) | 1.000⁶ | 0.92 | 0.58 | 0.65 | 0.71 | texmo_gate 106/106 | notes/data/p23-dispatch-2026-08-16.{csv,json} |
 
 ¹ Two same-day runs merged: the buffer-cap correctness fix between
 them cost geomean 0.980 (−0.5% small configs → −4% largest class,
@@ -42,6 +43,17 @@ configurations, so the columns are comparable. Frozen dylib
 (`plugin-native/texmo_gate.py`, whole-model vs jax-CPU) rather than
 `texmo_topconfs.py`'s per-config check, which is a Stage-1-route harness.
 
+⁶ vs the previous row (P22 native, same route and runner): **0.9999**
+geomean over 163 configurations — the P23 byte-gate fix cannot reach
+top_confs, whose models are far too small for the overcharge it removes to
+cross `METALJAX_COMPILE_BYTES_MB`. Against Stage 1 measured in the same hold:
+**1.0016** geomean, 163/163 within 1.2x, native faster on 63, 58 beating
+jax-CPU. Where the fix DOES land is the 106-config suite's `db` class
+(1.030 -> 1.0013) and with it the whole-suite geomean, 1.011 -> **1.005**,
+106/106 rows within 1.2x. Frozen dylib `frozen-rc-ed355691`; details
+benchmarks/perf-2026-08-native-baseline.md ("THE RC TABLE"), narrative
+notes/cpp-p23-dispatch.md.
+
 **Native-plugin baseline (2026-08-12, tree 845ab89):** Stage 1 re-measured on
 this tree is **1.046x faster** than the 0.11.3 anchor (163/163 checks ok, CPU
 control 0.986), so the anchor stands. The phase-2 plugin, same configurations
@@ -63,3 +75,12 @@ survives: three `db*-b256l512` rows are genuinely 1.31-1.77x slower natively
 LAUNCH, not the recognizer). Full tables:
 benchmarks/perf-2026-08-native-baseline.md ("THE RELEASE TABLE"), narrative
 notes/cpp-p22-release.md.
+
+**QUALIFIER CLOSED (2026-08-16, P23).** It was not the launch: the native byte
+estimate charged an msl-planned loop `trip x body` instead of its outputs
+(`_block_bytes`' msl case, missing from `BlockBytes` alone), which on the
+biggest `db` shapes crossed `METALJAX_COMPILE_BYTES_MB` and took away the
+training step's compiled body and chunked replay. One line; the three rows are
+now **0.998 / 0.999 / 0.985** of Stage 1, the suite geomean **1.005** with
+106/106 rows within 1.2x, and the plan census is unchanged. RC binary
+`frozen-rc-ed355691`; `execute_test` 536/536, gate 106/106.
