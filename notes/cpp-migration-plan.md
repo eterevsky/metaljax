@@ -1821,3 +1821,15 @@ on this binary and 3/3 on the RC one). Shipped binary
 re-run, and it is Oleg's decision. Until it lands, every same-day
 native/Stage-1 ratio on an eager-main row carries this difference -- which is
 what the 0.86x on row 19 above now measures.
+
+## Post-0.11.5 retirement (Oleg, 2026-08-16): confirmed FIRST post-release
+milestone — full cleanup INCLUDING docs. Delete: src/metaljax engine/
+interpreter/tape/msl_scan (~19.3k), plugin/ trampoline, frozen native/ +
+nanobind extension, METALJAX_ENGINE machinery, engine-API tests (71
+counter rows, test_native_tape, extension buffer tests), texmo_check
+(texmo_gate is the gate). Slim the loader to native-only; wheel build
+becomes bazel-native (METALJAX_WHEEL_PLUGIN retires; sdist story TBD).
+DOCS PASS: CLAUDE.md rewritten for the native-only world (Stage-1
+machinery moves to history/notes), README, RELEASING.md. Full battery
+on the native-only tree is the proof. Then the framework-gap fix list
+(notes/framework-gap-gemma31b.md) becomes the performance era.
