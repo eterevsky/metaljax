@@ -41,6 +41,16 @@ executes on the Metal device through plain `jax.numpy`.
   version numbers based on what's being published. Plan: iterate on
   0.4.x; when the gap list is closed to his satisfaction, jump straight
   to 0.11.0 (tracking the jax pin; 0.5–0.10 intentionally skipped).
+- **Release rule 1 — no stale numbers** (Oleg, 2026-08-16, after the
+  0.11.4 near-miss): every number in a release table must come from the
+  release binary. Changes after the last benchmark run are acceptable
+  only if they provably cannot move a number; otherwise re-measure the
+  affected rows before release.
+- **Release rule 2 — never "PASS" over a regression**: a significant
+  regression on any test suite or benchmark makes the gate verdict
+  REGRESSION, not PASS. Releasing over one requires (a) Oleg's explicit
+  confirmation, (b) the regression stated in the gate report itself.
+  Both rules go verbatim into every RC/release agent brief.
 - Python via **uv**: venv at `metaljax/.venv` (CPython 3.13.5), installed:
   `jax 0.11.0`, `jaxlib 0.11.0`, `mlx 0.32.0`, numpy, pytest.
   Run things with `.venv/bin/python`.
