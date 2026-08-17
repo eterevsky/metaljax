@@ -48,11 +48,11 @@ flake) are carried below with their evidence.
 | 2 | Pinned jax suite, native, 164 files, `--jobs 1`, vs the 129 whitelist | **PASS** — 28,073 / 129, zero new |
 | 3 | `tests/` both legs (Stage 1 + native) | **PASS** — 1258 / (1187+71 = 1053+205 deselected) |
 | 4 | texmo: suite-106 + top_confs pairings, both stacks; both correctness gates | **PASS** |
-| 5 | Model rows, every non-embargoed row, guarded | **REGRESSION** — one, named and attributed: P27's flush watermark costs rows 11/14 17 GB / 11 GB of peak for no speed |
+| 5 | Model rows, every non-embargoed row, guarded | **PASS** — the one regression (P27's flush watermark, rows 11/14) is **RESOLVED** by P28's benefit gate, re-measured at the historical budgets |
 | 5b | The no-panic contract | **PASS** |
 | 6 | Plugin contract suites | **PASS** |
 | 7 | Wheels: both variants, fresh-venv installs, `twine check` | **PASS** — nothing uploaded |
-| 8 | Finale: verdicts, release notes, recommendation | **GO, with one regression for Oleg to accept or refuse** |
+| 8 | Finale: verdicts, release notes, recommendation | **GO** — the one regression is resolved, not accepted (P28) |
 
 ---
 ## Gate 1 — the release binary, frozen — **PASS**
@@ -161,6 +161,47 @@ version bump), **not caused by the governor**, and **opt-out with one variable**
 Under release rule 2 it is stated here rather than absorbed: the cells above are
 the shipped-default runs at raised budgets, and the rows' *published* memory
 characteristics have changed.
+
+#### RESOLVED 2026-08-17 — P28's benefit gate (`notes/cpp-p28-benefit-gate.md`)
+
+Oleg chose option (b): benefit-gate the watermark, so the decode rows keep
+their historical footprint and row 19 keeps its fix. The two rows' flight logs
+name the counter that separates them, and it is not the flush count — the load
+takes **134 hard flushes in a single call**, so P27 reads it as an eager main —
+but the **live set**: the training step swings 6.8 → 20.5 GB every flush, while
+the load holds ~3 GB flat and simply has 14 GB of freed weights land in the
+pool at its last flush, and the decode step holds 1,197 MB at all 71 of its
+flushes. `flush_bound` gained a third rule, entering as one more `min` so it
+can only ever LOWER a bound:
+
+```
+earned = min(METALJAX_FLUSH_EARN_MULT * (live_hi - live_lo), live_hi)
+```
+
+`METALJAX_FLUSH_EARN_MULT` defaults to **2**; `0` restores P27 exactly. What
+each program earns: the load **3.6 GB** (was the 32 GB cap), the decode step
+**the floor**, the training step **20.5 GB** — more than the 18.6 GB pool it
+actually uses, so it pays nothing.
+
+Re-measured on `frozen-p28b-37060770`, shipped defaults, at the rows' **own
+historical budgets**, one guarded process per run:
+
+| row | budget | 0.11.5 as gated | **P28** | P25 semantics (control) |
+|---|---:|---|---|---|
+| **11** | **20 GB** | **0 of 6 complete** (21–25 GB) | **9 of 9 complete**, 16.61–16.83 ms/tok, peaks 9.6–19 GB | 9 of 9, 16.52–17.07, 7.6–17 GB |
+| **14** | **25 GB** | guard kill (26 GB) | **4 of 4 complete**, 31.82–32.13 ms/tok, peaks 9.1–17 GB | completes, 32.14, 7.7–15 GB |
+| **19** | 48 GB | 456.1 ms/step | **459.2 / 458.4 / 462.5 ms/step**, 25 GB, `loss` ≡ P27 to 13 digits | 811–834 ms/step |
+
+Speed is unchanged on all three (the decode rows were never paying for the
+pool, which was the finding). Row 11's peak is a sub-second **live** transient
+in the orbax restore — ~17 GB under every policy including P25's — with
+whatever the pool holds standing beside it; at 2 Hz sampling the peak readings
+scatter, so the completion counts are the statement.
+
+The regression's own verdict line is therefore **RESOLVED**, and gate 5's
+verdict is re-scored below with what the resolution cost elsewhere (nothing
+measurable: `execute_test` 553 ok, `texmo_gate` and the suite-106 pairing
+re-run).
 
 ### REGRESSION 2 — row 2 and row 6 sit 1.5–2.0 % above their cells
 
@@ -564,7 +605,7 @@ public PyPI and the git push are Oleg's.
 | 2 | Pinned jax suite, native, 164 files, `--jobs 1` | **PASS** | **28,073 passed / 129 failed = 99.54 %**, **zero new failures**, the failing set **identical id-for-id** to the RC gate's |
 | 3 | `tests/` both legs | **PASS** | Stage 1 **1258 / 0**; native **1187 / 71**, reconciled with the governor campaign's 1053 / 0 (same run, 205 deselected) |
 | 4 | texmo pairings + both correctness gates | **PASS** | suite-106 **0.9840** (0.9798 with the two artifacts re-measured standalone, **106/106 within 1.2×**, native faster on 65); top_confs bracketed **0.9970**, **1.072× the 0.11.3 anchor**, **59 configurations beating jax-CPU**; `texmo_gate` **106/106**, `texmo_check` **106/106** |
-| 5 | Model rows, all non-embargoed | **REGRESSION** | 15 of 17 measurable rows inside ±2 % of their cells, three better, rows 8/10 first-ever numbers — **and rows 11/14 now need 17 GB / 11 GB more peak footprint than the pool policy they shipped under**, for no speed |
+| 5 | Model rows, all non-embargoed | **PASS** (was REGRESSION) | 15 of 17 measurable rows inside ±2 % of their cells, three better, rows 8/10 first-ever numbers; the rows-11/14 footprint regression is **RESOLVED** — P28's benefit gate returns both to their historical budgets (9 of 9 and 4 of 4 complete) at unchanged speed, with row 19 holding 459.2 ms/step |
 | 5b | The no-panic contract | **PASS** | 21 governed model runs + 8 synthetic rungs + 24 further guarded runs tonight: **no panic, no wedge, no jetsam**; 1.5×-physical loads refuse cleanly 3/3; rows 8/9/10/15 complete |
 | 6 | Plugin contract suites | **PASS** | `execute_test` **549 ok**, `ingest_test` 13 checks / 0 failed, `decline_census` 35/35, coexist all four carrier cases, `bazel test` uncached PASSED |
 | 7 | Wheels, both variants | **PASS** | `twine check` ×2; native wheel's dylib **hash-identical to the gated binary**; fresh 3.12/3.13/3.14 installs of both; **nothing uploaded** |
@@ -586,23 +627,41 @@ public PyPI and the git push are Oleg's.
 | model rows, biggest movers | row 1 **237.3** ms/tok (−21 % vs 0.11.4's 301.6) · row 14 **32.0** (−8.6 %) · row 19 **456.1** (−2.9 %) · row 8 **29.6** and row 10 **1865**, first ever | gate 5 |
 | the no-panic contract | **holds** on every row tested, including 9/10/15 | gate 5b |
 
-## The regression, stated per release rule 2
+## The regression, stated per release rule 2 — and RESOLVED
 
-**P27's flush watermark costs the two maxtext decode rows 17 GB and 11 GB of
-peak footprint, buys them nothing, and guard-kills them at the budgets every
-previous campaign used.**
+**As gated, P27's flush watermark cost the two maxtext decode rows 17 GB and
+11 GB of peak footprint, bought them nothing, and guard-killed them at the
+budgets every previous campaign used.**
 
-| row | shipped defaults | with P25 semantics (`METALJAX_FLUSH_CLEAR_MB=2048 METALJAX_FLUSH_FOOTPRINT_MB=0`) |
+| row | shipped defaults, as gated | with P25 semantics (`METALJAX_FLUSH_CLEAR_MB=2048 METALJAX_FLUSH_FOOTPRINT_MB=0`) |
 |---|---|---|
 | 11 Qwen3-0.6B maxtext decode | **25 GB** peak, 16.92 ms/tok — guard-killed at its historical 20 GB budget | **7.6 GB** peak, 16.85 ms/tok |
 | 14 maxtext qwix-int8 0.6B | **26 GB** peak, 32.00 ms/tok — guard-killed at its historical 25 GB budget | **15 GB** peak, 32.14 ms/tok |
 
-It is **pre-existing in the 0.11.5 tree** (P27 landed in `00fba0f`, before the
+It was **pre-existing in the 0.11.5 tree** (P27 landed in `00fba0f`, before the
 version bump), **not the governor** (row 11 dies at 20 GB with
 `METALJAX_MEM_GOVERNOR=0` too), **opt-out with one variable**, and **new
 information**: P27's battery measured rows 19/18/13/2 and never these two.
-No Oleg-quoted acceptance exists for it, because it has never been put to him —
-this document is the first place it is measured.
+
+**RESOLVED the same evening, by Oleg's option (b) — a benefit gate on the
+watermark** (P28, `notes/cpp-p28-benefit-gate.md`, and gate 5's
+"RESOLVED 2026-08-17" section above). The rows' own flight logs name the
+counter that separates them — the LIVE SET, not the flush count, which says
+"eager main" for all three — and `flush_bound` gained a third rule bounding a
+program's pool by the live set it has demonstrated it CYCLES
+(`METALJAX_FLUSH_EARN_MULT`, default 2, `0` = P27 exactly). It enters as one
+more `min`, so no bound it decides is above P27's or below P25's floor.
+
+| row | budget | as gated | **with the benefit gate** |
+|---|---:|---|---|
+| 11 | **20 GB**, its historical | **0 of 6 complete** | **9 of 9 complete**, 16.61–16.83 ms/tok |
+| 14 | **25 GB**, its historical | guard kill | **4 of 4 complete**, 31.82–32.13 ms/tok |
+| 19 | 48 GB | 456.1 ms/step | **459.2 ms/step** (458.4 / 462.5), `loss` ≡ P27 to 13 digits |
+
+Neither decode row loses speed, which was the finding all along: they were
+paying footprint for a pool they never read. **The published memory
+characteristics of rows 11/14 return to their pre-P27 class**, and the cells in
+`benchmarks/models.md` are the P28 runs at the historical budgets.
 
 A **soft second** is recorded rather than escalated: rows 2 and 6 read 1.5–2.0 %
 above their cells (94.3 vs 92.9; 55.8 vs 54.7) with identical tokens and
@@ -674,13 +733,15 @@ your machine.**
   29.6 ms/tok**, **R1-Distill-32B 210.7**, **DeepSeek-V2-Lite completes**, and a
   93.4 GB Mixtral checkpoint streams end to end.
 * **The eager flush stops dumping MLX's buffer pool.** It now trims to a
-  watermark (P25) and the watermark itself is decided per flush from the
-  program's own memory pressure (P27). Worth **1.85×** on the maxtext training
-  row (868 → 456 ms/step measured at the canonical sequence length) and ~2 % on
-  the `big` half of the texmo suite. **Known cost**: on the two maxtext *decode*
-  rows the pool now claims up to 25 GB where it used to hold 8, for no speed
-  gain — `METALJAX_FLUSH_CLEAR_MB=2048 METALJAX_FLUSH_FOOTPRINT_MB=0` restores
-  the old behaviour exactly.
+  watermark (P25), the watermark is decided per flush from the program's own
+  memory pressure (P27), and a program only gets one at all if its own live set
+  shows it is CYCLING memory rather than storing it (P28). Worth **1.85×** on
+  the maxtext training row (868 → 456 ms/step measured at the canonical
+  sequence length) and ~2 % on the `big` half of the texmo suite, with no
+  footprint cost anywhere: the two maxtext *decode* rows, whose checkpoint load
+  briefly frees 14 GB into the pool and never reads it again, keep their
+  historical peaks. `METALJAX_FLUSH_EARN_MULT=0` restores P27's behaviour and
+  `METALJAX_FLUSH_CLEAR_MB=2048 METALJAX_FLUSH_FOOTPRINT_MB=0` P25's.
 * **Faster where it matters**: gemma4-31B decode **301.6 → 237.3 ms/tok** (the
   fused-attention recognizer now sees into `func.call` callees, so the decode
   body compiles), maxtext int8 0.6B **35.0 → 32.0**, E2B keras-int4 **80.3 →
@@ -708,6 +769,11 @@ your machine.**
 | texmo aggregates | `notes/data/release-0.11.5-texmo.json`, `release-0.11.5-{suite106,topconfs}.csv` |
 
 ## Recommendation
+
+**GO.** *(Updated 2026-08-17 evening: the decision below was taken — Oleg's
+option (b) — and the regression is resolved rather than accepted. See the
+RESOLVED sections above and `notes/cpp-p28-benefit-gate.md`; the paragraph is
+kept as the record of what was decided and why.)*
 
 **GO — with one decision to make first.** Every gate passes on the tree at
 `6500370` with the binary that would ship: the pinned jax suite reproduces its

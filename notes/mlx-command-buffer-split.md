@@ -1,5 +1,21 @@
 # MLX corrupts compiled graphs split across Metal command buffers (2026-08)
 
+> **ROOT CAUSE FOUND, 2026-08-17 — see `notes/mlx-patch-diagnosis.md`.** It is
+> one line: `compute_dynamic_offset` (`mlx/backend/metal/slicing.cpp:62` in
+> v0.32.0) registers an array that aliases the caller's index buffer as a
+> command-encoder temporary, and `CommandEncoder::end_encoding()` erases
+> temporaries from the cross-encoder fence bookkeeping — so the wait on the
+> index's producer is dropped and a dynamic slice runs at a stale offset.
+> Every face below is that defect: the compiled byte-budget face (KV-cache
+> writes) and the eager kernel-budget face (the init scan's per-layer parameter
+> writes) are both `dynamic_update_slice`. Patched, all the budget tables here
+> collapse: the 8B canary returns identical values at 40, 512 and 2048 MB, and
+> the two canaries in `tests/test_command_buffer.py` can no longer find a
+> corrupting budget. Upstream fixed it in `7e8b4ccc` (PR #4099), which is in no
+> release; `mlx-src/` carries it on `fix/command-buffer-split`. **The budget
+> pins in `src/metaljax/__init__.py` remain the shipped workaround until the
+> vendored build lands (`notes/mlx-vendoring-plan.md`).**
+
 ## Symptom
 
 maxtext Qwen3-0.6B decode on metal with bf16 weights emitted garbage tokens,

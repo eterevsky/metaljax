@@ -2,6 +2,8 @@
 /jax/
 /llvm-project/
 /xla/
+# our MLX fork checkout (vendoring work; branches live here, never pushed by agents)
+/mlx-src/
 /mlx-src/
 
 .venv/

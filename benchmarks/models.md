@@ -24,15 +24,15 @@ notes/data/. Append a column per release / major optimization.*
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | **29.6** ᴳ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | **210.7** ᴳ |
 | 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | **1865** ᴳ (88 GB) |
-| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | **16.92** ᶠ (25 GB) |
+| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | **16.81** ᶠ (13 GB) |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ download ᴳ (93.4 GB streams) |
 | 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | **79.0** |
-| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | **32.0** ᶠ (26 GB) |
+| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | **31.95** ᶠ (9.2 GB) |
 | 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | ✗ **WRONG OUTPUT** ᴳ ʷ (runs at 369.7) |
 | 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | **88.4** |
 | 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | **1259.9 / 5707.9** |
 | 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | **359.2** ᴳ |
-| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | **456.1** |
+| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | **459.2** ᶠ (25 GB) |
 | 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ declined ᴳ |
 
 Notes:
@@ -147,15 +147,32 @@ Notes:
   (CLAUDE.md item 12), not a governor cost. The cell is the bracketed value;
   the spread (21.9–24.2) is recorded in the gate document.
 
-- ᶠ **Rows 11 and 14 needed a RAISED GUARD BUDGET, and that is a finding.**
-  Both guard-killed at the budgets every previous campaign used (22 > 20 GB,
-  26 > 25 GB). One variable identifies it — not the governor (row 11 dies at
-  20 GB with `METALJAX_MEM_GOVERNOR=0` too) but **P27's flush watermark**: with
-  P25 semantics (`METALJAX_FLUSH_CLEAR_MB=2048 METALJAX_FLUSH_FOOTPRINT_MB=0`)
-  row 11 peaks at **7.6 GB instead of 25** and row 14 at **15 instead of 26**,
-  at the same speed (16.85 vs 16.92 · 32.14 vs 32.00 ms/tok). The cells above
-  are the shipped-default runs at raised budgets; the pool is dead memory
-  bought for nothing on these two rows.
+- ᶠ **Rows 11, 14 and 19 are the P28 re-measure, at the HISTORICAL budgets.**
+  The release gate found both decode rows guard-killing at the budgets every
+  previous campaign used (22 > 20 GB, 26 > 25 GB) and attributed it, one
+  variable at a time, to **P27's flush watermark** rather than the governor —
+  their checkpoint load takes 134 hard flushes in one call, so P27 reads it as
+  an eager main and lets the 14 GB it frees at its last flush stand in the
+  pool for the rest of the process. **P28's benefit gate**
+  (`METALJAX_FLUSH_EARN_MULT`, default 2, `notes/cpp-p28-benefit-gate.md`)
+  bounds a program's pool by the live set it has demonstrated it CYCLES: that
+  load earns 3.6 GB, the decode step earns the floor, and row 19's training
+  step — which genuinely swings 13.6 GB a flush — keeps everything P27 gave
+  it. All three cells above are **shipped defaults at the rows' own historical
+  budgets** (20 / 25 / 48 GB), medians of three or more guarded runs:
+
+  | row | budget | P27 (0.11.5 as gated) | **P28** | P25 semantics (the control) |
+  |---|---:|---|---|---|
+  | 11 | 20 GB | **0 of 6 complete**, 21–25 GB | **9 of 9**, 16.61–16.83 ms/tok, 9.6–19 GB | 9 of 9, 16.52–17.07, 7.6–17 GB |
+  | 14 | 25 GB | guard kill at 26 GB | **4 of 4**, 31.82–32.13 ms/tok, 9.1–17 GB | completes, 32.14, 7.7–15 GB |
+  | 19 | 48 GB | 456.1 ms/step, 25 GB | **459.2 / 458.4 / 462.5**, 25 GB | 811–834 ms/step |
+
+  Row 11's peak is a sub-second LIVE transient in the orbax restore (~17 GB
+  under *every* policy, P25 included) with whatever the pool holds standing
+  beside it, and `mem_guard.sh` samples at 2 Hz — so single peak readings
+  scatter and the completion counts, not the peaks, are the statement. Row
+  19's `loss` / `loss_first` are identical to P27's to thirteen digits in all
+  three runs.
 
 - ʷ **Row 15 is a WRONG-OUTPUT row, not a timing row.** Its memory blocker is
   gone (it completes, 79 GB peak, 0 governor refusals) and it decodes at

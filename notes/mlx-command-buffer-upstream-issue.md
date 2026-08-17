@@ -1,5 +1,25 @@
 # Draft: MLX upstream issue (ml-explore/mlx)
 
+> **SUPERSEDED, 2026-08-17 — DO NOT FILE AS WRITTEN.** This draft describes the
+> bug as an unexplained sensitivity to `MLX_MAX_*_PER_BUFFER`. The root cause
+> has since been found in MLX's source and fixed:
+> `compute_dynamic_offset` (`mlx/backend/metal/slicing.cpp:62`, v0.32.0)
+> registers an array that ALIASES the caller's index buffer as a command-encoder
+> temporary, and `CommandEncoder::end_encoding()` erases temporaries from the
+> cross-encoder fence bookkeeping — so the wait on the index's producer is
+> dropped and a dynamic slice can run at a stale offset. Upstream already fixed
+> it in `7e8b4ccc` (PR #4099, 2026-08-10), which is **not in any release**.
+>
+> What to send upstream instead: `notes/patches/fix-command-buffer-split-pr.md`
+> (a comment on #4099 asking for a release, with the 20-line pure-MLX
+> reproducer `notes/data/mlx-cbuf-repro/repro_c.py`) and, if wanted, the
+> hardening PR `notes/patches/fix-temporary-fence-tracking-pr.md`. Evidence and
+> mechanism: `notes/mlx-patch-diagnosis.md`.
+>
+> Everything below is kept as the record of what was known before the source
+> build; its *observations* are all still correct, and §"Observations that may
+> help localize it" is explained item by item in the diagnosis note.
+
 *Draft only — for Oleg to review and file. Everything below the rule is the
 issue body as it should be pasted; this preamble is not part of it.*
 

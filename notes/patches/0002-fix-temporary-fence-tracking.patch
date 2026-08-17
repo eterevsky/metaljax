@@ -1,0 +1,82 @@
+From 72729f3ef6aa73dde2e2c36664e78d6148826239 Mon Sep 17 00:00:00 2001
+From: Oleg Eterevsky <oleg@eterevsky.com>
+Date: Mon, 17 Aug 2026 22:35:48 +0200
+Subject: [PATCH] metal: keep temporaries in the fence bookkeeping when a
+ previous encoder wrote their buffer
+
+CommandEncoder::end_encoding() erases every temporary's buffer from
+all_inputs_/all_outputs_ before it emits the cross-command-encoder fence
+waits, on the grounds that temporaries do not cross encoder boundaries.
+That holds for the temporary ARRAY but not for its BUFFER:
+
+* eval_gpu helpers alias a caller's buffer into a temporary --
+  compute_dynamic_offset does exactly this (offset.copy_shared_buffer(
+  indices)) and then registers the alias as a temporary, and
+* MetalAllocator recycles freed buffers immediately, with no regard for
+  command buffers still in flight.
+
+In both cases the buffer may be one a previous command encoder wrote, and
+the wait this function emits is the only thing ordering the two -- Metal
+buffers are allocated hazard-tracking-untracked and the command buffers are
+created with unretained references, so nothing else will. Erasing the entry
+silently drops the dependency and the kernel reads stale data.
+
+Keep the entry when prev_ce_outputs_ knows the buffer; erase it otherwise, so
+the map stays small for genuinely fresh temporaries.
+
+Measured on an M5 Max (macOS 26.5, Metal 4): a 36-layer Qwen3-8B prefill
+graph returned a different answer on most evaluations and lost 5 of 15
+outputs entirely; with this patch it returns the same values at 40, 512 and
+2048 MB per command buffer.
+---
+ mlx/backend/metal/device.cpp | 25 ++++++++++++++++++-------
+ 1 file changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 29eecf55..479cd109 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -434,22 +434,33 @@ void CommandEncoder::end_encoding() {
+   //   from the map to limit the growth of the map and avoid unnecessary waits
+   // - Temporaries are a special case as they do not cross command encoder
+   //   boundaries. These can be removed early from the encoders inputs and
+-  //   outputs since they don't need synchronization.
++  //   outputs since they don't need synchronization -- unless a previous
++  //   command encoder wrote the temporary's buffer, see below.
+   if (!encoder_) {
+     return;
+   }
+ 
+-  // Remove temporaries from inputs and outputs.
+-  for (auto& t : temporaries_) {
+-    all_outputs_.erase(t.buffer().ptr());
+-    all_inputs_.erase(t.buffer().ptr());
+-  }
+-
+   // Keep references to the fences we waited on and put them in the completion
+   // handler so they are not prematurely released.
+   std::unordered_set<NS::SharedPtr<MTL::Fence>> waiting_on;
+   {
+     std::lock_guard lk(outputs_mtx_);
++    // Remove temporaries from inputs and outputs.
++    //
++    // A temporary ARRAY does not cross command encoder boundaries, but its
++    // BUFFER can: eval_gpu helpers alias a caller's buffer into a temporary
++    // (`copy_shared_buffer`), and the allocator recycles freed buffers with
++    // no regard for command buffers still in flight. When a previous encoder
++    // wrote that buffer, the wait below is the only thing ordering the two,
++    // so the temporary has to keep its place in the bookkeeping.
++    for (auto& t : temporaries_) {
++      auto ptr = t.buffer().ptr();
++      if (prev_ce_outputs_.find(ptr) != prev_ce_outputs_.end()) {
++        continue;
++      }
++      all_outputs_.erase(ptr);
++      all_inputs_.erase(ptr);
++    }
+     for (auto& in : all_inputs_) {
+       if (auto it = prev_ce_outputs_.find(in); it != prev_ce_outputs_.end()) {
+         // If we've already waited on a fence, don't wait on it again.
+-- 
+2.50.1 (Apple Git-155)
+

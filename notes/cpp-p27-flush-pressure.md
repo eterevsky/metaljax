@@ -1,5 +1,22 @@
 # P27: the flush watermark is not one number (2026-08-16)
 
+> **SUPERSEDED IN PART by P28 (`notes/cpp-p28-benefit-gate.md`, 2026-08-17).**
+> The two rules below are intact and still ship; a THIRD joined them, because
+> they turned out to grant a big pool to programs that do nothing with one.
+> The 0.11.5 release gate measured the consequence on the two rows this
+> battery never ran — the maxtext DECODE rows 11 and 14 — and scored gate 5
+> as REGRESSION over it: their checkpoint load is one program taking 134 hard
+> flushes in a single call, so it is an "eager main" by rule 1 and has
+> footprint to spare by rule 2, and the 14 GB of weights it frees at its last
+> flush then stand in the pool for the rest of the process. 17 GB and 11 GB
+> of peak footprint for no speed, and a guard kill at budgets those rows had
+> never come near. **Rule 3 (`METALJAX_FLUSH_EARN_MULT`, default 2) bounds a
+> program's pool by the live set it has demonstrated it cycles**; it enters
+> as one more `min`, so every number in this document that rule 3 does not
+> lower still stands, and the row-19 and row-18 results below were both
+> re-measured under it. Read this document for what rules 1 and 2 are and why;
+> read P28 for what a program has to show before it is given a pool at all.
+
 *P25 shipped the eager flush's pool TRIM and measured what the watermark
 itself is worth, leaving Oleg a table with no good row in it: the maxtext
 training row (STATUS 19) reaches its 0.11.3 anchor only at a 32 GB watermark,
@@ -250,6 +267,13 @@ that could let a count run away. Probe: the 106-config gate under
   claim 48 GB. Under the machine-lock discipline that does not arise, and the
   guard budgets have the same property, but a user running two trainings at
   once has 96 GB of permission on a 128 GB machine.
+* **Neither rule asks whether the pool is being USED, and that is the hole
+  P28 closes.** Both are permissions — "has this program flushed enough to be
+  a main" and "does the process have footprint to spare" — and a checkpoint
+  load that sweeps 134 flushes through one call satisfies both while cycling
+  ~3 GB. The gap was invisible here because this battery measured rows
+  19/18/13/2 and the rows it cost are 11 and 14. See
+  `notes/cpp-p28-benefit-gate.md`.
 * **Two suite rows move more than the aggregate, and the suite-context trap
   applies to both directions.** `mid11-b64l128` reads 1.125 and
   `big14-b32l128` 0.902 against the same-hold control INSIDE the sweep;

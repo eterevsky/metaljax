@@ -219,13 +219,27 @@ int64_t phys_footprint() {
 //     the pool is taken -- whatever it churns BETWEEN two flushes is served
 //     from the pool with no trim in the way. So:
 //
-//         earned = flush_earn_mult * (live_hi - live_lo)
+//         earned = min(flush_earn_mult * (live_hi - live_lo), live_hi)
 //
 //     over the program's own flushes. The multiplier is 2 because a flush
 //     point lands at an arbitrary phase of the program's cycle and the swing
 //     seen between two of them is a lower bound on it: measured, the training
-//     row's pool peaks at 1.58 swings, and 2 covers that with margin while
-//     still leaving the rows that must not have a pool at 2.4-7.1 GB.
+//     row's pool peaks at 1.58 swings.
+//
+//     The high-water clamp is the half that measurement added, and the row
+//     that earned it is row 11. Twice the swing is still too generous for a
+//     checkpoint load, which cycles ~2.8 GB of staging buffers through a
+//     3.1 GB live set and was handed a 7.1 GB pool for it. That row's peak is
+//     not the pool at all -- its restore crest is a LIVE transient of ~17 GB,
+//     present under every policy including P25's -- but whatever the pool
+//     holds stands beside that crest, and 7.1 GB of it put the guard at 22 GB
+//     against a 20 GB budget on one run in three (2.0 GB under P25: 9/16/17
+//     GB over three runs, no kill). A pool larger than the program's own
+//     high-water cannot be one it is cycling: at that high-water it held that
+//     much and no more, so anything past it was never in flight at once. The
+//     training row loses nothing to the clamp -- its high-water is 20.5 GB
+//     against a pool that peaks at 18.8 -- and the two loads fall to
+//     3.1-3.6 GB, the P25-class crest their budgets were written for.
 //
 // The floor -- P25's shipped 2048 MB -- is the no-regression anchor: it is
 // what every program got before, so no program can be trimmed HARDER than it
@@ -259,7 +273,8 @@ int64_t flush_bound(int64_t cache_now, const FlushState& st) {
     bound = std::min(bound, g_cfg.flush_footprint_bytes - live);
   }
   if (g_cfg.flush_earn_mult > 0)                             // rule 3
-    bound = std::min(bound, g_cfg.flush_earn_mult * st.swing());
+    bound = std::min(bound, std::min(g_cfg.flush_earn_mult * st.swing(),
+                                     st.peak_live()));
   return std::min(cap, std::max(floor, bound));
 }
 

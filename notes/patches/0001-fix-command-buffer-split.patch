@@ -1,0 +1,66 @@
+From 36a9cf468d25225684c6dbf69beba9630c940fc2 Mon Sep 17 00:00:00 2001
+From: Michael Ellis <michaelellis003@gmail.com>
+Date: Mon, 10 Aug 2026 23:48:12 -0500
+Subject: [PATCH] Fix fence tracking for donated dynamic slice offsets (#4099)
+
+Co-authored-by: Michael Ellis <michael@likelilab.com>
+Co-authored-by: Cheng <git@zcbenz.com>
+---
+ mlx/backend/metal/slicing.cpp |  2 +-
+ tests/gpu_tests.cpp           | 26 ++++++++++++++++++++++++++
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/mlx/backend/metal/slicing.cpp b/mlx/backend/metal/slicing.cpp
+index e92aef43..f6ff41ab 100644
+--- a/mlx/backend/metal/slicing.cpp
++++ b/mlx/backend/metal/slicing.cpp
+@@ -58,8 +58,8 @@ array compute_dynamic_offset(
+     offset.copy_shared_buffer(indices);
+   } else {
+     offset.set_data(allocator::malloc(offset.itemsize()));
++    compute_encoder.add_temporary(offset);
+   }
+-  compute_encoder.add_temporary(offset);
+ 
+   auto dtype = indices.dtype();
+   std::string lib_name = "compute_dynamic_offset_" + type_to_name(dtype);
+diff --git a/tests/gpu_tests.cpp b/tests/gpu_tests.cpp
+index d920da49..8bef07a6 100644
+--- a/tests/gpu_tests.cpp
++++ b/tests/gpu_tests.cpp
+@@ -480,6 +480,32 @@ TEST_CASE("test gpu validation") {
+   eval(scatter_max(array(1), {}, array(2), std::vector<int>{}));
+ }
+ 
++TEST_CASE("test dynamic slice update waits for its start") {
++  // Regression for #3880: a donated array-valued start could be read
++  // stale when a command-buffer boundary lands between its producer
++  // and the dynamic slice. The boundary occurs when the buffer's op
++  // or memory limits split the graph (or with MLX_MAX_OPS_PER_BUFFER
++  // set low); without a split the checks still assert the correct
++  // update position.
++  auto source = ones({2, 1 << 26}, int32);
++  auto target = zeros({4, 4}, int32);
++  auto update = full({1, 1}, 7, int32);
++  eval(source, target, update);
++
++  {
++    auto recycled = zeros({2}, int32);
++    eval(recycled);
++  }
++
++  auto out = [&] {
++    auto start = max(source, 1, false);
++    return slice_update(target, update, start, {0, 1});
++  }();
++
++  CHECK_EQ(slice(out, {1, 1}, {2, 2}).item<int>(), 7);
++  CHECK_EQ(slice(out, {0, 0}, {1, 1}).item<int>(), 0);
++}
++
+ TEST_CASE("test gpu int32 shape overflow errors") {
+   // (2^30, 2).flatten() — product 2^31 doesn't fit in ShapeElem.
+   // Issue #2681 reported wrapped shape (-2147483648,) and a
+-- 
+2.50.1 (Apple Git-155)
+

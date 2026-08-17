@@ -1,0 +1,257 @@
+From bce692e46190f3fb29b240185d990921439c2b3d Mon Sep 17 00:00:00 2001
+From: Oleg Eterevsky <oleg@eterevsky.com>
+Date: Mon, 17 Aug 2026 22:03:13 +0200
+Subject: [PATCH 1/2] diag: report cross-encoder fence waits dropped by the
+ temporaries erase
+
+Diagnostic scaffolding only, off by default:
+
+* MLX_SPLIT_DEBUG=1 prints one line per command encoder boundary with the
+  fence bookkeeping it performed (ops, MB, inputs, outputs, temporaries,
+  waits) plus the number of waits the temporaries erase dropped and the
+  number of write-after-read hazards across encoders.  =2 prints one line
+  per dropped wait.
+* MLX_SPLIT_FIX=1 keeps a temporary in the bookkeeping when a previous
+  command encoder wrote its buffer, so one binary can A/B the fix.
+
+Not for upstream; the shipped fix is unconditional.
+---
+ mlx/backend/metal/device.cpp | 108 +++++++++++++++++++++++++++++++++--
+ mlx/backend/metal/device.h   |   4 ++
+ 2 files changed, 107 insertions(+), 5 deletions(-)
+
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 29eecf55..dc8c1aa1 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -303,6 +303,24 @@ MTL::Library* load_library(
+ 
+ } // namespace
+ 
++// DIAGNOSTIC ONLY: set MLX_SPLIT_DEBUG=1 to print one line per command
++// encoder boundary with the fence bookkeeping it performed and the waits it
++// dropped (=2 also prints one line per dropped wait).  Off by default, read
++// once.
++static int split_debug() {
++  static int level = env::get_var("MLX_SPLIT_DEBUG", 0);
++  return level;
++}
++
++// DIAGNOSTIC ONLY: MLX_SPLIT_FIX=1 keeps temporaries whose buffer a previous
++// command encoder wrote in the fence bookkeeping, so end_encoding() still
++// waits on the producer's fence.  This exists so one binary can A/B the fix;
++// the shipped fix is unconditional.
++static bool split_fix() {
++  static bool enabled = env::get_var("MLX_SPLIT_FIX", 0) != 0;
++  return enabled;
++}
++
+ CommandEncoder::CommandEncoder(
+     Device& d,
+     int index,
+@@ -439,17 +457,35 @@ void CommandEncoder::end_encoding() {
+     return;
+   }
+ 
+-  // Remove temporaries from inputs and outputs.
+-  for (auto& t : temporaries_) {
+-    all_outputs_.erase(t.buffer().ptr());
+-    all_inputs_.erase(t.buffer().ptr());
+-  }
++  const int diag = split_debug();
++  const bool fix = split_fix();
++  size_t diag_n_inputs = all_inputs_.size();
++  size_t diag_n_outputs = all_outputs_.size();
+ 
+   // Keep references to the fences we waited on and put them in the completion
+   // handler so they are not prematurely released.
+   std::unordered_set<NS::SharedPtr<MTL::Fence>> waiting_on;
++  size_t diag_dropped_raw = 0;
++  size_t diag_war = 0;
++  size_t diag_kept = 0;
+   {
+     std::lock_guard lk(outputs_mtx_);
++    // Remove temporaries from inputs and outputs.  With MLX_SPLIT_FIX=1 a
++    // temporary whose buffer a previous command encoder wrote is KEPT, so the
++    // wait below still orders this encoder after that producer.
++    std::vector<const void*> diag_temp_ptrs;
++    for (auto& t : temporaries_) {
++      auto ptr = t.buffer().ptr();
++      if (diag && ptr != nullptr) {
++        diag_temp_ptrs.push_back(ptr);
++      }
++      if (fix && prev_ce_outputs_.find(ptr) != prev_ce_outputs_.end()) {
++        diag_kept++;
++        continue;
++      }
++      all_outputs_.erase(ptr);
++      all_inputs_.erase(ptr);
++    }
+     for (auto& in : all_inputs_) {
+       if (auto it = prev_ce_outputs_.find(in); it != prev_ce_outputs_.end()) {
+         // If we've already waited on a fence, don't wait on it again.
+@@ -459,15 +495,68 @@ void CommandEncoder::end_encoding() {
+         }
+       }
+     }
++    if (diag) {
++      // A temporary whose buffer a previous (possibly in-flight) command
++      // encoder wrote needs the same fence wait every other input gets; the
++      // erase above dropped it.  Count only the ones not covered by another
++      // input's wait on the same fence.
++      for (auto& p : diag_temp_ptrs) {
++        if (auto it = prev_ce_outputs_.find(p); it != prev_ce_outputs_.end()) {
++          if (waiting_on.find(it->second) == waiting_on.end()) {
++            diag_dropped_raw++;
++            if (diag > 1) {
++              fprintf(
++                  stderr,
++                  "[mlx-split]   DROP enc=%d temp_buf=%p producer_fence=%p\n",
++                  encoder_seq_,
++                  p,
++                  (void*)it->second.get());
++            }
++          }
++        }
++      }
++      // Write-after-read across encoders: this encoder writes a buffer a
++      // previous encoder read and never wrote (so no fence covers it).
++      for (auto& out : all_outputs_) {
++        if (prev_ce_outputs_.find(out) == prev_ce_outputs_.end() &&
++            prev_ce_inputs_.find(out) != prev_ce_inputs_.end()) {
++          diag_war++;
++        }
++      }
++      for (auto& in : all_inputs_) {
++        prev_ce_inputs_[in] = fence_;
++      }
++    }
+     for (auto& out : all_outputs_) {
+       prev_ce_outputs_[out] = fence_;
+     }
+   }
+ 
++  if (diag) {
++    fprintf(
++        stderr,
++        "[mlx-split] enc=%d ops=%d mb=%zu in=%zu out=%zu temps=%zu "
++        "waits=%zu dropped_temp_waits=%zu kept=%zu war=%zu\n",
++        encoder_seq_++,
++        buffer_ops_,
++        buffer_sizes_ >> 20,
++        diag_n_inputs,
++        diag_n_outputs,
++        temporaries_.size(),
++        waiting_on.size(),
++        diag_dropped_raw,
++        diag_kept,
++        diag_war);
++  }
++
+   encoder_->updateFence(fence_.get());
+   buffer_->addCompletedHandler([this,
++                                diag,
+                                 fence = std::move(fence_),
+                                 temporaries = std::move(temporaries_),
++                                all_inputs = (diag ? all_inputs_
++                                                   : std::unordered_set<
++                                                         const void*>{}),
+                                 all_outputs = std::move(all_outputs_),
+                                 waiting_on = std::move(waiting_on)](
+                                    MTL::CommandBuffer*) mutable {
+@@ -479,6 +568,15 @@ void CommandEncoder::end_encoding() {
+         }
+       }
+     }
++    if (diag) {
++      for (auto& i : all_inputs) {
++        if (auto it = prev_ce_inputs_.find(i); it != prev_ce_inputs_.end()) {
++          if (it->second == fence) {
++            prev_ce_inputs_.erase(it);
++          }
++        }
++      }
++    }
+   });
+ 
+   encoder_->endEncoding();
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index 871e95cc..b13f7499 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -139,6 +139,10 @@ class MLX_API CommandEncoder {
+ 
+   // A map of prior command encoder outputs to their corresponding fence.
+   std::unordered_map<const void*, NS::SharedPtr<MTL::Fence>> prev_ce_outputs_;
++  // DIAGNOSTIC ONLY (MLX_SPLIT_DEBUG): a map of prior command encoder *inputs*
++  // to their fence, used to report write-after-read hazards across encoders.
++  std::unordered_map<const void*, NS::SharedPtr<MTL::Fence>> prev_ce_inputs_;
++  int encoder_seq_{0};
+   std::mutex outputs_mtx_;
+ };
+ 
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 87c8ea34db0f848853284e273530799eea5720f1 Mon Sep 17 00:00:00 2001
+From: Oleg Eterevsky <oleg@eterevsky.com>
+Date: Mon, 17 Aug 2026 22:25:33 +0200
+Subject: [PATCH 2/2] diag: trace primitive names at MLX_SPLIT_DEBUG>=3
+
+Lets a canary log say which primitive owns the temporary whose fence wait
+end_encoding() dropped.
+---
+ mlx/backend/metal/device.cpp | 2 +-
+ mlx/backend/metal/device.h   | 3 +++
+ mlx/backend/metal/eval.cpp   | 7 +++++++
+ 3 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index dc8c1aa1..c48c4ca1 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -307,7 +307,7 @@ MTL::Library* load_library(
+ // encoder boundary with the fence bookkeeping it performed and the waits it
+ // dropped (=2 also prints one line per dropped wait).  Off by default, read
+ // once.
+-static int split_debug() {
++int split_debug() {
+   static int level = env::get_var("MLX_SPLIT_DEBUG", 0);
+   return level;
+ }
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index b13f7499..326d7e78 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -250,6 +250,9 @@ class MLX_API Device {
+   int max_mb_per_buffer_;
+ };
+ 
++// DIAGNOSTIC ONLY (MLX_SPLIT_DEBUG level).
++int split_debug();
++
+ MLX_API Device& device(mlx::core::Device);
+ MLX_API CommandEncoder& get_command_encoder(Stream s);
+ 
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+index e6826253..4dad44ed 100644
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -42,6 +42,13 @@ void eval(array& arr) {
+     }
+ 
+     debug_set_primitive_buffer_label(command_buffer, arr.primitive());
++    if (metal::split_debug() > 2) {
++      fprintf(
++          stderr,
++          "[mlx-split]   prim=%s size=%zu\n",
++          arr.primitive().name(),
++          static_cast<size_t>(arr.size()));
++    }
+     arr.primitive().eval_gpu(arr.inputs(), outputs);
+   }
+   std::unordered_set<std::shared_ptr<array::Data>> buffers;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -104,7 +104,9 @@ void eager_flush(const std::vector<std::optional<mx::array>>& env,
     // All appended AFTER `bound=`, which the execute_test contracts parse.
     const int64_t foot = phys_footprint();
     const int64_t earn =
-        g_cfg.flush_earn_mult > 0 ? g_cfg.flush_earn_mult * st.swing() : -1;
+        g_cfg.flush_earn_mult > 0
+            ? std::min(g_cfg.flush_earn_mult * st.swing(), st.peak_live())
+            : -1;
     debug_line("[metaljax-mem] flush #" + std::to_string(g_stats.flushes) +
                ": active=" + std::to_string(mx::get_active_memory() >> 20) +
                "MB cache=" + std::to_string(mx::get_cache_memory() >> 20) +

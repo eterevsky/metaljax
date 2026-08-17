@@ -312,6 +312,9 @@ struct FlushState {
   int64_t swing() const {
     return (live_hi < 0 || live_lo < 0) ? 0 : live_hi - live_lo;
   }
+  // ...and the most it has ever held at once, which is the other half of what
+  // it can be cycling. 0 until the first reading.
+  int64_t peak_live() const { return live_hi < 0 ? 0 : live_hi; }
 };
 
 // What a flush may leave cached: `cache_now` is the pool it found, `st` the
