@@ -44,6 +44,21 @@ what we plan to do. Roadmap history lives in CLAUDE.md.*
   notes/data/mlx-cbuf-repro/ (repro_a/b.py + .mlxfn, only mlx+numpy;
   corrupts at MLX's STOCK defaults). Issue draft ready for Oleg:
   notes/mlx-command-buffer-upstream-issue.md.
+  2026-08-17: FRESH WITNESS, and the canary was silently unrunnable —
+  scripts/run_stablehlo_bench.py never registered the chlo/sdy/mpmd
+  dialects, so notes/data/qwen3_8b_prefill_36layer.mlir died at PARSE
+  ("Dialect 'sdy' not found for custom op 'sdy.mesh'"); that, not a
+  decision, is why nobody re-ran it after 2026-08-03. Fixed. Re-run at
+  today's shipped 800/512 it STILL corrupts: FAIL(5), max_abs_err
+  1.085e+04, max_norm_err 1.000e+00 (total signal loss on 5 of 15
+  outputs), BIT-IDENTICAL on the native and the Stage 1 engine, two
+  passes. METALJAX_COMPILE=0 -> FAIL(3)/7.4e-02 (the eager
+  ops-alignment face). MLX_MAX_MB_PER_BUFFER=2048 -> FAIL(3)/4.1e-02:
+  removes the catastrophic face, does NOT make it pass — the raised
+  budget is not a fix and must not become a default. Add to the report:
+  row 15 is the whole-model face with a measured rate (2/10 collapses,
+  8/10 distinct answers from ten identical prefills in one process,
+  against a 0.6B control that is 10/10 identical).
 - ~~test_command_buffer canaries are stale~~ DONE 2026-08-04 (114b4d4):
   re-swept both axes on both assets and replaced the pinned comment
   values with SWEEP canaries — two tests that re-derive a corrupting
@@ -276,4 +291,4 @@ predicted peak memory, and only then retry the big model.
   (c) ThreeFry bits stay uint32 for signed result types in
   ops/rng.py (latent; differential pins both engines to it).
 
-- Row 15 (2026-08-17): 'known MLX-quantization bug' label WITHDRAWN (the 2026-08-03 diagnosis blamed the command-buffer split and exonerated the quantized dots). Fresh leading hypothesis H5: MLX_MAX_MB_PER_BUFFER counts ELEMENTS (~537M at '512'); row 15's untied logits_dense is 622M elements -> deterministic mid-matmul buffer split -> logit collapse (all-token-0 output). Row 14's tied embedding (155M) never crosses. Decisive 1-min probe: scripts/model_bench/row15_probe.py big (self-locking) -- run when the release-gate battery frees the lock. Full-row raised-budget arm still needs Oleg's sign-off; the standalone-replay probe does not.
+- Row 15 (2026-08-17): RESOLVED AS ATTRIBUTION, not as a fix. 'known MLX-quantization bug' label WITHDRAWN; H5 (622M-element logits_dense forcing a deterministic mid-matmul split) REFUTED by row15_probe.py big AND by the localization. Measured mechanism (notes/row15-wrong-output-2026-08-17.md §8, STATUS fn 34): NONDETERMINISTIC MLX command-buffer corruption at 8B traffic, on BOTH engines -- 10 prefills of the same loaded params in one process give 8 distinct first tokens + 2 collapses on native, 10 distinct on Stage 1, while row 14 gives the same token 10/10. Not our compile path (METALJAX_COMPILE=0 is WORSE), not the recognizer, not the chunked replay, not the int8 dots (bit-exact vs numpy at every row-14/row-15 width on both stacks). qwix is the AMPLIFIER: qarray.compute_scale_zero_point clamps a zero scale but not a NaN one, and calibration is a per-tensor absmax, so one bad element NaNs the whole tensor -> flat logits -> token 0. BLOCKED, needs Oleg's go (full 8B maxtext load above the 79 GB envelope = the 67-109 GB panic-#5 band): the 0.11.2-src provenance arm (guard-killed at 94 GB) and a jax-CPU reference (guard-killed twice; 34f627c's 'coherent' CPU cell has NO artifact behind it -- do not cite it as evidence). Driver for everything: scripts/model_bench/row15_ladder.sh.

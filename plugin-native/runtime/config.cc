@@ -175,14 +175,16 @@ std::vector<std::pair<std::string, int>> opcodes() {
 void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
                int64_t flush_clear_bytes, int64_t flush_footprint_bytes,
                int64_t flush_floor_bytes, int64_t flush_main_flushes,
-               int64_t loop_clear_cost, int64_t ingest_clear_bytes,
-               int64_t while_pipeline, bool debug, bool memdbg) {
+               int64_t flush_earn_mult, int64_t loop_clear_cost,
+               int64_t ingest_clear_bytes, int64_t while_pipeline, bool debug,
+               bool memdbg) {
   g_cfg.eager_flush_bytes = eager_flush_bytes;
   g_cfg.flush_sync_every = flush_sync_every;
   g_cfg.flush_clear_bytes = flush_clear_bytes;
   g_cfg.flush_footprint_bytes = flush_footprint_bytes;
   g_cfg.flush_floor_bytes = flush_floor_bytes;
   g_cfg.flush_main_flushes = flush_main_flushes;
+  g_cfg.flush_earn_mult = flush_earn_mult;
   g_cfg.loop_clear_cost = loop_clear_cost;
   g_cfg.ingest_clear_bytes = ingest_clear_bytes;
   g_cfg.while_pipeline = while_pipeline;
@@ -216,6 +218,16 @@ void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
   // whether the process has the FOOTPRINT to spare (`flush_footprint_bytes`)
   // -- with P25's shipped 2048 MB as the floor under both, which is why all
   // four numbers arrive here rather than one.
+  //
+  // ...AND NEITHER OF THOSE ASKS WHETHER THE POOL IS BEING USED (P28,
+  // notes/cpp-p28-benefit-gate.md). Both maxtext DECODE rows are past the
+  // gate (their checkpoint load is one program taking 134 flushes in a single
+  // call) and have footprint to spare (their live set is ~2 GB), so P27 hands
+  // them the whole cap -- and the 14 GB of weights their load frees at its
+  // last flush then stands in the pool for the rest of the process, 17 GB and
+  // 11 GB of peak footprint for no speed at all. `flush_earn_mult` is the
+  // third rule: a program may keep a multiple of the live-set SWING it has
+  // demonstrated, because that swing is the only thing a trim can cost it.
 }
 
 }  // namespace metaljax

@@ -163,10 +163,17 @@ def probe_qwix(args):
         return x + (y * hs * ws2).astype(jnp.bfloat16).astype(jnp.float32)
 
     def scanned(x, wi, wo):
+        # The scan emits its per-iteration output as `ys` so the SCAN arm can
+        # localize exactly like the unrolled one.  Without this the scan arm
+        # could only say "the end is wrong", which is the one thing the
+        # amplifier already guarantees (see the note's section 4b) -- and the
+        # scan arm is the interesting one, because the chunked replay only
+        # exists for scans.
         def body(carry, ws):
-            return layer(carry, ws[0], ws[1]), None
-        out, _ = jax.lax.scan(body, x, (wi, wo))
-        return out
+            out = layer(carry, ws[0], ws[1])
+            return out, out
+        _, ys = jax.lax.scan(body, x, (wi, wo))
+        return ys
 
     def unrolled(x, wi, wo):
         outs = []
@@ -176,17 +183,28 @@ def probe_qwix(args):
         return outs
 
     fj = jax.jit(scanned if args.structure == "scan" else unrolled)
+
+    def _layers(r):
+        """One host array per layer, whatever shape the arm returned."""
+        if isinstance(r, (list, tuple)):
+            return [np.asarray(v, dtype=np.float32) for v in r]
+        a = np.asarray(r, dtype=np.float32)
+        return list(a) if a.ndim == 3 else [a]   # scan `ys` stack -> per layer
+
     per = {}
-    for name, dev in (("cpu", cpu), ("metal", metal)):
+    # `--no-cpu` drops the reference arm: at 36 layers and 8B widths the weight
+    # set is 14.5 GB PER BACKEND, and the criterion that matters here is
+    # intrinsic anyway (a layer that has gone 100 % NaN needs no reference).
+    devs = [("metal", metal)] if args.no_cpu else [("cpu", cpu), ("metal", metal)]
+    for name, dev in devs:
         with jax.default_device(dev):
             r = fj(jnp.asarray(x0), jnp.asarray(w1), jnp.asarray(w2))
-        per[name] = ([np.asarray(v, dtype=np.float32) for v in r]
-                     if isinstance(r, (list, tuple))
-                     else [np.asarray(r, dtype=np.float32)])
+        per[name] = _layers(r)
         log(f"  {name}: done ({len(per[name])} checkpoint(s))")
 
     first_bad = None
-    for i, (g, c) in enumerate(zip(per["metal"], per["cpu"])):
+    ref = per.get("cpu") or per["metal"]
+    for i, (g, c) in enumerate(zip(per["metal"], ref)):
         denom = float(np.sqrt((c ** 2).mean())) or 1.0
         rec = {"probe": "qwix", "structure": args.structure,
                "widths": args.widths, "layer": i, "layers": layers,
@@ -197,11 +215,13 @@ def probe_qwix(args):
                "metal_zero_frac": float(np.count_nonzero(g == 0) / g.size),
                "cpu_zero_frac": float(np.count_nonzero(c == 0) / c.size),
                "metal_std": float(np.nan_to_num(g).std()),
-               "cpu_std": float(c.std())}
+               "cpu_std": float(c.std()),
+               "self_ref": bool(args.no_cpu)}
         # A COLLAPSE, not a tolerance: metal lost the signal the CPU kept, or
-        # produced values that are not numbers at all.
+        # produced values that are not numbers at all.  Under --no-cpu only
+        # the second clause is meaningful, and it is the one row 15 trips.
         rec["collapsed"] = bool(rec["metal_nonfinite"] or
-                                (rec["cpu_std"] > 0 and
+                                (not args.no_cpu and rec["cpu_std"] > 0 and
                                  rec["metal_std"] < 0.01 * rec["cpu_std"]))
         emit(rec)
         if (rec["collapsed"] or rec["rel_rms"] > 0.5) and first_bad is None:
@@ -289,6 +309,8 @@ def main():
     ap.add_argument("--structure", default="unroll", choices=["scan", "unroll"])
     ap.add_argument("--tokens", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-cpu", action="store_true",
+                    help="metal only; the collapse criterion is intrinsic")
     args = ap.parse_args()
     log(f"row15_probe {args.probe} widths={args.widths} "
         f"plugin={os.environ.get('METALJAX_PLUGIN_PATH', '(stage 1 default)')}")

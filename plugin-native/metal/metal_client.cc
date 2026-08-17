@@ -195,6 +195,15 @@ void ConfigureFromEnv() {
       /*flush_floor_bytes=*/EnvInt("METALJAX_FLUSH_FLOOR_MB", 2048) *
           (int64_t{1} << 20),
       /*flush_main_flushes=*/EnvInt("METALJAX_FLUSH_MAIN_FLUSHES", 8),
+      // ...and the third rule, the BENEFIT gate (P28): a program may keep
+      // this many times the live-set swing it has demonstrated. 2 because a
+      // flush point lands at an arbitrary phase of the program's allocation
+      // cycle, so the swing between two of them understates it -- measured,
+      // the maxtext training row's pool peaks at 1.58 swings. 0 restores
+      // P27's two-rule bound, which is what the two maxtext DECODE rows were
+      // guard-killed by: past the gate, footprint to spare, and 14 GB of
+      // freed checkpoint weights standing in a pool nothing ever reads.
+      /*flush_earn_mult=*/EnvInt("METALJAX_FLUSH_EARN_MULT", 2),
       /*loop_clear_cost=*/EnvInt("METALJAX_LOOP_CLEAR_COST", 500000),
       // METALJAX_INGEST_CLEAR_MB is this plugin's own (there is no Stage 1
       // module to copy it from): the reclamation cadence of the TRANSFER

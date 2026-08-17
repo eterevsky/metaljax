@@ -63,6 +63,7 @@
 #ifndef METALJAX_PROGRAM_H_
 #define METALJAX_PROGRAM_H_
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -202,6 +203,13 @@ struct Config {
   // at all (`runtime.cc::flush_bound`). 0 gives every program the pressure
   // rule from its first flush.
   int64_t flush_main_flushes = 8;
+  // METALJAX_FLUSH_EARN_MULT: the BENEFIT gate (P28), the third rule over
+  // the floor. A trim can only ever cost a program the memory it has to
+  // re-acquire AFTER the trim, and across a flush point that is bounded by
+  // how far its own live set falls and rises -- so a program may keep this
+  // many times the live-set SWING it has demonstrated, and no more. 0
+  // disables the rule, restoring P27's two-rule bound exactly.
+  int64_t flush_earn_mult = 2;
   int64_t loop_clear_cost = 500000;           // METALJAX_LOOP_CLEAR_COST
   int64_t ingest_clear_bytes = 8LL << 30;     // METALJAX_INGEST_CLEAR_MB
   int64_t while_pipeline = 1;                 // METALJAX_WHILE_PIPELINE
@@ -216,6 +224,7 @@ extern Config g_cfg;
 void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
                int64_t flush_clear_bytes, int64_t flush_footprint_bytes,
                int64_t flush_floor_bytes, int64_t flush_main_flushes,
+               int64_t flush_earn_mult,
                int64_t loop_clear_cost, int64_t ingest_clear_bytes,
                int64_t while_pipeline, bool debug, bool memdbg);
 
@@ -272,9 +281,42 @@ extern std::function<void()> g_gc_hook;
 void gc_collect();                              // host.cc: runs the hook
 void trim_cache(int64_t bytes);   // bound MLX's pool without dumping it
 int64_t phys_footprint();         // this process's footprint, or -1
-// What a flush may leave cached: `cache_now` is the pool it found,
-// `program_flushes` how many hard flushes the program it is inside has taken.
-int64_t flush_bound(int64_t cache_now, int64_t program_flushes);
+
+// Everything a flush point knows about the PROGRAM it is inside -- the two
+// counters `flush_bound`'s rules are written over, kept per program (not per
+// call) so a main pays its introductory trims once in its life rather than at
+// every step. Racy under METALJAX_CONCURRENT_EXECUTE in exactly the way
+// `g_stats` is, and as harmlessly: these decide a watermark.
+struct FlushState {
+  // P27: how many HARD eager flushes this program has taken -- what separates
+  // an eager MAIN (maxtext's training step: one call, hundreds of flushes, a
+  // live set a fraction of its traffic) from the small one-flush programs a
+  // model load is thousands of.
+  int64_t flushes = 0;
+  // P28: the high and low water of the program's own LIVE set, sampled at its
+  // hard flushes (`mx::get_active_memory`, i.e. what the program HOLDS, never
+  // what the pool caches -- so it is independent of the bound being decided,
+  // which is what makes it usable as evidence for that bound). Monotone: they
+  // only ever move apart, so the grant they imply cannot oscillate. -1 until
+  // the first flush has been seen.
+  int64_t live_hi = -1;
+  int64_t live_lo = -1;
+
+  void observe_live(int64_t live) {
+    if (live < 0) return;
+    live_hi = live_hi < 0 ? live : std::max(live_hi, live);
+    live_lo = live_lo < 0 ? live : std::min(live_lo, live);
+  }
+  // What this program has proven it cycles: 0 until two different live-set
+  // readings have been seen.
+  int64_t swing() const {
+    return (live_hi < 0 || live_lo < 0) ? 0 : live_hi - live_lo;
+  }
+};
+
+// What a flush may leave cached: `cache_now` is the pool it found, `st` the
+// program's own counters (see FlushState).
+int64_t flush_bound(int64_t cache_now, const FlushState& st);
 void debug_line(const std::string& line);
 void debug_print(const std::string& msg);
 void flush_eval(const std::vector<mx::array>& arrays, bool hard);
@@ -739,16 +781,10 @@ class Program {
   bool compile_disabled_ = false;
   bool compile_probe_ = true;   // settle the first compiled call (run_recovering)
   bool no_chunk_ = false;
-  // P27: how many HARD eager flushes this program has taken in its life --
-  // the one thing a flush point knows about the program it is inside, and
-  // what separates an eager MAIN (maxtext's training step: one call, hundreds
-  // of flushes, a live set a fraction of its traffic) from the small
-  // one-flush programs a model load is thousands of. `flush_bound` spends the
-  // big watermark only on the former; see runtime.cc. Counted per PROGRAM
-  // rather than per call, so a main pays the introductory trims once rather
-  // than at every step. Racy under METALJAX_CONCURRENT_EXECUTE in exactly the
-  // way `g_stats` is, and as harmlessly: the count decides a watermark.
-  int64_t flushes_ = 0;
+  // P27 + P28: what this program's own flush history has established about
+  // it -- the hard-flush count and the live-set water marks `flush_bound`'s
+  // three rules read. See FlushState.
+  FlushState flush_;
   mutable int reads_host_ = -1;   // lazily derived, never un-derived
   int64_t max_repeat_ = 1;
   std::vector<int> anchors_;

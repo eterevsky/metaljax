@@ -165,6 +165,7 @@ int main() {
                       /*flush_footprint_bytes=*/49152LL << 20,
                       /*flush_floor_bytes=*/2048LL << 20,
                       /*flush_main_flushes=*/8,
+                      /*flush_earn_mult=*/2,
                       /*loop_clear_cost=*/500000,
                       /*ingest_clear_bytes=*/8LL << 30, /*while_pipeline=*/1,
                       /*debug=*/false, /*memdbg=*/false);

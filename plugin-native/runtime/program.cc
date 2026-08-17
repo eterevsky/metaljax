@@ -24,7 +24,7 @@ namespace {
 // unreferenced, so MLX frees them as the evaluation walks the graph
 // instead of materializing the whole chain at once.
 void eager_flush(const std::vector<std::optional<mx::array>>& env,
-                 int64_t& program_flushes) {
+                 FlushState& st) {
   std::vector<mx::array> live;
   for (const auto& v : env)
     if (v) live.push_back(*v);
@@ -32,7 +32,7 @@ void eager_flush(const std::vector<std::optional<mx::array>>& env,
   g_stats.flushes++;
   const bool hard = g_cfg.flush_sync_every > 0 &&
                     g_stats.flushes % g_cfg.flush_sync_every == 0;
-  if (hard) program_flushes++;
+  if (hard) st.flushes++;
   flush_eval(live, hard);
   // "Frees" into MLX's CACHE, whose own limit is MLX's memory limit -- so an
   // eager phase whose traffic is many times its live set claims the traffic
@@ -51,11 +51,27 @@ void eager_flush(const std::vector<std::optional<mx::array>>& env,
   // spare and falls back to P25's shipped 2048 MB where it does not
   // (notes/cpp-p27-flush-pressure.md).
   int64_t cache_before = 0;
+  int64_t live_now = -1;
   int64_t bound = g_cfg.flush_clear_bytes;
   bool trimmed = false;
   if (hard && g_cfg.flush_clear_bytes >= 0) {
     cache_before = static_cast<int64_t>(mx::get_cache_memory());
-    bound = flush_bound(cache_before, program_flushes);
+    // P28: the program's LIVE set, read where it is settled -- `flush_eval`
+    // above has just evaluated everything the environment holds, so what MLX
+    // reports active is what this program is actually holding rather than a
+    // pending graph's transients. Two counter reads per hard flush; the
+    // watermarks they feed are what rule 3 spends (runtime.cc `flush_bound`).
+    //
+    // Kept and narrated as `live=` rather than re-read for the meter below,
+    // because the two reads are NOT the same number: `live` above still holds
+    // this flush's own references, and by the time the meter prints, the trim
+    // has run and MLX has moved whatever the step dropped out of active and
+    // into the pool. Measured on the P28 swing probe, the phase-change flush
+    // reads 399 MB here and 95 MB there. The rule's input is this one, so
+    // this one is what a flight log has to show.
+    live_now = static_cast<int64_t>(mx::get_active_memory());
+    st.observe_live(live_now);
+    bound = flush_bound(cache_before, st);
     if (cache_before > bound) {
       g_stats.cache_trims++;
       trim_cache(bound);
@@ -80,11 +96,15 @@ void eager_flush(const std::vector<std::optional<mx::array>>& env,
   if (g_cfg.memdbg && hard) {
     // `foot=` is the process footprint the bound was computed from (the
     // guard's metric, runtime.cc `phys_footprint`), `cap=` the ceiling it
-    // was allowed to reach and `n=` this PROGRAM's own hard-flush count --
-    // the three numbers `flush_bound` decided on, so a flight log says not
-    // just what the bound was but which of its rules chose it. All appended
-    // AFTER `bound=`, which the execute_test contracts parse.
+    // was allowed to reach, `n=` this PROGRAM's own hard-flush count, and
+    // `live=`/`earn=` rule 3's input and output (P28: the live set this flush
+    // sampled, and the multiplier times the swing it has seen; -1 both when
+    // the rule is off) -- the numbers `flush_bound` decided on, so a flight
+    // log says not just what the bound was but which of its rules chose it.
+    // All appended AFTER `bound=`, which the execute_test contracts parse.
     const int64_t foot = phys_footprint();
+    const int64_t earn =
+        g_cfg.flush_earn_mult > 0 ? g_cfg.flush_earn_mult * st.swing() : -1;
     debug_line("[metaljax-mem] flush #" + std::to_string(g_stats.flushes) +
                ": active=" + std::to_string(mx::get_active_memory() >> 20) +
                "MB cache=" + std::to_string(mx::get_cache_memory() >> 20) +
@@ -97,7 +117,11 @@ void eager_flush(const std::vector<std::optional<mx::array>>& env,
                std::to_string(g_cfg.flush_clear_bytes < 0
                                   ? -1
                                   : (g_cfg.flush_clear_bytes >> 20)) +
-               "MB n=" + std::to_string(program_flushes));
+               "MB n=" + std::to_string(st.flushes) +
+               " live=" +
+               std::to_string(live_now < 0 ? -1 : (live_now >> 20)) +
+               "MB earn=" + std::to_string(earn < 0 ? -1 : (earn >> 20)) +
+               "MB");
   }
 }
 
@@ -251,7 +275,7 @@ std::vector<mx::array> Program::interpret(const std::vector<mx::array>& inputs,
       acc += e.bytes;
       if (acc >= g_cfg.eager_flush_bytes) {
         acc = 0;
-        eager_flush(env, flushes_);
+        eager_flush(env, flush_);
       }
     }
   }

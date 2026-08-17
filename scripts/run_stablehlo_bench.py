@@ -44,6 +44,22 @@ def parse_arg_types(text):
     ctx.append_dialect_registry(reg)
     ctx.load_all_available_dialects()
     stablehlo.register_dialect(ctx)
+    # jax emits sdy (and sometimes mpmd) sharding ops even on one device, so a
+    # captured maxtext module carries `sdy.mesh` at the top of the file.
+    # `allow_unregistered_dialects` covers unknown ops in GENERIC form only; a
+    # custom assembly like `sdy.mesh @mesh = <[...]>` still needs the dialect,
+    # and without it this parse dies before any benchmark runs — which is what
+    # kept notes/data/qwen3_8b_prefill_36layer.mlir, the 8B command-buffer
+    # canary, from being re-run since 2026-08-03.  Same registration the
+    # engine does in src/metaljax/_ir.py::make_context.
+    # chlo for the same reason: `chlo.square` and friends survive into captured
+    # jax modules, and they parse in custom assembly too.
+    for _name in ("chlo", "sdy", "mpmd"):
+        try:
+            __import__(f"jaxlib.mlir.dialects.{_name}",
+                       fromlist=[_name]).register_dialect(ctx)
+        except Exception:
+            pass
     with ctx:
         module = ir.Module.parse(text)
         entry = None

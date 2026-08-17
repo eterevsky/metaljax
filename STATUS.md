@@ -519,53 +519,83 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
 
 33. Rows 8/10 first native results (2026-08-17, memory-governor binary frozen-gov7): ORIGINAL implementations, no benchmark modifications. Row 8 = 29.6 ms/tok (panic #7's row; first metaljax number ever). Row 10 completes at 88 GB peak (previously guard-killed at 122 GB); ms/tok cell to be filled by the 0.11.5 release-gate sweep. notes/data/no-panic-governor-rows-2026-08-17.json.
 
-34. **Row 15 runs and is WRONG — stop-the-line, mechanism OPEN**
-    (2026-08-17, `notes/row15-wrong-output-2026-08-17.md`; raw
-    `~/.cache/metaljax-bench/logs/no-panic-governor/qwix-int8-qwen3-8b-row15*`).
+34. **Row 15 runs and is WRONG — mechanism ESTABLISHED 2026-08-17 evening:
+    nondeterministic MLX command-buffer corruption at 8B traffic, on BOTH
+    engines, amplified to a logit collapse by qwix's per-tensor scale.**
+    Full record and every arm: `notes/row15-wrong-output-2026-08-17.md` §8;
+    raw `~/.cache/metaljax-bench/logs/row15-mechanism/` (driver
+    `scripts/model_bench/row15_ladder.sh`, rungs `A1,B,C,D,Dp,Ref,K,Rate`).
     The governor campaign cleared this row's *memory* blocker — it completes,
     exit 0, 79 GB peak, flat page cache, 0 refusals, 369.7 ms/tok — and
     uncovered the one underneath: the output is `" fragment!!!!!!!"`, token ids
-    `[12289, 0, 0, 0, 0, 0, 0, 0]`, and **`!` is Qwen3's token 0**. Greedy
-    `argmax` returns index 0 for a constant logit vector, so what this row
-    emits is **collapsed logits**, not plausible wrong text. The timing is
-    therefore NOT published as a cell (rule: a program computing the wrong
-    answer has no meaningful ms/tok), and the row's status stays ✗.
-    **The campaign's label — "the row's known MLX-quantization bug" — is
-    withdrawn: no such finding exists.** The 2026-08-03 diagnosis (`7932b4d`,
-    footnote 8) attributed the garbage to the MLX command-buffer split and
-    *explicitly exonerated the quantized dots* (layer-0 KV bit-exact vs CPU at
-    K=4096; pre- and post-`fdc7cde` engines failed identically). That
-    attribution is now under test rather than inherited, for three reasons:
-    (a) it was measured at `MLX_MAX_OPS_PER_BUFFER=400`, which became 800 the
-    next day (`52b90a2`), and the 8B canary
-    (`notes/data/qwen3_8b_prefill_36layer.mlir`) has never been re-run at
-    today's budgets; (b) the split bug's signature is per-process-random
-    plausible garbage, this is a deterministic collapse; (c) the collapse
-    survives `METALJAX_BODY_COMPILE=0` (row 15f, which gets *worse* — all 8
-    tokens are id 0), where the split face is compile-dependent — and 15f is a
-    clean single-variable arm, its `MAXTEXT_PREFILL_LEN=64` being a no-op
-    (the adapter already rounds a 5-token prompt up to 64). Against that:
-    the same-day gate-5 row-14 run is the same adapter, same qwix overrides,
-    same emits (1 sdpa, 0 qmm, 0 msl) at 0.6B and is **coherent** at 31.995
-    ms/tok, and the only quantitative differences are ~10× traffic per
-    compiled unit (3259 vs 323 MB/iteration at prefill, 3154 vs 289 at decode)
-    and the 8B's untied `logits_dense` (622 M elements — bigger than a whole
-    512 Mi-element command buffer on its own). **That last one is the leading
-    hypothesis**, because it is the only candidate that is a command-buffer
-    split *and* deterministic *and* absent from row 14: a weight operand
-    larger than the budget forces MLX to cut inside that one matmul, in the
-    same place, every call — where the 2026-08 face was a random draw. It also
-    survives the layout evidence: `METALJAX_BODY_COMPILE=0` does not shrink
-    the evals (`run_chunked` still unrolls 16 iterations, uncompiled) but does
-    move every sync point (78 flushes per call against 6), and the output does
-    not change. Cheapest decisive test, and it needs no checkpoint:
-    `scripts/model_bench/row15_probe.py big` — the over-budget dot vs an
-    under-budget control, bf16 and int8, against CPU, swept 512→2048.
-    Note also that ONE non-finite
-    element anywhere produces exactly this output (argmax is NaN-wins /
-    lowest-index on both stacks, and one NaN in the final hidden state NaNs
-    all 151,936 logits), so the text cannot discriminate the hypotheses — the
-    queued ladder compares NUMBERS on identical inputs (int8-dot inventory vs
-    numpy; the 8B canary vs CPU on both stacks; `METALJAX_VERIFY_COMPILE=1`;
-    single-variable budget/compile/emit arms on a captured module), rungs A/B
-    driven by `scripts/model_bench/row15_ladder.sh`.
+    `[12289, 0, 0, 0, 0, 0, 0, 0]`, and **`!` is Qwen3's token 0**. The timing
+    is NOT published as a cell (a program computing the wrong answer has no
+    meaningful ms/tok) and the row's status stays ✗.
+    **The decisive measurement is a rate, not a verdict.** Ten prefills of the
+    SAME loaded parameters, in ONE process, on identical inputs
+    (`row15_forensics.py --prefill-reps 10`): row 15 native returns **8
+    distinct first tokens and 2 full collapses**; row 15 on **Stage 1** returns
+    **10 distinct**; row 14 (0.6B, same adapter, same qwix overrides, same
+    script) returns **the same token 10/10** and decodes `" Paris. The
+    capital"`. A correct implementation is deterministic, so this is
+    self-proving — which matters, because the jax-CPU reference could not be
+    re-measured (below).
+    **Localization**: MaxEngine's prefill returns the layer-stacked KV cache,
+    so the first non-finite layer is readable with no model surgery. Baseline:
+    clean through layer 32, layers 33/34/35 **65536/65536 NaN, zero infs**,
+    prefill logits 151936/151936 NaN. But the entry point is itself a draw —
+    33, 6, 6, 11, or nowhere across arms; decode-side 27, then 1, then 1.
+    **The amplifier is qwix's own code**: `qarray.compute_scale_zero_point`
+    clamps a *zero* scale (`where(scale < sqrt(tiny), 1, scale)`) but not a
+    non-finite one, and calibration is a per-tensor `absmax = max(|x|)`, so one
+    bad element makes the whole tensor's scale NaN and every element of the
+    dequantized result NaN. That is why it is always 100 % and never an inf.
+    **What it is NOT** (single-variable arms, native release dylib, six
+    different answers): `METALJAX_RECOGNIZE=0` still wrong; `METALJAX_COMPILE=0`
+    *worse* (collapse at layer 11, so not our compiled path — it is the
+    ops-alignment face); `METALJAX_CHUNK_MAX` 10/12/16 all wrong. The
+    chunked-replay lead — 36 iterations at `kmax=16` replay as 16+16+4×1, and
+    the first localization landed on layer 32, exactly the first remainder call
+    — was **refuted by its own positive prediction** (`CHUNK_MAX=10` moves the
+    remainder to layer 30 and predicted a break there; it broke nowhere, and so
+    did a repeat of the unchanged baseline). H2 refuted too: all twelve row-14
+    and row-15 s8×s8→s32 contractions are **bit-exact** against an int64 numpy
+    reference on both stacks, and the qwix pattern at 8B widths matches CPU.
+    H5 stays refuted (gate-5 probe, and the collapse is nowhere near the
+    logits stage).
+    **The witness that settles provenance — the 8B canary, re-run for the first
+    time since 2026-08-03.** `notes/data/qwen3_8b_prefill_36layer.mlir` (36-layer
+    8B **bf16** prefill, weights as arguments, no qwix, no int8, no checkpoint)
+    still corrupts at today's shipped 800/512: **FAIL(5), max_abs_err 1.085e+04,
+    max_norm_err 1.000e+00** — total signal loss on 5 of 15 outputs — and
+    **bit-identically on the native and the Stage 1 engine**, reproduced across
+    two passes. `METALJAX_COMPILE=0` drops it to FAIL(3) / 7.4e-02;
+    `MLX_MAX_MB_PER_BUFFER=2048` to FAIL(3) / 4.1e-02 — the catastrophic face
+    goes, the failure does not, so the raised budget is **not a fix and not a
+    default** (2048 on a full 8B load is panic-#4 territory). This rung had been
+    silently unrunnable: `scripts/run_stablehlo_bench.py` never registered the
+    `chlo`/`sdy`/`mpmd` dialects, so the asset died at parse
+    (`Dialect 'sdy' not found for custom op 'sdy.mesh'`) — fixed.
+    **Provenance verdict: NOT a 0.11.3+ migration defect.** Stage 1's Python
+    engine is wrong on this row today, on the same checkpoint through the same
+    adapter, and more nondeterministically than the native one; its wrongness
+    has the *shape* the 2026-08-03 note recorded (plausible-magnitude garbage,
+    no collapse in ten draws), while native additionally reaches the collapsed
+    face. The 0.11.2-src arm is **blocked by memory** (guard kill at 94 GB — it
+    predates both `4d34bff` and the governor) and is no longer load-bearing,
+    since the canary answers the same question for both engines at once.
+    **Correction to the record**: `34f627c`'s "2118 (maxtext; coherent)" jax-CPU
+    cell has **no artifact behind it** (a one-line STATUS edit; no log on disk
+    carries jax-CPU text for this row), and re-measuring it tonight was
+    guard-killed twice (60 GB, then 92 GB at an 89 GB footprint with the free
+    list at 4.9 GB). Treat "jax-CPU is coherent on row 15" as an unverified
+    2026-08-02 claim. Row 14's 10/10 determinism is what exonerates the
+    harness, tokenizer, qwix path and conversion pipeline.
+    **Open, both needing Oleg's go** (a full 8B maxtext load above row 15's
+    79 GB envelope, i.e. the 67–109 GB panic-#5 band): the 0.11.2 arm and the
+    jax-CPU reference. Also unattributed: a residual 4–7 % norm error on 3 of
+    15 canary outputs that survives every arm including 2048 — possibly 36
+    layers of legitimate bf16 drift against a 2 % tolerance, possibly a second
+    smaller fault. No fix exists at our level; this goes to the upstream MLX
+    report (`notes/mlx-command-buffer-upstream-issue.md`) as its strongest
+    evidence yet.

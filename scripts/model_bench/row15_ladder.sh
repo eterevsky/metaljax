@@ -23,6 +23,12 @@ cd /Users/oleg/metaljax || exit 2
 L=$HOME/.cache/metaljax-bench/logs/row15-mechanism
 LOCK=/tmp/metaljax-bench.lock
 BENCH=$HOME/.cache/metaljax-bench/venvs/bench/bin/python
+# The maxtext rows need their own venv (omegaconf/orbax/flax the bench venv
+# does not carry) -- README_maxtext.md, and what final_run.sh uses.
+MAXT=$HOME/.cache/metaljax-bench/maxtext/venv/bin/python
+# 0.11.2's src/metaljax, extracted read-only for the provenance arm:
+#   git archive v0.11.2 src/metaljax | tar -x -C $V0112
+V0112=$HOME/.cache/metaljax-bench/provenance/v0112
 ASSET=notes/data/qwen3_8b_prefill_36layer.mlir
 mkdir -p "$L"
 D=$L/ladder.log
@@ -78,7 +84,10 @@ run() {  # run <tag> <budget_gb> <env...> -- <cmd...>
 # int8 arithmetic at row-15 widths, against an exact numpy reference.  No
 # checkpoint, no maxtext: if this fails, hypothesis H2 is the answer and no
 # 79 GB run is needed to find it.
-if has A; then
+#
+# `A1` is the same rung without the `big` arms, which the 0.11.5 release gate
+# already ran to completion (H5 refuted there — notes/release-gates-0.11.5.md).
+if has A || has A1; then
   for stack in native stage1; do
     envs=(JAX_PLATFORMS=metal,cpu METALJAX_DEBUG=1)
     [ "$stack" = native ] && envs+=(METALJAX_PLUGIN_PATH="$NATIVE")
@@ -90,6 +99,8 @@ if has A; then
     run "A-qwix-$stack" 30 "${envs[@]}" -- \
       "$BENCH" scripts/model_bench/row15_probe.py qwix --widths 8b --layers 4 --structure unroll
   done
+fi
+if has A; then
   # The one candidate that is an MLX command-buffer split AND deterministic
   # AND present in row 15 only: the untied logits weight is 622 M elements
   # against a ~537 M-element command buffer, so the cut lands inside that one
@@ -113,28 +124,139 @@ if has B; then
   [ -f "$ASSET" ] || { say "missing $ASSET"; exit 2; }
   # CPU reference first (bf16 in, f32 out), then the two metal replays: the
   # two must agree with each other bit-for-bit AND with the reference.
-  run "B-cpu-ref" 40 JAX_PLATFORMS=cpu -- \
+  run "B-cpu-ref" 70 JAX_PLATFORMS=cpu -- \
     "$BENCH" scripts/run_stablehlo_bench.py "$ASSET" --platform cpu \
       --reps 1 --warmup 1 --save-out "$L/B-cpu-ref.npz"
   for stack in native stage1; do
     envs=(JAX_PLATFORMS=metal,cpu METALJAX_SYNC=1)
     [ "$stack" = native ] && envs+=(METALJAX_PLUGIN_PATH="$NATIVE")
-    run "B-metal-$stack" 40 "${envs[@]}" -- \
+    run "B-metal-$stack" 70 "${envs[@]}" -- \
       "$BENCH" scripts/run_stablehlo_bench.py "$ASSET" --platform metal \
         --reps 3 --warmup 1 --save-out "$L/B-metal-$stack.npz" \
         --check "$L/B-cpu-ref.npz"
     # the op-by-op control: same program, no mx.compile anywhere
-    run "B-metal-$stack-nocompile" 40 "${envs[@]}" METALJAX_COMPILE=0 -- \
+    run "B-metal-$stack-nocompile" 70 "${envs[@]}" METALJAX_COMPILE=0 -- \
       "$BENCH" scripts/run_stablehlo_bench.py "$ASSET" --platform metal \
         --reps 1 --warmup 1 --save-out "$L/B-metal-$stack-nocompile.npz" \
         --check "$L/B-cpu-ref.npz"
   done
   if [ "${ROW15_RAISED:-0}" = 1 ]; then
-    run "B-metal-native-mb2048" 40 JAX_PLATFORMS=metal,cpu METALJAX_SYNC=1 \
+    run "B-metal-native-mb2048" 70 JAX_PLATFORMS=metal,cpu METALJAX_SYNC=1 \
       METALJAX_PLUGIN_PATH="$NATIVE" MLX_MAX_MB_PER_BUFFER=2048 -- \
       "$BENCH" scripts/run_stablehlo_bench.py "$ASSET" --platform metal \
         --reps 3 --warmup 1 --check "$L/B-cpu-ref.npz"
   fi
+fi
+
+# ---------------------------------------------------------------- rung C
+# The localization, on the real row: MaxEngine's prefill hands back the whole
+# per-layer KV cache, so the first layer whose K/V is non-finite is the entry
+# point of the fault, read off one array with no model surgery.
+# MEASURED 2026-08-17 (native, release dylib): clean through layer 32, layers
+# 33/34/35 100 % NaN.  36 iterations at kmax=16 replay as 16 + 16 + 4x1, so
+# layer 32 is the FIRST SINGLE-ITERATION REMAINDER CALL of run_chunked.
+if has C; then
+  run "C-row14-native" 30 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
+    METALJAX_PLUGIN_PATH="$NATIVE" -- \
+    "$MAXT" scripts/model_bench/row15_forensics.py --bench maxtext-qwix-int8 --decode 2
+  run "C-row15-native" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
+    GUARD_RSS_GB=105 METALJAX_PLUGIN_PATH="$NATIVE" -- \
+    "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b --decode 3
+fi
+
+# ---------------------------------------------------------------- rung D
+# The chunk-geometry discriminator, with a POSITIVE prediction rather than a
+# knob sweep.  `trip % K` iterations run as separate single-iteration calls
+# after the K-wide chunks, and the fault appeared at the first of them.  So:
+#
+#   K=12 -> 36 = 3x12 exactly, NO remainder at all      -> predict CLEAN
+#   K=10 -> 3x10 then 6 singles from layer 30           -> predict BAD AT 30
+#
+# A hypothesis that survives a moved prediction is worth more than one that
+# survives another off/on switch, and these two arms cost the same.
+if has D; then
+  for k in 12 10; do
+    run "D-chunk$k-native" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
+      GUARD_RSS_GB=105 METALJAX_CHUNK_MAX=$k METALJAX_DEBUG=1 \
+      METALJAX_PLUGIN_PATH="$NATIVE" -- \
+      "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b --decode 3
+  done
+fi
+
+# ---------------------------------------------------------------- rung Dp
+# PROVENANCE.  Same day, same checkpoint, same harness, three engines:
+# native (rung C above), Stage 1's Python engine as it stands today, and
+# 0.11.2's `src/metaljax` on PYTHONPATH in front of it -- the last release
+# before the C++ migration.  Clean on 0.11.2 makes this ours and recent;
+# collapsed on 0.11.2 makes it old and structural.
+if has Dp; then
+  run "Dp-stage1-today" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
+    GUARD_RSS_GB=105 METALJAX_DEBUG=1 -- \
+    "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b --decode 3
+  [ -d "$V0112/src/metaljax" ] || { say "missing $V0112 -- see notes/row15-wrong-output"; exit 2; }
+  run "Dp-0.11.2-src" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
+    GUARD_RSS_GB=105 PYTHONPATH="$V0112/src" -- \
+    "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b --decode 3
+fi
+
+# ---------------------------------------------------------------- rung Ref
+# The missing ground truth.  Every metal arm so far produced a DIFFERENT first
+# token (0 / 114179 / 6623 / 12289 across four runs), so "is this token right?"
+# cannot be answered from the harness -- and the "jax-CPU is coherent on this
+# row" claim is a 2026-08-02 measurement on a different tree.  jax-CPU on THIS
+# checkpoint, THIS prompt, THIS script.  No GPU work: it still takes the lock,
+# because an 8B int8 CPU decode is a memory event of its own.
+# Budget 92, not 60: the first attempt was guard-killed on the trajectory rule
+# at +16 GB/sample during the Orbax restore.  jax-CPU's 8B int8 restore is a
+# bigger memory event than the manifest's packed 9 GB suggests, and 92 is the
+# same envelope tonight's metal arms already ran in.
+if has Ref; then
+  run "Ref-cpu-row15" 92 JAX_PLATFORMS=cpu KMP_DUPLICATE_LIB_OK=TRUE \
+    GUARD_RSS_GB=105 -- \
+    "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b --decode 3
+fi
+
+# ---------------------------------------------------------------- rung K
+# Attribution knobs, one variable each, all on the native release dylib.
+# `repeat` is FIRST and is not a knob at all: it is the determinism control
+# the other arms are read against.  Four different answers from four runs is
+# either a lottery or four different configurations, and only a repeated
+# configuration tells them apart.
+if has K; then
+  run "K-repeat-native" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
+    GUARD_RSS_GB=105 METALJAX_PLUGIN_PATH="$NATIVE" -- \
+    "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b --decode 3
+  for arm in "METALJAX_RECOGNIZE=0" "METALJAX_COMPILE=0"; do
+    run "K-${arm%%=*}-native" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
+      GUARD_RSS_GB=105 "$arm" METALJAX_PLUGIN_PATH="$NATIVE" -- \
+      "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b --decode 3
+  done
+fi
+
+# ---------------------------------------------------------------- rung Rate
+# The failure RATE, ten draws for the price of one 80 s load.  Two runs of the
+# identical configuration already disagreed, so the honest description of this
+# row is a probability, and a probability needs a denominator.  The decode arm
+# is probed per step as well: every arm so far collapsed in decode even when
+# its prefill was clean, and that half was never localized.
+if has Rate; then
+  run "Rate-native" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
+    GUARD_RSS_GB=105 METALJAX_PLUGIN_PATH="$NATIVE" -- \
+    "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b \
+      --prefill-reps 10 --decode 3 --probe-decode
+  # 50, not 30: the 30 GB budget that carried a single-prefill row-14 run was
+  # tripped by the trajectory rule on the restore ramp when the arm got longer.
+  run "Rate-row14-native" 50 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
+    METALJAX_PLUGIN_PATH="$NATIVE" -- \
+    "$MAXT" scripts/model_bench/row15_forensics.py --bench maxtext-qwix-int8 \
+      --prefill-reps 10 --decode 3 --probe-decode
+  # Same ten draws on Stage 1: the provenance arm produced garbage of a
+  # DIFFERENT shape (plausible-magnitude tokens, not a collapse), and a rate
+  # says whether that is a different bug or the same lottery drawn elsewhere.
+  run "Rate-stage1" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
+    GUARD_RSS_GB=105 -- \
+    "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b \
+      --prefill-reps 10 --decode 3
 fi
 
 say "ladder $STEPS complete"

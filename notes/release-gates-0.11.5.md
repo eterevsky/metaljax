@@ -251,10 +251,39 @@ bit-exact in int8, 1e-06 relative in bf16 (ordinary bf16 rounding, the same as
 the under-budget control), no non-finite values, and metal's output standard
 deviation equal to CPU's to every printed digit. An over-budget `logits_dense`
 shape **alone** does not corrupt, so the collapse needs something the isolated
-dot does not have. The mechanism stays **open**, the remaining rungs (A's
-`dots`/`qwix` arms, B's 8B canary, C's program capture, D's knob A/B) are
-specified in the row-15 note, and the fix is post-gate work by construction:
-this row ships as ✗ in the table either way.
+dot does not have.
+
+**Post-gate follow-up, 2026-08-17 evening — the mechanism is now ESTABLISHED,
+and the gate verdict is unchanged.** The remaining rungs were run on this same
+release dylib (`notes/row15-wrong-output-2026-08-17.md` §8; raw
+`~/.cache/metaljax-bench/logs/row15-mechanism/`). The row is **nondeterministic
+MLX command-buffer corruption at 8B traffic, present on BOTH engines**,
+amplified into the logit collapse by qwix's per-tensor `absmax` scale (which
+guards a zero scale but not a NaN one, so one bad element NaNs a whole tensor):
+
+* Ten prefills of the **same loaded params, one process, identical inputs**:
+  row 15 native → **8 distinct first tokens, 2 full collapses**; row 15 on
+  Stage 1 → **10 distinct**; **row 14 → the same token 10/10**, decoding
+  `" Paris. The capital"`. Nondeterminism at fixed configuration is
+  self-proving, and it is what makes the timing cell meaningless.
+* Not ours: `METALJAX_COMPILE=0` fails *worse*, `METALJAX_RECOGNIZE=0` still
+  fails, `METALJAX_CHUNK_MAX` 10/12/16 all fail, and all twelve row-14/row-15
+  s8×s8→s32 contractions are bit-exact against an int64 numpy reference on
+  both stacks.
+* The committed 8B **bf16** canary (`notes/data/qwen3_8b_prefill_36layer.mlir`,
+  no qwix, no checkpoint) still corrupts at today's shipped 800/512 —
+  **FAIL(5), norm err 1.000e+00, bit-identical on native and Stage 1** — which
+  is the fresh witness the inherited 2026-08-03 attribution was missing.
+  (It had been unrunnable for a parse reason: `run_stablehlo_bench.py` never
+  registered the `chlo`/`sdy`/`mpmd` dialects. Fixed.)
+
+So H5's refutation above stands, and so does the ✗: **the row ships as ✗ WRONG
+OUTPUT, the cause is below both of our interpreters, and there is no fix at our
+level** — it is the upstream MLX command-buffer report. Two follow-ups need
+Oleg's go because they are full 8B maxtext loads above row 15's 79 GB envelope:
+the 0.11.2-src provenance arm (guard-killed at 94 GB) and a jax-CPU reference
+(guard-killed twice; note that `34f627c`'s "coherent" CPU cell has **no
+artifact behind it** and should not be cited as evidence until re-measured).
 
 ### The recognizer nondeterminism — CHECKED on this binary, and it persists on rows 5 and 7
 

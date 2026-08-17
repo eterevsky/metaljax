@@ -3346,6 +3346,13 @@ def _p27_flush_pressure(subprocess, tempfile, pathlib, re):
         env["METALJAX_MEMDBG"] = "1"
         env["METALJAX_COMPILE"] = "0"
         env["METALJAX_EAGER_FLUSH_MB"] = "64"
+        # P28's benefit gate OFF for these four arms, deliberately.  They test
+        # P27's two rules, one disabled at a time, and this program is exactly
+        # the shape P28 denies -- "a scalar carry: the live set stays flat", so
+        # its swing is zero and rule 3 alone would hold every bound at the
+        # floor, hiding whichever of rules 1 and 2 an arm is about to break.
+        # `_p28_benefit_gate` below turns it back on and owns its own arms.
+        env["METALJAX_FLUSH_EARN_MULT"] = "0"
         env.update({k: str(v) for k, v in extra.items()})
         with tempfile.NamedTemporaryFile("w", suffix=".py",
                                          delete=False) as fh:
@@ -3536,6 +3543,309 @@ def _p27_flush_pressure(subprocess, tempfile, pathlib, re):
     ]
 
 
+# --------------------------------------------------------------------------
+# P28: the benefit gate -- the pool has to be EARNED
+# --------------------------------------------------------------------------
+#
+# P27's two rules ask whether a program MAY have a big pool.  Neither asks
+# whether it is doing anything with one, and the two maxtext DECODE rows are
+# where that shows: their checkpoint load is a single program taking 134 hard
+# flushes in one call, so it is an "eager main" by rule 1 and has footprint to
+# spare by rule 2 -- and the 14 GB of weights it frees at its LAST flush then
+# stands in the pool for the rest of the process.  17 GB and 11 GB of extra
+# peak footprint, no speed, and a guard kill at budgets those rows had never
+# come near (notes/release-gates-0.11.5.md gate 5).
+#
+# `runtime.cc::flush_bound` now asks a third question, and the quantity it
+# asks it about is the program's own LIVE set: a trim can only ever cost a
+# program the memory it has to re-acquire AFTER the trim, and across a flush
+# point that is bounded by how far its live set falls and rises.  So a program
+# may keep METALJAX_FLUSH_EARN_MULT times the live-set SWING it has
+# demonstrated, and no more.
+#
+# The two arms below are the two shapes, run through the SAME harness so the
+# difference is the program and nothing else: P25's traffic program, whose
+# live set is flat by construction ("a scalar carry" -- the decode rows'
+# shape), and a program that genuinely cycles a large tensor in and out.
+_P28_SWING = r'''
+import numpy as np
+import jax, jax.numpy as jnp
+
+BASE = 4 * 1024 * 1024        # 16 MB of f32
+STEP = 256 * 1024
+DEPTH, ROUNDS = 24, 3
+WIDE = 8                      # phase A holds WIDE copies live
+
+
+def churn(x):
+    """Traffic in two phases: one with a large tensor LIVE across the flush
+    points, one without it.  The live set therefore falls and rises between
+    flushes, which is exactly what a buffer pool is for -- and exactly what
+    the flat-live-set program has none of."""
+    acc = jnp.float32(0)
+    big = jnp.concatenate([x] * WIDE)          # phase A: ~8x live
+    for i in range(DEPTH):
+        y = big[:BASE + i * STEP] * jnp.float32(1.0000001) + jnp.float32(0.5)
+        acc = acc + jnp.sum(y)
+    acc = acc + jnp.sum(big) * jnp.float32(0.0)   # last use of `big`
+    for i in range(DEPTH):                     # phase B: `big` is dead
+        y = x[:BASE + i * STEP] * jnp.float32(1.0000001) + jnp.float32(0.5)
+        acc = acc + jnp.sum(y)
+    return acc
+
+
+n = BASE + DEPTH * STEP
+x = jax.device_put(np.random.RandomState(11).rand(n).astype(np.float32))
+f = jax.jit(churn)
+total = 0.0
+for _ in range(ROUNDS):
+    total += float(np.asarray(f(x)))
+print("[probe] checksum %.6f" % total)
+'''
+
+
+def _p28_benefit_gate(subprocess, tempfile, pathlib, re):
+    """(label, check) pairs for the earned-pool rule over P27's two."""
+
+    _METER = re.compile(
+        r"\[metaljax-mem\] flush #\d+: active=(\d+)MB cache=(\d+)MB"
+        r"(?: \(was (\d+)MB\))? bound=(-?\d+)MB foot=(-?\d+)MB "
+        r"cap=(-?\d+)MB n=(\d+) live=(-?\d+)MB earn=(-?\d+)MB")
+
+    # Same clamps as P27's arms, and a footprint target no machine can reach,
+    # so rules 1 and 2 are out of the way and rule 3 is the only thing left
+    # that can hold a bound down.
+    CAP, FLOOR, GATE, MULT = 4096, 256, 8, 2
+    TARGET = 1 << 22
+
+    def run(source, **extra):
+        env = dict(os.environ)
+        env["METALJAX_DEBUG"] = "1"
+        env["METALJAX_MEMDBG"] = "1"
+        env["METALJAX_COMPILE"] = "0"
+        env["METALJAX_EAGER_FLUSH_MB"] = "64"
+        env["METALJAX_FLUSH_CLEAR_MB"] = str(CAP)
+        env["METALJAX_FLUSH_FLOOR_MB"] = str(FLOOR)
+        env["METALJAX_FLUSH_MAIN_FLUSHES"] = str(GATE)
+        env["METALJAX_FLUSH_FOOTPRINT_MB"] = str(TARGET)
+        env["METALJAX_FLUSH_EARN_MULT"] = str(MULT)
+        env.update({k: str(v) for k, v in extra.items()})
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(source)
+            script = fh.name
+        try:
+            proc = subprocess.run([sys.executable, script], env=env,
+                                  capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(script)
+            except OSError:
+                pass
+        rows = [tuple(int(g) if g else 0 for g in m.groups())
+                for m in _METER.finditer((proc.stdout or "") +
+                                         (proc.stderr or ""))]
+        checksum = None
+        for ln in (proc.stdout or "").splitlines():
+            if ln.startswith("[probe] checksum "):
+                checksum = ln.split()[2]
+        return proc, rows, checksum
+
+    def by_program(rows):
+        """Split meter rows into the PROGRAMS that produced them.
+
+        `n=` is the program's own hard-flush count, so it increases by one
+        within a program and drops when a different program flushes -- and the
+        water marks the rule keeps are per program, so anything that replays
+        the rule has to segment the same way.
+        """
+        progs, cur, prev = [], [], None
+        for r in rows:
+            if prev is not None and r[6] <= prev:
+                progs.append(cur)
+                cur = []
+            cur.append(r)
+            prev = r[6]
+        if cur:
+            progs.append(cur)
+        return progs
+
+    state = {}
+
+    def a_flat_live_set_earns_nothing():
+        """The rows-11/14 shape: past the gate, room to spare, no pool.
+
+        P25's traffic program carries a scalar between its chain steps, so its
+        live set barely moves at its flush points -- it never hands back a
+        pool's worth of memory that it then has to take out again, and a trim
+        therefore costs it almost nothing.  Rules 1 and 2 both wave it through
+        (it takes hundreds of hard flushes and its live set is a rounding
+        error against the target); rule 3 is the only reason its bound stays
+        down near the floor, and that is exactly why the two maxtext decode
+        rows stop carrying 17 GB and 11 GB of pool nothing reads.
+
+        The claim is not "the bound is the floor" -- a program whose live set
+        swings a little has earned a little -- but that what it earns tracks
+        its own swing instead of the cap.
+        """
+        proc, rows, checksum = run(_P25_TRAFFIC)
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-140:]
+        if len(rows) < 20:
+            return False, f"only {len(rows)} hard flushes narrated"
+        late = [r for r in rows if r[6] >= GATE]
+        if not late:
+            return False, "the gate was never crossed"
+        peak = max(r[1] for r in rows)
+        state["flat"] = (checksum, peak)
+        loose = CAP // 4
+        if max(r[3] for r in late) >= loose:
+            return False, (f"bound reached {max(r[3] for r in late)} MB for a "
+                           f"program that cycles nothing")
+        if peak >= loose:
+            return False, f"peak cache {peak} MB for a program that cycles nothing"
+        swing = max(max(p[7] for p in prog) - min(p[7] for p in prog)
+                    for prog in by_program(rows))
+        return True, (f"ok ({len(late)} flushes past the gate, bound <= "
+                      f"{max(r[3] for r in late)} MB against a {CAP} MB cap, "
+                      f"worst live-set swing {swing} MB, peak {peak} MB cached)")
+
+    def the_earn_rule_is_what_denies_it():
+        """The control that names the rule: the SAME program, rule off.
+
+        With `METALJAX_FLUSH_EARN_MULT=0` the bound is P27's again and the
+        flat-live-set program is handed the whole cap -- the behaviour the two
+        decode rows were guard-killed by, reproduced in a contract so that a
+        change which quietly re-enables it fails here rather than on a 25 GB
+        model row.  Same answers either way, and the pool it keeps is the
+        measurement: several times what the same program keeps with the rule
+        on, for a program that does nothing with either.
+        """
+        proc, rows, checksum = run(_P25_TRAFFIC, METALJAX_FLUSH_EARN_MULT=0)
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-140:]
+        if not rows:
+            return False, "no flushes narrated"
+        want, on_peak = state.get("flat", (None, 0))
+        if checksum != want:
+            return False, f"the arms disagree ({checksum} vs {want})"
+        late = [r for r in rows if r[6] >= GATE]
+        if not late or any(r[3] != CAP for r in late):
+            return False, (f"bound {max((r[3] for r in late), default=0)} MB "
+                           f"with the earn rule off; expected the {CAP} MB cap")
+        # `live=` is sampled either way -- it is one counter read and it keeps
+        # the meter uniform -- so the rule being OFF shows up as `earn=-1`.
+        if any(r[8] != -1 for r in rows):
+            return False, "the meter still reported an earn with the rule off"
+        peak = max(r[1] for r in rows)
+        if peak < 4 * max(on_peak, 1):
+            return False, (f"the rule saved nothing: peak {peak} MB with it "
+                           f"off against {on_peak} MB with it on")
+        return True, (f"ok (every bound {CAP} MB with the rule off, peak "
+                      f"{peak} MB cached against {on_peak} MB with it on)")
+
+    def a_cycling_live_set_earns_the_pool():
+        """...and the program the pool exists for still gets one.
+
+        This one holds a large tensor live across one stretch of flushes and
+        drops it across the next, so its live set genuinely falls and rises --
+        the maxtext training row's shape, whose 1.85x is the whole reason the
+        watermark rises above the floor at all.  Its bound must leave the
+        floor, and the pool must actually grow past it.
+        """
+        proc, rows, checksum = run(_P28_SWING)
+        if proc.returncode:
+            return False, (proc.stderr or proc.stdout).strip()[-140:]
+        if len(rows) < 20:
+            return False, f"only {len(rows)} hard flushes narrated"
+        state["swing"] = (rows, checksum)
+        late = [r for r in rows if r[6] >= GATE]
+        if not late:
+            return False, "the gate was never crossed"
+        earned = [r for r in late if r[3] > FLOOR]
+        if len(earned) < len(late) // 2:
+            return False, (f"only {len(earned)} of {len(late)} bounds past "
+                           f"the gate left the floor")
+        swing = max(max(p[7] for p in prog) - min(p[7] for p in prog)
+                    for prog in by_program(rows))
+        if swing < 128:
+            return False, (f"the probe's live set only swung {swing} MB -- it "
+                           f"is not exercising the rule")
+        peak = max(r[1] for r in rows)
+        if peak <= FLOOR + 64:
+            return False, f"the pool never grew past the floor ({peak} MB)"
+        return True, (f"ok (live-set swing {swing} MB, bound up to "
+                      f"{max(r[3] for r in late)} MB on {len(earned)} of "
+                      f"{len(late)} flushes, peak {peak} MB cached)")
+
+    def the_bound_is_the_multiplier_times_the_swing():
+        """The formula itself, in two halves the meter reports separately.
+
+        `earn=` is the rule's own product and `bound=` what the flush trimmed
+        to, so the first half is EXACT: past the gate, and with the other two
+        rules out of reach, the bound must be `earn` clamped to [floor, cap]
+        and nothing else.
+
+        The second half is that `earn` really is the live-set swing: it must
+        equal `mult * (hi - lo)` over that PROGRAM's own `live=` readings --
+        the values the rule sampled, which is why the meter prints them
+        separately from `active=` (the two differ by whatever the step dropped
+        between the sample and the print; on this probe's phase-change flush
+        they read 399 MB and 95 MB).  Per program, because that is where the
+        water marks live: a replay pooling every program's readings would be
+        checking a rule nothing implements.
+        """
+        rows = state.get("swing", ([], None))[0]
+        if not rows:
+            return False, "the swinging arm did not run"
+        worst, worst_row, checked = 0, None, 0
+        drift, drift_row = 0, None
+        for prog in by_program(rows):
+            hi = lo = None
+            for _active, _cache, _was, bound, _foot, _cap, n, live, earn in prog:
+                if earn == -1 or live == -1:
+                    return False, "the meter reported no earn with the rule on"
+                hi = live if hi is None else max(hi, live)
+                lo = live if lo is None else min(lo, live)
+                if abs(earn - MULT * (hi - lo)) > drift:
+                    drift = abs(earn - MULT * (hi - lo))
+                    drift_row = (earn, MULT * (hi - lo), hi, lo)
+                if n < GATE:
+                    continue
+                checked += 1
+                want = min(CAP, max(FLOOR, earn))
+                if abs(want - bound) > worst:
+                    worst, worst_row = abs(want - bound), (bound, want, earn)
+        if checked < 10:
+            return False, f"only {checked} flushes past the gate"
+        if worst > 0:
+            return False, (f"bound {worst_row[0]} MB where earn={worst_row[2]} "
+                           f"MB clamps to {worst_row[1]} MB")
+        # Byte state, megabyte narration: each water mark can lose a megabyte
+        # to the shift, so the product can be two out and no more.
+        if drift > 2 * MULT:
+            return False, (f"earn={drift_row[0]} MB where the sampled live set "
+                           f"says {drift_row[1]} MB (hi {drift_row[2]}, lo "
+                           f"{drift_row[3]})")
+        # The identity is vacuous unless the rule is what actually chose the
+        # bound on a fair share of the flushes rather than a clamp.
+        inside = [r for r in rows if r[6] >= GATE and FLOOR < r[3] < CAP]
+        if len(inside) < checked // 4:
+            return False, (f"only {len(inside)} of {checked} bounds left "
+                           f"their clamps")
+        span = (min(r[3] for r in inside), max(r[3] for r in inside))
+        return True, (f"ok (bound {span[0]}-{span[1]} MB on {len(inside)} of "
+                      f"{checked} flushes, worst {worst} MB off)")
+
+    return [
+        ("a flat live set earns nothing", a_flat_live_set_earns_nothing),
+        ("the earn rule is what denies it", the_earn_rule_is_what_denies_it),
+        ("a cycling live set earns the pool", a_cycling_live_set_earns_the_pool),
+        ("the bound is the multiplier times the swing",
+         the_bound_is_the_multiplier_times_the_swing),
+    ]
+
+
 # The no-panic contract's own program: one transfer, one execute, one print,
 # so that whichever of the two the governor is being asked about is the only
 # thing that can fail.  Every arm below runs THIS, with one variable moved.
@@ -3709,12 +4019,19 @@ def _governor(subprocess, tempfile, pathlib, re):
         standing beside somebody else's page cache.  Forced here by a free
         floor no machine can be above, which is the honest way to test a
         threshold whose real trigger is a full machine.
+
+        P28's benefit gate is off for BOTH arms, deliberately: this program's
+        live set is flat by construction, so rule 3 alone would hold both of
+        them at the floor and the contract would pass while proving nothing
+        about the governor.  The unpressured arm reaching the cap is this
+        test's precondition, not its claim.
         """
         CAP, FLOOR, GATE = 4096, 256, 8
         env = dict(METALJAX_DEBUG=1, METALJAX_MEMDBG=1, METALJAX_COMPILE=0,
                    METALJAX_EAGER_FLUSH_MB=64, METALJAX_FLUSH_CLEAR_MB=CAP,
                    METALJAX_FLUSH_FLOOR_MB=FLOOR,
                    METALJAX_FLUSH_MAIN_FLUSHES=GATE,
+                   METALJAX_FLUSH_EARN_MULT=0,
                    METALJAX_FLUSH_FOOTPRINT_MB=1 << 22)
         proc, out = run(_P25_TRAFFIC, **env)
         if proc.returncode:
@@ -4687,6 +5004,8 @@ def main():
                                             __import__("re"))
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,
                                                __import__("re"))
+                         + _p28_benefit_gate(subprocess, tempfile, pathlib,
+                                             __import__("re"))
                          + _p26_callee_sdpa(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _governor(subprocess, tempfile, pathlib,

@@ -187,33 +187,80 @@ int64_t phys_footprint() {
 // and its live set has reached 38 GB -- the bound it gets there is 11.1 GB,
 // then 2.2, and the 19.5 GB the spike frees is returned rather than held.
 //
+//  3. WHETHER IT IS EARNING IT (P28, notes/cpp-p28-benefit-gate.md). Rules 1
+//     and 2 between them ask whether a program MAY have a big pool; neither
+//     asks whether it is doing anything with one. The two maxtext DECODE rows
+//     are where that shows: measured with the meter below, each spends its
+//     whole life at a 2.4-3.0 GB pool and then, at the last one to four
+//     flushes of its checkpoint load, has 14 GB of freed weights land in the
+//     pool at once -- which rules 1 and 2 both wave through (the load is one
+//     program taking 134 flushes in a single call, so it is past the gate by
+//     flush 8, and its live set is ~2 GB, so the room is the whole cap). The
+//     pool is then dead weight: nothing ever takes it out again, the program
+//     ends, and the process carries 17 GB / 11 GB of extra footprint into a
+//     decode phase that never reaches an eager flush at all. Both rows
+//     guard-killed at budgets they had never come near.
+//
+//     What separates them from the training row is not the flush count, the
+//     call count or the traffic -- all three say "eager main" for the load --
+//     but the program's own LIVE SET:
+//
+//       maxtext train step   live 6.9 -> 20.5 GB, swinging every flush,
+//                            pool 11.7 GB p50 sustained over 352 flushes
+//       maxtext ckpt load    live ~2 GB flat, pool 2.4 GB p50 over 133
+//                            flushes and 19.6 GB on the 134th
+//       maxtext decode step  live 1.2 GB flat, pool at the floor, 71 calls
+//
+//     And the live set is the right question to ask, not merely a
+//     discriminator that happens to work: a trim can only ever cost a program
+//     the memory it has to RE-ACQUIRE after the trim, and across a flush
+//     point that is bounded by how far its live set falls and rises. A
+//     program whose live set is flat at its flush points loses nothing when
+//     the pool is taken -- whatever it churns BETWEEN two flushes is served
+//     from the pool with no trim in the way. So:
+//
+//         earned = flush_earn_mult * (live_hi - live_lo)
+//
+//     over the program's own flushes. The multiplier is 2 because a flush
+//     point lands at an arbitrary phase of the program's cycle and the swing
+//     seen between two of them is a lower bound on it: measured, the training
+//     row's pool peaks at 1.58 swings, and 2 covers that with margin while
+//     still leaving the rows that must not have a pool at 2.4-7.1 GB.
+//
 // The floor -- P25's shipped 2048 MB -- is the no-regression anchor: it is
 // what every program got before, so no program can be trimmed HARDER than it
-// was, and both rules above can only ever hand memory back.
+// was, and all three rules above can only ever hand memory back. Rule 3 in
+// particular enters as one more `min`, so every bound it decides is <= the
+// bound P27 decided and >= the floor P25 shipped: no program that was safe
+// under either becomes unsafe under this.
 //
 // The floor is clamped by the cap, not the other way round, so a caller that
 // asks for a SMALL cap still gets it: `execute_test`'s "the pool stays under
 // its bound" runs at 256 MB and must stay there.
-int64_t flush_bound(int64_t cache_now, int64_t program_flushes) {
+int64_t flush_bound(int64_t cache_now, const FlushState& st) {
   const int64_t cap = g_cfg.flush_clear_bytes;
   if (cap < 0) return cap;                     // METALJAX_FLUSH_CLEAR_MB=-1
   const int64_t floor = std::min(g_cfg.flush_floor_bytes, cap);
   // The governor's veto (the no-panic contract): while the MACHINE is being
   // squeezed -- the free list at a quarter of the governor's floor, or the
   // kernel itself reporting pressure -- no program keeps a pool for
-  // convenience, whatever P27's two rules would have granted it. The HARD
+  // convenience, whatever the rules below would have granted it. The HARD
   // line deliberately, not the soft one the ingest pacer uses: a warm page
   // cache puts free under the soft line routinely and this must not cost a
   // training step its pool for that (memory.cc `being_squeezed`). Cached, so
   // it costs a load and a branch; it can only ever LOWER the bound.
   if (governor_squeezed()) return floor;
-  if (program_flushes < g_cfg.flush_main_flushes) return floor;
-  if (g_cfg.flush_footprint_bytes <= 0) return cap;   // pressure half off
-  const int64_t foot = phys_footprint();
-  if (foot < 0) return floor;   // no reading: the conservative half of P25
-  const int64_t live = std::max<int64_t>(foot - cache_now, 0);
-  const int64_t room = g_cfg.flush_footprint_bytes - live;
-  return std::min(cap, std::max(floor, room));
+  if (st.flushes < g_cfg.flush_main_flushes) return floor;   // rule 1
+  int64_t bound = cap;
+  if (g_cfg.flush_footprint_bytes > 0) {                     // rule 2
+    const int64_t foot = phys_footprint();
+    if (foot < 0) return floor;   // no reading: the conservative half of P25
+    const int64_t live = std::max<int64_t>(foot - cache_now, 0);
+    bound = std::min(bound, g_cfg.flush_footprint_bytes - live);
+  }
+  if (g_cfg.flush_earn_mult > 0)                             // rule 3
+    bound = std::min(bound, g_cfg.flush_earn_mult * st.swing());
+  return std::min(cap, std::max(floor, bound));
 }
 
 // ops.control._loop_flush: a sync point inside a loop. Evaluates pending

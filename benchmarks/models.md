@@ -166,8 +166,22 @@ Notes:
   wrong answer measures nothing. Row 14 is the same adapter, the same qwix
   int8 overrides and the same emits at 0.6B and is coherent (31.995 ms/tok,
   the gate-5 run of the same day); the two differ by ~10× in traffic per
-  compiled unit and by tied-vs-untied logits. Mechanism **open** — evidence,
-  hypotheses and the queued ladder in
-  `notes/row15-wrong-output-2026-08-17.md`; the "known MLX-quantization bug"
+  compiled unit and by tied-vs-untied logits. The "known MLX-quantization bug"
   label the governor campaign gave it does not exist and has been withdrawn
   (2026-08-03 exonerated the quantized dots, `7932b4d`).
+
+  **Mechanism established 2026-08-17 evening** (`notes/row15-wrong-output-2026-08-17.md`
+  §8, STATUS fn 34): **nondeterministic MLX command-buffer corruption at 8B
+  traffic, on BOTH engines**, amplified into the collapse by qwix's per-tensor
+  `absmax` scale — which clamps a zero scale but not a NaN one, so one bad
+  element turns a whole tensor NaN. Ten prefills of the same loaded parameters
+  in one process, on identical inputs, return **8 distinct first tokens and 2
+  full collapses** on the native engine and **10 distinct** on Stage 1, while
+  **row 14 returns the same token 10/10**. It is not our compiled path
+  (`METALJAX_COMPILE=0` is worse), not the recognizer, not the chunked replay,
+  and not the int8 arithmetic (every row-14/row-15 s8×s8→s32 contraction is
+  bit-exact vs numpy on both stacks). The committed 8B **bf16** canary
+  `notes/data/qwen3_8b_prefill_36layer.mlir` — no quantization, no checkpoint —
+  still corrupts at today's shipped budgets, bit-identically on both engines.
+  No fix at our level: this is the upstream MLX report. **The cell stays
+  unpublished and the row stays ✗.**
