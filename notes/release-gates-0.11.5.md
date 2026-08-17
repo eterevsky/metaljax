@@ -1,4 +1,4 @@
-# 0.11.5 final gate battery — 2026-08-17 (tree 6500370 → e54ec10, docs-only)
+# 0.11.5 final gate battery — 2026-08-17 (tree 6500370 → ff2cedd, docs-only)
 
 **This document is the release gate.** Every gate is filled in as it lands;
 nothing is pre-judged. Era rules: measurement only (harness-fix exceptions are
@@ -34,8 +34,10 @@ kept at `~/.cache/metaljax-bench/logs/release-0.11.5/prepanic/` and its findings
 that survive as *method* (the top_confs position effect, the `db08` finiteness
 flake) are carried below with their evidence.
 
-* **Tree**: `6500370` at build time; `e54ec10` at write-up (two docs-only
-  commits — `models.md`/`STATUS.md` restructure — which cannot move a number).
+* **Tree**: `6500370` at build time; `ff2cedd` at write-up (three docs/probe
+  commits — the `models.md`/`STATUS.md` restructure and the row-15
+  investigation, none of which touches plugin code, so the frozen binary's hash
+  was re-verified against `bazel-bin` before anything was banked).
 * **Artifacts**: `~/.cache/metaljax-bench/logs/release-0.11.5/`.
 
 ## Checklist
@@ -43,14 +45,14 @@ flake) are carried below with their evidence.
 | # | gate | verdict |
 |---|---|---|
 | 1 | Freeze the release dylib (build, sha256, byte-identity) | **PASS** |
-| 2 | Pinned jax suite, native, 164 files, `--jobs 1`, vs the 129 whitelist | *pending* |
-| 3 | `tests/` both legs (Stage 1 + native) | *pending* |
-| 4 | texmo: suite-106 + top_confs pairings, both stacks; both correctness gates | *pending* |
-| 5 | Model rows, every non-embargoed row, guarded | **REGRESSION** (two named, both memory, both attributed and opt-out — see below) |
+| 2 | Pinned jax suite, native, 164 files, `--jobs 1`, vs the 129 whitelist | **PASS** — 28,073 / 129, zero new |
+| 3 | `tests/` both legs (Stage 1 + native) | **PASS** — 1258 / (1187+71 = 1053+205 deselected) |
+| 4 | texmo: suite-106 + top_confs pairings, both stacks; both correctness gates | **PASS** |
+| 5 | Model rows, every non-embargoed row, guarded | **REGRESSION** — one, named and attributed: P27's flush watermark costs rows 11/14 17 GB / 11 GB of peak for no speed |
 | 5b | The no-panic contract | **PASS** |
 | 6 | Plugin contract suites | **PASS** |
-| 7 | Wheels: both variants, fresh-venv installs, `twine check` | *pending* |
-| 8 | Finale: verdicts, release notes, recommendation | *pending* |
+| 7 | Wheels: both variants, fresh-venv installs, `twine check` | **PASS** — nothing uploaded |
+| 8 | Finale: verdicts, release notes, recommendation | **GO, with one regression for Oleg to accept or refuse** |
 
 ---
 ## Gate 1 — the release binary, frozen — **PASS**
@@ -91,7 +93,7 @@ should cost minutes, not an hour).
 | `coexist_test.py` (**gemma** venv) | **all four**: tensorflow ×2 + array_record ×2 PASS | 8 s |
 | `bazel test //... --nocache_test_results` | `//metal:runtime_gil_free_test` **PASSED** (uncached) | 1 s |
 
-## Gate 5 — the model rows — **REGRESSION** (two named)
+## Gate 5 — the model rows — **REGRESSION** (one named, plus a soft second)
 
 One guarded process per row (`g5_model.sh`: recovery precheck, settle to a
 recovered machine, `mem_guard.sh` at the row's historical budget, durable logs,
@@ -211,6 +213,49 @@ The governor is exonerated by its own control *and* by the fourth arm; what the
 first pair measured is the suite-context trap (CLAUDE.md item 12) with a 82 GB
 ambient page cache behind it. The cell is 21.9; the spread is published.
 
+### Row 15 — ✗ WRONG OUTPUT, and it is not a 0.11.5 regression
+
+Row 15 (qwix-int8 Qwen3-8B, maxtext) **completes** under the governor — its
+memory blocker is gone, 79 GB peak, 0 refusals — and that is the contract
+result. It is **not published as a timing cell**, because the text it produces
+is wrong: `" fragment!!!!!!!"`, token ids `[12289, 0, 0, 0, 0, 0, 0, 0]`, and
+`!` is Qwen3's token 0 — the logits have collapsed to a constant and greedy
+`argmax` returns index 0. Timing a program that computes the wrong answer
+measures nothing.
+
+**Verdict: ✗ WRONG OUTPUT, not a 0.11.5 regression — the row has never worked.**
+It was embargoed from 2026-08-04 (the MLX command-buffer class) until this
+campaign, so there is no earlier metaljax number for it to regress from. The
+governor campaign's "known MLX-quantization bug" label was **withdrawn**: no
+such bug exists — 2026-08-03 exonerated the quantized dots (`7932b4d`), and
+row 14 is the same adapter, the same qwix int8 overrides and the same emits at
+0.6B and is coherent (**32.0 ms/tok**, this gate's own run). Evidence,
+hypotheses and the ladder: `notes/row15-wrong-output-2026-08-17.md`.
+
+**The H5 probe, run as this battery's last measured item** —
+`scripts/model_bench/row15_probe.py big` on the release dylib, which tests the
+element-count hypothesis (the untied 622 M-element `logits_dense` is the one
+buffer that exceeds a whole command buffer by itself, so a split would be forced
+in the same place every call — deterministic, and absent from row 14):
+
+| case | mode | elems | vs budget | rel_rms | non-finite | metal_std vs cpu_std |
+|---|---|---:|---|---:|---:|---|
+| over-budget-logits | bf16 | 622 M | **OVER** | 1.02e-06 | 0 | 0.04988192 vs 0.04988192 |
+| over-budget-logits | int8 | 622 M | **OVER** | **0.0** | 0 | identical |
+| under-budget-logits | bf16 | 268 M | under | 1.01e-06 | 0 | identical |
+| under-budget-logits | int8 | 268 M | under | **0.0** | 0 | identical |
+| tied-embed-06b (row 14's shape) | bf16 / int8 | 156 M | under | 4.2e-07 / **0.0** | 0 | identical |
+
+**H5 is refuted at the level this probe tests.** The over-budget dot is clean —
+bit-exact in int8, 1e-06 relative in bf16 (ordinary bf16 rounding, the same as
+the under-budget control), no non-finite values, and metal's output standard
+deviation equal to CPU's to every printed digit. An over-budget `logits_dense`
+shape **alone** does not corrupt, so the collapse needs something the isolated
+dot does not have. The mechanism stays **open**, the remaining rungs (A's
+`dots`/`qwix` arms, B's 8B canary, C's program capture, D's knob A/B) are
+specified in the row-15 note, and the fix is post-gate work by construction:
+this row ships as ✗ in the table either way.
+
 ### The recognizer nondeterminism — CHECKED on this binary, and it persists on rows 5 and 7
 
 The RC gate's finding was that the fused-attention emits make decode run-to-run
@@ -269,3 +314,390 @@ the ramp, 15f costs 2.9× — so **the originals are the cells**. Row 12's
 "fix" is a 93 GB download and row 20's is a packed sub-byte quantized path (a
 feature, identified, not attempted); both were tested at their own scale through
 the transfer path instead.
+
+## Gate 4 — texmo: the two pairings, then the two correctness gates — **PASS**
+
+Protocol: each pairing gets a hold of its own with a settle and nothing heavy
+before it, and the correctness gates run **after** the measurements (a
+106-subprocess gate poisons the next few minutes in the same hold, and it
+poisons the arm that runs first — P23). `g4f_texmo_final.sh`, 14:13 → 15:08.
+
+### 4a — texmo suite-106 (64-step chunks), native / Stage 1
+
+Hold 14:15 → 14:31, native 480 s then Stage 1 498 s, 106/106 rows both arms.
+
+| aggregate | n | **0.11.5 final** | governor campaign | 0.11.5 first pass | P27 | P23 |
+|---|---:|---:|---:|---:|---:|---:|
+| whole suite, geomean | 106 | **0.9840** | 0.9876 | 0.9917 | 0.9893 | 1.0050 |
+| whole suite, median | 106 | **0.9983** | 1.0002 | 0.9999 | 1.0001 | 1.0012 |
+| `big` | 34 | 0.9630 | | 0.9732 | | 1.0107 |
+| `mid` | 30 | 0.9917 | | 1.0035 | | 1.0033 |
+| `db` (msl territory) | 40 | 0.9970 | | 1.0011 | | 1.0013 |
+| `synth` | 2 | 0.9750 | | 0.9485 | | 1.0062 |
+| **rows where native is faster** | 106 | **65** | | 55 | | 42 |
+| rows within 1.2× **as swept** | 106 | 104 | 106 | 106 | 106 | 106 |
+| **rows within 1.2× after the outliers are re-measured standalone** | 106 | **106** | | 106 | | 106 |
+
+**Drift controls**: the native arm reads **1.0026** of the first pass's native
+arm (a different binary — the governor costs 0.3 % here) and 1.0041 of P27's;
+the Stage-1 arm reads 1.0104 of the first pass's. So both arms reproduce, and
+the pair's movement 0.9917 → 0.9840 is mostly the Stage-1 arm being ~1 % slower
+today; four measurements this week put the pair in 0.984–0.992.
+
+**The two rows outside 1.2× in the sweep are in-suite artifacts, re-measured
+standalone before being reported** (`g4g_anomalies.sh`, 3 reps per arm, arms
+interleaved):
+
+| config | in-suite | standalone Stage 1 | standalone native | standalone | verdict |
+|---|---:|---:|---:|---:|---|
+| `big14-b32l128` | **1.2895** | 17.4518 | 17.4730 | **1.0012** | in-suite artifact |
+| `big12-b8l256` | **1.2098** | 5.1898 | 5.1804 | **0.9982** | in-suite artifact |
+| `big09-b8l256` | 0.6688 | 38.3611 | 25.3802 | **0.6616** | **REAL** (P22's coop width cap) |
+
+Both artifacts are the documented lottery rows (`big14-b32l128`: P23 saw 1.143
+in-suite and 0.998 standalone; `big12-b8l256`: P22 saw 1.159 and 0.998).
+Substituting the three standalone numbers: geomean **0.9798**, median 0.9983,
+**106 of 106 within 1.2×**, native faster on 66, worst row `big14-b8l256` 1.142.
+
+### 4b — top_confs (163 configurations), bracketed
+
+The first pass established that arm **position** inside a hold is worth ~2 % on
+this sub-ms suite — larger than the effect being measured — so the pairing is
+run as Stage 1 → native → Stage 1 and the ratio taken against the mean of the
+two Stage-1 arms. The two Stage-1 arms differ by **1.0011**: the hold is flat.
+
+| aggregate | n | **0.11.5 final** | first pass | P23 | P22 |
+|---|---:|---:|---:|---:|---:|
+| **native / Stage 1 (same PJRT route, bracketed)** | 163 | **0.9970** (median 0.9991) | 1.0025 | 1.0016 | 1.001 |
+| rows within 1.2× / outside ±10 % | 163 | **163** / **0** | 163 / 0 | 163 / 1 | 163 |
+| rows where native is faster | 163 | **91** | 52 | 63 | — |
+| biggest win / loss | | `tc136-w1488` **0.936** / `tc005-w12` 1.021 | | | |
+| **native vs the 0.11.3 anchor** | 163 | **1.072× faster** | 1.071 | | 1.073 |
+| **Stage 1 vs the 0.11.3 anchor** | 163 | **1.069× faster** | 1.074 | | 1.071 |
+| **configurations beating jax-CPU** | 163 | native **59** · Stage 1 **59** · anchor 53 | 59 / 59 | 58 / 59 | 59 |
+| native arm vs the first pass's native arm | 163 | **0.9987** | | | |
+
+The jax-CPU column is the **2026-08-16 23:08 engine-route arm** (163 ok, 0 FAIL,
+0 error), not re-run tonight: it measures frozen Stage-1 code and the CPU
+reference, neither of which can come from the release binary. Everything else in
+the table is tonight's, on the release dylib.
+
+### 4c — the two correctness gates (own hold, after the measurements)
+
+| gate | stack | result | wall |
+|---|---|---|---:|
+| `plugin-native/texmo_gate.py` | native | **106 ok** (18 via sensitivity scaling), **0 decline, 0 FAIL, 0 error** | 264 s |
+| `scripts/texmo_check.py` | Stage 1 | **106 ok, 0 FAIL, 0 error** (tol 0.002) | 143 s |
+
+**A note the first pass earned.** On 2026-08-16 the Stage-1 `texmo_check` came
+back 105/106 once, on `db08-b4l1024`, with `worst=inf sens=1.9e+01 bad=19` —
+nineteen of twenty outputs differing in **finiteness** on a draw whose 1-ULP
+sensitivity was 15× the row's historical value; two immediate re-runs were
+106/106 and tonight's is 106/106. `texmo_check` builds a fresh model and samples
+fresh data per run, so an `lrnn.4.4` recurrence over 1024 timesteps can draw a
+chunk that diverges, and the two backends then overflow at different steps. It
+is the documented lottery-row class (P21 `big10`, P23/P25 `mid03`) with a new
+face: those flaked on tolerance, this one on finiteness, which `nbad == 0`
+cannot excuse — so an equally unlucky future draw will fail again. Property of
+the ill-conditioned configuration, not of either stack.
+
+## Gate 2 — pinned jax suite, natively, all 164 files — **PASS (zero new failures)**
+
+`g2_suite_tests.sh`, own lock hold, 15:12:55 → 15:41:34. `scripts/release/jax_suite.sh`
+with `METALJAX_PLUGIN_PATH` = the frozen release dylib, `--jobs 1` (load-bearing:
+parallel runs under-report), `--tests jax-v0.11.0/tests` relative so node ids
+match the whitelist. **28.7 min**, 164 of 164 files, no timeouts.
+
+| | **0.11.5 final** | first pass (pre-governor) | the RC gate | the approved native run (2026-08-11) |
+|---|---:|---:|---:|---:|
+| passed | **28,073** | 28,073 | 28,068 | 28,068 |
+| failed | **129** | 129 | 129 | 129 |
+| skipped | 6,161 | 6,161 | 6,160 | 6,158 |
+| collection errors | 35 | 35 | 35 | 35 |
+| **pass rate** | **99.54 %** | 99.54 % | 99.54 % | 99.54 % |
+
+**The gate: `failures − whitelist = ∅`**, diffed against the reviewed native
+list `notes/data/p12-14-native-failures.txt` (the 142 ids Oleg signed off one by
+one in `notes/parity-whitelist-report.md`):
+
+* **NEW failures: 0** (`g2-new-failures.txt` is empty) — nothing outside the
+  reviewed set, so no id needed a standalone rerun.
+* **Newly passing: 13** — exactly the 13 the report says were fixed rather than
+  whitelisted (`aot_test` 2, `api_test` 2, `async_collectives_test` 2,
+  `export_test` 2, `lax_test` 2, `memories_test` 2, `lax_numpy_indexing_test` 1).
+  142 − 13 = **129**.
+* **Against the RC gate's own list the set is IDENTICAL, id for id** (`comm`
+  empty both ways) — and identical again to the pre-governor first pass, so the
+  memory governor moved nothing in the suite.
+
+Composition: `export_harnesses_multi_platform` 44, `lobpcg` 27, `x64_context` 13,
+`export_test` 5, `api_test` 5, `xla_transform` 4, `shape_poly` 4,
+`profiler_session` 3, `async_collectives` 3, `sparse_bcoo_bcsr` 2 (MLX's fusion
+bug #8), `logging` 2, `layout` 2, then singletons — the f64-policy /
+export-allowlist / PJRT-surface / harness-skew classes, unchanged.
+
+**The wrapper's own verdict line reads "FAIL, NEW failures: 12" and that is
+expected**: `jax_suite.sh` diffs against the **Stage-1-era 130-id list**
+(`notes/data/pinned-0.11.0-failures.txt`); the 12 are the known
+native-vs-Stage-1 split (`x64_context` 6, `sparse_bcoo_bcsr` 2,
+`dtypes`/`lax_numpy`/`layout`/`pickle` 1 each), every one inside the 142-id
+native list with a review verdict. Measured against the list that governs this
+stack the count is zero.
+
+Artifacts: `jax-suite/{jax_suite.md,jax_suite.log,jaxtests/{failures.txt,summary.csv}}`,
+`g2-new-failures.txt` (empty), `g2-newly-passing.txt` (13).
+
+## Gate 3 — `tests/` on both legs — **PASS**, and the 1053-vs-1187 question resolved
+
+Same script, second hold (15:42:34 → 15:45:57).
+
+| leg | result | wall |
+|---|---|---:|
+| default (**Stage 1** trampoline) | **1258 passed, 0 failed** | 89 s |
+| native (`METALJAX_PLUGIN_PATH` = frozen release dylib) | **1187 passed, 71 failed** | 61 s |
+| native, **deselected** (the governor campaign's form) | **1053 passed, 0 failed, 205 deselected** | 53 s |
+
+**The two native numbers are the same run seen two ways, and both are right.**
+The governor campaign ran `pytest tests -q -x --deselect tests/test_moe.py
+--deselect tests/test_qmm.py --deselect tests/test_qmm_mxfp4.py --deselect
+tests/test_engine_gc.py` and reported 1053/0; this gate runs the plain form and
+reports 1187/71. The arithmetic closes exactly:
+
+| | tests | of which pass natively | of which fail natively |
+|---|---:|---:|---:|
+| the four Stage-1-only files | **205** | 134 | **71** |
+| everything else | 1053 | 1053 | 0 |
+| **total** | **1258** | 1187 | 71 |
+
+The 71 are the documented composition — `test_moe` 28, `test_qmm` 26,
+`test_qmm_mxfp4` 16, `test_engine_gc` 1 — i.e. 70 recognizer-family Python
+counter assertions plus the Python engine's buffer-GC test, none of which a
+plugin holding no Python interpreter can satisfy (P17). Deselecting the four
+files removes all 205 of their tests, not just the 71 that fail, which is why
+the two counts look unrelated and are not. No new file appears in either form,
+and the Stage-1 leg — the release number — is exact at **1258**.
+
+## Gate 7 — wheels, both variants — **PASS** (nothing uploaded)
+
+`g7_wheels.sh`, own hold, 15:56:58 → 15:58:09. Built into **separate out-dirs**
+because both variants produce the *same* filename (the identical-filename trap).
+
+| variant | size | sha256 |
+|---|---:|---|
+| default (Stage 1 trampoline) | 291,083 B (288 K) | `0c0dd8df1b35a8fb60ef6d9c7d91b3a3781cff7d8559856891edf894de489f81` |
+| native (phase-2 plugin) | 12,077,249 B (12 M) | `138a1ee6ef2462333b72f85b93a6fa4759f020e1a3aaf2a45a1f7fded642ffcf` |
+
+Paths: `~/.cache/metaljax-bench/wheels-0.11.5/{default,native}/metaljax-0.11.5-py3-none-macosx_14_0_arm64.whl`.
+
+* `twine check`: **PASSED** on both.
+* **The native wheel carries the gated binary, verified by hash**: the dylib
+  inside it is `ebe56e71…9fb9f31` — byte-identical to
+  `frozen-0.11.5-ebe56e71.dylib` and to the tree's `bazel-bin` build. The thing
+  that was measured, gated and would be published is one file.
+* Tree restored after the builds (hatch parks the trampoline while building the
+  native wheel): `src/metaljax/lib/libmetal_pjrt.dylib` is back in place and
+  `git status` shows only this gate document.
+
+Fresh **non-editable** installs, each into a clean `uv venv`:
+
+| wheel | python | checks |
+|---|---|---|
+| native | **3.12 / 3.13 / 3.14** | `wheel_poc_test.py` all checkpoints; eigh reconstruction + a 128-step `lax.scan` matvec cell with `value_and_grad` (msl-family) vs numpy — **WHEEL SMOKE OK** on all three |
+| default | **3.12 / 3.13 / 3.14** | `[MetalDevice(id=0)]`, `2 * [1,2,3] = [2 4 6]` on all three |
+
+Two things the installs surface, neither new but both release-relevant:
+
+1. **`metaljax.__version__` reports `0.11.3` while the distribution is
+   `0.11.5`** — on both wheels, all six interpreters. `RELEASING.md` step 0
+   requires the version to be bumped in **both** `pyproject.toml` and
+   `src/metaljax/__init__.py`; `src/` has been frozen since 2026-08-10, so the
+   0.11.4 and 0.11.5 bumps touched only `pyproject.toml`. The skew therefore
+   already shipped in 0.11.4 (TestPyPI). It is cosmetic — nothing in the code
+   reads `__version__` — but it is wrong in a published artifact, and the fix is
+   one line **that unfreezes `src/` and so invalidates every Stage-1 number in
+   this document**. Flagged, deliberately not fixed here.
+2. **The default wheel runs the Python engine**, printing `[metaljax] native
+   engine not built (native/build.sh); running on the Python engine`. Documented
+   behaviour, measured at the RC gate: 1.00–1.02× on decode and training, 1.23×
+   on prefill, +2 GB peak.
+
+**Nothing was uploaded.** The TestPyPI upload is the main agent's, after review;
+public PyPI and the git push are Oleg's.
+
+---
+# Gate 8 — the go/no-go
+
+## Verdicts
+
+| # | gate | verdict | headline |
+|---|---|---|---|
+| 1 | Release binary frozen | **PASS** | `ebe56e71…9fb9f31`, byte-identical to the tree's `bazel-bin` **and** to the governor campaign's `frozen-gov7` — which is what licenses banking its model rows |
+| 2 | Pinned jax suite, native, 164 files, `--jobs 1` | **PASS** | **28,073 passed / 129 failed = 99.54 %**, **zero new failures**, the failing set **identical id-for-id** to the RC gate's |
+| 3 | `tests/` both legs | **PASS** | Stage 1 **1258 / 0**; native **1187 / 71**, reconciled with the governor campaign's 1053 / 0 (same run, 205 deselected) |
+| 4 | texmo pairings + both correctness gates | **PASS** | suite-106 **0.9840** (0.9798 with the two artifacts re-measured standalone, **106/106 within 1.2×**, native faster on 65); top_confs bracketed **0.9970**, **1.072× the 0.11.3 anchor**, **59 configurations beating jax-CPU**; `texmo_gate` **106/106**, `texmo_check` **106/106** |
+| 5 | Model rows, all non-embargoed | **REGRESSION** | 15 of 17 measurable rows inside ±2 % of their cells, three better, rows 8/10 first-ever numbers — **and rows 11/14 now need 17 GB / 11 GB more peak footprint than the pool policy they shipped under**, for no speed |
+| 5b | The no-panic contract | **PASS** | 21 governed model runs + 8 synthetic rungs + 24 further guarded runs tonight: **no panic, no wedge, no jetsam**; 1.5×-physical loads refuse cleanly 3/3; rows 8/9/10/15 complete |
+| 6 | Plugin contract suites | **PASS** | `execute_test` **549 ok**, `ingest_test` 13 checks / 0 failed, `decline_census` 35/35, coexist all four carrier cases, `bazel test` uncached PASSED |
+| 7 | Wheels, both variants | **PASS** | `twine check` ×2; native wheel's dylib **hash-identical to the gated binary**; fresh 3.12/3.13/3.14 installs of both; **nothing uploaded** |
+
+## The release table
+
+| claim | number | where |
+|---|---:|---|
+| texmo suite-106, native / Stage 1 (geomean) | **0.9840** (median 0.9983) | gate 4a |
+| — with the two in-suite artifacts substituted standalone | **0.9798** | gate 4a |
+| — rows within 1.2× / native faster | **106 of 106** / 65 | gate 4a |
+| texmo top_confs (163), native / Stage 1, bracketed | **0.9970** (median 0.9991) | gate 4b |
+| — rows within 1.2× / outside ±10 % / native faster | **163** / **0** / 91 | gate 4b |
+| — vs the 0.11.3 anchor | native **1.072× faster**, Stage 1 1.069× | gate 4b |
+| — configurations beating jax-CPU | native **59**, Stage 1 **59** (anchor 53) | gate 4b |
+| jax pinned suite (native) | **28,073 / 129 = 99.54 %**, zero new | gate 2 |
+| texmo correctness, both stacks | **106 / 106** each | gate 4c |
+| `tests/`, Stage 1 | **1258 / 1258** | gate 3 |
+| model rows, biggest movers | row 1 **237.3** ms/tok (−21 % vs 0.11.4's 301.6) · row 14 **32.0** (−8.6 %) · row 19 **456.1** (−2.9 %) · row 8 **29.6** and row 10 **1865**, first ever | gate 5 |
+| the no-panic contract | **holds** on every row tested, including 9/10/15 | gate 5b |
+
+## The regression, stated per release rule 2
+
+**P27's flush watermark costs the two maxtext decode rows 17 GB and 11 GB of
+peak footprint, buys them nothing, and guard-kills them at the budgets every
+previous campaign used.**
+
+| row | shipped defaults | with P25 semantics (`METALJAX_FLUSH_CLEAR_MB=2048 METALJAX_FLUSH_FOOTPRINT_MB=0`) |
+|---|---|---|
+| 11 Qwen3-0.6B maxtext decode | **25 GB** peak, 16.92 ms/tok — guard-killed at its historical 20 GB budget | **7.6 GB** peak, 16.85 ms/tok |
+| 14 maxtext qwix-int8 0.6B | **26 GB** peak, 32.00 ms/tok — guard-killed at its historical 25 GB budget | **15 GB** peak, 32.14 ms/tok |
+
+It is **pre-existing in the 0.11.5 tree** (P27 landed in `00fba0f`, before the
+version bump), **not the governor** (row 11 dies at 20 GB with
+`METALJAX_MEM_GOVERNOR=0` too), **opt-out with one variable**, and **new
+information**: P27's battery measured rows 19/18/13/2 and never these two.
+No Oleg-quoted acceptance exists for it, because it has never been put to him —
+this document is the first place it is measured.
+
+A **soft second** is recorded rather than escalated: rows 2 and 6 read 1.5–2.0 %
+above their cells (94.3 vs 92.9; 55.8 vs 54.7) with identical tokens and
+identical emit narration, inside the ±3 % tolerance the RC gate used and inside
+their own multi-binary spread, with no mechanism identified.
+
+## Known and accepted (with the quotes that accept them)
+
+1. **The 129 whitelisted jax-suite failures** — reviewed one per row by Oleg in
+   `notes/parity-whitelist-report.md`, reproduced exactly, identical id-for-id
+   to the RC gate's set.
+2. **The 71 native `tests/` failures** — the Stage-1 Python-counter families.
+   Accepted, and scheduled for deletion: *"Post-0.11.5 retirement (Oleg,
+   2026-08-16): confirmed FIRST post-release milestone — full cleanup INCLUDING
+   docs. Delete: … engine-API tests (71 counter rows, test_native_tape,
+   extension buffer tests), texmo_check (texmo_gate is the gate)."*
+3. **The frozen-Stage-1 backlog** — Stage 1 still dumps its buffer pool
+   (`src/metaljax/interpreter.py:776`, `native/program.cc:38`), so any same-day
+   native/Stage-1 ratio on an eager-main row carries that difference. Same
+   quote: Stage 1 is deleted first thing post-release.
+4. **The fused-attention nondeterminism** — **re-checked on this binary and it
+   persists on rows 5 and 7** (two samples each diverge at token 51), while
+   rows 1/2/3/4 are stable and Stage-1-identical. Native wheel only, opt-out
+   `METALJAX_RECOGNIZE=0`, timings reproducible to ±1 %. **No verbatim Oleg
+   acceptance exists**; the RC gate raised it as "the single most
+   decision-relevant thing in this document" and the 0.11.4 TestPyPI upload
+   proceeded, which is evidence of tolerance, not a quote. It belongs in the
+   release notes.
+5. **The sub-ms dispatch floor** — configurations under ~0.5 ms/step measure the
+   harness; on `top_confs` arm *position* inside a hold is worth ~2 %, which is
+   why that pairing is bracketed.
+6. **Rows 12 and 20 are not runnable for non-memory reasons** (a 93 GB
+   KaggleHub download; a packed sub-byte quantized path metaljax does not
+   implement — a feature, identified, not attempted). Both were tested at their
+   own scale through the transfer path under the contract.
+7. **Row 15 emits wrong text** — ✗ in the table, never worked, mechanism open,
+   H5 refuted by tonight's probe.
+8. **`metaljax.__version__` says 0.11.3** in both 0.11.5 wheels (see gate 7).
+
+## Release notes draft — metaljax 0.11.5
+
+*(Changes since 0.11.3, which is the last version whose numbers were published;
+0.11.4 was burned on TestPyPI before P24–P27 existed.)*
+
+**Headline: the whole engine now exists in C++, and the library will not panic
+your machine.**
+
+* **A second wheel variant: the fully native PJRT plugin** (`plugin-native/`,
+  built with `METALJAX_WHEEL_PLUGIN=native`). StableHLO is parsed and lowered in
+  C++ and executed with no Python interpreter in the loop — a GIL-free execute
+  path. It reaches parity with the Stage-1 trampoline across the board: the
+  texmo 106-configuration suite is **0.984** of Stage 1 (106/106 within 1.2×),
+  the 163-configuration `top_confs` suite **0.997**, both stacks **1.07× faster
+  than 0.11.3**, and **59 of 163** configurations now beat jax-CPU (0.11.3: 53).
+  Getting there: native control flow, gather/scatter, convolution, host-FFI
+  linalg, the emulated dtypes, sort/RNG/FFT, the qmm / MoE-gather / sdpa
+  recognizer emits, all three `msl_scan` modes, the compile decisions,
+  row-blocked quantized packing with a cross-executable cache, donation-aware
+  output copies, and an exported-symbols relink so the dylib can share a process
+  with TensorFlow and array_record.
+* **The no-panic contract, and the memory governor that keeps it.** metaljax
+  will not wedge the machine: under memory pressure it degrades (page-cache
+  sweeps, paced admissions), and when it cannot, it **refuses cleanly** with
+  `RESOURCE_EXHAUSTED` naming the ceiling and the knob. A load 1.5× physical
+  memory refuses reproducibly with the process alive; a 61 GB checkpoint now
+  leaves **1 MB** of page cache behind instead of 41–53 GB, with the free list
+  at 47 GB instead of 55 MB — and the governed load is 10 % *faster*. Four
+  previously embargoed model rows run for the first time: **Qwen3.6-35B-A3B
+  29.6 ms/tok**, **R1-Distill-32B 210.7**, **DeepSeek-V2-Lite completes**, and a
+  93.4 GB Mixtral checkpoint streams end to end.
+* **The eager flush stops dumping MLX's buffer pool.** It now trims to a
+  watermark (P25) and the watermark itself is decided per flush from the
+  program's own memory pressure (P27). Worth **1.85×** on the maxtext training
+  row (868 → 456 ms/step measured at the canonical sequence length) and ~2 % on
+  the `big` half of the texmo suite. **Known cost**: on the two maxtext *decode*
+  rows the pool now claims up to 25 GB where it used to hold 8, for no speed
+  gain — `METALJAX_FLUSH_CLEAR_MB=2048 METALJAX_FLUSH_FOOTPRINT_MB=0` restores
+  the old behaviour exactly.
+* **Faster where it matters**: gemma4-31B decode **301.6 → 237.3 ms/tok** (the
+  fused-attention recognizer now sees into `func.call` callees, so the decode
+  body compiles), maxtext int8 0.6B **35.0 → 32.0**, E2B keras-int4 **80.3 →
+  79.0**, LoRA training **407 → 359**.
+* **Correctness**: 28,073 of the pinned jax suite pass (99.54 %) with zero new
+  failures against the reviewed whitelist; all 106 texmo training
+  configurations match jax-CPU on both stacks.
+* **Known issues.** (a) With the native wheel the fused-attention path is
+  **run-to-run nondeterministic** on some models — identical timings, different
+  token streams after ~50 tokens; `METALJAX_RECOGNIZE=0` restores determinism
+  and Stage-1-identical output at ~4 %. The default wheel is unaffected.
+  (b) The default wheel still runs the Python engine (1.00–1.02× on decode and
+  training, 1.23× on prefill). (c) `metaljax.__version__` reports 0.11.3.
+  (d) maxtext int8 at 8B produces wrong output (investigation open). (e) The
+  129 whitelisted jax-suite failures and the f64 policy are unchanged.
+
+## Artifacts
+
+| what | path / hash |
+|---|---|
+| gated dylib | `~/.cache/metaljax-bench/frozen-0.11.5-ebe56e71.dylib` · `ebe56e7168eff581906718dfb24153b2575a69a4b9698801c01aea0a89fb9f31` |
+| default wheel | `~/.cache/metaljax-bench/wheels-0.11.5/default/metaljax-0.11.5-py3-none-macosx_14_0_arm64.whl` · `0c0dd8df1b35a8fb60ef6d9c7d91b3a3781cff7d8559856891edf894de489f81` |
+| native wheel | `~/.cache/metaljax-bench/wheels-0.11.5/native/metaljax-0.11.5-py3-none-macosx_14_0_arm64.whl` · `138a1ee6ef2462333b72f85b93a6fa4759f020e1a3aaf2a45a1f7fded642ffcf` |
+| every log, runner and jsonl | `~/.cache/metaljax-bench/logs/release-0.11.5/` (first pass under `prepanic/`) |
+| texmo aggregates | `notes/data/release-0.11.5-texmo.json`, `release-0.11.5-{suite106,topconfs}.csv` |
+
+## Recommendation
+
+**GO — with one decision to make first.** Every gate passes on the tree at
+`6500370` with the binary that would ship: the pinned jax suite reproduces its
+approved 129 failures with *zero* new ones and an identical failing set, both
+texmo gates are 106/106 on both stacks, `tests/` is 1258/1258 on Stage 1 and
+exactly the documented native split, the contract battery is 549/549 with the
+governor's five new contracts, fifteen of seventeen measurable model rows are
+inside ±2 % of their cells with two rows producing first-ever numbers, the
+no-panic contract holds across 45 guarded runs, and both wheels install clean
+into 3.12/3.13/3.14 with the native one carrying a hash-verified copy of the
+gated dylib.
+
+The decision is **the P27 watermark's memory cost on rows 11 and 14**: 17 GB and
+11 GB of extra peak footprint for no speed, which guard-kills both rows at their
+historical budgets. It is pre-existing in this tree, not the governor, opt-out
+with one environment variable, and invisible to every prior campaign because
+none of them measured those two rows. Under release rule 2 this document cannot
+score gate 5 as PASS over it. The options are (a) ship as-is and state it in the
+release notes (drafted above), (b) change the default before release — a
+one-line policy change in `runtime.cc` plus a re-gate of the affected rows, or
+(c) ship with the floor as the default for programs whose live set is small.
+That is Oleg's call, not this document's.
