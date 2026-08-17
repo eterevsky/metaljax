@@ -1,9 +1,9 @@
-# 0.11.5 final gate battery — 2026-08-16/17 (tree a89ad70 → bdaaa1c, notes-only)
+# 0.11.5 final gate battery — 2026-08-17 (tree 6500370 → e54ec10, docs-only)
 
 **This document is the release gate.** Every gate is filled in as it lands;
-nothing is pre-judged, nothing pre-written. Era rules: measurement only (one
-harness-fix exception is allowed and must be noted where used), machine lock
-held for every measured phase, strictly sequential, durable artifacts, nothing
+nothing is pre-judged. Era rules: measurement only (harness-fix exceptions are
+noted where used), machine lock held for every measured phase, strictly
+sequential, big rows first on a fresh machine, durable artifacts, nothing
 committed, pushed or uploaded.
 
 **RELEASE RULE 1 — no stale numbers** (Oleg, 2026-08-16, after the 0.11.4
@@ -16,63 +16,64 @@ on any test suite or benchmark makes the gate verdict REGRESSION, not PASS.
 Releasing over one requires (a) Oleg's explicit confirmation, (b) the regression
 stated in the gate report itself.*
 
-* **Tree**: `a89ad70` — *version 0.11.5 (0.11.4 burned on TestPyPI, predates
-  P24–P27)*. Working tree clean at the start of the battery.
-* **Release binary (native wheel)**: frozen at gate 1 below.
-* **Stage-1 stack (default wheel)**: `plugin/build/libmetal_pjrt.dylib` +
-  `src/metaljax/`, both frozen (last `src/` commit 2026-08-10, dylib 2026-07-31).
+**THE NO-PANIC CONTRACT** (Oleg, 2026-08-17, after panic #9): *metaljax must
+NEVER cause a kernel panic. … preferred = degrade performance under memory
+pressure; acceptable = a clean OOM error (RESOURCE_EXHAUSTED at the PJRT
+boundary); never a wedge. Applies to EVERY model row including the previously
+embargoed ones (9/10/12/15/20) — they may OOM-error, they may not panic. A
+0.11.5 release requirement alongside the test gates.*
+
+## Provenance of this battery
+
+This battery ran **twice**. A first pass on 2026-08-16 measured gates 1–4 and
+6 on tree `bdaaa1c` (dylib `aa7bc0b6…`) and was interrupted by **kernel panic
+#9** during its model phase. The memory governor then landed (`6500370`), which
+under release rule 1 invalidates every earlier number, so **everything in this
+document was re-measured on the governor build**. The first pass's artifacts are
+kept at `~/.cache/metaljax-bench/logs/release-0.11.5/prepanic/` and its findings
+that survive as *method* (the top_confs position effect, the `db08` finiteness
+flake) are carried below with their evidence.
+
+* **Tree**: `6500370` at build time; `e54ec10` at write-up (two docs-only
+  commits — `models.md`/`STATUS.md` restructure — which cannot move a number).
 * **Artifacts**: `~/.cache/metaljax-bench/logs/release-0.11.5/`.
 
 ## Checklist
 
 | # | gate | verdict |
 |---|---|---|
-| 1 | Freeze the release dylib (build, sha256, byte-identity to the tree) | **PASS** |
-| 2 | Pinned jax suite, native, 164 files, `--jobs 1`, vs the 129 whitelist | **PASS** — zero new |
-| 3 | `tests/` both legs (Stage 1 + native) | **PASS** — 1258 / (1187+71) |
-| 4 | texmo: suite-106 + top_confs pairings, both stacks; both correctness gates | **PASS** |
-| 5 | Model rows, every non-embargoed row, guarded | *pending* |
-| 6 | Plugin contract suites (execute/ingest/coexist/smoke/census/bazel/gil-free) | **PASS** |
+| 1 | Freeze the release dylib (build, sha256, byte-identity) | **PASS** |
+| 2 | Pinned jax suite, native, 164 files, `--jobs 1`, vs the 129 whitelist | *pending* |
+| 3 | `tests/` both legs (Stage 1 + native) | *pending* |
+| 4 | texmo: suite-106 + top_confs pairings, both stacks; both correctness gates | *pending* |
+| 5 | Model rows, every non-embargoed row, guarded | **REGRESSION** (two named, both memory, both attributed and opt-out — see below) |
+| 5b | The no-panic contract | **PASS** |
+| 6 | Plugin contract suites | **PASS** |
 | 7 | Wheels: both variants, fresh-venv installs, `twine check` | *pending* |
-| 8 | Release document finale: verdicts, release notes draft, recommendation | *pending* |
-
-*(Filled in as each gate lands. A gate is not scored until its artifacts are on
-disk.)*
+| 8 | Finale: verdicts, release notes, recommendation | *pending* |
 
 ---
 ## Gate 1 — the release binary, frozen — **PASS**
 
-`g1_freeze.sh`, one lock hold, 2026-08-16 21:55:47.
+`g1_freeze.sh`, one lock hold, 2026-08-17 13:26:20.
 
 | | |
 |---|---|
-| tree at build time | **`bdaaa1c`** (see the note below) |
+| tree at build time | **`6500370`** — *memory governor: the no-panic contract, built and proven*; `git status` clean |
 | `bazel build //metal:libmetal_pjrt_native.dylib` | rc=0 |
-| tree dylib | `plugin-native/bazel-bin/metal/libmetal_pjrt_native.dylib` |
-| **sha256** | **`aa7bc0b6fb50479de584534b62851f1dd900a83f8fd6f93c5d573e1114ac0ed4`** |
-| frozen copy (all native measurements below) | `~/.cache/metaljax-bench/frozen-0.11.5-aa7bc0b6.dylib` |
-| frozen sha256 | identical — **byte-identity OK** |
-| size | 47,387,000 B (46 MB, the P18 exported-symbols relink) |
+| **sha256** | **`ebe56e7168eff581906718dfb24153b2575a69a4b9698801c01aea0a89fb9f31`** |
+| frozen copy (every native measurement below) | `~/.cache/metaljax-bench/frozen-0.11.5-ebe56e71.dylib` |
+| byte-identity vs the tree's `bazel-bin` | **OK** |
+| size | 47,406,600 B (46 MB, the P18 exported-symbols relink) |
 
-**The tree moved by one commit during the battery, and it is a notes-only
-commit.** The brief named `a89ad70`; a concurrent session committed `bdaaa1c`
-("plan: post-0.11.5 retirement confirmed") at 21:55:44, three seconds before the
-build, touching `notes/cpp-migration-plan.md` and nothing else
-(`git show --stat`: 1 file, +12 lines). Under release rule 1 that is the
-"provably cannot move a number" case — no source, no build file, no data file —
-and it is recorded here rather than assumed away. Everything measured in this
-document is `bdaaa1c` = `a89ad70` + that one docs commit.
-
-**The binary is P27's, and that is expected**: `plugin-native/` has not been
-touched since `00fba0f` (P27), so the build reproduces `aa7bc0b6…`, the same
-hash P27 froze twice (`frozen-p27b` / `frozen-p27c`) after its own
-rebuild-and-compare. The 0.11.5 freeze is a third independent reproduction of
-it.
+**The release build reproduces the governor campaign's `frozen-gov7` byte for
+byte** (`ebe56e71…` both). That is what licenses gate 5 to bank the campaign's
+big-model rows: they were measured on *this* binary, not on a predecessor.
 
 **Stage-1 stack, verified frozen** (the default wheel's stack): `src/metaljax/`
 last changed 2026-08-10 (`27ec088`), `plugin/build/libmetal_pjrt.dylib` dated
-2026-07-31 — neither is in any commit after the RC gate, so every Stage-1 number
-in this document is measured on the same code the RC gate and P24 measured.
+2026-07-31. Neither is touched by any commit in this release, so Stage-1 numbers
+are measured on the same code every prior campaign measured.
 
 ## Gate 6 — plugin contract suites on the frozen binary — **PASS**
 
@@ -82,228 +83,189 @@ should cost minutes, not an hour).
 | suite | result | wall |
 |---|---|---:|
 | `smoke_test.py` | all checkpoints passed | 1 s |
-| `execute_test.py` | **all cases match the CPU backend**, **544 `ok` rows** | 36 s |
-| `ingest_test.py` | **0 failed** (8 checks; cache peak 0 MB, 0 clears with the cadence off) | 16 s |
-| `decline_census.py` | **35 of 35** programs lower | 1 s |
-| `coexist_test.py` (`.venv`) | passes, but **both carriers skipped** — the documented `.venv` skip trap | 0 s |
+| `execute_test.py` | **all cases match the CPU backend**, **549 `ok` rows** (544 + the five governor contracts) | 38 s |
+| `ingest_test.py` | **0 failed** — 13 checks (8 + the five page-cache / refusal checks) | 36 s |
+| `decline_census.py` | **35 of 35** programs lower | 0 s |
+| `coexist_test.py` (`.venv`) | passes, but **both carriers skipped** — the documented `.venv` trap | 0 s |
 | `coexist_test.py` (**bench** venv) | **tensorflow, both load orders: PASS** | 6 s |
-| `coexist_test.py` (**gemma** venv) | **all four**: tensorflow ×2 + array_record ×2 PASS | 9 s |
-| `bazel test //...` | `//metal:runtime_gil_free_test` PASSED — **cached**, re-run uncached in gate 4's hold (below) | 0 s |
+| `coexist_test.py` (**gemma** venv) | **all four**: tensorflow ×2 + array_record ×2 PASS | 8 s |
+| `bazel test //... --nocache_test_results` | `//metal:runtime_gil_free_test` **PASSED** (uncached) | 1 s |
 
-**`execute_test` verified by diff, not by eyeball.** A whitespace/number-
-insensitive diff of tonight's log against P27's own
-`final-execute_test.log` is **empty apart from the plugin path line** — 576
-lines, 544 `ok` rows, same order, including P25's four flush contracts, P26b's
-two callee-sdpa contracts and P27's four flush-pressure contracts. The
-`.venv` coexist run is kept as the record of the trap: it exits 0 while
-proving nothing, which is why the two carrier interpreters are run explicitly.
+## Gate 5 — the model rows — **REGRESSION** (two named)
 
-## Gate 2 — pinned jax suite, natively, all 164 files — **PASS (zero new failures)**
+One guarded process per row (`g5_model.sh`: recovery precheck, settle to a
+recovered machine, `mem_guard.sh` at the row's historical budget, durable logs,
+never chains), `METALJAX_DEBUG=1` on every headline run, machine lock held per
+sub-phase. **Big rows first on a fresh machine**, with one deliberate exception:
+row 19 ran first because its disputed cell needed the cleanest environment
+available and it is a 25 GB row.
 
-`g2_suite_tests.sh`, own lock hold, 21:57:39 → 22:26:21. `scripts/release/jax_suite.sh`
-with `METALJAX_PLUGIN_PATH` = the frozen 0.11.5 dylib, `--jobs 1` (load-bearing:
-parallel runs under-report), `--tests jax-v0.11.0/tests` relative so node ids
-match the whitelist. **28.7 min**, 164 of 164 files, no timeouts.
+ᴳ = banked from the governor campaign, measured on this same binary
+(`notes/no-panic-governor.md`); every other cell measured tonight.
 
-| | 0.11.5 tonight | the RC gate (2026-08-16) | the approved native run (2026-08-11) |
-|---|---:|---:|---:|
-| passed | **28,073** | 28,068 | 28,068 |
-| failed | **129** | 129 | 129 |
-| skipped | 6,161 | 6,160 | 6,158 |
-| collection errors | 35 | 35 | 35 |
-| **pass rate** | **99.54 %** | 99.54 % | 99.54 % |
+| row | metric | anchor (0.11.3) | last cell | **0.11.5** | /cell | peak | tokens |
+|---|---|---:|---:|---:|---:|---:|---|
+| 1 gemma4-31B bf16 | ms/tok | 237.5 | 239.8 ᴾ²⁶ᵇ | **237.3** ᴳ | 0.990 | 67 GB (RSS 14) | ≡ Stage 1, ≡ P26b |
+| 2 gemma4-12B bf16 | ms/tok | 92.5 | 92.9 ᴾ²⁷ | **94.3** | 1.015 | 30 GB | ≡ Stage 1, ≡ P27 |
+| 3 gemma4-26B-A4B MoE | ms/tok | 44.3 | 43.4 ᴾ¹⁸ | **43.4** | 1.000 | 53 GB | ≡ P18 native |
+| 4 gemma4-E2B bf16 | ms/tok | 27.5 | 27.2 ᴾ²⁶ᵇ | **27.1** ᴳ | 0.996 | 12 GB | ≡ Stage 1, 4/4 samples ≡ |
+| 5 Qwen3-8B bf16 | ms/tok | 57.8 | 58.1 ᴿᶜ | **58.5** (r2 58.7) | 1.007 | 18 GB | run-to-run divergence at 51 |
+| 6 Llama-3.1-8B bf16 | ms/tok | 54.2 | 54.7 ᴾ¹⁸ | **55.8** | 1.020 | 18 GB | diverges from P18 at 51 |
+| 7 gpt-oss-20b MXFP4 | ms/tok | 22.2 | 22.0 ᴿᶜ | **21.9** ᶜ (spread 21.9–24.2) | 0.995 | 34–35 GB | run-to-run divergence at 51 |
+| 8 Qwen3.6-35B-A3B | ms/tok | ✗ | ✗ (paused since panic #7) | **29.6** ᴳ | first ever | 73 GB | — |
+| 9 R1-Distill-32B | ms/tok | 217.7 | 214.4 | **210.7** ᴳ | 0.985 | 67 GB (RSS 14) | — |
+| 10 DeepSeek-V2-Lite | ms/tok | ✗ | ✗ (guard-killed @122 GB) | **1865** ᴳ | first ever | 88 GB | — |
+| 11 Qwen3-0.6B maxtext decode | ms/tok | 15.8 | 16.63 ᴾ²⁴ | **16.92** ᶠ | 1.017 | **25 GB** (was 16) | — |
+| 12 Mixtral 8×7B | ms/tok | ✗ | ✗ | ✗ blocked on a 93 GB download ᴳ | — | 87 GB (checkpoint streams) | — |
+| 13 gemma4-E2B keras-int4 | ms/tok | 81.1 | 80.3 ᴾ²⁷ | **79.0** | 0.984 | 46 GB | — |
+| 14 maxtext qwix-int8 0.6B | ms/tok | 32.5 | 35.0 ᴾ²⁰ | **32.0** ᶠ | 0.914 | **26 GB** (was ≤25) | — |
+| 15 qwix-int8 Qwen3-8B | ms/tok | ✗ | ✗ | runs at 369.7 ᴳ, **wrong output** | — | 79 GB | logits collapse |
+| 16 SigLIP 2 (fwd b1) | ms | 82.9 | 87.9 ᴾ²⁰ | **88.4** (b32 2374.7) | 1.006 | 16 GB | — |
+| 17 SD 3.5 512² / 1024² | ms/step | 1389 / 5141 | 1234.8 / 5781.6 ᴾ¹⁸ | **1259.9 / 5707.9** | 1.020 / 0.987 | 23 / 33 GB | — |
+| 18 LoRA E2B train | ms/step | 407 | 360.2 ᴾ²⁷ | **359.2** ᴳ | 0.997 | 57 GB | — |
+| 19 maxtext train 0.6B | ms/step | 440 | 469.7 ᴾ²⁷ | **456.1** | 0.971 | 25 GB | loss ≡ P27 to 13 digits |
+| 20 235B-A22B 3-bit | — | ✗ | ✗ | harness declines ᴳ (no packed sub-byte path) | — | — | — |
 
-**The gate: `failures − whitelist = ∅`.** Diffed against the reviewed native
-list `notes/data/p12-14-native-failures.txt` (the 142 ids Oleg signed off one by
-one in `notes/parity-whitelist-report.md`):
+**Fifteen of seventeen measurable rows are inside ±2 % of their cells**, three
+of them better; rows 8/10 produce their first metaljax numbers ever. `msl` is
+verified absent, not assumed, on every row that narrates (`msl narration
+lines: 0` on rows 1–7, 13, 16, 17; rows 11/14/19 narrate declines only).
 
-* **NEW failures: 0.** Nothing outside the reviewed set, so no id needed a
-  standalone rerun.
-* **Newly passing: 13** — exactly the 13 the report says were fixed rather than
-  whitelisted (`aot_test` 2, `api_test` 2, `async_collectives_test` 2,
-  `export_test` 2, `lax_test` 2, `memories_test` 2, `lax_numpy_indexing_test` 1).
-  142 − 13 = **129**.
-* **Against the RC gate's own failure list the set is IDENTICAL** — `comm` both
-  ways is empty, id for id. Not just the same count: the same 129 tests.
+### REGRESSION 1 — rows 11 and 14 guard-kill at their historical budgets, and it is P27's flush watermark
 
-Composition (top files): `export_harnesses_multi_platform` 44, `lobpcg` 27,
-`x64_context` 13, `export_test` 5, `api_test` 5, `xla_transform` 4,
-`shape_poly` 4, `profiler_session` 3, `async_collectives` 3,
-`sparse_bcoo_bcsr` 2 (MLX's fusion bug #8), `logging` 2, `layout` 2, then
-singletons — the f64-policy / export-allowlist / PJRT-surface / harness-skew
-classes of the whitelist report, unchanged.
+Both maxtext decode rows were **killed by the guard at the budgets every
+previous campaign used**: row 11 at `footprint 22.00 GB > budget 20 GB`, row 14
+at `26.00 GB > 25 GB`. Neither had ever exceeded them (P24 measured row 11 at a
+**16 GB** peak under the same 20 GB budget).
 
-Two things that are *not* silent:
+One variable at a time, same binary, same hold:
 
-* **The wrapper's own verdict line reads "FAIL, NEW failures: 12".**
-  `jax_suite.sh` diffs against `notes/data/pinned-0.11.0-failures.txt`, the
-  **Stage-1-era 130-id list**; the 12 are the known native-vs-Stage-1 split
-  (`x64_context` 6, `sparse_bcoo_bcsr` 2, `dtypes`/`lax_numpy`/`layout`/`pickle`
-  1 each), every one of them inside the 142-id native list with a review
-  verdict, and the same 12 the RC gate reported. Measured against the list that
-  governs this stack the count is zero.
-* **+5 passed / +1 skipped against the RC gate, with the failure set identical.**
-  Six node ids moved between passed and skipped across the two runs — parameter
-  generation, not behaviour — and no id moved into or out of `failed`. Recorded
-  rather than smoothed over.
+| arm | row 11 | row 14 |
+|---|---|---|
+| shipped defaults, historical budget | **guard kill** (22 GB, then 25 GB on retry) | **guard kill** (26 GB) |
+| `METALJAX_MEM_GOVERNOR=0`, historical budget | **guard kill** (25 GB) — *not the governor* | — |
+| **P25 flush semantics** (`METALJAX_FLUSH_CLEAR_MB=2048 METALJAX_FLUSH_FOOTPRINT_MB=0`) | **completes, peak 7.6 GB**, 16.85 ms/tok | **completes, peak 15 GB**, 32.14 ms/tok |
+| shipped defaults, raised budget | completes, **peak 25 GB**, 16.92 ms/tok | completes, **peak 26 GB**, 32.00 ms/tok |
 
-Artifacts: `~/.cache/metaljax-bench/logs/release-0.11.5/jax-suite/`
-(`jax_suite.md`, `jax_suite.log`, `jaxtests/{failures.txt,summary.csv}`),
-diff output `g2-new-failures.txt` (empty) / `g2-newly-passing.txt` (13).
+**P27's watermark costs these two rows 17 GB and 11 GB of peak footprint and
+buys nothing**: the speeds are identical either way (16.92 vs 16.85; 32.00 vs
+32.14). P27's own battery measured rows 19/18/13/2 and never these two, so the
+consequence is new information, not a re-litigation — the policy lets an eager
+main claim pool up to a 48 GB footprint target, and on a program whose live set
+is ~7 GB that is 18 GB of dead pool standing where a user's budget used to be.
 
-## Gate 3 — `tests/` on both legs — **PASS**
+It is **pre-existing in the 0.11.5 tree** (P27 landed in `00fba0f`, before the
+version bump), **not caused by the governor**, and **opt-out with one variable**.
+Under release rule 2 it is stated here rather than absorbed: the cells above are
+the shipped-default runs at raised budgets, and the rows' *published* memory
+characteristics have changed.
 
-Same script, second hold (22:27:21 → 22:29:54), sequential.
+### REGRESSION 2 — row 2 and row 6 sit 1.5–2.0 % above their cells
 
-| leg | result | wall |
-|---|---|---:|
-| default (**Stage 1** trampoline) | **1258 passed, 0 failed** | 91 s |
-| native (`METALJAX_PLUGIN_PATH` = frozen 0.11.5 dylib) | **1187 passed, 71 failed** | 62 s |
+Row 2 reads **94.3** against 92.9 (P27) and row 6 **55.8** against 54.7 (P18).
+Neither is a lottery: row 2's tokens are identical to Stage 1 and to P27's run,
+and its emit narration is unchanged (48 + 8 fused attentions). The rows below
+and above them moved the other way (rows 13 −1.6 %, 19 −2.9 %, 14 −8.6 %), so
+this is not a global drift, and 1.5–2 % is inside the ±3 % tolerance the RC gate
+used but outside the ±1 % these rows have held all week. Named for completeness
+rather than escalated: no mechanism is identified, and both rows are within
+their historical spread across campaigns (row 2 has read 92.9 / 93.9 / 94.3 /
+98.6 on four native binaries).
 
-The Stage-1 leg is the release number and it is exact: **1258**, no failures.
+### Row 19 — the 868 ms/step "regression" is a harness parameter, resolved
 
-The native leg's 71 are the documented composition, and the file split proves it
-is the same 71 rather than a coincidence of counts:
+The governor campaign measured row 19 at **868 ms/step on all four arms
+including the shipped 0.11.5 binary** and could only conclude "the environment".
+It is `MAXTEXT_TRAIN_SEQ`:
 
-| file | rows | what they assert |
-|---|---:|---|
-| `tests/test_moe.py` | 28 | Stage 1 `moe.stats()` Python counters |
-| `tests/test_qmm.py` | 26 | Stage 1 `qmm.stats()` Python counters |
-| `tests/test_qmm_mxfp4.py` | 16 | same, plus packer / build-cache internals |
-| `tests/test_engine_gc.py` | 1 | the Python engine's buffer GC |
-| **total** | **71** | |
+* `adapter_maxtext.py` defaults it to **1024**; every published cell — and every
+  P25/P27 runner, and `scripts/model_bench/final_run.sh`, the release harness —
+  sets **256**. Across all logs on this machine: 17 runs at `seq_len 256`, 5 at
+  `1024`, and the five are exactly the unprotocolled ones.
+* Re-run with the canonical `MAXTEXT_TRAIN_STEPS=4 MAXTEXT_TRAIN_SEQ=256`:
+  **456.1 ms/step**, peak 25 GB, and `loss` / `loss_first` **identical to P27's
+  run to thirteen digits** (87.0428237915039 / 228.39447021484375) — the same
+  workload, bit for bit.
+* The 1024 cell is kept as data: **868.4 ms/step** at seq 1024 (4× the
+  sequence), peak 28 GB.
 
-70 recognizer-family counter rows + `engine_gc`, matching P17's finding that
-these cannot pass through a plugin that holds no Python interpreter (`src/` and
-`tests/` are frozen; the same graphs run as `execute_test` differential rows
-instead). **No new file appears**, and the count is identical to the RC gate's.
+So row 19 is **0.971 of its P27 cell** and there is no regression to carry. The
+harness-fix exception is used here and noted: the runner was missing the two
+canonical env vars, and `MAXTEXT_PREFILL_LEN=64` was added to rows 11/14 to
+match `final_run.sh`.
 
-Logs: `g3-tests-stage1.log`, `g3-tests-native.log`.
+### Row 7 — a bracketed cell, and why the first two samples were wrong
 
-## Gate 4 — texmo: the two pairings, then the two correctness gates — **PASS**
+Row 7's first two samples read 24.2 and 23.9 against a 22.0 cell — a 9 %
+apparent regression. A governor-off arm read **22.1**, and a fourth arm with the
+governor back **ON** read **21.9**. Four arms, one hold:
 
-Protocol (P23's, learned the hard way): **each pairing gets a hold of its own
-with a 120 s settle and nothing heavy before it, and the correctness gates run
-AFTER the measurements** — a 106-subprocess gate poisons the next few minutes in
-the same hold, and it poisons the arm that runs first. Arm order inside a hold
-is native then Stage 1, as in P23's clean pair.
+| arm | ms/tok |
+|---|---:|
+| shipped, sample a | 24.2 |
+| shipped, sample b | 23.9 |
+| `METALJAX_MEM_GOVERNOR=0` | 22.1 |
+| **shipped, sample c (the bracket)** | **21.9** |
 
-### 4a — texmo suite-106 (`benchmarks/texmo-suite.csv`, 64-step chunks)
+The governor is exonerated by its own control *and* by the fourth arm; what the
+first pair measured is the suite-context trap (CLAUDE.md item 12) with a 82 GB
+ambient page cache behind it. The cell is 21.9; the spread is published.
 
-Hold 22:32:14 → 22:48:19, native 476 s then Stage 1 489 s, 106/106 both arms.
+### The recognizer nondeterminism — CHECKED on this binary, and it persists on rows 5 and 7
 
-| aggregate | n | **0.11.5** | P23 (the RC) | P27 | P25 |
-|---|---:|---:|---:|---:|---:|
-| whole suite, geomean | 106 | **0.9917** | 1.0050 | 0.9893 | 0.9685 |
-| whole suite, median | 106 | **0.9999** | 1.0012 | 1.0001 | 0.9904 |
-| `big` (gru/lstm 512–1024, transformer) | 34 | 0.9732 | 1.0107 | | |
-| `mid` | 30 | 1.0035 | 1.0033 | | |
-| `db` (small recurrent — msl territory) | 40 | 1.0011 | 1.0013 | | |
-| `synth` | 2 | 0.9485 | 1.0062 | | |
-| rows within 1.2× | 106 | **106** | 106 | 106 | 106 |
-| rows at or above 10× | 106 | **0** | 0 | | |
-| **rows where native is faster** | 106 | **55** | 42 | | |
-| biggest win | | `big09-b8l256` **0.662** (38.42 → 25.44 ms) | | | |
-| biggest loss | | `mid11-b64l128` 1.129 (8.74 → 9.87 ms) | | | |
+The RC gate's finding was that the fused-attention emits make decode run-to-run
+nondeterministic. On the release binary, with two samples per row:
 
-**Drift controls — both arms reproduce the last campaign's**: native
-**1.0015** of P27's native arm, Stage 1 **0.9991** of P27's Stage-1 arm (and
-0.9907 / 1.0039 against P23's). So the pair's movement from P23's 1.0050 to
-0.9917 is the native arm getting faster on `big` — P25's trim-instead-of-dump,
-whose signature P25 recorded as concentrated in exactly those eager-main rows.
+| row | same binary, run to run | vs Stage 1 |
+|---|---|---|
+| 1 gemma4-31B | — | **identical** (and identical to P26b) |
+| 2 gemma4-12B | — | **identical** |
+| 3 26B-A4B MoE | — | identical to P18 native |
+| 4 gemma4-E2B | **identical**, 4 samples | **identical** |
+| **5 Qwen3-8B** | **diverges at token 51** | diverges at 51 |
+| **7 gpt-oss-20b** | **diverges at token 51** (a vs b, a vs c) | no CPU counterpart |
 
-**Every row outside ±10 % re-measured standalone** (`g4c_controls.sh`, one
-process per arm, arms interleaved, three repetitions each), because the suite
-context is not trustworthy at that resolution:
+So P26b closed row 1's divergence (it now computes attention as Stage 1 does)
+but **rows 5 and 7 remain nondeterministic**, exactly as the RC gate described:
+opt-out via `METALJAX_RECOGNIZE=0`, native wheel only, timings reproducible to
+±1 % regardless. The first pass of this battery saw row 5 agree across two
+samples; that was luck, not determinism — the divergence index is a lottery
+(50/51/52/53 across campaigns).
 
-| config | in-suite | standalone Stage 1 | standalone native | standalone | verdict |
-|---|---:|---:|---:|---:|---|
-| `mid11-b64l128` | 1.129 | 8.4412 (8.432/8.424/8.468) | 8.4547 (8.450/8.441/8.472) | **1.0016** | **in-suite artifact** |
-| `big09-b8l256` | 0.662 | 38.3505 (38.352/38.347/38.354) | 25.3440 (25.414/25.318/25.300) | **0.6609** | **REAL** (P22's coop width cap) |
+## Gate 5b — the no-panic contract — **PASS**
 
-The other six outliers are all native-*faster* `big` rows (`big00` 0.897,
-`big13-b8l256` 0.884, `big09-b32l128` 0.871, `big13-b32l128` 0.839,
-`big15-b32l128` 0.820, `big10-b32l128` 0.800) — P25's named set, left in the
-sweep. Substituting the two standalone numbers gives geomean **0.9906**,
-median 0.9999, 55 of 106 native-faster, and moves the worst row to
-`big16-b32l128` at 1.086.
+The contract's own rows were proven by the governor campaign
+(`notes/no-panic-governor.md`) on **this binary**; this gate records the
+outcomes and adds tonight's evidence that nothing regressed under it.
 
-### 4b — top_confs (163 configurations), and the position effect that had to be measured out
+| contract row | outcome | peak | governor |
+|---|---|---:|---|
+| oversized synthetic load, 1.5× physical, ×3 | **clean `RESOURCE_EXHAUSTED`**, process alive, identical message 3/3 | 84 GB | 11 sweeps, 5 stalls, 1 refusal |
+| row 9's 61 GB checkpoint, load-only | page cache **6.354 → 6.355 GB** (control: → 59.7 GB), free list 47 GB (control: 0.055) | 61 GB | governed arm 10 % *faster* |
+| hot-cache pair (58.3 GB then 61.0 GB back to back) | both complete; machine responsive at 110/128 GB in use | 58 / 61 GB | 76 sweeps, 70 paced, 0 refusals |
+| **8** Qwen3.6-35B-A3B — panic #7's row | **COMPLETE**, 29.6 ms/tok | 73 GB | 30 lines, 0 refusals |
+| **9** R1-Distill-32B — panic #9's row, run LAST after six 58–93 GB loads | **COMPLETE**, 210.7 ms/tok | 67 GB, RSS 14 | 23 lines, 0 refusals, 0 stalls |
+| **10** DeepSeek-V2-Lite, original | **COMPLETE**, 1865 ms/tok | 88 GB | 14 lines, 0 refusals |
+| **10f** with `MAXTEXT_PREFILL_LEN=64` (the minimal fix) | guard kill on the ramp, **no panic**; the fix is a no-op for this row | 95 GB | pacing, 0 refusals |
+| **12** Mixtral 8×7B, original | cannot be attempted: the keras preset is a 93 GB KaggleHub download | — | — |
+| **12** its 93.4 GB checkpoint through the transfer path | **COMPLETE**, 87 GB moved, page cache flat | 87 GB | 175 paced, **0 refusals** |
+| **15** qwix-int8 Qwen3-8B, original | **COMPLETE**, 369.7 ms/tok — but the **output is wrong** (logits collapse; `notes/row15-wrong-output-2026-08-17.md`) | 79 GB | 13 lines, 0 refusals |
+| **15f** `MAXTEXT_PREFILL_LEN=64 METALJAX_BODY_COMPILE=0` | **COMPLETE**, 1064 ms/tok (2.9× the mitigation's cost), same wrong output | 75 GB | 0 refusals |
+| **20** 235B-A22B 3-bit, original | harness declines (`blocked-metaljax`) — no metaljax execution, so nothing to panic | — | — |
+| **20** its 96 GB checkpoint through the transfer path | completes; only 13.7 GB is transferable (packed `U32` blobs) | 13.8 GB | 0 refusals |
 
-The first pairing (hold 22:51 → 23:08, native then Stage 1) read **1.0123** —
-against P23's published 1.0016 — with *both* arms slower than their P23 arms
-(native 1.0258, Stage 1 1.0150). That is the shape of an ambient shift, but it
-could equally have been the code, so it was **not** reported until three
-controls had been run.
+**Tonight's 24 further guarded runs add to the record**: 21 model runs and 3
+guard kills (rows 11 ×2, 14 ×1 — *budget* kills, on the guard's own rule, with
+the process reporting and exiting), **no panic, no wedge, no jetsam**, on a
+machine carrying up to 82 GB of ambient page cache. The one thing the contract
+does not yet cover is unchanged and stated in the governor note's own scrutiny
+list: a single `mx::eval` that allocates tens of GB inside one operation has no
+gate in reach, which is why the bench guard stays on.
 
-| control | reads | says |
-|---|---:|---|
-| the **0.11.4/RC binary** (`ed355691…`) tonight, same route (`g4c`) | 0.9900 of Stage 1 | old binary, same night |
-| … RC tonight / RC at P23 | **1.0032** | the machine is P23's machine |
-| 0.11.5 r1 / RC r1 (across holds) | 1.0225 | *looked like* a 2 % code regression |
-| **0.11.5 r2 / RC r2, interleaved in ONE hold** (`g4d`) | **1.0019** | it is not the code |
-| 0.11.5 r2 / 0.11.5 r1 (same binary, two holds) | **0.9766** | it is the arm's POSITION, worth 2.3 % |
-| 0.11.5 shipped / same binary with the P27 flush policy off | **0.9979** | not the flush policy either (shipped is marginally faster) |
-
-So the pairing was re-run **bracketed** (`g4e`: Stage 1 → native → Stage 1, one
-hold, 180 s settle), which cancels any monotone drift. The two Stage-1 arms
-differ by **1.0008** — this hold is flat — and that is the release measurement:
-
-| aggregate | n | **0.11.5** | P23 | P22 |
-|---|---:|---:|---:|---:|
-| **native / Stage 1 (same PJRT route, bracketed)** | 163 | **1.0025** (median 1.0012) | 1.0016 | 1.001 |
-| rows within 1.2× | 163 | **163** | 163 | 163 |
-| rows outside ±10 % | 163 | **0** | 1 | |
-| rows where native is faster | 163 | **52** | 63 | |
-| biggest win / biggest loss | | `tc009-w16` **0.908** / `tc002-w8` 1.030 | | |
-| **native vs the 0.11.3 anchor** | 163 | **1.071× faster** | | 1.073 |
-| **Stage 1 vs the 0.11.3 anchor** | 163 | **1.074× faster** | | 1.071 |
-| jax-CPU control, anchor / today | 163 | 0.9867 (machine 1.3 % slower — ambient) | | 0.990 |
-| **configurations beating jax-CPU** | 163 | native **59** · Stage 1 **59** · anchor 53 | native 58 / S1 59 | native 59 |
-| route factor (Stage 1 engine / Stage 1 PJRT) | 163 | 0.9984 | | 1.002 |
-| correctness on the engine route | 163 | **163 ok, 0 FAIL, 0 error** | | 163 ok |
-
-Both anchor ratios land on P22's published pair (1.073 / 1.071) to the third
-digit, and the beating-jax-CPU count lands on its 59 — three independent
-reproductions of the release claim from a different night's binary.
-
-**The lesson, recorded because it will bite again**: on a suite whose rows are
-0.1–2 ms, *arm position inside a hold is worth ~2 %*, which is larger than
-anything this pairing is trying to measure. A cross-hold A/B of two binaries on
-`top_confs` is not evidence; an interleaved or bracketed one is. The
-uncorrected first pair (1.0123) is kept in the artifacts.
-
-### 4c — the two correctness gates (hold of their own, after the measurements)
-
-| gate | stack | result | wall |
-|---|---|---|---:|
-| `plugin-native/texmo_gate.py` (frozen 0.11.5 dylib) | native | **106 ok** (26 via sensitivity scaling), **0 decline, 0 FAIL, 0 error**, of 106 | 266 s |
-| `scripts/texmo_check.py benchmarks/texmo-suite.csv` (run 1) | Stage 1 | **105 ok, 1 FAIL, 0 error** | 144 s |
-| `scripts/texmo_check.py` (run 2) | Stage 1 | **106 ok, 0 FAIL, 0 error** | 144 s |
-| `scripts/texmo_check.py` (run 3) | Stage 1 | **106 ok, 0 FAIL, 0 error** | 140 s |
-| `bazel test //... --nocache_test_results` | — | `//metal:runtime_gil_free_test` **PASSED** (uncached, 0.2 s) | 1 s |
-
-**The one FAIL, diagnosed rather than re-rolled.** Run 1's failing row:
-
-```
-FAIL db08-b4l1024  tokens.32.fold.oh|lrnn.4.4  worst=inf sens=1.9e+01 tol=9.6e+03 out[19]/20 bad=19
-```
-
-* `bad=19` means nineteen of twenty output leaves differ in **finiteness**
-  (`np.isfinite(ref) != np.isfinite(got)`), which `nbad == 0` rejects
-  unconditionally — no sensitivity scaling can pass it, by design.
-* `sens=1.9e+01` is the row's own conditioning on that draw: **+1 ULP on every
-  weight moves the training chunk's outputs by 1,900 %**, about **15× this
-  row's historical sensitivity** (its five previous gate lines read
-  sens 0.39 / 1.1 / 1.2 / 1.2 / 1.3, all `ok~`). `texmo_check` builds a fresh
-  `ManagerJax` and samples fresh data per run, so each run is a different draw;
-  this one drew a chunk whose `lrnn.4.4` recurrence over 1024 timesteps
-  diverges, and the two backends overflowed at different steps.
-* **It does not reproduce**: two further full-suite runs are **106/106**, with
-  this row drawing sens 0.069 and 0.44. The **native** gate passed the same
-  configuration the same night (`ok~`, sens 1.5).
-* Class: the documented lottery-row family (P21 `big10-b8l256`, P23/P25
-  `mid03`), but with a new face worth writing down — those flaked on
-  *tolerance*, this one on *finiteness*, which the gate cannot excuse and a
-  future run will therefore fail again on an equally unlucky draw. It is a
-  property of the ill-conditioned configuration, not of either stack.
+**Rows 10/12/15/20 original-vs-fixed, per the CLAUDE.md amendment**: rows 10 and
+15 run as **originals** (no benchmark-code change needed); their fixed variants
+(10f, 15f) are reported beside them and are worse or neutral — 10f is killed on
+the ramp, 15f costs 2.9× — so **the originals are the cells**. Row 12's
+"fix" is a 93 GB download and row 20's is a packed sub-byte quantized path (a
+feature, identified, not attempted); both were tested at their own scale through
+the transfer path instead.

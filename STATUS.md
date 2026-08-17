@@ -47,7 +47,7 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | not run (PAUSED ¹⁷) | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **80.3** (0.99× anchor ³²) ᴾ²⁷ | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **35.0** (1.06× S1 / 1.08× anchor ³⁰) | — | — | — |
-| 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ MLX command-buffer bug ⁸ | not run (embargo) | — | — | — |
+| 15 | *qwix-int8 Qwen3-8B* | 2118 (coherent) | ✗ MLX command-buffer bug ⁸ | ✗ **WRONG OUTPUT** ³⁴ (runs, 369.7) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | **87.9** (1.02× S1 / 1.06× anchor ³⁰; b32 0.94×) | — | 29.8 (b32: 591) | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512², 5141 @1024² ⁹ | **1234.8** @512² (0.81× S1 / 0.89× anchor), **5781.6** @1024² (1.13× S1 / 1.12× anchor) ²⁷ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
 | 18 | LoRA E2B train (ms/step) | 2048 | **407** | **360.2** (0.89× anchor ³²) ᴾ²⁷ | — | 135.6 ¹⁰ | — |
@@ -518,3 +518,54 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
   `plugin-native/coexist_test.py`. Footnote 27.
 
 33. Rows 8/10 first native results (2026-08-17, memory-governor binary frozen-gov7): ORIGINAL implementations, no benchmark modifications. Row 8 = 29.6 ms/tok (panic #7's row; first metaljax number ever). Row 10 completes at 88 GB peak (previously guard-killed at 122 GB); ms/tok cell to be filled by the 0.11.5 release-gate sweep. notes/data/no-panic-governor-rows-2026-08-17.json.
+
+34. **Row 15 runs and is WRONG — stop-the-line, mechanism OPEN**
+    (2026-08-17, `notes/row15-wrong-output-2026-08-17.md`; raw
+    `~/.cache/metaljax-bench/logs/no-panic-governor/qwix-int8-qwen3-8b-row15*`).
+    The governor campaign cleared this row's *memory* blocker — it completes,
+    exit 0, 79 GB peak, flat page cache, 0 refusals, 369.7 ms/tok — and
+    uncovered the one underneath: the output is `" fragment!!!!!!!"`, token ids
+    `[12289, 0, 0, 0, 0, 0, 0, 0]`, and **`!` is Qwen3's token 0**. Greedy
+    `argmax` returns index 0 for a constant logit vector, so what this row
+    emits is **collapsed logits**, not plausible wrong text. The timing is
+    therefore NOT published as a cell (rule: a program computing the wrong
+    answer has no meaningful ms/tok), and the row's status stays ✗.
+    **The campaign's label — "the row's known MLX-quantization bug" — is
+    withdrawn: no such finding exists.** The 2026-08-03 diagnosis (`7932b4d`,
+    footnote 8) attributed the garbage to the MLX command-buffer split and
+    *explicitly exonerated the quantized dots* (layer-0 KV bit-exact vs CPU at
+    K=4096; pre- and post-`fdc7cde` engines failed identically). That
+    attribution is now under test rather than inherited, for three reasons:
+    (a) it was measured at `MLX_MAX_OPS_PER_BUFFER=400`, which became 800 the
+    next day (`52b90a2`), and the 8B canary
+    (`notes/data/qwen3_8b_prefill_36layer.mlir`) has never been re-run at
+    today's budgets; (b) the split bug's signature is per-process-random
+    plausible garbage, this is a deterministic collapse; (c) the collapse
+    survives `METALJAX_BODY_COMPILE=0` (row 15f, which gets *worse* — all 8
+    tokens are id 0), where the split face is compile-dependent — and 15f is a
+    clean single-variable arm, its `MAXTEXT_PREFILL_LEN=64` being a no-op
+    (the adapter already rounds a 5-token prompt up to 64). Against that:
+    the same-day gate-5 row-14 run is the same adapter, same qwix overrides,
+    same emits (1 sdpa, 0 qmm, 0 msl) at 0.6B and is **coherent** at 31.995
+    ms/tok, and the only quantitative differences are ~10× traffic per
+    compiled unit (3259 vs 323 MB/iteration at prefill, 3154 vs 289 at decode)
+    and the 8B's untied `logits_dense` (622 M elements — bigger than a whole
+    512 Mi-element command buffer on its own). **That last one is the leading
+    hypothesis**, because it is the only candidate that is a command-buffer
+    split *and* deterministic *and* absent from row 14: a weight operand
+    larger than the budget forces MLX to cut inside that one matmul, in the
+    same place, every call — where the 2026-08 face was a random draw. It also
+    survives the layout evidence: `METALJAX_BODY_COMPILE=0` does not shrink
+    the evals (`run_chunked` still unrolls 16 iterations, uncompiled) but does
+    move every sync point (78 flushes per call against 6), and the output does
+    not change. Cheapest decisive test, and it needs no checkpoint:
+    `scripts/model_bench/row15_probe.py big` — the over-budget dot vs an
+    under-budget control, bf16 and int8, against CPU, swept 512→2048.
+    Note also that ONE non-finite
+    element anywhere produces exactly this output (argmax is NaN-wins /
+    lowest-index on both stacks, and one NaN in the final hidden state NaNs
+    all 151,936 logits), so the text cannot discriminate the hypotheses — the
+    queued ladder compares NUMBERS on identical inputs (int8-dot inventory vs
+    numpy; the 8B canary vs CPU on both stacks; `METALJAX_VERIFY_COMPILE=1`;
+    single-variable budget/compile/emit arms on a captured module), rungs A/B
+    driven by `scripts/model_bench/row15_ladder.sh`.

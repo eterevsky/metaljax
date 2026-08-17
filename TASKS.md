@@ -275,3 +275,5 @@ predicted peak memory, and only then retry the big model.
   noticing; audit op-set vs the full registry, port convolution.
   (c) ThreeFry bits stay uint32 for signed result types in
   ops/rng.py (latent; differential pins both engines to it).
+
+- Row 15 (2026-08-17): 'known MLX-quantization bug' label WITHDRAWN (the 2026-08-03 diagnosis blamed the command-buffer split and exonerated the quantized dots). Fresh leading hypothesis H5: MLX_MAX_MB_PER_BUFFER counts ELEMENTS (~537M at '512'); row 15's untied logits_dense is 622M elements -> deterministic mid-matmul buffer split -> logit collapse (all-token-0 output). Row 14's tied embedding (155M) never crosses. Decisive 1-min probe: scripts/model_bench/row15_probe.py big (self-locking) -- run when the release-gate battery frees the lock. Full-row raised-budget arm still needs Oleg's sign-off; the standalone-replay probe does not.

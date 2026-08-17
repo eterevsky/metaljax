@@ -14,26 +14,26 @@ notes/data/. Append a column per release / major optimization.*
 
 | # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5rc |
 |---|---|---:|---:|---:|---:|---:|
-| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | … |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | … |
-| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | … |
-| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | … |
-| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | … |
-| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | … |
-| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | … |
+| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | **237.3** ᴳ |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | **94.3** |
+| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | **43.4** |
+| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | **27.1** ᴳ |
+| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | **58.5** |
+| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | **55.8** |
+| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | **21.9** ᶜ |
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | **29.6** ᴳ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | **210.7** ᴳ |
-| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | **completes** ᴳ (88 GB) |
-| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | … |
-| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | … |
-| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | … |
-| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | … |
-| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | **369.7** ᴳ ⚠wrong-output |
-| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | … |
-| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | … |
-| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | … |
-| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | … |
-| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | … |
+| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | **1865** ᴳ (88 GB) |
+| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | **16.92** ᶠ (25 GB) |
+| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ download ᴳ (93.4 GB streams) |
+| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | **79.0** |
+| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | **32.0** ᶠ (26 GB) |
+| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | ✗ **WRONG OUTPUT** ᴳ ʷ (runs at 369.7) |
+| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | **88.4** |
+| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | **1259.9 / 5707.9** |
+| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | **359.2** ᴳ |
+| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | **456.1** |
+| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ declined ᴳ |
 
 Notes:
 
@@ -133,4 +133,41 @@ Notes:
   2998 @1024²; llama.cpp 12B-bf16 44.2 / 31B-bf16 111.2 (the
   bandwidth roofline, 439–555 GB/s effective on every dense row).
 
-- ᴳ (0.11.5rc column) = measured under the memory governor (2026-08-17, frozen-gov7 ebe56e71): ORIGINAL jax implementations, no benchmark-code modifications; the rows that previously panicked (#7) or guard-killed (122 GB) now run under the no-panic contract. Row 10's per-token number pending the release-gate sweep; the governor campaign recorded the completion + peak.
+- ᴳ (0.11.5rc column) = measured under the memory governor (2026-08-17, frozen-gov7 ebe56e71): ORIGINAL jax implementations, no benchmark-code modifications; the rows that previously panicked (#7) or guard-killed (122 GB) now run under the no-panic contract. Row 10's per-token number is the governor campaign's own (1865 ms/tok, 88 GB peak, exit 0).
+
+- **Every unmarked 0.11.5rc cell** was measured by the release gate on
+  2026-08-17 on the frozen release dylib `ebe56e71…` — the SAME binary the ᴳ
+  cells were measured on (the release build reproduces `frozen-gov7` byte for
+  byte), one guarded process per row, machine lock held, `METALJAX_DEBUG=1`.
+  Details and per-row ratios: `notes/release-gates-0.11.5.md` gate 5.
+
+- ᶜ **Row 7 is a bracketed cell.** Its first two samples of the evening read
+  24.2 / 23.9 ms/tok; a governor-off arm read 22.1 and a fourth arm with the
+  governor back ON read **21.9**, so the pair was the suite-context trap
+  (CLAUDE.md item 12), not a governor cost. The cell is the bracketed value;
+  the spread (21.9–24.2) is recorded in the gate document.
+
+- ᶠ **Rows 11 and 14 needed a RAISED GUARD BUDGET, and that is a finding.**
+  Both guard-killed at the budgets every previous campaign used (22 > 20 GB,
+  26 > 25 GB). One variable identifies it — not the governor (row 11 dies at
+  20 GB with `METALJAX_MEM_GOVERNOR=0` too) but **P27's flush watermark**: with
+  P25 semantics (`METALJAX_FLUSH_CLEAR_MB=2048 METALJAX_FLUSH_FOOTPRINT_MB=0`)
+  row 11 peaks at **7.6 GB instead of 25** and row 14 at **15 instead of 26**,
+  at the same speed (16.85 vs 16.92 · 32.14 vs 32.00 ms/tok). The cells above
+  are the shipped-default runs at raised budgets; the pool is dead memory
+  bought for nothing on these two rows.
+
+- ʷ **Row 15 is a WRONG-OUTPUT row, not a timing row.** Its memory blocker is
+  gone (it completes, 79 GB peak, 0 governor refusals) and it decodes at
+  369.7 ms/tok, but the text is `" fragment!!!!!!!"` = token ids
+  `[12289, 0, 0, 0, 0, 0, 0, 0]`, and `!` is Qwen3's token 0 — i.e. the logits
+  have collapsed to a constant and greedy `argmax` returns index 0. The number
+  is therefore **not published as a cell**: timing a program that computes the
+  wrong answer measures nothing. Row 14 is the same adapter, the same qwix
+  int8 overrides and the same emits at 0.6B and is coherent (31.995 ms/tok,
+  the gate-5 run of the same day); the two differ by ~10× in traffic per
+  compiled unit and by tied-vs-untied logits. Mechanism **open** — evidence,
+  hypotheses and the queued ladder in
+  `notes/row15-wrong-output-2026-08-17.md`; the "known MLX-quantization bug"
+  label the governor campaign gave it does not exist and has been withdrawn
+  (2026-08-03 exonerated the quantized dots, `7932b4d`).
