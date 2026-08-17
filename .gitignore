@@ -2,6 +2,7 @@
 /jax/
 /llvm-project/
 /xla/
+/mlx-src/
 
 .venv/
 __pycache__/
