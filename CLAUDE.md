@@ -41,6 +41,15 @@ executes on the Metal device through plain `jax.numpy`.
   version numbers based on what's being published. Plan: iterate on
   0.4.x; when the gap list is closed to his satisfaction, jump straight
   to 0.11.0 (tracking the jax pin; 0.5–0.10 intentionally skipped).
+- **The no-panic contract** (Oleg, 2026-08-17, after panic #9): metaljax
+  must NEVER cause a kernel panic. The OS does not keep us in check, so
+  the library does: preferred = degrade performance under memory
+  pressure; acceptable = a clean OOM error (RESOURCE_EXHAUSTED at the
+  PJRT boundary); never a wedge. Applies to EVERY model row including
+  the previously embargoed ones (9/10/12/15/20) -- they may OOM-error,
+  they may not panic. A 0.11.5 release requirement alongside the test
+  gates, and a standing acceptance criterion for all future big-run
+  work.
 - **Release rule 1 — no stale numbers** (Oleg, 2026-08-16, after the
   0.11.4 near-miss): every number in a release table must come from the
   release binary. Changes after the last benchmark run are acceptable

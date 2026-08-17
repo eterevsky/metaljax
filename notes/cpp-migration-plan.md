@@ -1833,3 +1833,17 @@ DOCS PASS: CLAUDE.md rewritten for the native-only world (Stage-1
 machinery moves to history/notes), README, RELEASING.md. Full battery
 on the native-only tree is the proof. Then the framework-gap fix list
 (notes/framework-gap-gemma31b.md) becomes the performance era.
+
+## The no-panic contract (Oleg, 2026-08-17, panic #9 during the 0.11.5
+gate battery -- row 9 native, throttled, LAST in a 34-row sequence,
+hot page cache). REFRAME: metaljax never panics the machine; degrade
+or clean-OOM instead. 0.11.5 requirements now: (1) no tested model
+panics, incl. rows 9/10/12/15/20 (OOM-error acceptable); (2) prefer
+degradation over OOM; (3) under that contract, the 15 pre-migration
+rows work at not-worse-than-pre-migration performance. Design
+direction: an in-runtime memory governor (budget from hw.memsize +
+task footprint via the P27 machinery + macOS pressure signals),
+degrade ladder (hard trim -> ingest throttle/stall -> eval barriers)
+-> clean RESOURCE_EXHAUSTED past the hard line; page-cache discipline
+(madvise consumed mmap ranges away during ingest -- the hot-cache
+last-in-battery pattern is the common factor of #8/#9).
