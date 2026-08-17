@@ -40,9 +40,9 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.9** (0.99× S1 / 1.00× anchor ²⁷) | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
 | 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.7** (0.99× S1 / 1.01× anchor ²⁷) | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
 | 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **22.2** (1.01× S1 / 1.00× anchor ³⁰, 34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
-| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | not run (PAUSED ¹⁷) | **13.7** | — | — |
+| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | **29.6** ³³ | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | **214.4** (1.00× S1 / 0.98× anchor) ²⁹ | 131.8 | — | — |
-| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | not run (embargo) | **10.6** | — | — |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | **completes** ³³ (88 GB) | **10.6** | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | **16.63** (1.02× S1 / 1.05× anchor) ᴾ²⁴ ³¹ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | not run (PAUSED ¹⁷) | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **80.3** (0.99× anchor ³²) ᴾ²⁷ | — | — | — |
@@ -516,3 +516,5 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
   LLVM weak-definition coalescing, SIGSEGV at `dlopen` in both load orders; it
   blocked every keras / gemma-lib / maxtext row. Contract:
   `plugin-native/coexist_test.py`. Footnote 27.
+
+33. Rows 8/10 first native results (2026-08-17, memory-governor binary frozen-gov7): ORIGINAL implementations, no benchmark modifications. Row 8 = 29.6 ms/tok (panic #7's row; first metaljax number ever). Row 10 completes at 88 GB peak (previously guard-killed at 122 GB); ms/tok cell to be filled by the 0.11.5 release-gate sweep. notes/data/no-panic-governor-rows-2026-08-17.json.
