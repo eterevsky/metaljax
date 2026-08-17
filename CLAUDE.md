@@ -49,7 +49,11 @@ executes on the Metal device through plain `jax.numpy`.
   the previously embargoed ones (9/10/12/15/20) -- they may OOM-error,
   they may not panic. A 0.11.5 release requirement alongside the test
   gates, and a standing acceptance criterion for all future big-run
-  work.
+  work. Amendment (same day): in extreme cases the JAX benchmark/model
+  code may be MINIMALLY fixed (harness variants in scripts/model_bench,
+  never ~/texmo) -- try hard on the original first; if it cannot work,
+  the original may cleanly OOM or run slow (never panic) and the fixed
+  variant must work as intended. Both cells reported.
 - **Release rule 1 — no stale numbers** (Oleg, 2026-08-16, after the
   0.11.4 near-miss): every number in a release table must come from the
   release binary. Changes after the last benchmark run are acceptable
