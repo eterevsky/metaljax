@@ -31,6 +31,18 @@ executes on the Metal device through plain `jax.numpy`.
   target.
 
 ## Ground rules
+- **Owned MLX build** (Oleg, 2026-08-17): metaljax vendors its own MLX,
+  built from OUR FORK at the latest tagged release (currently v0.32.0 —
+  the pip pin already matches). Fix branches in the fork, one per fix,
+  sent upstream as patches/PRs, and incorporated into our build
+  REGARDLESS of upstream acceptance. This unties: direct fixes for the
+  MLX bug tally (command-buffer corruption, fusion #8, ...) instead of
+  bug reports and workaround knobs. Private install name for the
+  vendored dylib so pip's mlx can never collide. Pushing the fork and
+  opening upstream PRs = Oleg (never push rule applies to the fork
+  too); patch commits + PR-quality descriptions prepared locally.
+
+
 - All changes live in `/Users/oleg/metaljax`. **Never modify `metaljax/jax/`**
   or `metaljax/llvm-project/` — read-only reference clones (gitignored).
   JAX clone HEAD ≈ 2026-07-23, matches installed jax 0.11.0.
