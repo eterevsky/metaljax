@@ -12,28 +12,28 @@ Cells: metaljax warm decode ms/token (or the row's noted metric);
 version's commit. Full per-run tables live in STATUS.md; raw JSONL in
 notes/data/. Append a column per release / major optimization.*
 
-| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 |
-|---|---|---:|---:|---:|---:|
-| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ |
-| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 |
-| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 |
-| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 |
-| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 |
-| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 |
-| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | **29.6** ᴳ |
-| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 |
-| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | **completes** ᴳ (88 GB peak) |
-| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 |
-| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ |
-| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ |
-| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 |
-| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ |
-| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 |
-| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 |
-| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ |
-| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ |
-| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ |
+| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5rc |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | … |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | … |
+| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | … |
+| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | … |
+| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | … |
+| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | … |
+| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | … |
+| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | **29.6** ᴳ |
+| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | **210.7** ᴳ |
+| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | **completes** ᴳ (88 GB) |
+| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | … |
+| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | … |
+| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | … |
+| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | … |
+| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | **369.7** ᴳ ⚠wrong-output |
+| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | … |
+| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | … |
+| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | … |
+| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | … |
+| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | … |
 
 Notes:
 
@@ -133,4 +133,4 @@ Notes:
   2998 @1024²; llama.cpp 12B-bf16 44.2 / 31B-bf16 111.2 (the
   bandwidth roofline, 439–555 GB/s effective on every dense row).
 
-- ᴳ = first measured under the memory governor (2026-08-17, frozen-gov7 ebe56e71): ORIGINAL jax implementations, no benchmark-code modifications; the rows that previously panicked (#7) or guard-killed (122 GB) now run under the no-panic contract. Row 10's per-token number pending the release-gate sweep; the governor campaign recorded the completion + peak.
+- ᴳ (0.11.5rc column) = measured under the memory governor (2026-08-17, frozen-gov7 ebe56e71): ORIGINAL jax implementations, no benchmark-code modifications; the rows that previously panicked (#7) or guard-killed (122 GB) now run under the no-panic contract. Row 10's per-token number pending the release-gate sweep; the governor campaign recorded the completion + peak.
