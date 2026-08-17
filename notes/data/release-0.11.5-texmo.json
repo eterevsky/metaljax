@@ -1,0 +1,287 @@
+{
+ "suite106": {
+  "n_native": 106,
+  "n_stage1": 106,
+  "classes": {
+   "whole": {
+    "n": 106,
+    "geomean": 0.9917,
+    "median": 0.9999,
+    "min": 0.6621,
+    "max": 1.1293
+   },
+   "big": {
+    "n": 34,
+    "geomean": 0.9732,
+    "median": 1.0007,
+    "min": 0.6621,
+    "max": 1.086
+   },
+   "mid": {
+    "n": 30,
+    "geomean": 1.0035,
+    "median": 1.0009,
+    "min": 0.9713,
+    "max": 1.1293
+   },
+   "db": {
+    "n": 40,
+    "geomean": 1.0011,
+    "median": 0.9994,
+    "min": 0.9803,
+    "max": 1.0767
+   },
+   "synth": {
+    "n": 2,
+    "geomean": 0.9485,
+    "median": 0.9489,
+    "min": 0.9203,
+    "max": 0.9775
+   }
+  },
+  "bands": {
+   "within_1.2x": 106,
+   "1.2x_to_10x": 0,
+   "at_or_above_10x": 0,
+   "native_faster": 55,
+   "biggest_win": [
+    "big09-b8l256",
+    0.6621,
+    38.4165,
+    25.436
+   ],
+   "biggest_loss": [
+    "mid11-b64l128",
+    1.1293,
+    8.744,
+    9.8742
+   ],
+   "outside_10pct": [
+    [
+     "mid11-b64l128",
+     1.1293,
+     8.744,
+     9.8742
+    ],
+    [
+     "big00-b32l128",
+     0.8967,
+     11.4354,
+     10.2542
+    ],
+    [
+     "big13-b8l256",
+     0.8837,
+     92.4102,
+     81.6659
+    ],
+    [
+     "big09-b32l128",
+     0.8712,
+     23.9651,
+     20.8795
+    ],
+    [
+     "big13-b32l128",
+     0.8388,
+     67.3617,
+     56.5015
+    ],
+    [
+     "big15-b32l128",
+     0.8195,
+     71.4981,
+     58.5926
+    ],
+    [
+     "big10-b32l128",
+     0.7997,
+     59.0152,
+     47.1963
+    ],
+    [
+     "big09-b8l256",
+     0.6621,
+     38.4165,
+     25.436
+    ]
+   ]
+  },
+  "native_over_p27native": {
+   "n": 106,
+   "geomean": 1.0015,
+   "median": 0.9996,
+   "min": 0.9072,
+   "max": 1.227
+  },
+  "stage1_over_p27stage1": {
+   "n": 106,
+   "geomean": 0.9991,
+   "median": 1.0008,
+   "min": 0.8598,
+   "max": 1.181
+  },
+  "native_over_p23native": {
+   "n": 106,
+   "geomean": 0.9907,
+   "median": 1.0006,
+   "min": 0.7671,
+   "max": 1.2016
+  },
+  "stage1_over_p23stage1": {
+   "n": 106,
+   "geomean": 1.0039,
+   "median": 1.0015,
+   "min": 0.9294,
+   "max": 1.0985
+  },
+  "worst_vs_p27": [
+   [
+    "big12-b32l128",
+    1.227,
+    9.7287,
+    11.9374
+   ],
+   [
+    "big12-b8l256",
+    1.1199,
+    5.1873,
+    5.8094
+   ],
+   [
+    "big07-b32l128",
+    1.0356,
+    19.3161,
+    20.0032
+   ],
+   [
+    "big14-b32l128",
+    1.0341,
+    20.2267,
+    20.916
+   ],
+   [
+    "big06-b32l128",
+    1.0284,
+    18.9001,
+    19.4375
+   ],
+   [
+    "big14-b8l256",
+    1.0277,
+    11.5171,
+    11.8357
+   ],
+   [
+    "mid13-b64l128",
+    1.0138,
+    6.7874,
+    6.8811
+   ],
+   [
+    "mid12-b64l128",
+    1.013,
+    10.8712,
+    11.0126
+   ]
+  ]
+ },
+ "topconfs": {
+  "n_native": 163,
+  "n_stage1_pjrt": 163,
+  "n_stage1_engine": 163,
+  "native_over_stage1_pjrt": {
+   "n": 163,
+   "geomean": 1.0123,
+   "median": 1.009,
+   "min": 0.9634,
+   "max": 1.0792
+  },
+  "native_over_stage1_engine": {
+   "n": 163,
+   "geomean": 1.0139,
+   "median": 1.0088,
+   "min": 0.8969,
+   "max": 1.0839
+  },
+  "route_factor_engine_over_pjrt": {
+   "n": 163,
+   "geomean": 0.9984,
+   "median": 0.999,
+   "min": 0.9059,
+   "max": 1.1272
+  },
+  "bands": {
+   "within_1.2x": 163,
+   "1.2x_to_10x": 0,
+   "at_or_above_10x": 0,
+   "native_faster": 28,
+   "biggest_win": [
+    "tc002-w8",
+    0.9634,
+    0.2296,
+    0.2212
+   ],
+   "biggest_loss": [
+    "tc009-w16",
+    1.0792,
+    0.9663,
+    1.0428
+   ],
+   "outside_10pct": []
+  },
+  "stage1_engine_vs_anchor": {
+   "n": 163,
+   "geomean": 1.06,
+   "median": 1.0223,
+   "min": 0.9467,
+   "max": 1.1788
+  },
+  "native_vs_anchor": {
+   "n": 163,
+   "geomean": 1.0455,
+   "median": 1.027,
+   "min": 0.9239,
+   "max": 1.1958
+  },
+  "stage1_pjrt_vs_anchor": {
+   "n": 163,
+   "geomean": 1.0583,
+   "median": 1.0371,
+   "min": 0.926,
+   "max": 1.2076
+  },
+  "cpu_control_anchor_over_today": {
+   "n": 163,
+   "geomean": 0.9867,
+   "median": 0.9877,
+   "min": 0.8981,
+   "max": 1.0576
+  },
+  "beating_cpu_today": {
+   "native": 56,
+   "stage1_pjrt": 58,
+   "stage1_engine": 54,
+   "anchor": 53
+  },
+  "checks": {
+   "ok": 163,
+   "n": 163,
+   "not_ok": []
+  },
+  "native_over_p23native": {
+   "n": 163,
+   "geomean": 1.0258,
+   "median": 1.0166,
+   "min": 0.9942,
+   "max": 1.1388
+  },
+  "stage1_over_p23stage1": {
+   "n": 163,
+   "geomean": 1.015,
+   "median": 1.0113,
+   "min": 0.9369,
+   "max": 1.0593
+  }
+ }
+}

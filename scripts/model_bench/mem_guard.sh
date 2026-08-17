@@ -30,7 +30,12 @@
 #
 # The log doubles as the load-time memory profiler: one line per sample,
 #
-#   <epoch> <footprint_gb> <rss_gb> <sys_used_gb> <swap_used_gb> <state>
+#   <epoch> <footprint_gb> <rss_gb> <sys_used_gb> <swap_used_gb> <state> \
+#       file=<file_backed_gb> free=<free_gb>
+#
+# The two trailing fields are APPENDED (nothing that parsed columns 2 and 3
+# changes) and they are the ones the machine-wedge panics happened in: see the
+# comment beside the vm_stat call below.
 #
 # Sampled with `top -l 1 -o mem -stats pid,mem,command` (MEM = the process's
 # physical footprint, the number jetsam actually reads) plus `ps` RSS and
@@ -78,12 +83,23 @@ while kill -0 $CHILD 2>/dev/null; do
   # top's PhysMem "used": that figure includes the reclaimable file cache,
   # which a 60+ GB checkpoint read fills legitimately -- it false-tripped
   # the ceiling at zero actual pressure (rows 8/9, 2026-08-03).
-  SYS=$(vm_stat 2>/dev/null | awk '
+  # ...and, in the same call, the two counters that were the ONLY unhealthy
+  # thing at both machine wedges (panics #7 and #9): the file-backed page
+  # count and the free list.  NOT a kill rule -- a checkpoint read fills the
+  # page cache legitimately and killing on it would kill every big load.  They
+  # are LOGGED because the flight logs of both wedges are missing exactly this
+  # column: every metric the guard sampled read "ok" while physical memory was
+  # full of file pages and the free list was on the floor.  The in-process
+  # memory governor (runtime/memory.cc) is what acts on them.
+  read -r SYS FILEB FREEB <<< "$(vm_stat 2>/dev/null | awk '
       /page size of/ {ps=$8}
       /Pages wired down/ {w=$4+0}
       /Anonymous pages/ {a=$3+0}
       /Pages occupied by compressor/ {c=$5+0}
-      END {printf "%.1fG", (w+a+c)*ps/1073741824}')
+      /Pages free/ {f=$3+0}
+      /File-backed pages/ {fb=$3+0}
+      END {printf "%.1fG %.1f %.1f", (w+a+c)*ps/1073741824,
+                                     fb*ps/1073741824, f*ps/1073741824}')"
   RSSKB=$(ps -o rss= -p $CHILD 2>/dev/null | tr -d ' ')
   SWAP=$(/usr/sbin/sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}')
   NOW=$(date +%s)
@@ -97,9 +113,9 @@ while kill -0 $CHILD 2>/dev/null; do
       u=substr($0,length($0),1); n=substr($0,1,length($0)-1)+0;
       if (u=="G") printf "%.1f", n; else if (u=="M") printf "%.1f", n/1024;
       else printf "0" }')
-  printf '%s %s %s %s %s %s\n' "$NOW" "$FOOT_GB" "$RSS_GB" \
+  printf '%s %s %s %s %s %s file=%s free=%s\n' "$NOW" "$FOOT_GB" "$RSS_GB" \
       "${SYS:-?}" "${SWAP:-?}" "$([ $KILLED = 1 ] && echo killing || echo ok)" \
-      >> "$LOG"
+      "${FILEB:-?}" "${FREEB:-?}" >> "$LOG"
 
   if [ $KILLED = 0 ]; then
     VERDICT=$(awk -v f="$FOOT_GB" -v p="$PREV" -v b="$BUDGET_GB" \

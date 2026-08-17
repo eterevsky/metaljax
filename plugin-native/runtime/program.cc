@@ -62,6 +62,13 @@ void eager_flush(const std::vector<std::optional<mx::array>>& env,
       trimmed = true;
     }
   }
+  // ...and the governor's look at the machine, at the same cadence and AFTER
+  // the trim above, so it judges a process that has already given back what
+  // it was holding for convenience (the no-panic contract, memory.cc). A hard
+  // flush is the only sync point a long eager main reaches, which makes it
+  // the only place a program that grows without transferring can be stopped
+  // before the machine is.
+  if (hard) governor_admit(0, MemWhere::kFlush);
   // METALJAX_MEMDBG: the eager path's meter, and the one the memory ladder
   // reads. It has to come from INSIDE the dylib because a flush point is
   // reachable from nowhere else: an embedder can only sample BETWEEN
@@ -341,6 +348,12 @@ std::vector<mx::array> Program::run_recovering(
       }
       return outs;
     } catch (const std::exception& ex) {
+      // A governor refusal is not a failure to recover FROM: the machine is
+      // out of memory, and every rung of this ladder (retire the compiled
+      // path, clear the cache, run again) would spend more of it to arrive at
+      // the same answer more slowly. It leaves immediately, keeping the
+      // program's compiled path -- the next call may well fit.
+      if (is_oom(ex)) throw;
       resource_limit = is_resource_limit(ex);
       err = std::current_exception();
     }

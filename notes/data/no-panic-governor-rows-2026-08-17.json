@@ -1,0 +1,92 @@
+[
+ {
+  "id": "gemma4-31b-bf16",
+  "ok": true,
+  "load_s": 126.16,
+  "decode_ms_tok": 237.3,
+  "step_ms": null,
+  "mem_gb": 0.0,
+  "error": null
+ },
+ {
+  "id": "gemma4-e2b-bf16",
+  "ok": true,
+  "load_s": 21.14,
+  "decode_ms_tok": 27.2,
+  "step_ms": null,
+  "mem_gb": 10.2,
+  "error": null
+ },
+ {
+  "id": "gemma4-e2b-bf16",
+  "ok": true,
+  "load_s": 17.47,
+  "decode_ms_tok": 27.2,
+  "step_ms": null,
+  "mem_gb": 10.2,
+  "error": null
+ },
+ {
+  "id": "gemma4-e2b-bf16",
+  "ok": true,
+  "load_s": 17.5,
+  "decode_ms_tok": 27.1,
+  "step_ms": null,
+  "mem_gb": 10.2,
+  "error": null
+ },
+ {
+  "id": "gemma4-e2b-bf16",
+  "ok": true,
+  "load_s": 18.13,
+  "decode_ms_tok": 26.9,
+  "step_ms": null,
+  "mem_gb": 10.2,
+  "error": null
+ },
+ {
+  "id": "gemma4-e2b-bf16",
+  "ok": true,
+  "load_s": 20.68,
+  "decode_ms_tok": 27.1,
+  "step_ms": null,
+  "mem_gb": 10.2,
+  "error": null
+ },
+ {
+  "id": "lora-gemma4-e2b",
+  "ok": true,
+  "load_s": 33.4,
+  "decode_ms_tok": null,
+  "step_ms": 359.17016649909783,
+  "mem_gb": 10.2,
+  "error": null
+ },
+ {
+  "id": "qwen3-8b-bf16",
+  "ok": true,
+  "load_s": 45.03,
+  "decode_ms_tok": 58.4,
+  "step_ms": null,
+  "mem_gb": 16.4,
+  "error": null
+ },
+ {
+  "id": "qwen36-35b-a3b",
+  "ok": true,
+  "load_s": 104.41,
+  "decode_ms_tok": 29.6,
+  "step_ms": null,
+  "mem_gb": 71.1,
+  "error": null
+ },
+ {
+  "id": "r1-distill-32b",
+  "ok": true,
+  "load_s": 322.01,
+  "decode_ms_tok": 210.7,
+  "step_ms": null,
+  "mem_gb": 65.5,
+  "error": null
+ }
+]

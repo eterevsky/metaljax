@@ -224,6 +224,19 @@ MetalLoadedExecutable::RunOnce(
   BindThread();
   std::unique_lock<std::recursive_mutex> submission = SubmissionLock();
 
+  // The governor's look at the machine before a program is entered (the
+  // no-panic contract, runtime/memory.cc).  Sampled, so a decode loop paying
+  // it once per token pays a compare; what it catches is the process that is
+  // ALREADY past a hard line -- refusing to start is the difference between
+  // an error and a program that allocates its way into a wedge with no sync
+  // point in reach.  `want` is 0 because a tape's peak is not knowable here:
+  // its flushes carry the check from then on.
+  try {
+    governor_admit(0, MemWhere::kExecute);
+  } catch (const std::exception& e) {
+    return absl::ResourceExhaustedError(e.what());
+  }
+
   // XLA's donation contract is per CALL, not only per buffer: a caller that
   // hands the same buffer to a donated and to a plain position has asked for
   // an argument to be both consumed and read.  Every PjRtClient refuses that
@@ -373,6 +386,12 @@ MetalLoadedExecutable::RunOnce(
       }
     }
   } catch (const std::exception& e) {
+    // A governor refusal is not an internal failure: it is the machine
+    // saying no, and jax's users read the status code.  RESOURCE_EXHAUSTED
+    // is what XLA's own backends raise for it (jax turns it into
+    // `XlaRuntimeError: RESOURCE_EXHAUSTED: ...`), and the message names what
+    // was needed, what was there and which variable moves the line.
+    if (is_oom(e)) return absl::ResourceExhaustedError(e.what());
     return absl::InternalError(
         absl::StrCat("metaljax-native: ", name_, " failed: ", e.what()));
   }

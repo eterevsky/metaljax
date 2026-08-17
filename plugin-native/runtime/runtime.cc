@@ -198,6 +198,15 @@ int64_t flush_bound(int64_t cache_now, int64_t program_flushes) {
   const int64_t cap = g_cfg.flush_clear_bytes;
   if (cap < 0) return cap;                     // METALJAX_FLUSH_CLEAR_MB=-1
   const int64_t floor = std::min(g_cfg.flush_floor_bytes, cap);
+  // The governor's veto (the no-panic contract): while the MACHINE is being
+  // squeezed -- the free list at a quarter of the governor's floor, or the
+  // kernel itself reporting pressure -- no program keeps a pool for
+  // convenience, whatever P27's two rules would have granted it. The HARD
+  // line deliberately, not the soft one the ingest pacer uses: a warm page
+  // cache puts free under the soft line routinely and this must not cost a
+  // training step its pool for that (memory.cc `being_squeezed`). Cached, so
+  // it costs a load and a branch; it can only ever LOWER the bound.
+  if (governor_squeezed()) return floor;
   if (program_flushes < g_cfg.flush_main_flushes) return floor;
   if (g_cfg.flush_footprint_bytes <= 0) return cap;   // pressure half off
   const int64_t foot = phys_footprint();
@@ -236,6 +245,10 @@ void loop_eval(const std::vector<mx::array>& arrays) {
 // rather than an eval of the carry -- a different array to wait on, the same
 // iteration of work to charge, and the same cadence either way.
 void loop_account(int64_t cost_units) {
+  // A multi-hour loop is the one execution shape that can walk the machine
+  // into pressure without ever reaching a transfer or an eager flush, so the
+  // governor is asked here too (sampled: the fast path is a compare).
+  governor_admit(0, MemWhere::kFlush);
   g_stats.loop_flushes++;
   g_flushed_cost += cost_units;
   if (g_cfg.loop_clear_cost > 0 && g_flushed_cost >= g_cfg.loop_clear_cost) {
@@ -291,6 +304,11 @@ void loop_flush(const std::vector<mx::array>& arrays, int64_t cost_units) {
 // in every configuration but `METALJAX_CONCURRENT_EXECUTE=1`, where a racing
 // transfer can cost the cadence a clear -- the same benign inexactness every
 // other counter in `g_stats` has.
+// NB the memory governor is NOT called from here, deliberately: this runs
+// after the bytes are already resident, and both of its callers gate the
+// transfer with `governor_admit` BEFORE staging it -- where a refusal is
+// still a status a caller can be handed rather than an exception escaping
+// through the PJRT C boundary.
 void ingest_account(int64_t bytes) {
   if (bytes <= 0) return;
   g_stats.ingest_bytes += bytes;
@@ -300,6 +318,12 @@ void ingest_account(int64_t bytes) {
   g_ingested_since_clear = 0;
   g_stats.ingest_clears++;
   const int64_t cache_before = mx::get_cache_memory();
+  // ...and the page cache the load has filled on its way here (the no-panic
+  // contract). This cadence is the right one for it: it is denominated in
+  // transferred bytes, which is exactly what a streaming load produces file
+  // pages in proportion to, and the sweep costs one pass over this process's
+  // VM regions per 8 GB moved.
+  sweep_page_cache(g_gov.sweep_min);
   gc_collect();  // dead refcycles pin buffers clear_cache cannot free
   mx::clear_cache();
   if (g_cfg.debug || g_cfg.memdbg)
@@ -308,7 +332,14 @@ void ingest_account(int64_t bytes) {
                std::to_string(g_stats.ingest_bytes >> 20) + "MB active=" +
                std::to_string(mx::get_active_memory() >> 20) + "MB cache=" +
                std::to_string(cache_before >> 20) + "->" +
-               std::to_string(mx::get_cache_memory() >> 20) + "MB");
+               std::to_string(mx::get_cache_memory() >> 20) + "MB" +
+               // ...and the page-cache discipline's own meter (memory.cc):
+               // how much of what has been read through a mapping was handed
+               // straight back, which is the number a load's flight log is
+               // argued on.
+               " released=" + std::to_string(g_stats.pages_released >> 20) +
+               "MB deactivated=" +
+               std::to_string(g_stats.pages_deactivated >> 20) + "MB");
 }
 
 // The loop counter / branch index of a control-flow op, on the host. Reading

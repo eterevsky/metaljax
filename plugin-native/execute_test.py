@@ -3536,6 +3536,230 @@ def _p27_flush_pressure(subprocess, tempfile, pathlib, re):
     ]
 
 
+# The no-panic contract's own program: one transfer, one execute, one print,
+# so that whichever of the two the governor is being asked about is the only
+# thing that can fail.  Every arm below runs THIS, with one variable moved.
+_GOV_PROGRAM = r'''
+import numpy as np, jax, jax.numpy as jnp
+try:
+    x = jax.device_put(np.arange(1 << 20, dtype=np.float32))
+    print("[probe] transferred")
+    print("[probe] checksum %.6f" % float(np.asarray(jax.jit(
+        lambda a: jnp.sum(a * 2.0))(x))))
+except BaseException as exc:                                    # noqa: BLE001
+    print("[probe] raised %s: %s" % (type(exc).__name__,
+                                     " ".join(str(exc).split())[:400]))
+'''
+
+
+# ...and the same for a program that GROWS: 512 MB a step, kept, with no
+# transfer after the first one -- the shape of a materialization phase, which
+# is the failure mode a transfer gate cannot see.
+_GOV_GROWTH = r'''
+import numpy as np, jax, jax.numpy as jnp
+
+x = jax.device_put(np.zeros(1 << 27, np.float32))          # 512 MB
+# Every scalar the loop needs, transferred BEFORE it starts: a `device_put`
+# inside the loop would be refused by the transfer gate first, and this arm is
+# about the other one.
+step = [jax.device_put(np.float32(i)) for i in range(32)]
+f = jax.jit(lambda a, i: a + i)
+held = []
+for i in range(32):
+    try:
+        y = f(x, step[i])
+        held.append(y)   # this plugin executes synchronously: y is real
+    except BaseException as exc:                            # noqa: BLE001
+        print("[probe] refused at %d: %s"
+              % (i, " ".join(str(exc).split())[:300]))
+        break
+else:
+    print("[probe] never refused")
+print("[probe] alive")
+'''
+
+
+def _governor(subprocess, tempfile, pathlib, re):
+    """(label, check) pairs for the memory governor (the no-panic contract).
+
+    The governor's job is to make a machine wedge impossible, and the thing it
+    must never do to earn that is refuse work the machine can do.  So each arm
+    below moves ONE of its numbers to a value the running process is already
+    on the wrong side of -- which is how a threshold whose real trigger takes
+    a 65 GB checkpoint gets a contract that runs in a second.
+    """
+
+    _METER = re.compile(
+        r"\[metaljax-mem\] flush #\d+: active=(\d+)MB cache=(\d+)MB"
+        r"(?: \(was (\d+)MB\))? bound=(-?\d+)MB foot=(-?\d+)MB "
+        r"cap=(-?\d+)MB n=(\d+)")
+
+    def run(source, **extra):
+        env = dict(os.environ)
+        env["METALJAX_MEM_STALL_MS"] = "0"    # arms assert, they do not wait
+        env["METALJAX_MEM_SAMPLE_US"] = "0"   # ...and never on a stale sample
+        env.update({k: str(v) for k, v in extra.items()})
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(source)
+            script = fh.name
+        try:
+            proc = subprocess.run([sys.executable, script], env=env,
+                                  capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(script)
+            except OSError:
+                pass
+        return proc, (proc.stdout or "") + (proc.stderr or "")
+
+    def a_transfer_past_the_hard_line_is_refused():
+        """The load path's answer to a model that cannot fit.
+
+        A budget of one megabyte is the arithmetic limit of "this process is
+        already over": the transfer is refused BEFORE its staging block is
+        allocated, and what the caller gets is a status -- RESOURCE_EXHAUSTED,
+        the code XLA's own backends use -- rather than a machine that spends
+        the next minute in a reclaim storm.  The message has to name the
+        variable that moves the line, because the alternative is a user
+        guessing.
+        """
+        proc, out = run(_GOV_PROGRAM, METALJAX_MEM_BUDGET_MB=1)
+        if proc.returncode:
+            return False, out.strip()[-140:]
+        if "[probe] transferred" in out:
+            return False, "the transfer was admitted"
+        if "RESOURCE_EXHAUSTED" not in out and "RESOURCE EXHAUSTED" not in out:
+            return False, f"not a resource-exhausted error: {out.strip()[-140:]}"
+        if "METALJAX_MEM_BUDGET_MB" not in out:
+            return False, "the error does not name the variable"
+        if "metaljax out of memory at transfer" not in out:
+            return False, "the error does not name the transfer path"
+        return True, "ok (RESOURCE_EXHAUSTED, names the budget)"
+
+    def the_machine_ceiling_refuses_too():
+        """...and the same for the machine's own memory, not just ours.
+
+        Both wedges happened at ~55 GB of process footprint, well inside any
+        budget this process would set for itself: what was full was the
+        MACHINE.  `METALJAX_MEM_SYS_MB` is that second line, read from
+        `host_statistics64` rather than from `task_info`, and this arm is what
+        proves the two are separately wired.
+        """
+        proc, out = run(_GOV_PROGRAM, METALJAX_MEM_SYS_MB=1)
+        if proc.returncode:
+            return False, out.strip()[-140:]
+        if "[probe] transferred" in out:
+            return False, "the transfer was admitted"
+        if "METALJAX_MEM_SYS_MB" not in out:
+            return False, f"wrong reason: {out.strip()[-140:]}"
+        return True, "ok (RESOURCE_EXHAUSTED, names the ceiling)"
+
+    def an_execute_that_grows_is_stopped():
+        """A program is not entered when the process is already over.
+
+        The transfer path is where a LOAD is stopped; this is the other half,
+        for the row that grows inside its own executes (row 15's post-restore
+        materialization is the measured case: +4-7 GB per guard sample with no
+        transfer in sight).  512 MB a step against a 4 GB budget, and what
+        this asserts is not only the refusal but what the process does after
+        it: it is still running, and it says so.
+        """
+        proc, out = run(_GOV_GROWTH, METALJAX_MEM_BUDGET_MB=4096)
+        if proc.returncode:
+            return False, out.strip()[-140:]
+        if "[probe] never refused" in out:
+            return False, "16 GB of live buffers were admitted under a 4 GB "\
+                          "budget"
+        if "RESOURCE_EXHAUSTED" not in out:
+            return False, f"nothing was refused: {out.strip()[-200:]}"
+        if "[probe] alive" not in out:
+            return False, "the process did not survive its own refusal"
+        where = ("execute" if "out of memory at execute" in out else
+                 "flush" if "out of memory at flush" in out else
+                 "transfer" if "out of memory at transfer" in out else "?")
+        if where not in ("execute", "flush"):
+            return False, f"refused at {where}, not inside the program"
+        step = [ln for ln in out.splitlines() if "[probe] refused at" in ln]
+        return True, f"ok (refused at {where}, {step[0].split()[3][:-1]} steps in)"
+
+    def the_governor_can_be_turned_off():
+        """The control, and the escape hatch.
+
+        Same impossible budget, `METALJAX_MEM_GOVERNOR=0`: the program runs to
+        completion.  A user who would rather take the risk than the refusal
+        has one variable to set, and this arm is what says the refusals above
+        are the governor's doing and not something else breaking.
+        """
+        proc, out = run(_GOV_PROGRAM, METALJAX_MEM_BUDGET_MB=1,
+                        METALJAX_MEM_SYS_MB=1, METALJAX_MEM_GOVERNOR=0)
+        if proc.returncode:
+            return False, out.strip()[-140:]
+        if "[probe] checksum" not in out:
+            return False, f"the program did not run: {out.strip()[-140:]}"
+        return True, "ok (same program completes with the governor off)"
+
+    def pressure_takes_the_pool_back():
+        """The DEGRADE path, which is the one the contract prefers.
+
+        P27 lets an eager main keep a big buffer pool because that is worth
+        1.9x on the maxtext training row.  Under machine pressure it may not:
+        `flush_bound` asks the governor first, and every bound collapses to
+        the floor -- the same program, the same answers, a pool that is not
+        standing beside somebody else's page cache.  Forced here by a free
+        floor no machine can be above, which is the honest way to test a
+        threshold whose real trigger is a full machine.
+        """
+        CAP, FLOOR, GATE = 4096, 256, 8
+        env = dict(METALJAX_DEBUG=1, METALJAX_MEMDBG=1, METALJAX_COMPILE=0,
+                   METALJAX_EAGER_FLUSH_MB=64, METALJAX_FLUSH_CLEAR_MB=CAP,
+                   METALJAX_FLUSH_FLOOR_MB=FLOOR,
+                   METALJAX_FLUSH_MAIN_FLUSHES=GATE,
+                   METALJAX_FLUSH_FOOTPRINT_MB=1 << 22)
+        proc, out = run(_P25_TRAFFIC, **env)
+        if proc.returncode:
+            return False, out.strip()[-140:]
+        free = [tuple(int(g) if g else 0 for g in m.groups())
+                for m in _METER.finditer(out)]
+        base = [ln for ln in out.splitlines() if ln.startswith("[probe] checksum")]
+        # ...and the same run with the floor above the machine's memory, so
+        # the governor is pressured at every flush.
+        proc2, out2 = run(_P25_TRAFFIC, METALJAX_MEM_FREE_FLOOR_MB=1 << 22,
+                          **env)
+        if proc2.returncode:
+            return False, out2.strip()[-140:]
+        held = [tuple(int(g) if g else 0 for g in m.groups())
+                for m in _METER.finditer(out2)]
+        got = [ln for ln in out2.splitlines()
+               if ln.startswith("[probe] checksum")]
+        if not free or not held:
+            return False, f"{len(free)} / {len(held)} flushes narrated"
+        if base != got:
+            return False, f"the arms disagree ({base} vs {got})"
+        late = [r for r in free if r[6] >= GATE]
+        if not late or any(r[3] != CAP for r in late):
+            return False, "the unpressured arm never reached the cap"
+        if any(r[3] != FLOOR for r in held):
+            return False, (f"a pressured flush was bounded at "
+                           f"{max(r[3] for r in held)} MB, not the floor")
+        peak_free = max(r[1] for r in free)
+        peak_held = max(r[1] for r in held)
+        if peak_held > FLOOR + 128:
+            return False, f"pool reached {peak_held} MB under pressure"
+        return True, (f"ok (pool {peak_free} -> {peak_held} MB cached, every "
+                      f"bound {FLOOR} MB)")
+
+    return [
+        ("a transfer past the hard line is refused",
+         a_transfer_past_the_hard_line_is_refused),
+        ("the machine ceiling refuses too", the_machine_ceiling_refuses_too),
+        ("the governor can be turned off", the_governor_can_be_turned_off),
+        ("an execute that grows is stopped",
+         an_execute_that_grows_is_stopped),
+        ("pressure takes the pool back", pressure_takes_the_pool_back),
+    ]
+
+
 # P26: an attention rooted inside a `func.call` callee, in a DYNAMICALLY
 # bounded loop -- the shape gemma-lib's sampler and maxtext both emit, and the
 # one jax gives any loop whose body calls a named function.  Two layers inside
@@ -4464,7 +4688,9 @@ def main():
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,
                                                __import__("re"))
                          + _p26_callee_sdpa(subprocess, tempfile, pathlib,
-                                            __import__("re"))):
+                                            __import__("re"))
+                         + _governor(subprocess, tempfile, pathlib,
+                                     __import__("re"))):
         try:
             ok, detail = check()
         except BaseException as exc:  # noqa: BLE001 - report and continue

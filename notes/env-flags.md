@@ -20,6 +20,15 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 | `METALJAX_FLUSH_FOOTPRINT_MB` | `3/8 of RAM` | user knob | plugin-native only: process footprint an eager main's pool is trimmed to stay under (48 GB on a 128 GB machine); 0 disables the pressure rule |
 | `METALJAX_FLUSH_MAIN_FLUSHES` | `8` | user knob | plugin-native only: hard flushes a program must have taken before it counts as an eager MAIN and may pass the floor; 0 grants it from the first flush |
 | `METALJAX_INGEST_CLEAR_MB` | `8192` | user knob | plugin-native only: reclamation cadence of the host->device TRANSFER path, in megabytes ingested (0 disables); a model load reaches no other sync point |
+| `METALJAX_INGEST_ADVISE_KB` | `1024` | user knob | plugin-native only: smallest transfer whose consumed source range is handed back to the OS after the staging copy (the no-panic contract's page-cache discipline); 0 disables |
+| `METALJAX_INGEST_SWEEP_MB` | `64` | user knob | plugin-native only: smallest MAPPING the ingest-cadence page-cache sweep invalidates (a checkpoint shard is GBs, a framework resource file is not); 0 disables the sweep |
+| `METALJAX_MEM_BUDGET_MB` | `3/4 of RAM` | user knob | plugin-native only: the memory governor's hard line on THIS PROCESS's footprint; past it a transfer or a program is refused with RESOURCE_EXHAUSTED |
+| `METALJAX_MEM_FREE_FLOOR_MB` | `1/16 of RAM` | user knob | plugin-native only: the governor's SOFT line — the machine free list below which a load is paced and the page cache swept (a quarter of it is where MLX's pool is given back) |
+| `METALJAX_MEM_GOVERNOR` | `1` | user knob | plugin-native only: =0 turns the memory governor (and its page-cache discipline) off entirely |
+| `METALJAX_MEM_SAMPLE_US` | `20000` | user knob | plugin-native only: how often the governor may re-read the machine; the fast path is a compare |
+| `METALJAX_MEM_STALL_MS` | `5000` | user knob | plugin-native only: how long the governor waits at a hard line before refusing |
+| `METALJAX_MEM_SYS_MB` | `3/4 of RAM` | user knob | plugin-native only: the governor's hard line on the MACHINE's unreclaimable memory (wired+anonymous+compressor) |
+| `METALJAX_MEM_THROTTLE_KBPS` | `1048576` | user knob | plugin-native only: cumulative transfer rate a load is paced to while the free list is below the floor (1 GB/s) |
 | `METALJAX_LOOP_CLEAR_COST` | `500000` | user knob | cache-clear cadence in loop op-units (default 500000) |
 | `METALJAX_MATMUL_PRECISION` | `highest` | user knob | default=MLX default arch; unset picks the accurate g16g matmul path |
 | `METALJAX_MEMDBG` | `` | debug-bisect | =1 logs active/cache memory at loop clears and execute end |

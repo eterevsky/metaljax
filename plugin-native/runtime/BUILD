@@ -31,6 +31,7 @@ cc_library(
         "host.cc",
         "host_callback.cc",
         "host_lapack.cc",
+        "memory.cc",
         "msl.cc",
         "ops_conv.cc",
         "ops_elementwise.cc",

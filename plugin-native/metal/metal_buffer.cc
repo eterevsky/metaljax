@@ -276,6 +276,14 @@ absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> MetalBuffer::CopyToMemorySpace(
         "supported.");
   }
   ASSIGN_OR_RETURN(mx::array settled, Settled());
+  // The governor gates this bulk path too (the no-panic contract): a loop of
+  // `device_put(x, may_alias=False)` moves a model's worth of bytes, and the
+  // gate has to be BEFORE the copy that makes them resident.
+  try {
+    governor_admit(static_cast<int64_t>(settled.nbytes()), MemWhere::kIngest);
+  } catch (const std::exception& e) {
+    return absl::ResourceExhaustedError(e.what());
+  }
   mx::array fresh = mx::copy(settled);
   {
     BindThread();

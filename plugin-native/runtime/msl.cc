@@ -481,7 +481,11 @@ void Program::settle_msl(const std::vector<mx::array>& inputs,
       for (MslPlan* p : t_msl_pending) p->validate();
       t_msl_pending.clear();
       return;
-    } catch (const std::exception&) {
+    } catch (const std::exception& ex) {
+      // A governor refusal says the machine is out of memory, not that this
+      // kernel is unbuildable: retiring a plan over it would cost the program
+      // its kernels for the rest of the process (see run_recovering).
+      if (is_oom(ex)) throw;
       err = std::current_exception();
     }
     for (MslPlan* p : t_msl_pending) p->kill();

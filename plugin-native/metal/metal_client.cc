@@ -209,6 +209,50 @@ void ConfigureFromEnv() {
       /*while_pipeline=*/EnvInt("METALJAX_WHILE_PIPELINE", 1),
       /*debug=*/EnvFlag("METALJAX_DEBUG"),
       /*memdbg=*/EnvFlag("METALJAX_MEMDBG"));
+
+  // The memory governor (runtime/memory.cc), whose knobs are this plugin's
+  // own -- Stage 1 has none, and every default here is a FRACTION of this
+  // machine's memory rather than a constant.
+  //
+  //  * the budget and the ceiling are the two hard lines. 3/4 of hw.memsize
+  //    (96 GB here) sits under the bench guard's own GUARD_SYS_GB=100 on
+  //    purpose: the governor must act while the guard is still watching, so
+  //    that a governor failure is a guard kill and not a machine wedge.
+  //  * the free floor is the SOFT line, and it is the panic signature: at
+  //    both wedges the machine's free list was drained while its page cache
+  //    held tens of GB and every metaljax number looked healthy. 1/16 of
+  //    memory (8 GB) is where a load starts being paced instead of refused.
+  //  * the pace, 1 GB/s, is a SAFETY VALVE rather than the mechanism, and
+  //    the numbers say why: panic #7's load filled at 1.2 GB/s and panic #9's
+  //    was already externally throttled to 0.30 GB/s, so no rate is "the"
+  //    safe one.  What it buys is a reclaimer that is not racing a streamer
+  //    while the free list is on the floor, and it engages only there; the
+  //    page-cache discipline above is what keeps the free list off the floor
+  //    in the first place.
+  //  * the advise threshold is the page-cache discipline's: a range smaller
+  //    than this is not worth a syscall, and a checkpoint tensor is never
+  //    that small.
+  const int64_t mem = machine_memory();
+  const int64_t mem_mb = mem > 0 ? (mem >> 20) : 131072;
+  configure_governor(
+      /*on=*/EnvInt("METALJAX_MEM_GOVERNOR", 1) != 0,
+      /*budget_bytes=*/EnvInt("METALJAX_MEM_BUDGET_MB", mem_mb * 3 / 4) *
+          (int64_t{1} << 20),
+      /*sys_bytes=*/EnvInt("METALJAX_MEM_SYS_MB", mem_mb * 3 / 4) *
+          (int64_t{1} << 20),
+      /*free_floor_bytes=*/EnvInt("METALJAX_MEM_FREE_FLOOR_MB", mem_mb / 16) *
+          (int64_t{1} << 20),
+      /*stall_ms=*/EnvInt("METALJAX_MEM_STALL_MS", 5000),
+      /*sample_us=*/EnvInt("METALJAX_MEM_SAMPLE_US", 20000),
+      /*advise_min_bytes=*/EnvInt("METALJAX_INGEST_ADVISE_KB", 1024) *
+          (int64_t{1} << 10),
+      // ...and the sweep's own threshold: the smallest mapping worth
+      // invalidating.  64 MB is above every resource file a framework maps
+      // and far below a checkpoint shard (2-5 GB).  0 turns the sweep off,
+      // which is the control arm the ingest test runs.
+      /*sweep_min_bytes=*/EnvInt("METALJAX_INGEST_SWEEP_MB", 64) *
+          (int64_t{1} << 20),
+      /*throttle_kbps=*/EnvInt("METALJAX_MEM_THROTTLE_KBPS", 1024 * 1024));
 }
 
 }  // namespace
@@ -422,6 +466,19 @@ MetalClient::BufferFromHostBuffer(
   // memory for the duration of this call.
   const size_t item = wire->host_item;
   const size_t nbytes = static_cast<size_t>(total) * item;
+  // The governor gate (the no-panic contract, runtime/memory.cc): a model
+  // load is thousands of these and nothing else, so this is where a load that
+  // cannot fit has to be told so -- BEFORE the staging block is allocated,
+  // while the answer is still a clean error rather than a machine under a
+  // reclaim storm.  Under pressure it paces the caller here instead; past the
+  // hard line it throws, and the catch below is what makes that a
+  // RESOURCE_EXHAUSTED status.
+  try {
+    governor_admit(static_cast<int64_t>(nbytes), MemWhere::kIngest);
+  } catch (const std::exception& e) {
+    if (on_done_with_host_buffer) std::move(on_done_with_host_buffer)();
+    return absl::ResourceExhaustedError(e.what());
+  }
   char* stage = static_cast<char*>(std::malloc(nbytes));
   if (stage == nullptr) {
     // The callback still runs: the caller's host buffer is no longer ours to
@@ -431,11 +488,43 @@ MetalClient::BufferFromHostBuffer(
         absl::StrCat("metaljax: could not stage ", nbytes, " host bytes"));
   }
   const char* src = static_cast<const char*>(data);
+  // Where the caller's bytes actually live: `data` and `nbytes` for a
+  // contiguous transfer, and for a strided one the bounding box of the view
+  // -- which starts BELOW `data` when a stride is negative (a flipped numpy
+  // view's logical first element is not its lowest address; the same fact
+  // `StridedGather` exists for).  jax hands this plugin explicit byte strides
+  // for most host arrays, so the strided arm is not the exotic one.
+  const char* span_lo = src;
+  const char* span_hi = src + nbytes;
+  if (byte_strides.has_value()) {
+    int64_t lo = 0, hi = static_cast<int64_t>(item);
+    for (size_t i = 0; i < dims.size(); i++) {
+      const int64_t reach = (dims[i] - 1) * (*byte_strides)[i];
+      if (reach < 0) lo += reach; else hi += reach;
+    }
+    span_lo = src + lo;
+    span_hi = src + hi;
+  }
   if (!byte_strides.has_value()) {
     std::memcpy(stage, src, nbytes);
   } else {
     StridedGather(src, stage, dims, *byte_strides, item);
   }
+  // The copy is made, so the caller's pages have done their job.  If they are
+  // a mapped checkpoint -- which `release_page_cache` establishes from the VM
+  // itself, not from anything the caller said -- hand them back now instead
+  // of leaving 65 GB of consumed file pages behind a load for the reclaimer to
+  // fight over under the next one.  A no-op for host buffers that are not
+  // mapped files, which is every other transfer this plugin makes.
+  //
+  // A SPARSE view is left alone: its bounding box holds bytes this transfer
+  // never read, and dropping a neighbour's cached pages to save its own is
+  // not a trade this can make without knowing what the neighbour is.  Half
+  // the box is the line, which every contiguous or nearly-contiguous view
+  // clears.
+  const int64_t span = static_cast<int64_t>(span_hi - span_lo);
+  if (span > 0 && span <= 2 * static_cast<int64_t>(nbytes))
+    release_page_cache(span_lo, span);
   if (wire->widen) {
     // f64 wire -> f32 device (or c128 -> c64): narrow in place.  Same
     // rounding as numpy's astype (C double->float, round-to-nearest-even).

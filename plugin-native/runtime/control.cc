@@ -125,6 +125,7 @@ class BodyRunner {
       limit_retries_ = 0;
       return out;
     } catch (const std::exception& ex) {
+      if (is_oom(ex)) throw;   // the governor's refusal: see run_recovering
       resource_limit = is_resource_limit(ex);
       err = std::current_exception();
     }

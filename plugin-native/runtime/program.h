@@ -240,6 +240,17 @@ struct Stats {
   int64_t msl_launches = 0;     // generated persistent kernels launched
   int64_t msl_failures = 0;     // ...plans retired to their loops
   int64_t host_calls = 0;       // entries that reacquired the GIL
+  // The memory governor (memory.cc, the no-panic contract).
+  int64_t mem_reclaims = 0;     // ladder step 1: pool dumped under pressure
+  int64_t mem_degrades = 0;     // ...admissions that ran degraded
+  int64_t mem_throttles = 0;    // ladder step 2: transfers paced
+  int64_t mem_throttle_ns = 0;  // ...for this long in total
+  int64_t mem_stalls = 0;       // ladder step 3: waits that cleared
+  int64_t mem_stall_ns = 0;     // ...time spent waiting (cleared or not)
+  int64_t mem_refusals = 0;     // ladder step 4: clean OOM errors raised
+  int64_t pages_released = 0;   // page-cache bytes invalidated after ingest
+  int64_t pages_deactivated = 0;  // ...and bytes only deactivated (COW maps)
+  int64_t page_sweeps = 0;      // sweeps of this process's own mappings
 };
 
 extern Stats g_stats;
@@ -274,6 +285,65 @@ void ingest_account(int64_t bytes);
 int64_t item_int(const mx::array& a);
 bool item_bool(const mx::array& a);
 bool loop_item_bool(const mx::array& a);
+
+// --------------------------------------------------------------------------
+// the memory governor (memory.cc — the no-panic contract)
+// --------------------------------------------------------------------------
+//
+// Everything above bounds what METALJAX holds. This bounds what the MACHINE
+// is asked to hold, because both kernel panics happened with every metaljax
+// number healthy: a full page cache, a drained free list and a load still
+// pulling pages in. The governor reads the machine (`host_statistics64`, the
+// kernel pressure level) as well as the process, degrades first (trim, pace,
+// stall) and refuses last, and it hands consumed checkpoint pages back to the
+// OS instead of leaving them for a reclaimer to fight over.
+
+struct MemSample {
+  int64_t footprint = -1;   // this process (task_info), or -1
+  int64_t total = 0;        // hw.memsize
+  int64_t free = 0;         // free pages, speculative NOT counted
+  int64_t file = 0;         // file-backed (the page cache)
+  int64_t claimed = 0;      // wired + anonymous + compressor: unreclaimable
+  int64_t purgeable = 0;
+  int pressure = 1;         // 1 normal, 2 warning, 4 critical
+  uint64_t stamp_ns = 0;
+};
+
+struct MemGovernor {
+  bool on = true;               // METALJAX_MEM_GOVERNOR=0 turns it all off
+  int64_t budget = 0;           // METALJAX_MEM_BUDGET_MB (this process)
+  int64_t sys_ceiling = 0;      // METALJAX_MEM_SYS_MB (machine, claimed)
+  int64_t free_floor = 0;       // METALJAX_MEM_FREE_FLOOR_MB (soft line)
+  int64_t stall_ms = 5000;      // METALJAX_MEM_STALL_MS before refusing
+  int64_t sample_ns = 20000000; // METALJAX_MEM_SAMPLE_US between samples
+  int64_t advise_min = 0;       // METALJAX_INGEST_ADVISE_KB (0 = off)
+  int64_t sweep_min = 0;        // METALJAX_INGEST_SWEEP_MB (0 = off): the
+                                // smallest mapping the ingest sweep touches
+  int64_t throttle_bps = 0;     // METALJAX_MEM_THROTTLE_KBPS under pressure
+};
+
+extern MemGovernor g_gov;
+
+enum class MemWhere { kIngest, kFlush, kExecute };
+
+void configure_governor(bool on, int64_t budget_bytes, int64_t sys_bytes,
+                        int64_t free_floor_bytes, int64_t stall_ms,
+                        int64_t sample_us, int64_t advise_min_bytes,
+                        int64_t sweep_min_bytes, int64_t throttle_kbps);
+int64_t machine_memory();          // hw.memsize
+int memory_pressure_level();       // the kernel's own ladder
+MemSample read_machine();          // one uncached reading
+MemSample governor_sample(bool force);   // ...the cached one
+bool governor_pressured();         // the cached verdict (the ingest pacer)
+bool governor_squeezed();          // ...the harder one (the flush's veto)
+void governor_admit(int64_t want, MemWhere where);
+int64_t release_page_cache(const void* data, int64_t bytes);
+// ...and the same for every large read-only file mapping THIS PROCESS holds,
+// which is what a loader that copies before `device_put` needs.
+int64_t sweep_page_cache(int64_t min_region_bytes);
+// A governor refusal, told apart from every other failure by its message (the
+// plugin builds without RTTI, and `is_resource_limit` sets the precedent).
+bool is_oom(const std::exception& e);
 
 // A permutation that changes nothing; gather, scatter and msl all ask.
 inline bool is_identity_perm(const std::vector<int>& p) {
