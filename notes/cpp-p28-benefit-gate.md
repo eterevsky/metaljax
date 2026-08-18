@@ -15,9 +15,11 @@ written in came out of the two rows' own flight logs: **the live set**.*
 `METALJAX_FLUSH_EARN_MULT=0`, see §5). `src/` and `native/` are FROZEN and
 untouched. Raw data, runners and the frozen binaries:
 `~/.cache/metaljax-bench/logs/p28-benefit-gate/` (`p28_diag.sh` — the
-diagnosis; `p28_battery.sh` — every validation phase; `meter.py`,
-`evaluate.py` — the trace analysis, which replays candidate rules over the
-MEASURED flush traces before any of them was built).*
+diagnosis; `p28_battery.sh` — every validation phase; `p28_suite.sh` — the
+suite; `p28_close.sh` — the `texmo_gate` re-run and §7's combined-build
+re-spot; `meter.py`, `evaluate.py` — the trace analysis, which replays
+candidate rules over the MEASURED flush traces before any of them was
+built).*
 
 ## 1. What the flight logs say, and what they refuse to say
 
@@ -161,28 +163,114 @@ per row, never chained, machine lock held per phase.
 | **11** Qwen3-0.6B decode | **20 GB** | guard kill (22-25 GB) | **16.61 / 16.81 / 16.75 ms/tok**, exit 0 ×3 (+6 more) | 19 / 18 / 11 GB | at budget, ≡ the 16.85-16.92 cell |
 | **14** maxtext qwix-int8 | **25 GB** | guard kill (26 GB) | **31.95 / 32.13 / 31.82 ms/tok**, exit 0 ×3 | 9.2 / 9.1 / 13 GB | at budget, ≡ the 32.00-32.14 cell |
 | **19** maxtext train 0.6B | 48 GB | 456.1 ms/step | **459.2 / 458.4 / 462.5 ms/step** | 25 GB ×3 | the 456-470 class holds; `loss` / `loss_first` **identical to P27's to 13 digits** |
-| **18** LoRA E2B train | 70 GB | 359.2 ms/step | *(§6)* | | |
-| suite-106 | | 0.9840 geomean | *(§6)* | | |
+| **18** LoRA E2B train | 70 GB | 359.2 ms/step | **361.8 ms/step**, exit 0 | 60 GB (guard) / **57,478 MB** (meter) | 1.007× the cell; §4.1 |
+| suite-106 (native) | | the rc column | **0.9963** of it (106/106) | | no row regressed; §4.2 |
+
+### 4.1 Row 18 — the spike is the same event, to the megabyte
+
+361.8 ms/step against 359.2 (the gate's cell) and 360.2 (P27) — 1.007×, inside
+the ±2 % this row has held all week — with the final loss 2.8648, inside the
+2.8469-2.8701 band P27 measured across nine runs of BOTH policies.
+
+The peak deserves its own line because the guard's number went UP (its flight
+log reads 60 GB against the gate's 57) while the meter's went nowhere: the
+`foot=` field inside the dylib — the same `task_info` reading P27 published —
+maxes at **57,478 MB**, against P27's **56,712 / 57,480 / 57,479 MB** for the
+same event, within 2 MB of two of them. Rule 3 cannot raise a bound (it
+enters as a `min`), so a policy-caused increase is not available as an
+explanation; what the two readings differ about is a 2 Hz sampler catching a
+sub-second live-set spike at a different phase, which is exactly what P25's
+"37-56 GB band" turned out to be. Rule 3 in fact LOWERS this row's bound as
+well — its 250th flush reads `bound=6654MB earn=6654MB` against a 32 GB cap —
+and the row is no slower for it.
+
+### 4.2 Suite-106 — no regression against the recorded rc column
+
+Per Oleg's scope ruling of 2026-08-18 the Python engine is out of release
+scope, so the claim is **not** a native/Stage-1 pairing: it is this campaign's
+native run against the **recorded rc numbers** for the same 106 configs (the
+release gate's own native arm), plus P27's native arm as the second control.
+Both arms are `ms_step`, so **> 1 means P28 is slower**.
+
+| P28 native against | geomean | median | min / max | rows > 1.1× |
+|---|---:|---:|---|---:|
+| **the recorded rc column** | **0.9963** | 0.9997 | 0.826 / 1.094 | **0** |
+| P27's native arm | 1.0004 | 0.9994 | 0.973 / 1.069 | **0** |
+
+| class | vs rc | vs P27 |
+|---|---:|---:|
+| `big` (34) | 0.9795 | 1.0031 |
+| `mid` (30) | 1.0052 | 0.9989 |
+| `db` (40) | 1.0023 | 0.9991 |
+| `synth` (2) | 1.0303 | 1.0025 |
+
+**No row regressed past 1.1× against either control**, and exactly one row
+falls outside ±10 % at all — `big12-b8l256` at **0.826**, i.e. faster. Summed
+over the suite, 1995.4 ms against the rc column's 2003.2. Against P27 the
+whole suite is flat to 0.04 %, which is the expected result for a rule that
+enters as a `min` and that no suite config's live set is shaped to trip:
+these are compiled training steps, not checkpoint loads.
 
 ## 5. Battery
 
+Everything below is on `frozen-p28b-37060770` — the binary the rows were
+measured on. That is not a formality: the battery had been run on the previous
+build and §5.1 is what re-running it found.
+
 | gate | result |
 |---|---|
-| `execute_test` | **553 `ok` rows**, all cases match the CPU backend (549 + P28's four) |
+| `execute_test` | **553 `ok` rows**, all cases match the CPU backend (549 + P28's four) — after §5.1 |
 | `ingest_test` | 0 failed, 13 checks |
 | `smoke_test` | all checkpoints passed |
 | `bazel test //...` | `runtime_gil_free_test` PASSED, uncached |
-| `texmo_gate` | *(§6)* |
+| `texmo_gate` | **106 ok / 0 FAIL / 0 decline / 0 error of 106** (24 via sensitivity scaling) |
 
 **The four new contracts** (`execute_test.py::_p28_benefit_gate`) are two
 programs run through one harness, so the difference is the program:
 
 | contract | reads |
 |---|---|
-| a flat live set earns nothing | 545 flushes past the gate, bound ≤ 256 MB against a 4096 MB cap, peak 320 MB cached |
-| the earn rule is what denies it | same program, `EARN_MULT=0`: every bound the 4096 MB cap, peak 3350 MB — 10× the pool, same checksum |
-| a cycling live set earns the pool | live-set swing 362 MB, bound up to 724 MB on 221 of 260 flushes, peak 964 MB cached |
-| the bound is the multiplier times the swing | bound 692-724 MB on 221 of 260 flushes, **worst 0 MB off** the `min(cap, max(floor, earn))` identity |
+| a flat live set earns nothing | 545 flushes past the gate, bound ≤ 256 MB against a 4096 MB cap, worst live-set swing 79 MB, peak 309 MB cached |
+| the earn rule is what denies it | same program, `EARN_MULT=0`: every bound the 4096 MB cap, peak 3379 MB — 11× the pool, same checksum |
+| a cycling live set earns the pool | live-set swing 377 MB, bound up to 434 MB on 221 of 260 flushes, peak 786 MB cached |
+| the bound is the multiplier times the swing | bound 419-434 MB on 221 of 260 flushes, **worst 0 MB off** the `min(cap, max(floor, earn))` identity; `earn` bound by the high-water on 221 flushes and by the swing on 46 |
+
+### 5.1 The fourth contract was still testing the rule's first draft
+
+Re-running the battery on the shipped binary — the contracts phase had been
+run on `frozen-p28-f7f3c708`, the build BEFORE the `peak_live` clamp, while
+every model row came from `frozen-p28b-37060770` after it — failed one case:
+
+```
+the bound is the multiplier times the swing
+    FAIL: earn=419 MB where the sampled live set says 724 MB (hi 419, lo 57)
+```
+
+**The rule was right and the contract was stale.** Its second half asserted
+`earn == mult * (hi - lo)`, which is §2's formula before measurement added the
+high-water clamp; the swing probe drops to 57 MB from a 419 MB high-water, so
+`2 * swing` is 724 MB and `peak_live` is what the shipped rule hands it — the
+clamp doing exactly the job row 11 bought it for, on a probe whose shape
+happens to match. The check is now the shipped identity
+`min(mult * (hi - lo), hi)`, and it narrates which of the two terms bound each
+flush, so a future divergence names the term rather than the rule (221
+high-water, 46 swing on this probe). The first half — `bound` equals `earn`
+clamped to `[floor, cap]` — was exact on both binaries and is untouched.
+
+The battery above is the 11:36-11:38 run of 2026-08-18, with the fix in. One
+edit landed after it — the success message now prints the total flush count
+alongside the two term counts — and it is narration only: it runs after every
+assertion in the case and formats a string. Under release rule 1 that is the
+"provably cannot move a number" exemption, taken deliberately rather than by
+queue-jumping the vendoring milestone's model rows for a re-run of a print
+statement.
+
+The three other contracts pass on both builds; what moved between them is the
+*numbers* in the table above (the pool the swing probe keeps is 786 MB rather
+than 964, because the clamp is what now bounds it). The lesson is P27's own
+"the measured binary is the tree", one step further out: a battery split
+across two builds attests neither, and the half that was not re-run is the
+half that failed.
 
 **Two pre-existing arms are now pinned to `METALJAX_FLUSH_EARN_MULT=0`, and
 that is deliberate**: P27's four arms and the governor's "pressure takes the
@@ -230,3 +318,47 @@ and were updated together.
   rule's premise. Its timing is unchanged (31.8-32.1 vs the 32.00 cell), which
   is the evidence that a floor-bounded pool costs a flat-live-set program
   nothing.
+* **The battery spans two libmlx builds, and the split is dated, not hidden.**
+  The model rows (§3, §4), the suite and the row-18 run are 2026-08-17, on
+  pip's stock MLX 0.32.0. The contracts and `texmo_gate` above were re-run
+  2026-08-18 11:29-11:39, by which time the concurrent vendoring work had
+  staged our patched fork build into the venv MLX the plugin resolves through
+  `@rpath` — so those two gates attest the rule against the *patched* library.
+  Both are pass/fail correctness gates rather than timings, and both passed on
+  both libraries (the 08-17 `texmo_gate` run reached 70 ok / 0 FAIL before it
+  was interrupted, the 08-18 one 106/106), so nothing here rests on which was
+  loaded. §7 is the re-spot that closes it for the numeric cells.
+* **The earn expression exists twice** — `runtime.cc::flush_bound` decides it
+  and `program.cc`'s meter re-derives it for `earn=`. They cannot be shared
+  without either recomputing the bound or plumbing it out, and the fourth
+  contract's first half (`bound == clamp(earn)`) is what would catch them
+  drifting apart: it compares the two through the meter on every flush past
+  the gate. Worth knowing before editing one of them.
+
+## 7. The re-spot on the combined build
+
+The vendoring milestone replaces the library this rule allocates out of, so
+the three rows were re-measured on `frozen-vendor-d651add3` — the plugin
+linked against the private patched `libmlx_metaljax.dylib` — at the same
+historical budgets, one guarded process per row
+(`p28_close.sh vspot`, 2026-08-18 11:40-11:43):
+
+| row | budget | P28 on stock MLX | **P28 + vendored patched MLX** | peak |
+|---|---:|---|---|---:|
+| 11 | 20 GB | 16.61 / 16.81 / 16.75 ms/tok | **16.60**, exit 0 | 16 GB |
+| 14 | 25 GB | 31.95 / 32.13 / 31.82 ms/tok | **31.94**, exit 0 | 9.2 GB |
+| 19 | 48 GB | 459.2 / 458.4 / 462.5 ms/step | **463.5**, exit 0 | 25 GB |
+
+Each row completes at its historical budget. Row 14 lands inside its P28
+spread, row 11 0.01 ms under the bottom of its own, and row 19's 463.5 sits
+1.0 ms above the top of its trio and inside the 456-470 class it must hold —
+single runs against three-run spreads, all inside these rows' week-long noise.
+Row 19's `loss` (**87.0428237915039**) and `loss_first`
+(**228.39447021484375**) are **bit-identical across all eight runs of this
+campaign** — seven on stock MLX, one on the patched library. Rule 3 reads
+`mx::get_active_memory()`, which the fence fix does not touch, so the rule is
+expected to be indifferent to the substitution; this is the measurement that
+says it is.
+
+The rest of the vendoring attestation (its own contracts, `texmo_gate`, suite
+and model rows) belongs to that milestone's battery, not this one.

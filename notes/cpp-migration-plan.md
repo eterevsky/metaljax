@@ -1847,3 +1847,49 @@ degrade ladder (hard trim -> ingest throttle/stall -> eval barriers)
 -> clean RESOURCE_EXHAUSTED past the hard line; page-cache discipline
 (madvise consumed mmap ranges away during ingest -- the hot-cache
 last-in-battery pattern is the common factor of #8/#9).
+
+## P28: the flush watermark has to be EARNED (2026-08-17..18,
+## notes/cpp-p28-benefit-gate.md)
+
+The 0.11.5 release gate scored gate 5 as REGRESSION over one thing: P27's
+watermark cost the two maxtext DECODE rows (11, 14) 17 GB and 11 GB of peak
+footprint, bought them no speed, and guard-killed both at the budgets every
+previous campaign used. Oleg chose option (b) -- benefit-gate it. `flush_bound`
+gains a THIRD rule over P25's floor, entering as one more `min` so it can only
+ever lower a bound and no program that was safe under P25/P27 becomes unsafe:
+
+    earned = min(METALJAX_FLUSH_EARN_MULT * (live_hi - live_lo), live_hi)
+
+over the PROGRAM's own live set (`mx::get_active_memory`, sampled at its hard
+flushes, kept in `FlushState`). The discriminator came out of the two rows'
+own flight logs and it is NOT the flush count -- their checkpoint load takes
+134 hard flushes in a single call, so every P27 counter reads "eager main" for
+it. It is the live set: the training step swings 6.8 -> 20.5 GB every flush
+(pool 11.7 GB p50 over 352 flushes), while the load holds ~3 GB flat and
+merely has 14 GB of freed weights land in the pool at its last flush, and the
+decode step holds 1,197 MB at all 71 of its flushes. Both terms are
+load-bearing: `2*swing` alone leaves the loads at 7.1 GB (row 11 killed 1 run
+in 3), `peak_live` alone hands the flat decode step a pool it never reads.
+`METALJAX_FLUSH_EARN_MULT` default 2 (1 breaks row 19 at 569.9 ms/step); 0
+restores P27 exactly.
+
+Result at the rows' HISTORICAL budgets: row 11 9/9 complete at 20 GB
+(16.61-16.83 ms/tok), row 14 4/4 at 25 GB (31.82-32.13), row 19 holds its P27
+fix (459.2/458.4/462.5 ms/step at 48 GB, loss identical to P27's to 13
+digits), row 18 361.8 ms/step with its live-set spike unmoved (meter peak
+57,478 MB against P27's 57,479/57,480). Suite-106 native reads 0.9963 of the
+recorded rc column with 0 of 106 rows past 1.1x, and 1.0004 of P27's native
+arm. Battery: `texmo_gate` 106/106, `execute_test` 553 ok, `ingest_test`,
+`smoke_test`, `bazel test //...`.
+
+Two process findings worth the ledger. (a) **A battery split across two builds
+attests neither**: the contracts had been run on the pre-clamp binary and the
+rows on the shipped one, and re-running them on the shipped binary failed one
+of P28's own four contracts -- it still asserted the rule's FIRST DRAFT
+(`earn == 2*swing`) rather than the shipped `min(2*swing, peak_live)`. The
+rule was right, the contract was stale; it now checks the shipped identity and
+narrates which term bound each flush. (b) The rows were re-spotted on the
+COMBINED build (P28 + the vendored patched libmlx, `frozen-vendor-d651add3`):
+16.60 / 31.94 ms/tok and 463.5 ms/step at the same budgets, row 19's loss
+bit-identical across all eight runs of the campaign -- the rule reads a
+counter the fence fix does not touch, and the measurement says so.

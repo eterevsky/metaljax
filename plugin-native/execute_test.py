@@ -3786,20 +3786,28 @@ def _p28_benefit_gate(subprocess, tempfile, pathlib, re):
         rules out of reach, the bound must be `earn` clamped to [floor, cap]
         and nothing else.
 
-        The second half is that `earn` really is the live-set swing: it must
-        equal `mult * (hi - lo)` over that PROGRAM's own `live=` readings --
-        the values the rule sampled, which is why the meter prints them
-        separately from `active=` (the two differ by whatever the step dropped
-        between the sample and the print; on this probe's phase-change flush
-        they read 399 MB and 95 MB).  Per program, because that is where the
-        water marks live: a replay pooling every program's readings would be
-        checking a rule nothing implements.
+        The second half is that `earn` really is what the live set says: it
+        must equal `min(mult * (hi - lo), hi)` -- BOTH terms, the multiplier
+        over the swing and the high-water clamp -- over that PROGRAM's own
+        `live=` readings, the values the rule sampled, which is why the meter
+        prints them separately from `active=` (the two differ by whatever the
+        step dropped between the sample and the print; on this probe's
+        phase-change flush they read 399 MB and 95 MB).  Per program, because
+        that is where the water marks live: a replay pooling every program's
+        readings would be checking a rule nothing implements.
+
+        The clamp is not decoration here: this probe drops to 57 MB from a
+        419 MB high-water, so `2 * swing` is 724 MB and the high-water is what
+        the rule actually hands it.  Checking `mult * swing` alone passed on
+        the pre-clamp binary and FAILS on the shipped one -- which is how this
+        contract came to be re-run in the first place.
         """
         rows = state.get("swing", ([], None))[0]
         if not rows:
             return False, "the swinging arm did not run"
         worst, worst_row, checked = 0, None, 0
         drift, drift_row = 0, None
+        bound_by = {"swing": 0, "high-water": 0}
         for prog in by_program(rows):
             hi = lo = None
             for _active, _cache, _was, bound, _foot, _cap, n, live, earn in prog:
@@ -3807,9 +3815,14 @@ def _p28_benefit_gate(subprocess, tempfile, pathlib, re):
                     return False, "the meter reported no earn with the rule on"
                 hi = live if hi is None else max(hi, live)
                 lo = live if lo is None else min(lo, live)
-                if abs(earn - MULT * (hi - lo)) > drift:
-                    drift = abs(earn - MULT * (hi - lo))
-                    drift_row = (earn, MULT * (hi - lo), hi, lo)
+                # The shipped rule is both terms (runtime.cc `flush_bound`,
+                # notes/cpp-p28-benefit-gate.md §2), and which of them binds
+                # is narrated below so a failure names the term.
+                want_earn = min(MULT * (hi - lo), hi)
+                bound_by["swing" if MULT * (hi - lo) <= hi else "high-water"] += 1
+                if abs(earn - want_earn) > drift:
+                    drift = abs(earn - want_earn)
+                    drift_row = (earn, want_earn, hi, lo)
                 if n < GATE:
                     continue
                 checked += 1
@@ -3825,8 +3838,8 @@ def _p28_benefit_gate(subprocess, tempfile, pathlib, re):
         # to the shift, so the product can be two out and no more.
         if drift > 2 * MULT:
             return False, (f"earn={drift_row[0]} MB where the sampled live set "
-                           f"says {drift_row[1]} MB (hi {drift_row[2]}, lo "
-                           f"{drift_row[3]})")
+                           f"says min({MULT}*({drift_row[2]}-{drift_row[3]}), "
+                           f"{drift_row[2]}) = {drift_row[1]} MB")
         # The identity is vacuous unless the rule is what actually chose the
         # bound on a fair share of the flushes rather than a clamp.
         inside = [r for r in rows if r[6] >= GATE and FLOOR < r[3] < CAP]
@@ -3835,7 +3848,10 @@ def _p28_benefit_gate(subprocess, tempfile, pathlib, re):
                            f"their clamps")
         span = (min(r[3] for r in inside), max(r[3] for r in inside))
         return True, (f"ok (bound {span[0]}-{span[1]} MB on {len(inside)} of "
-                      f"{checked} flushes, worst {worst} MB off)")
+                      f"{checked} flushes past the gate, worst {worst} MB off; "
+                      f"over all {len(rows)} narrated flushes earn was bound by "
+                      f"the high-water on {bound_by['high-water']} and by the "
+                      f"swing on {bound_by['swing']})")
 
     return [
         ("a flat live set earns nothing", a_flat_live_set_earns_nothing),
