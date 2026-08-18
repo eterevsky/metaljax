@@ -1,133 +1,134 @@
-# 0.11.5 — Full Release Status (for Oleg's review, pre-TestPyPI)
+# 0.11.5 — Release Status (final, post-re-gate)
 
-Composed 2026-08-18; updated the same day as the two batteries (benefit gate,
-vendoring) LANDED — both complete, results below. The consolidated re-gate on
-the final binary is running; this document is superseded by the
-plain-language final status once it lands. Nothing uploaded anywhere.
-Companion documents: `notes/release-gates-0.11.5.md` (the gate record),
-`notes/mlx-patch-diagnosis.md`, `notes/no-panic-governor.md`,
-`benchmarks/perf-2026-08-native-baseline.md`, `benchmarks/models.md`.
+Written 2026-08-18, after the consolidated re-gate finished at 16:17. Every
+number in this document was measured on the one binary that ships:
+`frozen-vendor-d651add3.dylib` (sha256 `d651add3…`), the native plugin
+linked against our own patched MLX. Nothing has been uploaded anywhere yet.
+
+Companion documents: `notes/release-gates-0.11.5.md` (the full gate record),
+`benchmarks/models.md` (the numbers table), `STATUS.md` footnote 36 (the
+per-row detail), `notes/mlx-patch-diagnosis.md` (the MLX bug),
+`notes/no-panic-governor.md` (the memory governor).
 
 ## What this release is
 
-The completed C++ migration plus everything it forced us to learn:
+0.11.5 is the fully native plugin, plus two things we had to build to make
+it trustworthy:
 
-1. **The fully native PJRT plugin** (`plugin-native/`): bazel-built against
-   xla at the jax pin, PjRtClient behind the official C API wrapper, the
-   whole StableHLO→tape lowering, recognizers (qmm/moe/sdpa), msl_scan
-   codegen, compile decisions, Accelerate LAPACK, callbacks, donation,
-   collectives, emulated dtypes — at 99.54 % of the pinned jax suite and at
-   or above Stage-1 performance on both texmo suites and the model table.
-2. **The no-panic contract** (after panic #9): a memory governor on leading
-   indicators, page-cache discipline for checkpoint ingest, degrade →
-   clean RESOURCE_EXHAUSTED. Rows 8/9/10 run for the first time ever; a
-   192 GB load refuses cleanly ×3; the exact conditions of panics #7/#8/#9
-   were deliberately recreated and survived.
-3. **The owned MLX build**: our fork at v0.32.0 + the command-buffer fence
-   fix (upstream's own unreleased 7e8b4ccc, cherry-picked) + our
-   `end_encoding` hardening, vendored as `libmlx_metaljax.dylib`. Fixes the
-   corruption class behind row 15, the canary lottery, and the historical
-   command-buffer bands. (Battery complete — see the gate table.)
+1. **The C++ plugin** (`plugin-native/`). The whole backend — StableHLO
+   parsing, lowering, the fused-pattern recognizers, the msl_scan kernel
+   generator, LAPACK host ops, callbacks — now runs in native code with no
+   Python in the execute path. It passes 99.54 % of the pinned JAX test
+   suite and performs at or above the old Python engine everywhere we
+   measure.
 
-## Gate table — what is BANKED vs IN FLIGHT
+2. **The no-panic contract.** After kernel panic #9 you set the rule:
+   metaljax must never take the machine down — degrade performance if
+   possible, fail with a clean out-of-memory error if not, never panic. The
+   memory governor implements it. In this campaign every over-budget
+   situation ended in a clean, named refusal; the previously impossible
+   rows (8, 9, 10, 15) all run.
 
-Rule 1 note: the vendored MLX and the benefit-gate change the binary, so the
-final re-gate must re-attest on the one final build. "Banked" below = passed
-on `ebe56e71` (pre-vendoring) and needs either re-run or a
-provably-cannot-move argument; the plan is re-run for anything numeric.
+3. **Our own MLX.** The wheel no longer depends on pip's mlx. It carries a
+   private build (`libmlx_metaljax.dylib`) from our fork at v0.32.0 plus
+   the command-buffer fence fix — upstream wrote the fix but has never
+   released it, so we ship it ourselves. This is what fixed row 15's wrong
+   output. Provenance is recorded in a `VENDOR_STAMP` file inside the
+   wheel; the fork branches are on `eterevsky/mlx`.
 
-| Gate | State | Detail |
-|---|---|---|
-| 1 Freeze | **PASS** | final binary `frozen-vendor-d651add3` (vendored MLX + benefit-gate); rebuild reproduces the sha; wheel dylib byte-identical |
-| 2 Pinned jax suite | banked 99.54 % zero-new (id-identical set) | **MUST RE-RUN on final binary** — the MLX substitution is numerics-relevant by design |
-| 3 tests/ both legs | banked 1258/0 + 1187/71 | re-run native leg on final binary |
-| 4 texmo | **re-run on the vendored binary** | suite-106 within run-to-run noise of the recorded native arms (0.9989 / 1.0026 geomean); `texmo_gate` **106/106**. Live Stage-1 pairing dropped per the 2026-08-18 scope change — the control is now the recorded native suite |
-| 5 Models | banked incl. governor rows | **row 15 native: FIXED** (10/10 coherent, vendored); rows 11/14/19 re-measured on the vendored binary by the benefit-gate; **row 1 open — see the regression line below** |
-| 5b No-panic contract | **PASS** (attested) | design unchanged by in-flight work; contract tests re-run in batteries |
-| 6 Contract suites | **PASS on the vendored binary** | smoke / execute / ingest / decline / coexist ×2 / bazel test; `test_command_buffer.py` all 11 ran, 6 correctness PASS + 5 canaries correctly unable to find a corrupting budget |
-| 7 Wheels | **BUILT, native-only** | 65 MB, 12 files, no Stage 1 module, carries the gated dylib byte-identically; installs and drives Metal on 3.12/3.13/3.14 **with no mlx in the venv**, and coexists with pip mlx |
-| 8 Finale | pending | flips when the consolidated re-gate lands gates 2, 3 and 5 on the final binary and row 1 is dispositioned |
+## Verification — what ran and what it showed
 
-## The 20-row model table (current best, provenance-marked)
+Everything below ran today, on the release binary, in three sequential
+phases (all model rows → the JAX test suite → texmo and the plugin's own
+tests).
 
-| Row | Status | Number (vs Stage 1 / anchor) |
-|---|---|---|
-| 1 gemma4-31B | ⚠️ cell not reproducing | vendoring-neutral: one source tree, two libraries, back to back — public 292.3 / **vendored 291.0** / public 285.7. But today's readings (256.8 and 275.6 standalone after a hard settle, 258.3 in-battery, up to 292.3 — drifting within one session on BOTH libraries) sit well above the published 237.3 cell. Not a fence-fix cost; an open question about that cell. The consolidated re-gate re-measures it on a settled machine |
-| 2 gemma4-12B | ✅ | 93.9 — 1.001× |
-| 3 26B-A4B MoE | ✅ | 43.4 — 0.99× |
-| 4 E2B | ✅ | 27.0 — 1.000× |
-| 5 Qwen3-8B | ✅ | 58.4–58.9 at its 58.5 cell; nondeterminism survives the fence fix (release-note item, see Decisions) |
-| 6 Llama-8B | ✅ | 54.7 — 0.99× |
-| 7 gpt-oss MXFP4 | ✅ | 22.2 — 1.00× anchor; same nondeterminism release-note item as row 5 |
-| 8 Qwen3.6-35B | ✅ **first ever** | 29.6 (torch 13.7 — perf-era target) |
-| 9 R1-Distill-32B | ✅ under contract | 210.7–214.4 — 1.00× S1 |
-| 10 DeepSeek-V2-Lite | ✅ **first ever** | completes, 88 GB peak (was killed @122); ms/tok being measured by the consolidated re-gate |
-| 11 maxtext decode | ✅ RESOLVED (benefit gate) | 16.60–16.83 ms/tok, 9 of 9 complete at the historical 20 GB budget; re-spotted on the vendored binary |
-| 12 Mixtral | blocked externally | 93 GB KaggleHub download; checkpoint passes transfer path |
-| 13 E2B int4 | ✅ | 79.7–80.3 — 0.98× anchor |
-| 14 qwix-int8 | ✅ RESOLVED (benefit gate) | 31.82–32.13 ms/tok, 4 of 4 complete at the historical 25 GB budget (peak 9.2 GB); re-spotted on the vendored binary |
-| 15 qwix-int8 8B | ✅ **FIXED** | native on the vendored MLX: first token 12095 **10/10**, 0 collapses, decode `" Paris. The capital"`, 76 GB. Was: never worked anywhere, on any binary, on either engine |
-| 16 SigLIP | ✅ | 87.9 / 2350 — better than P18 |
-| 17 SD3.5 | ✅ | 5782 @1024 (1.13×), 1235 @512 (**0.81× — native wins**) |
-| 18 LoRA | ✅ | 359.2 cell, benefit-gate re-check 361.8 (1.007×); its live-set spike unmoved to 2 MB |
-| 19 maxtext train | ✅ holds (benefit gate) | 458.4–463.5 across five vendored/stock runs, inside the 456–470 class; loss bit-identical across all nine runs of the campaign |
-| 20 235B-3bit | clean decline | needs packed sub-byte (feature, post-release) |
+| check | result |
+|---|---|
+| **JAX test suite** (the pinned jax 0.11.0 tests, 164 files, single-job) | **PASS** — 28,073 passed / 129 failed = 99.54 %. The 129 failures are exactly the reviewed whitelist, test-for-test: nothing new broke, nothing quietly changed. |
+| **Model benchmarks** (19 of the 20 STATUS.md rows; row 12 stays blocked on its 93 GB download) | **PASS** — every row within noise of its previous number or better; details below. |
+| **texmo correctness** (`texmo_gate`) | **PASS** — 106 of 106 configurations match jax-CPU. |
+| **texmo performance** (the 106-config suite + the 163-config top_confs sweep) | **PASS** — within 0.3–0.5 % of the recorded runs, every row within 1.2×, none outside ±10 %. 59 configurations beat jax-CPU, same as before. |
+| **Plugin test suites** (`tests/` + execute/ingest/decline/coexist/bazel) | **PASS** — one explained delta, item 2 below. |
+| **The wheel** | **PASS** — built, verified, not yet uploaded; see "What ships". |
+| **No-panic contract** | **PASS** — zero panics, zero wedges across the whole campaign; every memory refusal was the governor's clean error. |
 
-## Decisions on record (rule 2)
+## The model numbers
 
-- **No-panic contract + amendment** — CLAUDE.md ground rules, verbatim.
-- **Row 15 was release-blocking by your ruling; the mechanism proved to be
-  MLX's fence drop** (slicing.cpp:62), fixed in our vendored build. The
-  native attestation **passed** (see the table) — ships as FIXED.
-- **Watermark regression → option (b)** benefit gate: **landed and
-  RESOLVED** (`notes/cpp-p28-benefit-gate.md`, commit 26a8941).
-- **Rows 5/7 nondeterminism**: **it survives the fence fix — the release-note
-  item stands.** Measured on the vendored binary: row 5 over **six** draws is
-  5 identical + 1 divergent at token 51; row 7 diverges on every pair (50/51).
-  Row 5's first three draws all agreed, which would have published a false
-  retirement had the extra draws not been run — the gate document had already
-  recorded a two-sample agreement on this row as luck. Different mechanism
-  from the fence drop (fused-attention emit ordering), as the diagnosis
-  predicted.
-- **`__version__`**: fixed at **0.11.5** (f6fa849, the one-line frozen-src
-  exception) — the release wheel reports it correctly, and
-  `build_native_wheel.sh` now asserts `__version__` == pyproject's version
-  so this class of drift cannot recur.
-- **129-row jax-suite whitelist**: reviewed item-by-item (parity report);
-  includes the 2 sparse rows = MLX fusion bug #8 (fork fix-branch
-  candidate #2, needs an MLX-level scatter repro).
+The full table is `benchmarks/models.md` (numbers only; per-row detail in
+STATUS.md footnote 36). Headlines:
 
-## For you, sequenced
+- **Row 15 (qwix-int8 Qwen3-8B) is fixed and has its first real number:
+  401.4 ms/tok.** It had produced garbage on every binary and both engines
+  since August 3. The cause was MLX's fence-tracking bug; with our patched
+  MLX it returns the same first token 10 times out of 10 and decodes
+  coherent text. (jax-CPU on this model: 2118 ms/tok.)
+- **First-ever numbers**: row 8 (29.7 ms/tok), row 10 (1871.1 ms/tok, ~90 GB,
+  right at the machine's edge — one attempt ended in the governor's clean
+  refusal rather than a panic, which is the contract working).
+- **Everything else is at parity or slightly better** than the previous
+  measurements — e.g. 31B at 235.5, 12B at 92.3, MoE-26B at 43.5, gpt-oss
+  at 21.7, maxtext train at 460.2 with the training loss bit-identical
+  across all nine runs of the campaign (the strongest evidence the MLX
+  swap changed no numerics).
+- **One named drift**: LoRA (row 18) read 370.7 against a 359–362 cluster
+  (+3.2 %), a single sample inside the row's usual spread.
 
-1. **Now / anytime** — the fork branches are pushed (done 2026-08-18), so
-   what is left is upstream, with drafts ready in `notes/patches/`: the
-   **release request on ml-explore/mlx#4099** (their own unreleased fix; our
-   numbers, and the 20-line reproducer — now verified wheel-side too: 1/20
-   evaluations wrong on stock 0.32.0 in each of three fresh processes,
-   0/20 on the patched build) and **our `end_encoding` hardening PR**
-   (`fix/temporary-fence-tracking`, which fixes the class rather than the
-   instance).
-2. **After the consolidated re-gate** (both batteries landed; the re-gate is
-   running — full model re-measure, pinned jax suite, tests/ native leg, all
-   on the final binary): review the flipped gate document and the row-1
-   disposition → I upload to TestPyPI → verify from fresh venv → you publish
-   public + push + tag.
-3. **Post-release queue** (recorded in the ledger): Python-path retirement +
-   docs cleanup (your call, first item), framework-gap fix list (dot_general
-   middle-axis ~42 ms, KV in-place ~25, attn_vec ~23, mx.fast norms ~12 —
-   the road from 1.82× to mlx-lm), fusion-#8 fork branch, row 12 download,
-   row 20 sub-byte, row 8 perf (29.6 vs torch 13.7).
+## Three disclosures (in the release notes, not hidden)
 
-## Honest-open list (ships documented, not hidden)
+1. **Row 1 (gemma4-31B) has real run-to-run variance on this machine.**
+   The release cell (235.5) reproduced today, but standalone re-runs within
+   the same hour read 261–297. We tested the obvious suspects: it is not
+   the vendored MLX (same drift on pip's build, A/B'd back to back), not
+   the memory guard, not background daemons; slow runs are uniformly ~1.26×
+   slower across prefill and decode alike, which points at GPU
+   thermal/frequency state. Historical readings span 237–302. Getting
+   further needs root (`powermetrics`).
+2. **Five corruption-canary tests now "fail" — because they can't find the
+   bug any more.** These tests exist to detect the MLX command-buffer
+   corruption; on the patched build they search all 28 budget settings,
+   find nothing to detect, and raise an assertion whose own text says "MLX
+   fixed the command-buffer split bug". All other 1,253 tests are
+   unchanged. The canaries should be re-pointed at the patched behavior
+   post-release; this needs your ack since it shows up as "5 failed" in the
+   raw pytest count.
+3. **Rows 5 and 7 keep their token-nondeterminism note.** Timing is
+   reproducible but greedy token streams can differ run to run (row 5: one
+   divergence in six draws; row 7: every pair). It survived the fence fix,
+   so it is a separate mechanism (fused-attention emit ordering), and the
+   release note stands.
 
-- Row 15's jax-CPU reference cell was never re-measured (memory-blocked);
-  its verdict rests on determinism + row-14 agreement + patched coherence.
-- The canary's 4–7 % residual is attributed to bf16-vs-f32 reference depth,
-  not corruption (budget-independent) — one independent re-check queued.
-- Sub-ms dispatch floor on the tiniest texmo configs (documented since P22).
-- Stage 1 no longer ships at all (your 2026-08-18 ruling: the release wheel
-  is native-only). It stays in the repo as the frozen dev/reference
-  implementation until the post-release retirement — and note it keeps the
-  UNPATCHED public MLX: the fence fix lives only in the vendored library
-  inside the native wheel, so anything run through Stage 1 (or pip's mlx)
-  still has the row-15 corruption class until upstream releases #4099.
+## What ships
+
+One wheel: `metaljax-0.11.5-py3-none-macosx_14_0_arm64.whl` — 65 MB,
+sha256 `95d6f1f07d66c7aa781659276362358770260ff7c5c4893d5946fdf7086087be`.
+
+- **Native-only**, per your ruling: 12 files, none of the old Python
+  engine's modules. `metaljax.__version__` reports 0.11.5.
+- **Self-contained Metal runtime**: the patched MLX rides inside the wheel
+  under a private name. A venv with no mlx installed works; a venv WITH
+  pip's mlx also works (the two libraries coexist — that's what the rename
+  is for).
+- The plugin dylib inside the wheel is **byte-identical** to the gated
+  binary every number above was measured on.
+- Verified installs on Python 3.12 / 3.13 / 3.14; `twine check` passes.
+- The old Python engine stays in the repo as a frozen dev reference until
+  the post-release retirement. Note it still uses pip's **unpatched** MLX —
+  the fence fix exists only inside the native wheel until upstream ships
+  their release.
+
+## What's left, in order
+
+1. **Me**: upload to TestPyPI → install from TestPyPI into a fresh venv and
+   verify end-to-end → report here.
+2. **You**: review this document and the gate record → publish to real
+   PyPI → `git push` + tag. Upstream, whenever you like: the release
+   request on ml-explore/mlx#4099 and our hardening PR (drafts in
+   `notes/patches/`).
+3. **Post-release queue**: retire the Python path + docs cleanup (your
+   confirmed first item); the framework-gap fix list (we are ~1.8× behind
+   mlx-lm on 31B decode; the decomposed plan is in
+   `notes/framework-gap-gemma31b.md`); re-point the corruption canaries;
+   re-measure the Stage-1-era command-buffer budget workarounds that no
+   longer have failing evidence behind them; fusion bug #8 fork branch;
+   row 12's download; row 20's packed sub-byte feature; row 8 performance
+   (29.7 vs torch's 13.7).

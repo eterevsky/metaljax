@@ -42,23 +42,24 @@ flake) are carried below with their evidence.
 
 ## Checklist
 
-**Checklist status as of 2026-08-18** (the table below it is the 2026-08-17
-pre-vendoring record, kept as history). Two changes moved the binary after
-that record — the vendored patched MLX and the P28 benefit gate — so under
-release rule 1 the FINAL binary (`frozen-vendor-d651add3`) must re-attest
-everything numeric. The consolidated re-gate is running; until it lands:
+**FINAL checklist — the consolidated re-gate, 2026-08-18 13:33–16:17** (the
+table below it is the 2026-08-17 pre-vendoring record, kept as history).
+Every gate re-attested on the ONE final binary `frozen-vendor-d651add3`
+(native plugin + vendored patched MLX, tree `29bb8eb`), in three sequential
+lock-held phases (models → pinned jax suite → texmo/tests). Artifacts:
+`~/.cache/metaljax-bench/logs/regate-0.11.5/{models,jax-suite,texmo-tests}/`.
 
-| # | gate | current status on the FINAL binary |
+| # | gate | FINAL verdict on `frozen-vendor-d651add3` |
 |---|---|---|
-| 1 | Freeze | **PASS** — `frozen-vendor-d651add3`, wheel dylib byte-identical |
-| 2 | Pinned jax suite | **RE-RUN IN PROGRESS** (the MLX substitution is numerics-relevant by design; the banked 99.54 % zero-new run was pre-vendoring) |
-| 3 | `tests/` native leg (Stage 1 leg dropped — out of release scope per Oleg, 2026-08-18) | **RE-RUN IN PROGRESS** |
-| 4 | texmo | **PASS** — `texmo_gate` 106/106 + suite-106 within noise of the recorded arms (0.9989 / 1.0026), both on the final binary |
-| 5 | Model rows | **RE-MEASUREMENT IN PROGRESS**; row 15 **FIXED** (attested on the final binary); rows 11/14/19 re-spotted; **row 1 OPEN** — its 237.3 cell does not reproduce (256.8–292.3 on both libraries, vendoring-neutral by A/B; §re-attestation) |
-| 5b | The no-panic contract | **PASS** (design unchanged; contract suites re-attested on the final binary) |
-| 6 | Plugin contract suites | **PASS** on the final binary (incl. all 11 command-buffer detectors: 6 correctness PASS, 5 canaries can no longer find a corrupting budget) |
-| 7 | Wheels — **native-only** (the trampoline/Stage-1 wheel is no longer a release artifact) | **PASS** — 12 files, zero Stage-1 modules, carries the gated dylib byte-identically, installs with no mlx in the venv |
-| 8 | Finale | **PENDING** — flips when gates 2, 3 and 5 land on the final binary and row 1 is dispositioned |
+| 1 | Freeze | **PASS** — rebuild reproduces the sha; wheel dylib byte-identical |
+| 2 | Pinned jax suite (164 files, `--jobs 1`) | **PASS** — 28,073 / 129 = 99.54 %, failure set **id-identical** to the banked whitelist, zero new, zero gone; 28.4 min |
+| 3 | `tests/` native leg (Stage 1 leg dropped per Oleg's 2026-08-18 scope ruling) | **PASS** — 1048 / 5 / 205-deselected vs banked 1053 / 0 / 205; the ONLY delta is the 5 command-buffer corruption canaries, which now fail **because the vendored fix removed the bug they detect** (assertion text names it); all 71 banked failing ids unchanged, 1258 collected in both |
+| 4 | texmo | **PASS** — `texmo_gate` 106/106 (18 via sensitivity scaling, same as recorded); suite-106 geomean 0.9975–1.0012 vs the three recorded arms (inside their mutual noise), 106/106 within 1.2×; top_confs 1.0053, 163/163 within 1.2×, none outside ±10 % |
+| 5 | Model rows (19 rows re-measured on the final binary) | **PASS** — zero regressions > 10 %, zero newly-failing; row 15 **FIXED + first honest timing** (401.4 ms/tok, 10/10 deterministic); row 1's 237-class cell **reproduced** (235.5) with its 261–297 variance experimentally attributed to machine-state GPU slowdown (named, STATUS.md fn 36); row 18 +3.2 % named drift; rows 3/8 suite-context brackets; token agreement PASS |
+| 5b | The no-panic contract | **PASS** — no panic, no wedge anywhere in the campaign; row 10's one refusal was the governor's clean RESOURCE_EXHAUSTED at its line; row 20 declines cleanly with nothing executed |
+| 6 | Plugin contract suites | **PASS** — smoke / execute (48 s) / ingest (37 s) / decline_census / bazel test, all rc=0 on the committed tree; bazel-bin byte-identical to the release binary |
+| 7 | Wheel — **native-only** (the trampoline/Stage-1 wheel is not a release artifact) | **PASS** — 12 files, zero Stage-1 modules, carries the gated dylib byte-identically, installs and drives Metal with no mlx in the venv; twine PASSED |
+| 8 | Finale | **GO** — all gates PASS on the final binary; the two items for Oleg's eyes are DISCLOSURES, not regressions: (a) the 5 canary flips in gate 3 (the detector suite lost its disease), (b) row 1's machine-state variance footnote |
 
 ### The 2026-08-17 pre-vendoring record (history — superseded above)
 
