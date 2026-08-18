@@ -234,10 +234,14 @@ out = mx.slice_update(target, update, mx.max(source, axis=1), (0, 1))
 
 *Provenance of that table*: the failing numbers were measured with this exact
 recipe run as an inline script (`3 fresh processes x 20 evaluations`, wheel
-venv) before it was packaged as `repro_c.py`; the packaged file has been run on
-the patched build (0 wrong) but a wheel-side rerun of the packaged file was
-still queued behind the machine lock when this note was written. The recipe is
-unchanged between the two.
+venv) before it was packaged as `repro_c.py`. The wheel-side run **of the
+packaged file** happened 2026-08-18 during the vendoring battery
+(`~/.cache/metaljax-bench/logs/mlx-vendoring/v7.log`): on the public pip
+wheel it reports **1/20 evaluations at the wrong offset in each of three
+fresh processes** (libmlx sha `1876795e…`), and 0/20 on the vendored patched
+build — so the packaged file demonstrably fails where it should and is safe
+to attach upstream as-is. The recipe is unchanged between the inline and
+packaged versions.
 
 Two properties of the repro are the mechanism in miniature: the start index
 must **not** be bound to a Python name (a second reference makes it

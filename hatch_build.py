@@ -18,6 +18,16 @@ py3-none-macosx_14_0_arm64 serves every supported interpreter. Building the
 trampoline from sdist requires the Xcode command-line tools (clang++); the
 native variant additionally requires bazel and the `plugin-native/`
 workspace, which the sdist does not ship.
+
+Since the vendoring milestone the native variant also CARRIES ITS OWN METAL
+RUNTIME: our patched MLX build (`scripts/vendor_mlx.sh` ->
+`src/metaljax/lib/mlx/lib/`), renamed to a private install name and placed
+inside the wheel at `metaljax/lib/mlx/lib/`, which is where the plugin's
+`@loader_path/mlx/lib` run-path looks.  So the native wheel runs in a venv
+with no `mlx` installed at all, and in one that has the public `mlx` the two
+libraries coexist instead of colliding.  The default (trampoline) wheel is
+untouched: Stage 1's Python engine imports the public `mlx`, and nothing
+about that changes here.
 """
 
 import os
@@ -54,6 +64,13 @@ class CustomBuildHook(BuildHookInterface):
             if tramp.exists():
                 tramp.replace(libdir / _PARKED)
             self._build_native(root, libdir / NATIVE_DYLIB)
+            # The vendored Metal runtime rides along.  force_include rather
+            # than the `artifacts` glob in pyproject.toml on purpose: the
+            # glob applies to BOTH variants and the default wheel must stay
+            # a 288 KB trampoline, so which files the native wheel adds is
+            # decided here, per build, from the same env var.
+            build_data.setdefault("force_include", {}).update(
+                self._vendored_mlx(libdir))
         else:
             (libdir / NATIVE_DYLIB).unlink(missing_ok=True)
             self._build_trampoline(root, libdir / TRAMPOLINE_DYLIB)
@@ -75,6 +92,41 @@ class CustomBuildHook(BuildHookInterface):
         if parked.exists():
             parked.replace(libdir / TRAMPOLINE_DYLIB)
 
+    # -- the vendored Metal runtime ---------------------------------------
+
+    # What the native wheel carries beside the plugin.  `mlx.metallib` is
+    # located by MLX at run time by dladdr'ing itself and looking in its OWN
+    # directory, so it must sit next to the dylib in every layout, wheel
+    # included.  `include/` is deliberately NOT shipped: it is a build input
+    # (~4 MB of C++ headers), not a runtime one.
+    # (path under src/metaljax/lib/mlx/, path under metaljax/ in the wheel)
+    _MLX_RUNTIME = (
+        ("lib/libmlx_metaljax.dylib", "lib/mlx/lib/libmlx_metaljax.dylib"),
+        ("lib/libjaccl_metaljax.dylib", "lib/mlx/lib/libjaccl_metaljax.dylib"),
+        ("lib/mlx.metallib", "lib/mlx/lib/mlx.metallib"),
+        ("VENDOR_STAMP", "lib/mlx/VENDOR_STAMP"),
+    )
+
+    def _vendored_mlx(self, libdir):
+        """{staged file -> path inside the wheel} for the vendored runtime."""
+        # METALJAX_VENDORED_MLX lets the runtime live outside the source
+        # tree being packaged, which is what a staged native-only build
+        # needs: the 183 MB tree stays in the repo and is force_included
+        # from there, so it is never copied and never walked twice.
+        env = os.environ.get("METALJAX_VENDORED_MLX")
+        staged = pathlib.Path(env) if env else libdir / "mlx"
+        files = {}
+        for rel, dst in self._MLX_RUNTIME:
+            src = staged / rel
+            if not src.exists():
+                raise RuntimeError(
+                    f"METALJAX_WHEEL_PLUGIN=native, but the vendored MLX "
+                    f"runtime is missing ({src}). Run scripts/vendor_mlx.sh "
+                    f"-- the native plugin links libmlx_metaljax.dylib and "
+                    f"the wheel has to carry it.")
+            files[str(src)] = f"metaljax/{dst}"
+        return files
+
     # -- variants ---------------------------------------------------------
 
     def _build_trampoline(self, root, out):
@@ -94,6 +146,24 @@ class CustomBuildHook(BuildHookInterface):
         )
 
     def _build_native(self, root, out):
+        # A PREBUILT plugin may be named instead of rebuilding.  Release
+        # rule 1 is the reason: the numbers in a release table come from one
+        # gated binary, and a wheel that re-runs bazel carries whatever the
+        # tree produces at packaging time instead.  Pointing this at the
+        # frozen, gated dylib makes "the wheel ships the binary that was
+        # measured" a build-time fact rather than a hope -- and it lets the
+        # wheel be built from a staged source tree that has no bazel
+        # workspace in it at all (scripts/build_native_wheel.sh).
+        prebuilt = os.environ.get("METALJAX_NATIVE_DYLIB")
+        if prebuilt:
+            src = pathlib.Path(prebuilt)
+            if not src.exists():
+                raise RuntimeError(
+                    f"METALJAX_NATIVE_DYLIB={prebuilt!r} does not exist")
+            _unlink_forced(out)
+            shutil.copyfile(src, out)      # not copy2: frozen copies are r-x
+            out.chmod(0o755)
+            return
         workspace = root / "plugin-native"
         if not (workspace / "WORKSPACE").exists():
             raise RuntimeError(

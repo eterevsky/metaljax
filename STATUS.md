@@ -47,7 +47,7 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | not run (PAUSED ¹⁷) | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **80.3** (0.99× anchor ³²) ᴾ²⁷ | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **35.0** (1.06× S1 / 1.08× anchor ³⁰) | — | — | — |
-| 15 | *qwix-int8 Qwen3-8B* | 2118 (coherent) | ✗ MLX command-buffer bug ⁸ | ✗ **WRONG OUTPUT** ³⁴ (runs, 369.7) | — | — | — |
+| 15 | *qwix-int8 Qwen3-8B* | 2118 (coherent) | ✗ MLX command-buffer bug ⁸ | ✅ **coherent** ³⁵ (10/10, vendored MLX) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | **87.9** (1.02× S1 / 1.06× anchor ³⁰; b32 0.94×) | — | 29.8 (b32: 591) | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512², 5141 @1024² ⁹ | **1234.8** @512² (0.81× S1 / 0.89× anchor), **5781.6** @1024² (1.13× S1 / 1.12× anchor) ²⁷ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
 | 18 | LoRA E2B train (ms/step) | 2048 | **407** | **360.2** (0.89× anchor ³²) ᴾ²⁷ | — | 135.6 ¹⁰ | — |
@@ -599,3 +599,44 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
     smaller fault. No fix exists at our level; this goes to the upstream MLX
     report (`notes/mlx-command-buffer-upstream-issue.md`) as its strongest
     evidence yet.
+35. **Row 15 is FIXED (2026-08-18) — the defect was MLX's, and MLX is now
+    ours.** Footnote 34 is the investigation; this is the outcome. The
+    corruption was located in MLX's own source: `compute_dynamic_offset`
+    (`mlx/backend/metal/slicing.cpp:62`, v0.32.0) registers a **donated**
+    dynamic-slice offset — an array that ALIASES a live graph buffer — as a
+    command-encoder temporary, and `CommandEncoder::end_encoding()`
+    (`device.cpp:442`) erases every temporary from `all_inputs_`/
+    `all_outputs_`, which are the only input to MLX's cross-command-buffer
+    fence bookkeeping. The erase deletes exactly the dependency that orders
+    the producer of the start index against the kernel that reads it, so a
+    `slice_update` lands at a **stale offset** whenever a command-buffer
+    boundary falls between the two — a whole KV block, or a layer's
+    parameters, written at the wrong position. Instrumented count on the 8B
+    canary: 144 dropped fence waits in one run = 36 layers × 4 executions,
+    with 0 write-after-read hazards (the other candidate hole never fires).
+    Full derivation: `notes/mlx-patch-diagnosis.md`.
+    **The fix ships.** metaljax vendors its own MLX, built from our fork at
+    `vendor/0.32.0` (= upstream's own **unreleased** `7e8b4ccc` / PR #4099,
+    cherry-picked, plus our generic `end_encoding` hardening), linked
+    privately as `libmlx_metaljax.dylib` and carried inside the native
+    wheel — so the fix does not wait on an MLX release.
+    **Measured on the release binary `frozen-vendor-d651add3`**, row 15's
+    own forensics, ten prefills of one loaded parameter set in one process
+    plus a greedy decode (92 GB guard, 76 GB peak): **the same first token
+    10 times out of 10** (12095, `" Paris"` — the token row 14 returns
+    10/10), **zero collapses**, `logits_std` 2.292 where the collapse used
+    to flatten the logits, and the decode reads **`" Paris. The capital"`**.
+    Against the pre-vendoring native's 8 distinct first tokens and 2 full
+    collapses. The row has emitted nothing but garbage since 2026-08-03, on
+    every binary and both engines; it is now deterministic and coherent on
+    the one that ships.
+    The ms/tok cell stays unpublished: this was a correctness attestation,
+    and a timing cell needs its own measured run (release rule 1). The two
+    memory-blocked follow-ups in footnote 34 (the 0.11.2-src provenance arm
+    and the jax-CPU reference) remain open and are no longer load-bearing —
+    the verdict rests on determinism, row-14 agreement and coherent text.
+    Corroborating, on the same build: `tests/test_command_buffer.py`'s five
+    corruption canaries can no longer find a corrupting budget across 28
+    budget settings and three sync-point layouts, and the 20-line pure-MLX
+    reproducer `notes/data/mlx-cbuf-repro/repro_c.py` goes 0/20 wrong where
+    the public wheel fails. Battery: `notes/mlx-vendoring-plan.md` §6.4.

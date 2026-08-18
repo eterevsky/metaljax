@@ -42,6 +42,26 @@ flake) are carried below with their evidence.
 
 ## Checklist
 
+**Checklist status as of 2026-08-18** (the table below it is the 2026-08-17
+pre-vendoring record, kept as history). Two changes moved the binary after
+that record — the vendored patched MLX and the P28 benefit gate — so under
+release rule 1 the FINAL binary (`frozen-vendor-d651add3`) must re-attest
+everything numeric. The consolidated re-gate is running; until it lands:
+
+| # | gate | current status on the FINAL binary |
+|---|---|---|
+| 1 | Freeze | **PASS** — `frozen-vendor-d651add3`, wheel dylib byte-identical |
+| 2 | Pinned jax suite | **RE-RUN IN PROGRESS** (the MLX substitution is numerics-relevant by design; the banked 99.54 % zero-new run was pre-vendoring) |
+| 3 | `tests/` native leg (Stage 1 leg dropped — out of release scope per Oleg, 2026-08-18) | **RE-RUN IN PROGRESS** |
+| 4 | texmo | **PASS** — `texmo_gate` 106/106 + suite-106 within noise of the recorded arms (0.9989 / 1.0026), both on the final binary |
+| 5 | Model rows | **RE-MEASUREMENT IN PROGRESS**; row 15 **FIXED** (attested on the final binary); rows 11/14/19 re-spotted; **row 1 OPEN** — its 237.3 cell does not reproduce (256.8–292.3 on both libraries, vendoring-neutral by A/B; §re-attestation) |
+| 5b | The no-panic contract | **PASS** (design unchanged; contract suites re-attested on the final binary) |
+| 6 | Plugin contract suites | **PASS** on the final binary (incl. all 11 command-buffer detectors: 6 correctness PASS, 5 canaries can no longer find a corrupting budget) |
+| 7 | Wheels — **native-only** (the trampoline/Stage-1 wheel is no longer a release artifact) | **PASS** — 12 files, zero Stage-1 modules, carries the gated dylib byte-identically, installs with no mlx in the venv |
+| 8 | Finale | **PENDING** — flips when gates 2, 3 and 5 land on the final binary and row 1 is dispositioned |
+
+### The 2026-08-17 pre-vendoring record (history — superseded above)
+
 | # | gate | verdict |
 |---|---|---|
 | 1 | Freeze the release dylib (build, sha256, byte-identity) | **PASS** |
@@ -93,7 +113,7 @@ should cost minutes, not an hour).
 | `coexist_test.py` (**gemma** venv) | **all four**: tensorflow ×2 + array_record ×2 PASS | 8 s |
 | `bazel test //... --nocache_test_results` | `//metal:runtime_gil_free_test` **PASSED** (uncached) | 1 s |
 
-## Gate 5 — the model rows — **REGRESSION** (one named, plus a soft second)
+## Gate 5 — the model rows — **PASS** (was REGRESSION; the named one is RESOLVED, the soft second stands as named; **row 1's cell non-reproduction surfaced later and is OPEN** — see the re-attestation section and the top checklist)
 
 One guarded process per row (`g5_model.sh`: recovery precheck, settle to a
 recovered machine, `mem_guard.sh` at the row's historical budget, durable logs,
@@ -198,10 +218,58 @@ in the orbax restore — ~17 GB under every policy including P25's — with
 whatever the pool holds standing beside it; at 2 Hz sampling the peak readings
 scatter, so the completion counts are the statement.
 
+**What the resolution cost elsewhere: nothing measurable.**
+
+| check | result |
+|---|---|
+| **row 18** LoRA E2B train, 70 GB budget | **361.8 ms/step** (1.007× the 359.2 cell), exit 0; meter peak **57,478 MB** against P27's 56,712 / 57,480 / 57,479 MB for the same live-set spike — the same event to within 2 MB |
+| **suite-106**, native, against the **recorded rc column** | **0.9963** geomean, median 0.9997, **0 of 106 rows past 1.1×**; one row outside ±10 % and it is faster (`big12-b8l256` 0.826). Against P27's native arm 1.0004 — flat |
+| `texmo_gate` | **106 ok / 0 FAIL** of 106 |
+| `execute_test` | 553 ok, all cases match the CPU backend |
+| `ingest_test` / `smoke_test` / `bazel test //...` | 0 failed (13 checks) / all checkpoints / `runtime_gil_free_test` PASSED |
+
+Two provenance notes, both under release rule 1:
+
+* The battery was originally split across two builds — the contracts on the
+  pre-clamp `frozen-p28-f7f3c708`, the rows on the shipped
+  `frozen-p28b-37060770`. Re-running the contracts on the shipped binary
+  **failed one of P28's four new cases**: it still asserted the rule's first
+  draft (`earn == 2 × swing`) rather than the shipped
+  `min(2 × swing, peak_live)`. The rule measured correct on every row; the
+  *contract* was stale, is fixed, and now names which term bound each flush
+  (`notes/cpp-p28-benefit-gate.md` §5.1). Nothing about the numbers above
+  changed with it.
+* The rows, the suite and row 18 are 2026-08-17 on pip's stock MLX; the
+  contracts and `texmo_gate` were re-run 2026-08-18, by which time the
+  vendoring work had staged our patched fork libmlx into the venv. Both
+  re-runs are correctness gates and both pass on both libraries.
+
+**The re-spot on the combined build.** Because the vendored MLX and the
+benefit gate are two changes to one binary, the three cells were re-measured
+on `frozen-vendor-d651add3` — the plugin linked against the private patched
+`libmlx_metaljax.dylib` — at the same historical budgets, one guarded process
+per row, 2026-08-18 11:40-11:43:
+
+| row | budget | P28 on stock MLX (2026-08-17) | **P28 + vendored patched MLX** | peak |
+|---|---:|---|---|---:|
+| 11 | 20 GB | 16.61 / 16.81 / 16.75 (9 of 9 complete) | **16.60 ms/tok**, exit 0 | 16 GB |
+| 14 | 25 GB | 31.95 / 32.13 / 31.82 (4 of 4) | **31.94 ms/tok**, exit 0 | 9.2 GB |
+| 19 | 48 GB | 459.2 / 458.4 / 462.5 | **463.5 ms/step**, exit 0 | 25 GB |
+
+Every row completes at its historical budget on the combined build. Row 14 is
+inside its P28 spread, row 11 lands 0.01 ms under the bottom of its own, and
+row 19's 463.5 sits 1.0 ms above the top of its trio and inside the 456–470
+class it is required to hold — i.e. single runs against three-run spreads, all
+within the run-to-run noise these rows have shown all week. Row 19's `loss`
+**87.0428237915039** and
+`loss_first` **228.39447021484375** are bit-identical across all eight runs of
+this campaign — the seven on stock MLX and the one on the patched library. The
+gate document's rows-11/14/19 cells can therefore be read on either build; the
+vendoring milestone's own battery is the attestation for the rest of the
+table.
+
 The regression's own verdict line is therefore **RESOLVED**, and gate 5's
-verdict is re-scored below with what the resolution cost elsewhere (nothing
-measurable: `execute_test` 553 ok, `texmo_gate` and the suite-106 pairing
-re-run).
+verdict is re-scored below.
 
 ### REGRESSION 2 — row 2 and row 6 sit 1.5–2.0 % above their cells
 
@@ -318,13 +386,47 @@ guards a zero scale but not a NaN one, so one bad element NaNs a whole tensor):
   (It had been unrunnable for a parse reason: `run_stablehlo_bench.py` never
   registered the `chlo`/`sdy`/`mpmd` dialects. Fixed.)
 
-So H5's refutation above stands, and so does the ✗: **the row ships as ✗ WRONG
-OUTPUT, the cause is below both of our interpreters, and there is no fix at our
-level** — it is the upstream MLX command-buffer report. Two follow-ups need
-Oleg's go because they are full 8B maxtext loads above row 15's 79 GB envelope:
-the 0.11.2-src provenance arm (guard-killed at 94 GB) and a jax-CPU reference
-(guard-killed twice; note that `34f627c`'s "coherent" CPU cell has **no
-artifact behind it** and should not be cited as evidence until re-measured).
+So H5's refutation above stands, and the cause is below both of our
+interpreters — it is the upstream MLX command-buffer report.
+
+### Row 15 — **FIXED by the vendored patch** (2026-08-18, native)
+
+The "no fix at our level" clause expired the moment the level became ours.
+`notes/mlx-patch-diagnosis.md` located the defect at `slicing.cpp:62` (a
+donated dynamic-slice offset registered as a command-encoder temporary, which
+`end_encoding()` then erases from the fence bookkeeping), and the vendoring
+milestone shipped it: the release plugin now links our fork
+(`libmlx_metaljax.dylib`, `vendor/0.32.0` @ `651c39cd` = upstream's own
+unreleased `7e8b4ccc` + our `end_encoding` hardening).
+
+Re-run on `frozen-vendor-d651add3` — the release binary — with the row's own
+forensics, ten prefills of one loaded parameter set in one process plus a
+greedy decode, 92 GB guard, peak 76 GB:
+
+| build | engine | 10 draws | distinct first tokens | collapses | decode |
+|---|---|---|---|---|---|
+| pip wheel 0.32.0 | native | 10 | **8** | **2** | garbage |
+| pip wheel 0.32.0 | Stage 1 | 10 | **10** | 0 | ` stack NIL�输出` (garbage) |
+| patched fork | Stage 1 | 10 | 1 | 0 | `" Paris. The capital"` |
+| **patched fork** | **native (ships)** | 10 | **1** — token 12095, ten times | **0** | **`" Paris. The capital"`** |
+
+Token 12095 is the same first token row 14 (the 0.6B control) returns ten
+times out of ten, and `logits_flat` is false on every rep (`logits_std`
+2.292) where the collapse used to flatten them. **A row that has emitted
+nothing but garbage since 2026-08-03, on every binary and both engines, is
+now deterministic and coherent on the one that ships.**
+
+Verdict: **✗ WRONG OUTPUT → ✅ FIXED**. The timing cell (369.7 ms/tok) was
+always meaningless while the output was wrong; it now measures something,
+but it is not re-published here — this battery attested correctness, and a
+number would need its own measured run under rule 1.
+
+Two follow-ups still need Oleg's go, both full 8B maxtext loads above row
+15's 79 GB envelope: the 0.11.2-src provenance arm (guard-killed at 94 GB)
+and a jax-CPU reference (guard-killed twice; note that `34f627c`'s
+"coherent" CPU cell has **no artifact behind it** and should not be cited as
+evidence until re-measured). Neither is load-bearing for the verdict above,
+which rests on determinism, row-14 agreement, and coherent text.
 
 ### The recognizer nondeterminism — CHECKED on this binary, and it persists on rows 5 and 7
 
@@ -346,6 +448,34 @@ opt-out via `METALJAX_RECOGNIZE=0`, native wheel only, timings reproducible to
 ±1 % regardless. The first pass of this battery saw row 5 agree across two
 samples; that was luck, not determinism — the divergence index is a lottery
 (50/51/52/53 across campaigns).
+
+#### Re-measured on the vendored MLX — **it survives the fence fix** (2026-08-18)
+
+The open question was whether the command-buffer fence drop was also the
+source of this: the release-status note recorded rows 5/7 as "accepted as a
+release-note item *if it survives the fence fix*". It survives. Measured on
+`frozen-vendor-d651add3`, one guarded process per draw, token ids compared
+pairwise (`~/.cache/metaljax-bench/logs/mlx-vendoring/tokens.py`):
+
+| row | draws | outcome | divergence index |
+|---|---:|---|---|
+| **5 Qwen3-8B bf16** | **6** | 5 draws identical, **1 (draw 4) diverges from all five** | **51** |
+| **7 gpt-oss-20b** | 3 | **all three pairs diverge** | 50 / 51 |
+
+**Row 5's first three draws were identical, and that was the trap this
+document already named.** Three more draws were run precisely because the
+gate had been burned by a two-sample agreement before; the fourth draw broke
+it. A 3-draw pass would have published "the fence fix retired row 5's
+nondeterminism" — false. What changed is the *rate*, not the property: row 5
+shows roughly one divergent draw in six here, row 7 diverges on every pair,
+and both keep the token-50/51 signature they have had across campaigns.
+
+This is consistent with the diagnosis' separation of concerns
+(`notes/mlx-patch-diagnosis.md` §4): the fence drop is a command-buffer
+synchronisation defect, cured and *proven* cured by budget-independence and
+28 clean canary budgets; the recognizer nondeterminism is a different
+mechanism (fused-attention emit ordering) and is untouched by it. **The
+release-note item stands** — it is not retired by the vendored build.
 
 ## Gate 5b — the no-panic contract — **PASS**
 
@@ -547,7 +677,7 @@ files removes all 205 of their tests, not just the 71 that fail, which is why
 the two counts look unrelated and are not. No new file appears in either form,
 and the Stage-1 leg — the release number — is exact at **1258**.
 
-## Gate 7 — wheels, both variants — **PASS** (nothing uploaded)
+## Gate 7 — wheels, both variants — **PASS** (nothing uploaded) *(2026-08-17 record, SUPERSEDED: the release wheel is now native-only with the vendored MLX inside — see the re-attestation section; these two wheels are not release artifacts)*
 
 `g7_wheels.sh`, own hold, 15:56:58 → 15:58:09. Built into **separate out-dirs**
 because both variants produce the *same* filename (the identical-filename trap).
@@ -597,6 +727,13 @@ public PyPI and the git push are Oleg's.
 ---
 # Gate 8 — the go/no-go
 
+*(This whole gate-8 section, its verdict table, release table and GO
+recommendation are the **2026-08-17 pre-vendoring record** on `ebe56e71` —
+kept as history. The binary changed twice after it (vendored MLX, benefit
+gate); the CURRENT status lives in the checklist at the top of this document
+and in the vendored-MLX re-attestation section below, and the final go/no-go
+is written by the consolidated re-gate on `frozen-vendor-d651add3`.)*
+
 ## Verdicts
 
 | # | gate | verdict | headline |
@@ -605,7 +742,7 @@ public PyPI and the git push are Oleg's.
 | 2 | Pinned jax suite, native, 164 files, `--jobs 1` | **PASS** | **28,073 passed / 129 failed = 99.54 %**, **zero new failures**, the failing set **identical id-for-id** to the RC gate's |
 | 3 | `tests/` both legs | **PASS** | Stage 1 **1258 / 0**; native **1187 / 71**, reconciled with the governor campaign's 1053 / 0 (same run, 205 deselected) |
 | 4 | texmo pairings + both correctness gates | **PASS** | suite-106 **0.9840** (0.9798 with the two artifacts re-measured standalone, **106/106 within 1.2×**, native faster on 65); top_confs bracketed **0.9970**, **1.072× the 0.11.3 anchor**, **59 configurations beating jax-CPU**; `texmo_gate` **106/106**, `texmo_check` **106/106** |
-| 5 | Model rows, all non-embargoed | **PASS** (was REGRESSION) | 15 of 17 measurable rows inside ±2 % of their cells, three better, rows 8/10 first-ever numbers; the rows-11/14 footprint regression is **RESOLVED** — P28's benefit gate returns both to their historical budgets (9 of 9 and 4 of 4 complete) at unchanged speed, with row 19 holding 459.2 ms/step |
+| 5 | Model rows, all non-embargoed | **PASS** (was REGRESSION) | 15 of 17 measurable rows inside ±2 % of their cells, three better, rows 8/10 first-ever numbers; the rows-11/14 footprint regression is **RESOLVED** — P28's benefit gate returns both to their historical budgets (9 of 9 and 4 of 4 complete) at unchanged speed, with row 19 holding 459.2 ms/step. Cost of the resolution measured: row 18 361.8 ms/step, suite-106 native **0.9963** of the recorded rc column (0 of 106 rows past 1.1×), `texmo_gate` 106/106, `execute_test` 553 ok. Re-spotted on the combined (vendored-MLX) build: 16.60 / 31.94 ms/tok, 463.5 ms/step, all at the historical budgets |
 | 5b | The no-panic contract | **PASS** | 21 governed model runs + 8 synthetic rungs + 24 further guarded runs tonight: **no panic, no wedge, no jetsam**; 1.5×-physical loads refuse cleanly 3/3; rows 8/9/10/15 complete |
 | 6 | Plugin contract suites | **PASS** | `execute_test` **549 ok**, `ingest_test` 13 checks / 0 failed, `decline_census` 35/35, coexist all four carrier cases, `bazel test` uncached PASSED |
 | 7 | Wheels, both variants | **PASS** | `twine check` ×2; native wheel's dylib **hash-identical to the gated binary**; fresh 3.12/3.13/3.14 installs of both; **nothing uploaded** |
@@ -796,3 +933,33 @@ release notes (drafted above), (b) change the default before release — a
 one-line policy change in `runtime.cc` plus a re-gate of the affected rows, or
 (c) ship with the floor as the default for programs whose live set is small.
 That is Oleg's call, not this document's.
+
+---
+
+## Vendored-MLX re-attestation (2026-08-18)
+
+The binary this document scores changed once more after the benefit gate: the
+plugin now links **our own MLX**. Everything below was re-run on
+`frozen-vendor-d651add3` — `plugin-native` at HEAD (a rebuild reproduces the
+same sha256; the only source commit since is `execute_test.py` itself) linked
+against `libmlx_metaljax.dylib`, our fork at `vendor/0.32.0`. Full battery and
+artifacts: `notes/mlx-vendoring-plan.md` §6.4,
+`~/.cache/metaljax-bench/logs/mlx-vendoring/`.
+
+| gate | on the vendored binary |
+|---|---|
+| 4 texmo | `texmo_gate` **106/106** (0 decline, 0 FAIL, 0 error). Suite-106 vs the **recorded** native arms: geomean **0.9989** (gate's) and **1.0026** (p28's), 105–106 of 106 within 1.2× — inside the 0.9963 noise of those two recorded runs against each other. Live Stage-1 pairings dropped per Oleg's 2026-08-18 native-only scope change |
+| 5 models | **row 15 FIXED** (above); row 19 **462.2 ms/step** with bit-identical losses (a second vendored-binary run beside the benefit gate's 463.5 re-spot — two distinct runs, both inside the 456–470 class); rows 5/7 at their cells; **row 1 OPEN — its 237.3 cell does not reproduce**: battery 258.3, standalone after a hard settle 256.8 and 275.6, and a same-tree A/B unconfounds the library — public 292.3 / vendored 291.0 / public 285.7, i.e. vendoring-neutral, drifting on BOTH libraries within one session (full narrative: `notes/mlx-vendoring-plan.md` §6.4). The consolidated re-gate re-measures it on a settled machine |
+| 6 contracts | smoke / ingest / decline / coexist ×2 / `bazel test` all pass; **`execute_test` passes** on the committed file (sha256 `3ff58598…`, rc=0). `tests/test_command_buffer.py`: all 11 ran for the first time (the native and pipelined detectors were previously skipped by a version skew), 6 correctness PASS, and the 5 corruption canaries can no longer find a corrupting budget across 28 settings — the patched-build signature |
+| 7 wheels | **native-only**, 65 MB, 12 files, no Stage 1 module, dylib byte-identical to the gated binary; installs and drives Metal on 3.12/3.13/3.14 **in venvs with no mlx at all**, and coexists with pip mlx in one process |
+
+**Two things this changes for the release notes.** The row-15 line flips from
+"✗ wrong output, no fix at our level" to fixed-and-shipping. The rows-5/7
+nondeterminism line **stays**: it was conditional on surviving the fence fix,
+and six draws of row 5 (five identical, one divergent at token 51) plus three
+of row 7 (every pair divergent) say it survives.
+
+**And one that does not.** The default/trampoline wheel is no longer a release
+artifact, so "metaljax carries a patched MLX" is a statement about the native
+wheel only. Nothing that installs the public `mlx` from PyPI gets the fence
+fix — that still waits on ml-explore/mlx#4099 being released.

@@ -28,7 +28,7 @@ notes/data/. Append a column per release / major optimization.*
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ download ᴳ (93.4 GB streams) |
 | 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | **79.0** |
 | 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | **31.95** ᶠ (9.2 GB) |
-| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | ✗ **WRONG OUTPUT** ᴳ ʷ (runs at 369.7) |
+| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | ✅ **coherent** ᵛ (10/10 deterministic; ms/tok not re-measured) |
 | 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | **88.4** |
 | 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | **1259.9 / 5707.9** |
 | 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | **359.2** ᴳ |
@@ -174,6 +174,15 @@ Notes:
   19's `loss` / `loss_first` are identical to P27's to thirteen digits in all
   three runs.
 
+  **Re-spotted on the combined build** (2026-08-18, `frozen-vendor-d651add3` —
+  the same plugin linked against the vendored patched `libmlx_metaljax.dylib`),
+  same historical budgets, one guarded process per row: **16.60** ms/tok
+  (16 GB), **31.94** ms/tok (9.2 GB), **463.5** ms/step (25 GB), all exit 0 —
+  single runs against the three-run spreads above and inside their noise (row
+  14 inside, row 11 0.01 ms under, row 19 1.0 ms over its trio and inside the
+  456–470 class), with row 19's loss bit-identical across all eight runs of the
+  campaign. The cells stand on either library.
+
 - ʷ **Row 15 is a WRONG-OUTPUT row, not a timing row.** Its memory blocker is
   gone (it completes, 79 GB peak, 0 governor refusals) and it decodes at
   369.7 ms/tok, but the text is `" fragment!!!!!!!"` = token ids
@@ -201,4 +210,25 @@ Notes:
   `notes/data/qwen3_8b_prefill_36layer.mlir` — no quantization, no checkpoint —
   still corrupts at today's shipped budgets, bit-identically on both engines.
   No fix at our level: this is the upstream MLX report. **The cell stays
-  unpublished and the row stays ✗.**
+  unpublished and the row stays ✗.** *(Superseded 2026-08-18 — the level
+  became ours; see footnote ᵛ.)*
+
+- ᵛ **Row 15 is FIXED as of 2026-08-18 — the level became ours.** Footnote ʷ
+  above is the history; this is the outcome. The defect was located in MLX's
+  own source (`mlx/backend/metal/slicing.cpp:62` registering a *donated*
+  dynamic-slice offset as a command-encoder temporary, which
+  `device.cpp`'s `end_encoding()` then erases from the cross-encoder fence
+  bookkeeping — so the slice reads a stale offset whenever a command-buffer
+  boundary falls between producer and consumer;
+  `notes/mlx-patch-diagnosis.md`). metaljax now vendors its own MLX built
+  from our fork (`vendor/0.32.0` = upstream's unreleased `7e8b4ccc` /
+  PR #4099 + our `end_encoding` hardening), linked privately as
+  `libmlx_metaljax.dylib` and carried inside the wheel.
+  On the release binary `frozen-vendor-d651add3`, ten prefills of one
+  loaded parameter set in one process return **the same first token 10/10**
+  (12095, `" Paris"` — row 14's token), **zero collapses**, `logits_std`
+  2.292, and the greedy decode reads **`" Paris. The capital"`**. The
+  ms/tok cell is still not published: this battery attested correctness,
+  and a timing cell would need its own measured run under release rule 1.
+  Details: `notes/release-gates-0.11.5.md` § "Row 15 — FIXED by the
+  vendored patch".
