@@ -53,13 +53,13 @@ lock-held phases (models → pinned jax suite → texmo/tests). Artifacts:
 |---|---|---|
 | 1 | Freeze | **PASS** — rebuild reproduces the sha; wheel dylib byte-identical |
 | 2 | Pinned jax suite (164 files, `--jobs 1`) | **PASS** — 28,073 / 129 = 99.54 %, failure set **id-identical** to the banked whitelist, zero new, zero gone; 28.4 min |
-| 3 | `tests/` native leg (Stage 1 leg dropped per Oleg's 2026-08-18 scope ruling) | **PASS** — 1048 / 5 / 205-deselected vs banked 1053 / 0 / 205; the ONLY delta is the 5 command-buffer corruption canaries, which now fail **because the vendored fix removed the bug they detect** (assertion text names it); all 71 banked failing ids unchanged, 1258 collected in both |
+| 3 | `tests/` native leg (Stage 1 leg dropped per Oleg's 2026-08-18 scope ruling) | **PASS** — 1048 / 5 / 205-deselected vs banked 1053 / 0 / 205; the ONLY delta was the 5 command-buffer corruption canaries, which failed **because the vendored fix removed the bug they detect**; all 71 banked failing ids unchanged, 1258 collected in both. **Canaries since REMOVED per Oleg (2026-08-18)** — the file's 6 correctness detectors re-run 6/6 on the release binary; the shipped-budget re-measure moves to the post-release queue |
 | 4 | texmo | **PASS** — `texmo_gate` 106/106 (18 via sensitivity scaling, same as recorded); suite-106 geomean 0.9975–1.0012 vs the three recorded arms (inside their mutual noise), 106/106 within 1.2×; top_confs 1.0053, 163/163 within 1.2×, none outside ±10 % |
 | 5 | Model rows (19 rows re-measured on the final binary) | **PASS** — zero regressions > 10 %, zero newly-failing; row 15 **FIXED + first honest timing** (401.4 ms/tok, 10/10 deterministic); row 1's 237-class cell **reproduced** (235.5) with its 261–297 variance experimentally attributed to machine-state GPU slowdown (named, STATUS.md fn 36); row 18 +3.2 % named drift; rows 3/8 suite-context brackets; token agreement PASS |
 | 5b | The no-panic contract | **PASS** — no panic, no wedge anywhere in the campaign; row 10's one refusal was the governor's clean RESOURCE_EXHAUSTED at its line; row 20 declines cleanly with nothing executed |
 | 6 | Plugin contract suites | **PASS** — smoke / execute (48 s) / ingest (37 s) / decline_census / bazel test, all rc=0 on the committed tree; bazel-bin byte-identical to the release binary |
 | 7 | Wheel — **native-only** (the trampoline/Stage-1 wheel is not a release artifact) | **PASS** — 12 files, zero Stage-1 modules, carries the gated dylib byte-identically, installs and drives Metal with no mlx in the venv; twine PASSED |
-| 8 | Finale | **GO** — all gates PASS on the final binary; the two items for Oleg's eyes are DISCLOSURES, not regressions: (a) the 5 canary flips in gate 3 (the detector suite lost its disease), (b) row 1's machine-state variance footnote |
+| 8 | Finale | **GO** — all gates PASS on the final binary; disclosures: (a) the 5 canary flips in gate 3 — **resolved: canaries removed per Oleg**, the bug they detect no longer exists in the shipped library; (b) row 1's machine-state variance footnote |
 
 ### The 2026-08-17 pre-vendoring record (history — superseded above)
 

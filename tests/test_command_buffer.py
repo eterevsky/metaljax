@@ -25,20 +25,25 @@ loads, and the two modules below -- that decode program, and that init scan
 
 Every finite budget is a draw in the same lottery, and OUR OWN COMMITS
 RESHUFFLE IT: any change that moves a lowering moves where the command
-buffers get cut. So the correctness tests (shipped budgets, must be clean)
-are paired with CANARIES that sweep known-corrupting budgets in subprocesses
-and fail if none of them corrupts any more -- a passing correctness test
-proves nothing unless the same detector can still see the bug. Sweeps, not
-single pinned values: a single value goes stale the moment a lowering shifts
-(400 -> 200 did, after fdc7cde's shift peephole).
+buffers get cut. This file therefore used to pair the correctness tests
+(shipped budgets, must be clean) with CANARIES that swept known-corrupting
+budgets in subprocesses and failed if none of them corrupted any more.
 
-And there are two ENGINES to ask, not one: Stage 2 M3 gave the native engine
-its own mx::compile, loop replay and flush discipline, which is a different
-sync-point layout over the same ops -- a different ticket in the same
-lottery. Measured, and the bands barely overlap: 400 and 200 kernels per
-buffer corrupt the Python scan detector while leaving the native one clean;
-100 and 50 do the reverse. Hence the third detector below and its own pair
-of sweeps.
+THE CANARIES WERE REMOVED 2026-08-18 (Oleg's call): the underlying MLX
+defect -- the dropped cross-command-buffer fence, `notes/
+mlx-patch-diagnosis.md` -- is FIXED in the vendored `libmlx_metaljax` the
+release links, so on this build no budget in any swept range corrupts, and
+every canary failed by design ("no budget corrupts any more"). Their last
+green run on stock MLX and their sweep data live in git history at
+`29bb8eb` and in `~/.cache/metaljax-bench/logs/mlx-vendoring/v3-cbuf.log`.
+Consequence worth remembering: the shipped command-buffer budgets in
+`metaljax/__init__.py` are no longer pinned by any failing evidence --
+re-measuring (or retiring) them is on the post-release queue.
+
+The correctness detectors STAY, one per sync-point layout (Python-engine
+scan, compiled decode, native scan, pipelined loop): the engines cut
+command buffers differently, and these still guard the shipped budgets
+against any future regression of the same class.
 """
 
 import json
@@ -477,38 +482,7 @@ def test_eager_scan_is_independent_of_flush_cadence():
     assert not bad, "\n".join(bad)
 
 
-# --- canaries: the detectors above must still be able to SEE the bug -------
-
-# Budgets that corrupted on 114b4d4 (2026-08-04), each in its own process
-# because MLX reads the budgets once, at load. Swept with the detectors
-# above; logs in ~/.cache/metaljax-bench/logs/canary-repin/.
-#
-# Kernel budget, scan detector, byte budget held at the shipped 512
-# (bracketed = clean, everything else corrupts; swept in steps of 50):
-#   50 100 [150] 200 [250 300 350] 400 [450 ... 1300] 1350 1400 ... 10^9
-#   400, 200, 100 and 1600 each corrupt 5/5 fresh processes; the clean
-#   band 450..1300 is 0/5 at both edges. Note the whole high tail
-#   corrupts: with no kernel cut, the 512 MB byte budget cuts badly by
-#   itself (clean again only at >=2048).
-# Byte budget, compiled detector, kernel budget held at the shipped 800:
-#   8 12 16 24 32 40 48 corrupt, 56 and up clean (the 2026-08-03 note said
-#   80 corrupted -- that edge moved, which is exactly why these are sweeps).
-#
-# The sweeps run in the listed order and stop at the first value that
-# corrupts, so the usual cost is one subprocess (~3 s scan, ~2 s compiled);
-# the full fallback is ~25 s and only happens when the canary is dying.
-_CANARY_OPS = (400, 200, 100, 2000, 50, 1600)
-_CANARY_MB = (40, 20, 8, 48)
-
-_CANARY_HELP = (
-    "Either MLX fixed the command-buffer split bug (then the shipped budgets "
-    "in metaljax/__init__.py are no longer pinned by anything and the whole "
-    "workaround should be re-measured), or our lowering moved far enough "
-    "that these assets no longer straddle a bad boundary (then the canary "
-    "needs a bigger graph -- notes/mlx-command-buffer-split.md, and "
-    "notes/data/qwen3_8b_prefill_36layer.mlir is the strongest asset we "
-    "have). Do NOT just delete the canary: it is the only evidence that "
-    "this file's other two tests can still fail.")
+# --- subprocess probe (budgets latch at load; a fresh process per setting) --
 
 
 def _probe(mode, **budgets):
@@ -540,50 +514,13 @@ def _probe(mode, **budgets):
     return rec["corrupt"], rec
 
 
-def test_kernel_budget_canary_still_corrupts():
-    """Some kernel budget must still break the eager scan detector."""
-    tried = []
-    for ops in _CANARY_OPS:
-        corrupt, _ = _probe("scan", MLX_MAX_OPS_PER_BUFFER=ops)
-        tried.append((ops, corrupt))
-        if corrupt:
-            return
-    raise AssertionError(
-        f"no kernel budget in {_CANARY_OPS} corrupts the init scan any more "
-        f"(tried {tried}). " + _CANARY_HELP)
-
-
-def test_byte_budget_canary_still_corrupts():
-    """Some byte budget must still break the compiled-graph detector."""
-    tried = []
-    for mb in _CANARY_MB:
-        corrupt, _ = _probe("compiled", MLX_MAX_MB_PER_BUFFER=mb)
-        tried.append((mb, corrupt))
-        if corrupt:
-            return
-    raise AssertionError(
-        f"no byte budget in {_CANARY_MB} corrupts the compiled decode "
-        f"program any more (tried {tried}). " + _CANARY_HELP)
-
-
-# --- the same three questions, asked of the native engine ------------------
+# --- the same question, asked of the native engine and the pipelined loop --
 #
-# Stage 2 M3 gave the native engine its own mx::compile, its own loop replay
-# and its own flush discipline, so it draws its OWN ticket in this lottery --
-# and the numbers say so. Swept on this milestone with the detector above,
-# byte budget at the shipped 512 for the kernel axis and kernels at 800 for
-# the byte axis:
-#   kernels: 800 clean (4/4 reps), 400 clean, 200 clean, 100 WRONG (9 of 66
-#            outputs), 50 WRONG (7)
-#   bytes:   512 clean, 400 clean, 256 WRONG (1), 128 WRONG (7), 64 WRONG (7),
-#            40 WRONG (7)
-# Note how little the two engines' bad bands have in common: 400 and 200
-# kernels corrupt the PYTHON scan detector 5/5 and leave the native one
-# clean, while 100 and 50 do the reverse. That is the whole reason this file
-# now carries both -- a budget proven safe for one engine says nothing about
-# the other.
-_NATIVE_CANARY_OPS = (100, 50, 200, 400, 2000, 1600)
-_NATIVE_CANARY_MB = (128, 64, 40, 256, 20, 8)
+# The native engine has its own mx::compile, loop replay and flush
+# discipline (a different sync-point layout over the same ops), and the
+# pipelined dynamic loop is a third layout again -- on stock MLX their
+# corrupting-budget bands barely overlapped, which is why each keeps its own
+# correctness detector at the shipped budgets.
 
 
 def test_native_engine_scan_is_correct_at_the_shipped_budgets():
@@ -591,62 +528,9 @@ def test_native_engine_scan_is_correct_at_the_shipped_budgets():
     assert not corrupt, "\n".join(rec["detail"])
 
 
-def test_native_kernel_budget_canary_still_corrupts():
-    """Some kernel budget must still break the native scan detector."""
-    tried = []
-    for ops in _NATIVE_CANARY_OPS:
-        corrupt, _ = _probe("native", MLX_MAX_OPS_PER_BUFFER=ops)
-        tried.append((ops, corrupt))
-        if corrupt:
-            return
-    raise AssertionError(
-        f"no kernel budget in {_NATIVE_CANARY_OPS} corrupts the init scan on "
-        f"the native engine any more (tried {tried}). " + _CANARY_HELP)
-
-
-def test_native_byte_budget_canary_still_corrupts():
-    """Some byte budget must still break the native scan detector."""
-    tried = []
-    for mb in _NATIVE_CANARY_MB:
-        corrupt, _ = _probe("native", MLX_MAX_MB_PER_BUFFER=mb)
-        tried.append((mb, corrupt))
-        if corrupt:
-            return
-    raise AssertionError(
-        f"no byte budget in {_NATIVE_CANARY_MB} corrupts the init scan on the "
-        f"native engine any more (tried {tried}). " + _CANARY_HELP)
-
-
-# --- and of the pipelined dynamic loop (Stage 2 M5a) -----------------------
-#
-# Swept on this milestone with the detector above (`pipeline`), on the same
-# axes and against the same shipped budgets:
-#   kernels: 800 clean (3/3 reps), 100 clean, 50 clean
-#   bytes:   512 clean (3/3 reps), 128 WRONG (5 of 66 outputs), 64 WRONG (4)
-# Only the BYTE axis bites this layout -- which is its own small piece of
-# evidence that a pipelined loop draws a different ticket from the serial one
-# it replaces (that one corrupts at 100 and 50 kernels and is clean at 128 MB
-# only down to 256).
-_PIPELINE_CANARY_MB = (128, 64, 40, 256, 20, 8)
-
-
 def test_pipelined_loop_is_correct_at_the_shipped_budgets():
     corrupt, rec = _probe("pipeline")
     assert not corrupt, "\n".join(rec["detail"])
-
-
-def test_pipeline_byte_budget_canary_still_corrupts():
-    """Some byte budget must still make the pipelined loop disagree with the
-    serial one. Nothing else proves the test above can fail."""
-    tried = []
-    for mb in _PIPELINE_CANARY_MB:
-        corrupt, _ = _probe("pipeline", MLX_MAX_MB_PER_BUFFER=mb)
-        tried.append((mb, corrupt))
-        if corrupt:
-            return
-    raise AssertionError(
-        f"no byte budget in {_PIPELINE_CANARY_MB} makes the pipelined loop "
-        f"disagree with the serial one (tried {tried}). " + _CANARY_HELP)
 
 
 if __name__ == "__main__":

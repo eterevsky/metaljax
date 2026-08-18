@@ -83,14 +83,15 @@ STATUS.md footnote 36). Headlines:
    slower across prefill and decode alike, which points at GPU
    thermal/frequency state. Historical readings span 237–302. Getting
    further needs root (`powermetrics`).
-2. **Five corruption-canary tests now "fail" — because they can't find the
-   bug any more.** These tests exist to detect the MLX command-buffer
-   corruption; on the patched build they search all 28 budget settings,
-   find nothing to detect, and raise an assertion whose own text says "MLX
-   fixed the command-buffer split bug". All other 1,253 tests are
-   unchanged. The canaries should be re-pointed at the patched behavior
-   post-release; this needs your ack since it shows up as "5 failed" in the
-   raw pytest count.
+2. **The five corruption-canary tests are removed (your call, 2026-08-18).**
+   They existed to prove the detectors could still see the MLX
+   command-buffer bug; with the vendored fix the bug does not exist in the
+   shipped library, so on the release build they could only fail. The six
+   correctness detectors stay (they guard the shipped budgets against any
+   future regression of the class) and pass 6/6 on the release binary. The
+   sweep history lives in git at `29bb8eb`. Related post-release item: the
+   shipped command-buffer budget workarounds are no longer pinned by any
+   failing evidence and should be re-measured or retired.
 3. **Rows 5 and 7 keep their token-nondeterminism note.** Timing is
    reproducible but greedy token streams can differ run to run (row 5: one
    divergence in six draws; row 7: every pair). It survived the fence fix,
