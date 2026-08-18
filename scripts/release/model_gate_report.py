@@ -67,7 +67,16 @@ ROW_BENCH = {
 }
 
 TAG_RE = re.compile(r"^\[maxtext(?:-train)?\]\s+(\S+)\s+/\s+(\S+)")
-SUPERSCRIPTS = "¹²³⁴⁵⁶⁷⁸⁹⁰˟*"
+# Ledger-cell dressing around the number: superscript digits (footnote
+# references like ᴾ²⁷) and modifier-letter run annotations (ᴳ ᶠ ᶜ ᵛ ʷ ᴾ ...,
+# U+02B0-02FF and U+1D00-1DBF), plus stray bold asterisks.
+FOOTNOTE_RE = re.compile(
+    "[*¹²³"          # latin-1 superscript digits
+    "ʰ-˿"                 # spacing modifier letters (ʷ ˟ ...)
+    "ᴀ-ᶿ"                 # phonetic ext. modifier caps (ᴳ ᶠ ᶜ ᵛ ᴾ)
+    "⁰-₟]")               # superscripts and subscripts block
+PAREN_RE = re.compile(r"\s*\([^()]*\)\s*$")
+NUM_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 
 
 def merge_maxtext(raw, merged):
@@ -134,14 +143,18 @@ def parse_ledger(path):
 
 
 def clean_cell(cell):
-    s = cell.replace("**", "").strip()
-    s = s.strip(SUPERSCRIPTS).strip()
+    """Leading number of a ledger cell, or None if the cell has none.
+
+    Cells carry markdown bold, footnote glyphs and trailing parentheticals:
+    "**21.9** ᶜ (spread 21.9–24.2)" -> 21.9.  ✗/—/n/a cells -> None.
+    """
+    s = cell.replace("**", "")
+    s = PAREN_RE.sub("", s)
+    s = FOOTNOTE_RE.sub("", s).strip()
     if not s or s.startswith("✗") or s in {"—", "-", "n/a"}:
         return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
+    m = NUM_RE.match(s)
+    return float(m.group()) if m else None
 
 
 def main():
