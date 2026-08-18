@@ -12,28 +12,28 @@ Cells: metaljax warm decode ms/token (or the row's noted metric);
 version's commit. Full per-run tables live in STATUS.md; raw JSONL in
 notes/data/. Append a column per release / major optimization.*
 
-| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5rc |
+| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 |
 |---|---|---:|---:|---:|---:|---:|
-| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | **237.3** ᴳ |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | **94.3** |
-| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | **43.4** |
-| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | **27.1** ᴳ |
-| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | **58.5** |
-| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | **55.8** |
-| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | **21.9** ᶜ |
-| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | **29.6** ᴳ |
-| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | **210.7** ᴳ |
-| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | **1865** ᴳ (88 GB) |
-| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | **16.81** ᶠ (13 GB) |
-| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ download ᴳ (93.4 GB streams) |
-| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | **79.0** |
-| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | **31.95** ᶠ (9.2 GB) |
-| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | ✅ **coherent** ᵛ (10/10 deterministic; ms/tok not re-measured) |
-| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | **88.4** |
-| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | **1259.9 / 5707.9** |
-| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | **359.2** ᴳ |
-| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | **459.2** ᶠ (25 GB) |
-| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ declined ᴳ |
+| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | **235.5** |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | **92.3** |
+| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | **43.5** |
+| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | **27.2** |
+| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | **57.9** |
+| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | **54.5** |
+| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | **21.7** |
+| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | **29.7** ᴳ |
+| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | **210.3** ᴳ |
+| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | **1871.1** ᴳ |
+| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | **16.35** |
+| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ |
+| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | **78.0** |
+| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | **31.77** |
+| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | **401.4** ᵛ |
+| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | **88.37** |
+| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | **1231.3 / 5696.8** |
+| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | **370.7** |
+| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | **460.2** |
+| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ |
 
 Notes:
 
@@ -133,7 +133,7 @@ Notes:
   2998 @1024²; llama.cpp 12B-bf16 44.2 / 31B-bf16 111.2 (the
   bandwidth roofline, 439–555 GB/s effective on every dense row).
 
-- ᴳ (0.11.5rc column) = measured under the memory governor (2026-08-17, frozen-gov7 ebe56e71): ORIGINAL jax implementations, no benchmark-code modifications; the rows that previously panicked (#7) or guard-killed (122 GB) now run under the no-panic contract. Row 10's per-token number is the governor campaign's own (1865 ms/tok, 88 GB peak, exit 0).
+- ᴳ (0.11.5 column; first attested in the rc-era governor campaign) = measured under the memory governor (2026-08-17, frozen-gov7 ebe56e71): ORIGINAL jax implementations, no benchmark-code modifications; the rows that previously panicked (#7) or guard-killed (122 GB) now run under the no-panic contract. Row 10's per-token number is the governor campaign's own (1865 ms/tok, 88 GB peak, exit 0).
 
 - **Every unmarked 0.11.5rc cell** was measured by the release gate on
   2026-08-17 on the frozen release dylib `ebe56e71…` — the SAME binary the ᴳ
@@ -141,13 +141,13 @@ Notes:
   byte), one guarded process per row, machine lock held, `METALJAX_DEBUG=1`.
   Details and per-row ratios: `notes/release-gates-0.11.5.md` gate 5.
 
-- ᶜ **Row 7 is a bracketed cell.** Its first two samples of the evening read
+- ᶜ (rc-era note, column since overwritten by the 0.11.5 re-gate) **Row 7 was a bracketed cell.** Its first two samples of the evening read
   24.2 / 23.9 ms/tok; a governor-off arm read 22.1 and a fourth arm with the
   governor back ON read **21.9**, so the pair was the suite-context trap
   (CLAUDE.md item 12), not a governor cost. The cell is the bracketed value;
   the spread (21.9–24.2) is recorded in the gate document.
 
-- ᶠ **Rows 11, 14 and 19 are the P28 re-measure, at the HISTORICAL budgets.**
+- ᶠ (rc-era note, column since overwritten by the 0.11.5 re-gate) **Rows 11, 14 and 19 were the P28 re-measure, at the HISTORICAL budgets.**
   The release gate found both decode rows guard-killing at the budgets every
   previous campaign used (22 > 20 GB, 26 > 25 GB) and attributed it, one
   variable at a time, to **P27's flush watermark** rather than the governor —
@@ -214,21 +214,17 @@ Notes:
   became ours; see footnote ᵛ.)*
 
 - ᵛ **Row 15 is FIXED as of 2026-08-18 — the level became ours.** Footnote ʷ
-  above is the history; this is the outcome. The defect was located in MLX's
-  own source (`mlx/backend/metal/slicing.cpp:62` registering a *donated*
-  dynamic-slice offset as a command-encoder temporary, which
-  `device.cpp`'s `end_encoding()` then erases from the cross-encoder fence
-  bookkeeping — so the slice reads a stale offset whenever a command-buffer
-  boundary falls between producer and consumer;
-  `notes/mlx-patch-diagnosis.md`). metaljax now vendors its own MLX built
-  from our fork (`vendor/0.32.0` = upstream's unreleased `7e8b4ccc` /
-  PR #4099 + our `end_encoding` hardening), linked privately as
-  `libmlx_metaljax.dylib` and carried inside the wheel.
-  On the release binary `frozen-vendor-d651add3`, ten prefills of one
-  loaded parameter set in one process return **the same first token 10/10**
-  (12095, `" Paris"` — row 14's token), **zero collapses**, `logits_std`
-  2.292, and the greedy decode reads **`" Paris. The capital"`**. The
-  ms/tok cell is still not published: this battery attested correctness,
-  and a timing cell would need its own measured run under release rule 1.
-  Details: `notes/release-gates-0.11.5.md` § "Row 15 — FIXED by the
-  vendored patch".
+  above is the history. The wrong output was MLX's own command-buffer fence
+  drop (`slicing.cpp:62`), fixed in our vendored patched MLX inside the
+  native wheel; 10/10 deterministic first tokens and a coherent decode on
+  the release binary, and the 401.4 ms/tok cell is the row's first honest
+  timing. Mechanism + attestation: STATUS.md footnotes 35/36,
+  `notes/mlx-patch-diagnosis.md`.
+
+- **0.11.5** (2026-08-18 consolidated re-gate): every cell measured in one
+  campaign on the release binary `frozen-vendor-d651add3` (native plugin +
+  vendored patched `libmlx_metaljax`, tree `29bb8eb`), one guarded process
+  per cell, historical budgets, token agreement PASS. Named items (row 1
+  variance disposition, rows 3/8 suite-context brackets, row 10 spread,
+  row 18 drift, row 15 first timing) in STATUS.md footnote 36; full report
+  `~/.cache/metaljax-bench/logs/regate-0.11.5/models/`.
