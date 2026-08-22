@@ -802,6 +802,14 @@ const int64_t kTraceBudget = EnvInt("METALJAX_TRACE_BUDGET", 20000);
 const bool kBodyCompile = EnvOn("METALJAX_BODY_COMPILE");
 const int64_t kChunkMax = EnvInt("METALJAX_CHUNK_MAX", 16);
 const int64_t kChunkMaxCost = EnvInt("METALJAX_CHUNK_MAX_COST", 1500);
+// The runtime's bound on unrolling a counted loop INSIDE a trace
+// (runtime/control.cc run_while's in-trace arm, same number): past 64
+// iterations the trace holds more intermediates than Metal's buffer budget
+// allows.  `WhileTraceable` must not approve what `run_while` will refuse --
+// an approved-then-refused unroll fails the enclosing compiled body at trace
+// time and retires its compiled path permanently (the lowering/runtime
+// mismatch of notes/topconfs16k-sweep-2026-08-22.md).
+const int64_t kUnrollMax = 64;
 const int64_t kCompileBytesMb = EnvInt("METALJAX_COMPILE_BYTES_MB", 65536);
 const int64_t kCompileBytes =
     std::max<int64_t>(kCompileBytesMb, 0) * (int64_t{1} << 20);
@@ -1179,6 +1187,13 @@ std::shared_ptr<MslPlanned> MslPlanFor(LowerContext& ctx,
                    static_cast<long long>(plan->N), plan->state_pos.size(),
                    plan->stacked_pos.size(),
                    static_cast<long long>(plan->num_packed));
+      // The generated MSL, on request: a build error's line numbers point
+      // into MLX's prepended preamble, so the source is what an
+      // investigation actually needs (the bf16 float->bfloat conversion
+      // hunt is what made this a knob).
+      if (std::getenv("MJDBG_MSL_SOURCE") != nullptr)
+        std::fprintf(stderr, "[metaljax] msl source %s:\n%s\n",
+                     plan->kernel_name.c_str(), plan->source.c_str());
     }
   }
   ctx.msl[key] = plan;
@@ -1725,8 +1740,12 @@ bool WhileTraceable(LowerContext& ctx, mlir::Operation* op) {
       const int64_t trip = std::max<int64_t>(c->n - *start, 0);
       // The byte gate is asked LAST, so a gate that fires means "everything
       // else said compile" -- which is what makes its debug line mean
-      // something.
-      ok = trip * BlockCost(ctx, body) <= kTraceBudget &&
+      // something.  `trip <= kUnrollMax` is asked FIRST: it is the runtime's
+      // own refusal, and a deliberate DIVERGENCE from ops/control.py, whose
+      // `_while_traceable` has the budget tests only (Stage 1's engine
+      // recovers from the refusal more cheaply than this one).
+      ok = trip <= kUnrollMax &&
+           trip * BlockCost(ctx, body) <= kTraceBudget &&
            BlockIsPure(ctx, body) &&
            BytesOk(ctx, body, trip, "unroll-in-trace");
     }

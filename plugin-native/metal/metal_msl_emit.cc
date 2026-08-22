@@ -64,6 +64,16 @@ std::string Scalarize(const EVal& v) {
   return v.second > 1 ? absl::StrCat(v.first, "[r]") : v.first;
 }
 
+// The Metal compiler has no implicit float -> bfloat conversion ("assigning
+// to 'bfloat16_t' (aka 'bfloat') from incompatible type 'float'", measured
+// on the first coop bf16 kernels), so every value landing in a bf16 register
+// or buffer is cast EXPLICITLY -- which is also the rounding the HLO's own
+// dtype asks for.  Every other dtype keeps Stage 1's exact spelling.
+std::string CastTo(const std::string& dtype, const std::string& expr) {
+  if (dtype != "bf16") return expr;
+  return absl::StrCat("((bfloat16_t)(", expr, "))");
+}
+
 // The one place the op tables turn into an expression: `_UNARY`/`_BINARY`'s
 // "{0}"/"{1}" placeholders, filled.
 std::string Format(const std::string& pattern,
@@ -90,6 +100,12 @@ std::string ElemExpr(const Sym* s, const std::vector<std::string>& acc,
   if (s->op == "clamp")
     return absl::StrCat("metal::min(metal::max(", acc[1], ", ", acc[0], "), ",
                         acc[2], ")");
+  // bfloat16: MLX's kernel preamble instantiates the metal:: math library for
+  // bfloat16_t (bf16_math.h) -- but not `sign`, and a bare bfloat argument is
+  // ambiguous between the float and half overloads.  Compute in float; the
+  // typed destination local rounds (sign's values are exact in bf16 anyway).
+  if (s->op == "stablehlo.sign" && s->dtype == "bf16")
+    return absl::StrCat("metal::sign((float)(", acc[0], "))");
   auto u = MslUnaryOps().find(s->op);
   if (u != MslUnaryOps().end()) return Format(u->second, acc);
   auto b = MslBinaryOps().find(s->op);
@@ -347,7 +363,7 @@ std::string MslPlanned::EmitScalar() {
     } else if (s->kind == SymKind::kElem) {
       std::vector<std::string> args;
       for (const Sym* a : s->args) args.push_back(emit(a));
-      const std::string e = ElemExpr(s, args, "emit");
+      const std::string e = CastTo(s->dtype, ElemExpr(s, args, "emit"));
       const std::string name = absl::StrCat("v", tmp_++);
       body_.push_back(absl::StrCat("  ", T(s->dtype), " ", name, " = ", e, ";"));
       v = name;
@@ -496,26 +512,38 @@ std::string MslPlanned::EmitVector() {
     if (s->weight->offset != 0)
       terms.insert(terms.begin(), absl::StrCat(s->weight->offset, "u"));
     const std::string name = absl::StrCat("v", tmp_++);
-    const std::string dacc =
-        d.second > 1 ? absl::StrCat(d.first, "[cc]") : d.first;
+    std::string dacc = d.second > 1 ? absl::StrCat(d.first, "[cc]") : d.first;
+    // The accumulator register is ALWAYS float; the result register is the
+    // dot's own dtype and rounds once at the end (XLA's bf16-dot semantics).
+    // Non-f32 operands are cast so the PRODUCTS are f32 too -- native
+    // bfloat*bfloat would round each product first.  f32 emission is
+    // byte-identical to Stage 1's.
+    std::string wread = absl::StrCat(Src(wsid), "[{OFF}]");
+    if (s->data->dtype != "f32") dacc = absl::StrCat("(float)", dacc);
+    if (s->weight->dtype != "f32") wread = absl::StrCat("(float)", wread);
+    auto wexpr = [&](const std::string& off) {
+      return absl::StrReplaceAll(wread, {{"{OFF}", off}});
+    };
+    const std::string acast = CastTo(s->dtype, "_a");
     if (s->dsize > 1) {
       const std::string woff =
           terms.empty() ? "0u" : absl::StrJoin(terms, " + ");
-      body_.push_back(absl::StrCat("  float ", name, "[", s->dsize, "];"));
+      body_.push_back(absl::StrCat("  ", T(s->dtype), " ", name, "[",
+                                   s->dsize, "];"));
       body_.push_back(absl::StrCat(
           "  for (int d = 0; d < ", s->dsize, "; d++) { float _a = 0.0f; ",
           "for (int cc = 0; cc < ", s->csize, "; cc++) _a += ", dacc, " * ",
-          Src(wsid), "[", woff, "]; ", name, "[d] = _a; }"));
+          wexpr(woff), "; ", name, "[d] = ", acast, "; }"));
     } else {
       std::vector<std::string> t0;
       for (const std::string& t : terms)
         if (t.find("(uint)d") == std::string::npos) t0.push_back(t);
       const std::string woff = t0.empty() ? "0u" : absl::StrJoin(t0, " + ");
-      body_.push_back(absl::StrCat("  float ", name, ";"));
+      body_.push_back(absl::StrCat("  ", T(s->dtype), " ", name, ";"));
       body_.push_back(absl::StrCat(
           "  { float _a = 0.0f; for (int cc = 0; cc < ", s->csize,
-          "; cc++) _a += ", dacc, " * ", Src(wsid), "[", woff, "]; ", name,
-          " = _a; }"));
+          "; cc++) _a += ", dacc, " * ", wexpr(woff), "; ", name,
+          " = ", acast, "; }"));
     }
     return {name, s->dsize};
   };
@@ -637,7 +665,7 @@ std::string MslPlanned::EmitVector() {
         body_.push_back(absl::StrCat("  ", Declare(name, s->dtype, r)));
         std::vector<std::string> acc;
         for (const EVal& a : args) acc.push_back(Scalarize(a));
-        const std::string e = ElemExpr(s, acc, "vec emit");
+        const std::string e = CastTo(s->dtype, ElemExpr(s, acc, "vec emit"));
         if (r > 1) {
           body_.push_back(absl::StrCat("  for (int r = 0; r < ", r, "; r++) ",
                                        name, "[r] = ", e, ";"));
@@ -656,9 +684,17 @@ std::string MslPlanned::EmitVector() {
 
   // Emit writes of `val` into a buffer whose per-step layout is row-major
   // `per_shape`; absorbs top-level transposes into the write strides and
-  // materializes SymStacks part by part.
+  // materializes SymStacks part by part.  `store_cast` wraps every stored
+  // scalar (a bf16 register stored into the f32 hidden-stack buffer needs an
+  // explicit widening -- no implicit conversion crosses bfloat).
   auto emit_write = [&](const Sym* val, const MslShape& per_shape,
-                        const std::string& dest) {
+                        const std::string& dest,
+                        const std::string& store_cast = "") {
+    auto stored = [&](const std::string& expr) {
+      return store_cast.empty()
+                 ? expr
+                 : absl::StrCat("(", store_cast, ")(", expr, ")");
+    };
     if (val->kind == SymKind::kStack) {
       MslShape vshape = val->shape;
       int64_t vaxis = val->axis;
@@ -697,12 +733,14 @@ std::string MslPlanned::EmitVector() {
         const std::string off2 = VecOff(kv.second->shape, &st_al, 0);
         const int64_t base_off = kv.first * ax_stride;
         if (p.second > 1) {
-          writes_.push_back(absl::StrCat("  for (int r = 0; r < ", p.second,
-                                         "; r++) ", dest, "(", off2, ") + ",
-                                         base_off, "u] = ", p.first, "[r];"));
+          writes_.push_back(absl::StrCat(
+              "  for (int r = 0; r < ", p.second, "; r++) ", dest, "(", off2,
+              ") + ", base_off, "u] = ",
+              stored(absl::StrCat(p.first, "[r]")), ";"));
         } else {
           writes_.push_back(absl::StrCat("  ", dest, "(", off2, ") + ",
-                                         base_off, "u] = ", p.first, ";"));
+                                         base_off, "u] = ", stored(p.first),
+                                         ";"));
         }
       }
       return;
@@ -739,7 +777,7 @@ std::string MslPlanned::EmitVector() {
       tgt_R = v2->shape.empty() ? 1 : v2->shape.back();
     }
     const std::string src =
-        MslRegSrc(e.first, e.second, tgt_R, "stacked write");
+        stored(MslRegSrc(e.first, e.second, tgt_R, "stacked write"));
     if (tgt_R > 1) {
       writes_.push_back(absl::StrCat("  for (int r = 0; r < ", tgt_R,
                                      "; r++) ", dest, "(", off2, ")] = ", src,
@@ -762,8 +800,11 @@ std::string MslPlanned::EmitVector() {
   }
   for (const auto& h : hidden_) {
     const int64_t numel = MslNumel(h.first->shape);
+    // Hidden per-step stacks are declared f32 whatever the term's dtype
+    // (LowerMslPlan): a bf16 term crosses with an explicit widening.
     emit_write(h.first, h.first->shape,
-               absl::StrCat(h.second, "[t * ", numel, "u + "));
+               absl::StrCat(h.second, "[t * ", numel, "u + "),
+               h.first->dtype == "f32" ? "" : "float");
   }
   struct NewState {
     std::string name;
@@ -1022,19 +1063,29 @@ std::string MslPlanned::EmitCoop() {
         const std::string woff =
             terms.empty() ? "0u" : absl::StrJoin(terms, " + ");
         const std::string name = absl::StrCat("v", tmp_++);
+        // The staging array and the accumulator are float for every dtype
+        // (bf16 data upconverts at the threadgroup store, so products and
+        // sums are f32); the result register is the dot's own dtype and
+        // rounds once.  f32 emission is byte-identical to Stage 1's.
+        const std::string wld =
+            s->weight->dtype != "f32"
+                ? absl::StrCat("(float)", Src(wsid), "[", woff, "]")
+                : absl::StrCat(Src(wsid), "[", woff, "]");
+        const std::string acast = CastTo(s->dtype, "_a");
         if (k_out > 1) {
-          body_.push_back(absl::StrCat("  float ", name, "[", k_out, "];"));
+          body_.push_back(absl::StrCat("  ", T(s->dtype), " ", name, "[",
+                                       k_out, "];"));
           body_.push_back(absl::StrCat(
               "  for (int g = 0; g < ", k_out,
               "; g++) { float _a = 0.0f; for (int cc = 0; cc < ", s->csize,
-              "; cc++) _a += ", shname, "[cc] * ", Src(wsid), "[", woff, "]; ",
-              name, "[g] = _a; }"));
+              "; cc++) _a += ", shname, "[cc] * ", wld, "; ",
+              name, "[g] = ", acast, "; }"));
         } else {
-          body_.push_back(absl::StrCat("  float ", name, ";"));
+          body_.push_back(absl::StrCat("  ", T(s->dtype), " ", name, ";"));
           body_.push_back(absl::StrCat(
               "  { float _a = 0.0f; for (int cc = 0; cc < ", s->csize,
-              "; cc++) _a += ", shname, "[cc] * ", Src(wsid), "[", woff, "]; ",
-              name, " = _a; }"));
+              "; cc++) _a += ", shname, "[cc] * ", wld, "; ",
+              name, " = ", acast, "; }"));
         }
         v = {name, k_out};
         dot_memo_[dkey] = v;
@@ -1051,7 +1102,7 @@ std::string MslPlanned::EmitCoop() {
         body_.push_back(absl::StrCat("  ", Declare(name, s->dtype, r)));
         std::vector<std::string> acc;
         for (const EVal& a : args) acc.push_back(Scalarize(a));
-        const std::string e = ElemExpr(s, acc, "coop emit");
+        const std::string e = CastTo(s->dtype, ElemExpr(s, acc, "coop emit"));
         if (r > 1) {
           body_.push_back(absl::StrCat("  for (int r = 0; r < ", r, "; r++) ",
                                        name, "[r] = ", e, ";"));
@@ -1097,8 +1148,11 @@ std::string MslPlanned::EmitCoop() {
     const int64_t numel = MslNumel(h.first->shape);
     const std::string off = CoopOff(h.first->shape, nullptr, 0);
     const int64_t tgt_R = CoopRShape(h.first->shape);
-    const std::string src = MslRegSrc(e.first, e.second, tgt_R,
-                                      absl::StrCat("hidden stack ", h.second));
+    std::string src = MslRegSrc(e.first, e.second, tgt_R,
+                                absl::StrCat("hidden stack ", h.second));
+    // Hidden stacks are f32 buffers whatever the term's dtype (LowerMslPlan):
+    // a bf16 register crosses with an explicit widening.
+    if (h.first->dtype != "f32") src = absl::StrCat("(float)(", src, ")");
     if (tgt_R > 1) {
       writes_.push_back(absl::StrCat("  for (int r = 0; r < ", tgt_R,
                                      "; r++) ", h.second, "[t * ", numel,

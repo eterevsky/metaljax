@@ -216,6 +216,9 @@ void Program::run_while(const Entry& e,
       // intermediates than Metal's buffer budget allows, and the answer
       // is the same as the Python engine's -- abort, and let the caller
       // fall back to the eager path (run_recovering does that here).
+      // The lowering's `WhileTraceable` carries the same bound
+      // (metal_lowering.cc kUnrollMax), so a body it let compile never
+      // reaches this throw; keep the two numbers together.
       if (trip > 64)
         throw std::runtime_error(
             "metaljax: refusing to unroll trip=" + std::to_string(trip) +
@@ -256,9 +259,30 @@ void Program::run_while(const Entry& e,
     }
     BodyRunner runner(body, body_caps, 1);
     vals = ins;
+    // `period` stays the SUBMISSION cadence, but the BLOCKING eval gets a
+    // floor: a pessimistically-costed body (an inner plan-less scan charged
+    // trip x cost by the estimator) collapses period to 1, and a blocking
+    // mx::eval every iteration serializes host and device for the whole
+    // loop.  Between blocking points each sync submits (async_eval) and
+    // charges the same op-units, so the clear cadence is unchanged.  Safe
+    // by construction: the unevaluated graph never exceeds `hard_floor`
+    // submissions of one iteration each, the interpreter's own
+    // byte-denominated eager_flush still fires INSIDE a big body, and a
+    // body whose cost collapsed the period to 1 is big precisely because it
+    // holds inner loops with sync points of their own.
+    const int64_t hard_floor = 8;
+    const int64_t hard_every =
+        period * std::max<int64_t>(1, (hard_floor + period - 1) / period);
     for (int64_t i = 1; i <= trip; i++) {
       vals = runner.run_one(vals);
-      if (i % period == 0) loop_flush(vals, period * cost);
+      if (i % period == 0) {
+        if (i % hard_every == 0) {
+          loop_flush(vals, period * cost);
+        } else {
+          mx::async_eval(vals);
+          loop_account(period * cost);
+        }
+      }
     }
     write_results(e, env, vals);
     return;

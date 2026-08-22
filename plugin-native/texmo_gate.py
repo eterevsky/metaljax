@@ -73,9 +73,29 @@ def configs_from_csv(path):
             # texmo renamed the raw_fold tokenset to fold (2026-08); older
             # suite CSVs still carry the old spec strings.
             spec = row["spec"].replace(".raw_fold", ".fold")
-            key = (spec, int(row["batch"]), int(row["length"]))
+            key = (spec, "fp32", int(row["batch"]), int(row["length"]))
             seen.setdefault(key, row["name"])
     return [(name, *key) for key, name in seen.items()]
+
+
+def configs_from_jsonl(path):
+    """A top-configurations JSONL (`spec, precision, batch, length, ...`),
+    named exactly as `scripts/bench_texmo_pjrt.py` names them, so a gate row
+    and a bench row with the same name are the same configuration."""
+    import json
+
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            spec = row["spec"].replace(".raw_fold", ".fold")
+            name = row.get("name") or f"tc{len(rows):03d}-w{row.get('weights', 0)}"
+            rows.append((name, spec, row.get("precision", "fp32"),
+                         int(row["batch"]), int(row["length"])))
+    return rows
 
 
 # --------------------------------------------------------------------------
@@ -83,20 +103,21 @@ def configs_from_csv(path):
 # --------------------------------------------------------------------------
 
 
-def dump_one(out_dir, spec, batch, length, nsteps):
+def dump_one(out_dir, spec, batch, length, nsteps, precision="fp32"):
     """Module text, inputs, CPU reference and 1-ULP sensitivity, to disk."""
     sys.path.insert(0, str(_REPO / "scripts"))
     import texmo_check as tc          # sets jax_platforms=cpu at import
 
     import jax
     import jax.numpy as jnp
+    import ml_dtypes
     from texmo.configuration import Configuration
     from texmo.manager_jax import ManagerJax
     from texmo.precision import Precision
     from texmo.spec_parser import parse_model2
 
     conf = Configuration(
-        parse_model2(spec, precision=Precision("fp32")),
+        parse_model2(spec, precision=Precision(precision)),
         lr=0.01, length=length, batch=batch, steps=nsteps,
         decay=1.0, cosine=False,
     )
@@ -122,7 +143,16 @@ def dump_one(out_dir, spec, batch, length, nsteps):
     pert = []
     for x in leaves:
         a = np.asarray(x).copy()
-        if a.dtype.kind == "f" and a.size:
+        if a.dtype == ml_dtypes.bfloat16 and a.size:
+            # +1 ULP in the array's OWN precision.  A bf16 numpy array has
+            # kind 'V' and np.nextafter refuses it, so bump the bit pattern:
+            # toward +inf is +1 on nonnegative patterns, -1 on negative ones.
+            f32 = a.astype(np.float32).reshape(-1)
+            u = a.view(np.uint16).reshape(-1)
+            fin = np.isfinite(f32)
+            u[fin & (f32 >= 0)] += 1
+            u[fin & (f32 < 0)] -= 1
+        elif a.dtype.kind == "f" and a.size:
             f = a.reshape(-1)
             f[:] = np.nextafter(f, np.float32(1e9))
         pert.append(jnp.asarray(a))
@@ -131,8 +161,12 @@ def dump_one(out_dir, spec, batch, length, nsteps):
     sens = 0.0
     for a, b in zip(jax.tree_util.tree_leaves(ref),
                     jax.tree_util.tree_leaves(ref_p)):
-        a = np.asarray(a, dtype=np.float64)
-        b = np.asarray(b, dtype=np.float64)
+        a = np.asarray(np.asarray(a).astype(np.float64)
+                       if np.asarray(a).dtype == ml_dtypes.bfloat16
+                       else a, dtype=np.float64)
+        b = np.asarray(np.asarray(b).astype(np.float64)
+                       if np.asarray(b).dtype == ml_dtypes.bfloat16
+                       else b, dtype=np.float64)
         if a.dtype.kind != "f" or not a.size:
             continue
         d = float(np.abs(a - b).max())
@@ -144,14 +178,27 @@ def dump_one(out_dir, spec, batch, length, nsteps):
     (out_dir / "mod.mlir").write_text(text)
     saved = {"sens": np.asarray(sens),
              "n_in": np.asarray(len(flat_in))}
+    bf16_in = []
     for i, x in enumerate(flat_in):
         # NOT np.ascontiguousarray: it promotes a rank-0 array to rank 1, and
         # a training chunk's arguments include scalars (the step counter, a
         # scalar weight), which would then not match the module's tensor<f32>.
-        saved[f"i{i}"] = np.asarray(x)
-    flat_ref = [np.asarray(x, dtype=np.float32)
-                if np.asarray(x).dtype.kind == "f" else np.asarray(x)
-                for x in jax.tree_util.tree_leaves(ref)]
+        a = np.asarray(x)
+        if a.dtype == ml_dtypes.bfloat16:
+            # np.savez cannot serialize the extension dtype; ship the bit
+            # pattern and the parent views it back.
+            bf16_in.append(i)
+            a = a.view(np.uint16)
+        saved[f"i{i}"] = a
+    saved["bf16_in"] = np.asarray(bf16_in, dtype=np.int64)
+    flat_ref = []
+    for x in jax.tree_util.tree_leaves(ref):
+        a = np.asarray(x)
+        # References in f32 always: bf16 outputs are compared upconverted,
+        # and the tolerance (not the storage) is what carries the precision.
+        if a.dtype == ml_dtypes.bfloat16 or a.dtype.kind == "f":
+            a = a.astype(np.float32)
+        flat_ref.append(a)
     saved["n_ref"] = np.asarray(len(flat_ref))
     for i, x in enumerate(flat_ref):
         saved[f"r{i}"] = x
@@ -200,11 +247,15 @@ def compare(outs, refs, tol, sens):
 def run_one(work, tol):
     """Compile and execute one dumped configuration; returns (tag, detail)."""
     import jax
+    import ml_dtypes
     from jax._src.lib import xla_client as xc
 
     data = np.load(work / "data.npz")
     text = (work / "mod.mlir").read_text()
-    flat_in = [data[f"i{i}"] for i in range(int(data["n_in"]))]
+    bf16_in = set(data["bf16_in"].tolist()) if "bf16_in" in data else set()
+    flat_in = [data[f"i{i}"].view(ml_dtypes.bfloat16) if i in bf16_in
+               else data[f"i{i}"]
+               for i in range(int(data["n_in"]))]
     refs = [data[f"r{i}"] for i in range(int(data["n_ref"]))]
     sens = float(data["sens"])
 
@@ -242,27 +293,35 @@ def main():
     ap.add_argument("--spec", default="")
     ap.add_argument("--batch", type=int, default=0)
     ap.add_argument("--length", type=int, default=0)
+    ap.add_argument("--precision", default="fp32")
     args = ap.parse_args()
 
     if args.dump:
         return dump_one(args.dump, args.spec, args.batch, args.length,
-                        args.steps)
+                        args.steps, args.precision)
 
     os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
     dylib = pathlib.Path(os.environ["METALJAX_PLUGIN_PATH"])
     if not dylib.exists():
         sys.exit(f"plugin dylib not found: {dylib}")
     os.environ["JAX_PLATFORMS"] = "metal"
-    tol = float(os.environ.get("CHECK_TOL", "2e-3"))
+    # Base tolerance by precision (CHECK_TOL overrides both): fp32 keeps the
+    # suite's 2e-3; bf16 carries ~3 significant digits, so cross-backend
+    # rounding legitimately lands around 1e-2 (texmo_check's bf16 bar).
+    tol_env = os.environ.get("CHECK_TOL", "")
+    tol_of = lambda precision: (float(tol_env) if tol_env
+                                else (2e-2 if precision == "bf16" else 2e-3))
     print(f"plugin: {dylib} ({dylib.stat().st_size / 1e6:.1f} MB)")
 
-    configs = sorted(configs_from_csv(args.csv))
+    if args.csv.endswith(".jsonl"):
+        configs = configs_from_jsonl(args.csv)
+    else:
+        configs = sorted(configs_from_csv(args.csv))
     if args.only:
         configs = [c for c in configs if args.only in c[0] or args.only in c[1]]
     if args.limit:
         configs = configs[:args.limit]
-    print(f"{len(configs)} configurations, {args.steps} steps per chunk, "
-          f"tol {tol}\n")
+    print(f"{len(configs)} configurations, {args.steps} steps per chunk\n")
 
     # Imported here rather than in `run_one`, and after JAX_PLATFORMS is
     # fixed: a plugin that cannot load should say so before the first child
@@ -273,7 +332,7 @@ def main():
     counts = {"ok": 0, "ok~": 0, "decline": 0, "FAIL": 0, "ERROR": 0}
     declines, failures = {}, []
     print(f"{'':<6} {'config':<18} {'spec':<46} detail")
-    for name, spec, batch, length in configs:
+    for name, spec, precision, batch, length in configs:
         t0 = time.perf_counter()
         work = root / name
         child = dict(os.environ)
@@ -282,14 +341,15 @@ def main():
         proc = subprocess.run(
             [sys.executable, str(pathlib.Path(__file__).resolve()),
              "--dump", str(work), "--spec", spec, "--batch", str(batch),
-             "--length", str(length), args.csv, str(args.steps)],
+             "--length", str(length), "--precision", precision,
+             args.csv, str(args.steps)],
             env=child, capture_output=True, text=True)
         if proc.returncode != 0:
             tag, detail = "ERROR", ("build: " + " ".join(
                 (proc.stderr or proc.stdout).split())[-110:])
         else:
             try:
-                tag, detail = run_one(work, tol)
+                tag, detail = run_one(work, tol_of(precision))
             except BaseException as exc:                # noqa: BLE001
                 tag, detail = "ERROR", (f"{type(exc).__name__}: "
                                         f"{str(exc).splitlines()[0][:100]}")

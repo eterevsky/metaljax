@@ -158,6 +158,11 @@ std::vector<mx::array> MslPlan::run(const std::vector<mx::array>& carries,
       total = total ? mx::add(*total, t) : t;
     }
     if (!total) throw std::runtime_error("msl: accumulator with no terms");
+    // A bf16 accumulator's hidden stacks are f32 (the kernel upconverts at
+    // the store), so the total arrives f32; land it back on the carry's own
+    // dtype or the loop's next iteration sees a promoted carry.  f32 plans
+    // never take the astype.
+    if (total->dtype() != x.dtype()) total = mx::astype(*total, x.dtype());
     vals[static_cast<size_t>(a.first)] = mx::add(x, *total);
   }
   return vals;

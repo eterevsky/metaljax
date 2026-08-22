@@ -206,6 +206,15 @@ def _cases():
     # where jax-CPU itself is 1.3e-6.
     DOT = (1e-5, 1e-5)
     HALF = (5e-3, 5e-3)
+    # bf16 contractions/backward passes: reordered accumulation at 2^-8 ULP.
+    BF16DOT = (2e-2, 2e-2)
+    # The fissioned bf16 weight gradient sums ~100 bf16-rounded products, and
+    # the CPU rounds the scan carry to bf16 every step where a fused MLX
+    # chain (and the kernel's f32 registers) do not: measured 6.25e-02 on an
+    # O(1) element -- a few bf16 ULP -- and the METALJAX_MSL=0 arm computes
+    # the SAME value, so the spread is the graph path's, not the kernel's.
+    BF16GRAD = (5e-2, 1e-1)
+    bf = lambda a: np.asarray(a).astype(jnp.bfloat16)  # noqa: E731
 
     # stablehlo.convolution's layouts, spelled the way jax spells them.  Every
     # one of them reaches the executor as three permutations and nothing else,
@@ -514,12 +523,35 @@ def _cases():
         ("msl nested unrolled loop", _msl_nested,
          [_rand((4, 8), 85), _rand((10, 4, 8), 86),
           _rand((8, 8), 87) * f(0.2)], *DOT),
+
+        # msl in bf16 (the topconfs16k cliff, 2026-08-22): the dtype table
+        # maps bf16 to MLX's bfloat16_t, so all three modes must plan and
+        # agree with the CPU's bf16 arithmetic; the "bf16 msl plans build"
+        # contract below reads the census.  Forward passes round per op on
+        # both engines (HALF); the fissioned backward passes contract the
+        # weight gradient in a different order, and one bf16 ULP is 2^-8, so
+        # their band is wider.
+        ("msl bf16 affine cell (mingru)", _msl_mingru,
+         [bf(_rand((4, 16), 460)), bf(_rand((24, 4, 16), 461)),
+          bf(_rand((16,), 462)), bf(_rand((16,), 463))], *HALF),
+        ("msl bf16 affine cell, backward", _msl_mingru_grad,
+         [bf(_rand((4, 16), 464)), bf(_rand((24, 4, 16), 465)),
+          bf(_rand((16,), 466)), bf(_rand((16,), 467))], *BF16DOT),
+        ("msl bf16 vector matvec cell", _msl_rnn,
+         [bf(_rand((4, 4), 468)), bf(_rand((16, 4, 4), 469)),
+          bf(_rand((4, 4), 470) * f(0.3))], *BF16DOT),
+        ("msl bf16 coop cell, weight grad", _msl_rnn_grad,
+         [bf(_rand((8, 32), 471)), bf(_rand((12, 8, 32), 472)),
+          bf(_rand((32, 32), 473) * f(0.1))], *BF16GRAD),
+
         # The same decision, one size up: 200 iterations still fit the OP
-        # budget, so the lowering calls the body traceable and compiles main
-        # around it -- and the executor then refuses to unroll more than 64
-        # into one trace and hands the program back to the eager path
-        # (`run_recovering`).  Both engines take that route; what this row
-        # checks is that the answer survives it.
+        # budget, but the executor refuses to unroll more than 64 into one
+        # trace -- and since the topconfs16k cascade fix the LOWERING carries
+        # the same bound (metal_lowering.cc kUnrollMax), so the loop is never
+        # called traceable and main takes the eager loop path outright
+        # instead of compiling, failing at trace time and retiring its
+        # compiled path.  What this row checks is that the answer survives
+        # that route.
         ("counted loop past the unroll ceiling",
          lambda x: jax.lax.fori_loop(0, 200, lambda i, c: c + 1.0, x),
          [np.float32(0.0)], *EXACT),
@@ -4737,11 +4769,37 @@ def _p21_msl(subprocess, pathlib, re):
                            "-- the byte gate does not see the kernel")
         return True, f"{on:.1f} MB planned vs {off:.1f} MB interpreted"
 
+    def bf16_takes_a_kernel():
+        """The topconfs16k cliff (2026-08-22): Stage 1's dtype table has no
+        bf16 row, so every bf16 scan fell to the cascade -- 25x slower and a
+        62 us/timestep plateau.  The native table maps bf16 -> bfloat16_t;
+        the bf16 msl cases must plan in ALL THREE modes, and the old
+        `not eligible (dtype bf16)` must never come back."""
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        proc = subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).resolve()),
+             "--msl-bf16"], env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout).splitlines()[-1][:80]
+        dtype_declines = len(re.findall(r"not eligible \(dtype bf16\)",
+                                        proc.stderr))
+        if dtype_declines:
+            return False, f"{dtype_declines} 'dtype bf16' decline(s) are back"
+        modes = re.findall(r"msl_scan: compiled plan .*?mode=(\w+)",
+                           proc.stderr)
+        missing = {"scalar", "vector", "coop"} - set(modes)
+        if missing:
+            return False, (f"no bf16 plan in {sorted(missing)} mode "
+                           f"(saw {sorted(set(modes))})")
+        return True, f"{len(modes)} bf16 kernels: {', '.join(sorted(set(modes)))}"
+
     return [("msl covers its three modes", modes_are_covered),
             ("METALJAX_MSL=0 builds no kernel", the_kill_switch_kills),
             ("msl coop width cap (F>=1024)", the_width_cap_holds),
             ("msl loop charged as one kernel",
-             a_planned_loop_is_charged_as_one_kernel)]
+             a_planned_loop_is_charged_as_one_kernel),
+            ("bf16 msl plans build", bf16_takes_a_kernel)]
 
 
 def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
@@ -4814,6 +4872,18 @@ def main():
         import jax
         for name, fn, args, _rtol, _atol in _cases():
             if name.startswith("msl "):
+                jax.jit(fn)(*args)
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--msl-bf16":
+        # The bf16 rows of the census, alone: these must PLAN (the dtype
+        # table maps bf16 since the topconfs16k cliff), and the parent reads
+        # the plugin's narration to tell a planned loop from a silently
+        # interpreted one.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        for name, fn, args, _rtol, _atol in _cases():
+            if name.startswith("msl bf16"):
                 jax.jit(fn)(*args)
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--msl-wide-coop":

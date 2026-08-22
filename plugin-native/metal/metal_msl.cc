@@ -152,11 +152,19 @@ void Debug(const std::string& line) {
 // ------------------------------------------------------------------ dtypes
 
 const std::map<std::string, std::string>& MslDtypes() {
+  // bf16 spells MLX's `bfloat16_t` (a typedef of the native MSL 3.1 `bfloat`
+  // in the vendored build) rather than `bfloat` itself: mx::fast::metal_kernel
+  // prepends MLX's kernel preamble (utils.h -> bf16.h + bf16_math.h), which
+  // both defines the typedef and instantiates the metal:: math library for it
+  // -- so the name works wherever MLX's own kernels do.  A DIVERGENCE from
+  // msl_scan.py, whose table has no bf16 row at all: Stage 1 declines every
+  // bf16 loop, and the 25x topconfs16k cliff (notes/topconfs16k-sweep-
+  // 2026-08-22.md) is what that costs.
   static const auto* m = new std::map<std::string, std::string>{
       {"f32", "float"}, {"f16", "half"},    {"i32", "int"},
       {"i1", "bool"},   {"i64", "long"},    {"i16", "short"},
       {"i8", "char"},   {"ui64", "ulong"},  {"ui32", "uint"},
-      {"ui16", "ushort"}, {"ui8", "uchar"}};
+      {"ui16", "ushort"}, {"ui8", "uchar"}, {"bf16", "bfloat16_t"}};
   return *m;
 }
 
@@ -790,7 +798,7 @@ class MslAnalyzer {
   Sym* DotGeneral(mlir::Operation* o, const std::vector<Sym*>& ins);
   Sym* InlaneDot(Sym* lhs, Sym* rhs,
                  const std::vector<std::vector<int64_t>>& dims4,
-                 const MslShape& shape);
+                 const MslShape& shape, const std::string& rdt);
   Sym* CounterArith(const std::string& name, Sym* a, Sym* b);
   Sym* Sliced(Sym* x, const std::vector<int64_t>& starts,
               const MslShape& sizes);
@@ -1307,7 +1315,11 @@ Sym* MslAnalyzer::ReduceAsDot(Sym* x, const std::vector<int64_t>& dims,
       if (!((d_ax == rank - 2 && red == rank - 1) ||
             (d_ax == rank - 1 && red == rank - 2)))
         continue;
-      if (x->dtype != "f32") continue;
+      // f32 or bf16: the emitters accumulate every dot in a float register
+      // regardless, and the typed result register rounds once at the end --
+      // XLA's own bf16-dot semantics (f32 products, f32 accumulate, one
+      // rounding).  A DIVERGENCE from msl_scan.py, which is f32-only here.
+      if (x->dtype != "f32" && x->dtype != "bf16") continue;
       const int64_t csize = x->shape[red], dsize = x->shape[d_ax];
       if (csize > 4096 || dsize > 4096) continue;
       // Compact weight: drop broadcast (stride-0 or size-1) dims.
@@ -1365,7 +1377,7 @@ Sym* MslAnalyzer::ReduceAsDot(Sym* x, const std::vector<int64_t>& dims,
         }
         roles.push_back(r);
       }
-      return MakeDot(arena_, data, wleaf, roles, widx, csize, dsize, "f32",
+      return MakeDot(arena_, data, wleaf, roles, widx, csize, dsize, x->dtype,
                      out_shape);
     }
   }
@@ -1436,7 +1448,7 @@ Sym* MslAnalyzer::ReduceAsDot(Sym* x, const std::vector<int64_t>& dims,
       const auto it = std::find(einsum_order.begin(), einsum_order.end(), ax);
       perm.push_back(static_cast<int64_t>(it - einsum_order.begin()));
     }
-    return MakeAccDot(arena_, ca, cb, {lb, rb, lc, rc}, out_shape, "f32",
+    return MakeAccDot(arena_, ca, cb, {lb, rb, lc, rc}, out_shape, x->dtype,
                       &perm);
   }
   return nullptr;
@@ -1477,6 +1489,13 @@ Sym* MslAnalyzer::DotGeneral(mlir::Operation* o, const std::vector<Sym*>& ins) {
            (s->leaf == LeafKind::kWhole || s->leaf == LeafKind::kArg);
   };
   const MslShape shape = ShapeOf(o->getResult(0));
+  // The RESULT dtype is the dot's own (preferred_element_type: bf16 operands
+  // may produce an f32 result).  The emitters accumulate in a float register
+  // either way; this dtype is the register the sum lands in.
+  const std::string rdt = Dt(o->getResult(0));
+  auto dot_dtype_ok = [](const std::string& d) {
+    return d == "f32" || d == "bf16";
+  };
 
   auto attempt = [&](Sym* w, Sym* data, const std::vector<int64_t>& wb,
                      const std::vector<int64_t>& db,
@@ -1493,7 +1512,9 @@ Sym* MslAnalyzer::DotGeneral(mlir::Operation* o, const std::vector<Sym*>& ins) {
     if (wfree.size() != 1) return nullptr;
     const int64_t dsize = w->shape[wfree[0]];
     if (csize > 4096 || dsize > 4096) return nullptr;
-    if (w->dtype != "f32" || data->dtype != "f32") return nullptr;
+    if (!dot_dtype_ok(w->dtype) || !dot_dtype_ok(data->dtype) ||
+        w->dtype != data->dtype || !dot_dtype_ok(rdt))
+      return nullptr;
     std::vector<MslRole> widx(w->shape.size());
     for (size_t i = 0; i < wb.size(); i++) {
       MslRole r;
@@ -1532,13 +1553,13 @@ Sym* MslAnalyzer::DotGeneral(mlir::Operation* o, const std::vector<Sym*>& ins) {
       }
       roles.push_back(reg);
     }
-    return MakeDot(arena_, data, w, roles, widx, csize, dsize, "f32", shape);
+    return MakeDot(arena_, data, w, roles, widx, csize, dsize, rdt, shape);
   };
 
   Sym* out = attempt(rhs, lhs, rb, lb, rc, lc, false);
   if (out == nullptr) out = attempt(lhs, rhs, lb, rb, lc, rc, true);
   if (out == nullptr) {
-    out = InlaneDot(lhs, rhs, {lb, rb, lc, rc}, shape);
+    out = InlaneDot(lhs, rhs, {lb, rb, lc, rc}, shape, rdt);
     if (out != nullptr) {
       inlane_fired = true;
       if (fired_ != nullptr) fired_->inlane = true;
@@ -1547,7 +1568,7 @@ Sym* MslAnalyzer::DotGeneral(mlir::Operation* o, const std::vector<Sym*>& ins) {
   if (out == nullptr) {
     // Cross-lane contraction (weight-gradient accumulation): representable
     // only as a hoisted post-kernel einsum.
-    out = MakeAccDot(arena_, lhs, rhs, {lb, rb, lc, rc}, shape, "f32");
+    out = MakeAccDot(arena_, lhs, rhs, {lb, rb, lc, rc}, shape, rdt);
   }
   return out;
 }
@@ -1555,13 +1576,16 @@ Sym* MslAnalyzer::DotGeneral(mlir::Operation* o, const std::vector<Sym*>& ins) {
 // msl_scan.py `_inlane_dot`: small dots between two LOOP-COMPUTED values.
 Sym* MslAnalyzer::InlaneDot(Sym* lhs, Sym* rhs,
                             const std::vector<std::vector<int64_t>>& dims4,
-                            const MslShape& shape) {
+                            const MslShape& shape, const std::string& rdt) {
   const std::vector<int64_t>& lb = dims4[0];
   const std::vector<int64_t>& rb = dims4[1];
   const std::vector<int64_t>& lc = dims4[2];
   const std::vector<int64_t>& rc = dims4[3];
   if (no_inlane_dot_ || !Flags().inlane_dots) return nullptr;
-  if (lhs->dtype != "f32" || rhs->dtype != "f32") return nullptr;
+  auto ok = [](const std::string& d) { return d == "f32" || d == "bf16"; };
+  if (!ok(lhs->dtype) || !ok(rhs->dtype) || lhs->dtype != rhs->dtype ||
+      !ok(rdt))
+    return nullptr;
   if (std::max(lhs->shape.size(), rhs->shape.size()) < 3 && shape.size() < 3) {
     // Matrix-state signature only: rank-2 cases are fission territory.
     return nullptr;
@@ -1589,7 +1613,12 @@ Sym* MslAnalyzer::InlaneDot(Sym* lhs, Sym* rhs,
         rdims[rfree[k]] = nb + static_cast<int64_t>(lfree.size()) + k;
       Sym* a = Broadcasted(lhs, shape, ldims);
       Sym* b = Broadcasted(rhs, shape, rdims);
-      return MakeElem(arena_, "stablehlo.multiply", {a, b}, "f32", shape);
+      // A widened result dtype (preferred_element_type) converts the
+      // operands EXPLICITLY: the products are computed wide, as XLA's dot
+      // does, and the emitters never mix dtypes inside one Elem.
+      if (a->dtype != rdt) a = MakeElem(arena_, "convert", {a}, rdt, a->shape, rdt);
+      if (b->dtype != rdt) b = MakeElem(arena_, "convert", {b}, rdt, b->shape, rdt);
+      return MakeElem(arena_, "stablehlo.multiply", {a, b}, rdt, shape);
     }
     if (lc.size() == 1 && rc.size() == 1 && lhs->shape.size() >= 2 &&
         rhs->shape.size() >= 2 &&
@@ -1612,8 +1641,10 @@ Sym* MslAnalyzer::InlaneDot(Sym* lhs, Sym* rhs,
       rdims[rc[0]] = last;
       Sym* a = Broadcasted(lhs, inner, ldims);
       Sym* b = Broadcasted(rhs, inner, rdims);
-      Sym* mul = MakeElem(arena_, "stablehlo.multiply", {a, b}, "f32", inner);
-      return MakeRedReg(arena_, mul, shape, "f32");
+      if (a->dtype != rdt) a = MakeElem(arena_, "convert", {a}, rdt, a->shape, rdt);
+      if (b->dtype != rdt) b = MakeElem(arena_, "convert", {b}, rdt, b->shape, rdt);
+      Sym* mul = MakeElem(arena_, "stablehlo.multiply", {a, b}, rdt, inner);
+      return MakeRedReg(arena_, mul, shape, rdt);
     }
   } catch (const MslUnsupported& e) {
     Debug(absl::StrCat("inlane_dot bail: ", e.msg));
@@ -2259,9 +2290,12 @@ std::string MslLiteral(const Sym* s) {
     return absl::StrCat(s->ival);
   }
   const double v = s->dval;
-  if (v != v) return "NAN";
-  if (v > 0 && std::isinf(v)) return "INFINITY";
-  if (v < 0 && std::isinf(v)) return "(-INFINITY)";
+  if (v != v)
+    return s->dtype == "bf16" ? "((bfloat16_t)NAN)" : "NAN";
+  if (v > 0 && std::isinf(v))
+    return s->dtype == "bf16" ? "((bfloat16_t)INFINITY)" : "INFINITY";
+  if (v < 0 && std::isinf(v))
+    return s->dtype == "bf16" ? "((bfloat16_t)(-INFINITY))" : "(-INFINITY)";
   // Python's `repr(float)` -- the shortest decimal that round-trips -- with a
   // decimal point forced, since `1f` is not a float literal in MSL.
   std::string out = absl::StrFormat("%.17g", v);
@@ -2277,6 +2311,13 @@ std::string MslLiteral(const Sym* s) {
       out.find("inf") == std::string::npos &&
       out.find("nan") == std::string::npos)
     absl::StrAppend(&out, ".0");
+  // A bf16 constant is emitted AS bf16: a bare float literal makes a call
+  // like metal::max(x, 0.5f) ambiguous (the bfloat, float and half overloads
+  // are all one implicit conversion away), and typing the literal is also
+  // the HLO's own arithmetic -- a bf16 op computes on bf16 values.  f32 and
+  // f16 literals keep Stage 1's exact spelling.
+  if (s->dtype == "bf16")
+    return absl::StrCat("((bfloat16_t)", out, "f)");
   return absl::StrCat(out, "f");
 }
 
@@ -2503,7 +2544,12 @@ MslPlanned::MslPlanned(const MslEnv& env, mlir::Block& body,
     }
     if (ContainsAccDot(sym))
       MslDecline(absl::StrCat("acc under elementwise: ", Dump(sym)));
-    if (sym->dtype != "f32") MslDecline("non-f32 accumulator operand");
+    // f32 or bf16: a hidden per-step stack is DECLARED f32 either way
+    // (LowerMslPlan), so a bf16 term is upconverted at the kernel's store
+    // and the post-kernel accumulation runs in f32 -- one rounding when the
+    // total lands back on the carry (MslPlan::run).
+    if (sym->dtype != "f32" && sym->dtype != "bf16")
+      MslDecline(absl::StrCat("accumulator operand dtype ", sym->dtype));
     for (size_t hi = 0; hi < hidden_.size(); hi++) {
       if (hidden_[hi].first == sym) {
         out.kind = 0;

@@ -95,3 +95,46 @@ anchor `notes/data/texmo-topconfs-final.jsonl` covers the retired 163-row
 set). Gate-harness anchor swap folds into the post-release cleanup
 (task #48); until then `topconfs16k-metal-2026-08-22.jsonl` is the
 comparison file.
+
+## 4. FIX LANDED (same day): bf16 fast paths in the native engine
+
+bf16/fp32 geomean **24.7 → 1.086** on the 223-config set (22.8× faster
+than the pre-fix bf16 leg, 0/223 rows regressed vs it; warmup total
+2603 s → 146 s). fp32 no-regression: geomean 0.9983 with all excursions
+disproven standalone (binary-equal); suite-106 0.9673 vs the release arm,
+six in-suite excursions all binary-equal standalone (the suite-context
+trap); texmo_gate 106/106; execute/ingest/bazel green. What landed:
+
+- **msl bf16**: `MslDtypes()` maps bf16 → MLX's `bfloat16_t`; typed bf16
+  literals (Metal has NO implicit float→bfloat conversion — measured, an
+  11-case kernel experiment in the logs); `CastTo` on every value landing
+  in a bf16 register (all three emitters); `sign` computed via float.
+- **bf16 dots** (ReduceAsDot / DotGeneral / InlaneDot / accumulator
+  fission): XLA bf16-dot semantics — operands widened to f32, f32
+  accumulate, one rounding at the typed result store; result dtype honors
+  `preferred_element_type`; hidden weight-grad stacks stay f32 with the
+  total astype'd back to the carry dtype.
+- **Cascade hardening**: `kUnrollMax=64` aligns `WhileTraceable` with
+  `run_while`'s in-trace refusal (the approve-then-fail path that retired
+  compiled bodies permanently); the eager counted loop's BLOCKING flush
+  floors at 8 iterations (submission cadence + op-unit accounting
+  unchanged — bit-identical for period ≥ 8).
+- **Tests**: 4 bf16 msl differential cases (forward bit-exact vs CPU) +
+  a "bf16 msl plans build in all three modes / no dtype-bf16 declines"
+  contract in execute_test; texmo_gate gains JSONL configs + bf16-aware
+  checking (uint16-view ULP bumps, f32 references).
+
+Measured answer to "why didn't chunking save the plateau": it was
+working — K=16 chunked replays cost ~60 µs/timestep intrinsically at b1
+(encode-bound, ~8–10 launches/t; CHUNK_MAX 16→256 changes nothing). The
+graph path cannot rescue these shapes; only the msl kernel (0.4 µs/t) can.
+
+Remaining, stated: 8 bf16 rows at 2–4.2× fp32 (small-F matvec cells,
+per-element bf16 weight-load conversion — optimization remainder, kernels
+correct); f16 dots still declined (no workload); a LATENT WEDGE seen once
+on an intermediate broken build — repeated Metal kernel-build failures
+inside chunked replays left an MLX shared event unsignaled, process hung
+in `Event::wait()` (stack on file). Unreachable on the final build but a
+no-panic-contract concern → follow-up task filed.
+
+Logs: `~/.cache/metaljax-bench/logs/bf16-msl/`.
