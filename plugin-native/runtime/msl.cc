@@ -11,6 +11,8 @@
 #include "msl.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <tuple>
@@ -44,6 +46,23 @@ MslPlan::MslPlan(std::string name, std::string source, std::string header,
   if (out_shapes_.size() != out_dtypes_.size() ||
       out_shapes_.size() != out_names_.size())
     throw std::invalid_argument("msl: output spec mismatch");
+  // MJDBG_MSL_DUMP=<dir>: write every generated kernel to <dir>/<name>.msl.
+  // A generated kernel that differs by one index expression is silent
+  // wrongness, so being able to READ the shader is the first move of any
+  // msl investigation -- it is what found the nested-scan P0 (twelve
+  // unrolled steps all loading one hoisted window).
+  if (const char* dir = std::getenv("MJDBG_MSL_DUMP")) {
+    std::string path = std::string(dir) + "/" + name_ + ".msl";
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+      std::fprintf(f, "// inputs:");
+      for (const std::string& n : in_names_) std::fprintf(f, " %s", n.c_str());
+      std::fprintf(f, "\n// outputs:");
+      for (const std::string& n : out_names_) std::fprintf(f, " %s", n.c_str());
+      std::fprintf(f, "\n%s\n/* ---- source ---- */\n%s\n", header_.c_str(),
+                   source_.c_str());
+      std::fclose(f);
+    }
+  }
   parse(layout);
 }
 

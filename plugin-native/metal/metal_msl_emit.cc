@@ -286,18 +286,21 @@ std::string MslPlanned::EmitScalar() {
                              lane[i], "u;"));
   }
 
-  // Whole (invariant) tensors: load once.  0-dim inputs arrive by value.
+  // Whole (invariant) tensors: load once PER WINDOW.  0-dim inputs arrive by
+  // value.
   for (const auto& kv : wholes_) {
     const int sid = kv.first;
-    const Sym* leaf = kv.second.first;
-    const std::string& name = kv.second.second;
-    if (BufferShape(leaf).empty()) {
-      L.push_back(absl::StrCat(T(leaf->dtype), " ", name, " = inp", sid, ";"));
-    } else {
-      const std::string off =
-          MslOffStrided(leaf->shape, leaf->strides, lane, leaf->offset);
-      L.push_back(absl::StrCat(T(leaf->dtype), " ", name, " = ", Src(sid), "[",
-                               off, "];"));
+    for (const WholeEntry& w : kv.second) {
+      const Sym* leaf = w.leaf;
+      const std::string& name = w.name;
+      if (BufferShape(leaf).empty()) {
+        L.push_back(absl::StrCat(T(leaf->dtype), " ", name, " = inp", sid, ";"));
+      } else {
+        const std::string off =
+            MslOffStrided(leaf->shape, leaf->strides, lane, leaf->offset);
+        L.push_back(absl::StrCat(T(leaf->dtype), " ", name, " = ", Src(sid),
+                                 "[", off, "];"));
+      }
     }
   }
   // State registers.
@@ -353,10 +356,10 @@ std::string MslPlanned::EmitScalar() {
         if (st != state_args_.end()) {
           v = absl::StrCat("st", st->second);
         } else {
-          v = wholes_.at(SourceKey(s->source)).second;
+          v = Whole(s).name;
         }
       } else if (s->leaf == LeafKind::kWhole) {
-        v = wholes_.at(SourceKey(s->source)).second;
+        v = Whole(s).name;
       } else {
         MslDecline("leaf kind");
       }
@@ -426,18 +429,20 @@ std::string MslPlanned::EmitVector() {
                                lane[i], "u;"));
   }
 
-  // Invariant tensors (not weights): preload.
+  // Invariant tensors (not weights): preload, one register per window.
   for (const auto& kv : wholes_) {
     const int sid = kv.first;
-    const Sym* leaf = kv.second.first;
-    const std::string& name = kv.second.second;
-    const int64_t r = R(leaf);
-    out.push_back(Declare(name, leaf->dtype, r));
-    if (BufferShape(leaf).empty()) {
-      out.push_back(r == 1 ? absl::StrCat(name, " = inp", sid, ";") : "");
-    } else {
-      Load(&out, name, leaf->dtype, r, Src(sid),
-           VecOff(leaf->shape, &leaf->strides, leaf->offset));
+    for (const WholeEntry& w : kv.second) {
+      const Sym* leaf = w.leaf;
+      const std::string& name = w.name;
+      const int64_t r = R(leaf);
+      out.push_back(Declare(name, leaf->dtype, r));
+      if (BufferShape(leaf).empty()) {
+        out.push_back(r == 1 ? absl::StrCat(name, " = inp", sid, ";") : "");
+      } else {
+        Load(&out, name, leaf->dtype, r, Src(sid),
+             VecOff(leaf->shape, &leaf->strides, leaf->offset));
+      }
     }
   }
   // States.
@@ -572,12 +577,12 @@ std::string MslPlanned::EmitVector() {
             v = {absl::StrCat("st", st->second),
                  shape.empty() ? 1 : shape.back()};
           } else {
-            const auto& w = wholes_.at(SourceKey(s->source));
-            v = {w.second, R(w.first)};
+            const WholeEntry& w = Whole(s);
+            v = {w.name, R(w.leaf)};
           }
         } else if (s->leaf == LeafKind::kWhole) {
-          const auto& w = wholes_.at(SourceKey(s->source));
-          v = {w.second, R(w.first)};
+          const WholeEntry& w = Whole(s);
+          v = {w.name, R(w.leaf)};
         } else {
           MslDecline("leaf kind in vector mode");
         }
@@ -908,15 +913,17 @@ std::string MslPlanned::EmitCoop() {
 
   for (const auto& kv : wholes_) {
     const int sid = kv.first;
-    const Sym* leaf = kv.second.first;
-    const std::string& name = kv.second.second;
-    const int64_t r = CoopR(leaf);
-    out.push_back(Declare(name, leaf->dtype, r));
-    if (BufferShape(leaf).empty()) {
-      out.push_back(absl::StrCat(name, " = inp", sid, ";"));
-    } else {
-      Load(&out, name, leaf->dtype, r, Src(sid),
-           CoopOff(leaf->shape, &leaf->strides, leaf->offset));
+    for (const WholeEntry& w : kv.second) {
+      const Sym* leaf = w.leaf;
+      const std::string& name = w.name;
+      const int64_t r = CoopR(leaf);
+      out.push_back(Declare(name, leaf->dtype, r));
+      if (BufferShape(leaf).empty()) {
+        out.push_back(absl::StrCat(name, " = inp", sid, ";"));
+      } else {
+        Load(&out, name, leaf->dtype, r, Src(sid),
+             CoopOff(leaf->shape, &leaf->strides, leaf->offset));
+      }
     }
   }
   for (size_t j = 0; j < states_.size(); j++) {
@@ -977,12 +984,12 @@ std::string MslPlanned::EmitCoop() {
             CheckStateView(s, pos, true);
             v = {absl::StrCat("st", st->second), CoopRShape(arg_shapes[pos])};
           } else {
-            const auto& w = wholes_.at(SourceKey(s->source));
-            v = {w.second, CoopR(w.first)};
+            const WholeEntry& w = Whole(s);
+            v = {w.name, CoopR(w.leaf)};
           }
         } else if (s->leaf == LeafKind::kWhole) {
-          const auto& w = wholes_.at(SourceKey(s->source));
-          v = {w.second, CoopR(w.first)};
+          const WholeEntry& w = Whole(s);
+          v = {w.name, CoopR(w.leaf)};
         } else {
           MslDecline("coop leaf kind");
         }

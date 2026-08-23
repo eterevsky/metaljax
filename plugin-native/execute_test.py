@@ -205,13 +205,12 @@ def _msl_chunked(h0, xs, us, wz, wh):
     first and what a caller reads back last.
 
     Driven by the "a forced kernel-build failure never wedges" contract, not
-    by `_cases()`, and that is deliberate: with the kernel force-failed the
-    answer comes from the interpreted loop and matches the CPU, but with the
-    kernel RUNNING this shape is subject to a separate, pre-existing bug --
-    an msl scan nested inside an outer scan computes wrong values on HEAD
-    (standalone msl scans are bit-exact; even ONE outer iteration is wrong;
-    independent of METALJAX_COMPILE).  Reported for its own fix; a case here
-    would fail for that reason and say nothing about the wedge.
+    by `_cases()`: what it pins is the wedge, and the shape's arithmetic is
+    covered by the two "nested scan ..." cases below.  Those exist because
+    this shape ALSO carried the nested-scan P0 -- an msl scan inside an outer
+    scan read one timestep of the captured sequence for every step -- which
+    was a collision between invariant loads keyed by source rather than by
+    window, and is fixed.
     """
     import jax
     import jax.numpy as jnp
@@ -484,6 +483,45 @@ def _cases():
                  None),
              np.float32(0), xs)[0],
          [_rand((4, 3), 48)], *F32),
+
+        # THE NESTED-SCAN P0.  An inner counted scan over a sequence CAPTURED
+        # from the enclosing scope, inside an outer scan: the msl analyzer
+        # unrolls the inner loop symbolically into the outer loop's kernel,
+        # which turns `us[j]` into one loop-INVARIANT load per unrolled step,
+        # each addressing a different window of the same buffer.  Invariant
+        # loads used to be keyed by SOURCE alone, so all twelve collapsed onto
+        # one window and every step read the same timestep -- full-magnitude
+        # wrong answers, no error, and only when nested (a standalone msl scan
+        # was always bit-exact, which is what hid it).
+        #
+        # The first form is the decodable one and is deliberately EXACT: with
+        # us[t] = 2**t the carry is literally the bitmask of the timesteps the
+        # loop read, so a stuck index shows up as the wrong POWER OF TWO and
+        # not as drift.  Correct = 3 * (2**12 - 1) = 12285; the unfixed engine
+        # returned 36, having read us[0] twelve times per outer iteration.
+        ("nested scan reads every timestep",
+         lambda h0, xs, us: jax.lax.scan(
+             lambda h, x: (jax.lax.scan(lambda c, u: (c + u, None),
+                                        h + x, us)[0], None),
+             h0, xs)[0],
+         [np.zeros((2, 8), f), np.zeros((3, 2, 8), f),
+          np.tile((f(2.0) ** np.arange(12, dtype=f))[:, None, None],
+                  (1, 2, 8))], *EXACT),
+        # ...and the shape it was found in: a gated cell over a captured
+        # sequence, whose wrongness was a plausible-looking 4.2e-2 on values
+        # of scale 6.3e-2.  Wrong on the FIRST outer iteration already, so one
+        # outer step is enough to catch it.
+        ("nested scan over a captured sequence",
+         lambda h0, xs, us, wz, wh: jax.lax.scan(
+             lambda h, x: (jax.lax.scan(
+                 lambda c, u: (jax.nn.sigmoid(u * wz) * c
+                               + (1.0 - jax.nn.sigmoid(u * wz))
+                               * jnp.tanh(u * wh), None),
+                 h + x, us)[0], None),
+             h0, xs)[0],
+         [_rand((4, 16), 93), _rand((2, 4, 16), 94) * f(0.1),
+          _rand((12, 4, 16), 95) * f(0.1), _rand((16,), 96) * f(0.3),
+          _rand((16,), 97) * f(0.3)], *F32),
         ("scan with a stacked output",
          lambda w, xs: jax.lax.scan(
              lambda c, x: (c + x @ w, c), jnp.zeros((3,), jnp.float32), xs)[1],

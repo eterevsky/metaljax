@@ -2872,7 +2872,10 @@ MslPlanned::MslPlanned(const MslEnv& env, mlir::Block& body,
       static_cast<int64_t>(hidden_.size());
   if (raw_bind > Flags().pack_trigger) {
     std::map<int, Sym*> per_sid;
-    for (const auto& kv : wholes_) per_sid.emplace(kv.first, kv.second.first);
+    // Any window of a source names the same BUFFER, and the pool slot is
+    // sized from the buffer -- so the first entry stands for the source.
+    for (const auto& kv : wholes_)
+      if (!kv.second.empty()) per_sid.emplace(kv.first, kv.second.front().leaf);
     for (const ReadEntry& r : reads_) per_sid.emplace(r.sid, r.leaf);
     for (const auto& kv : weights_) per_sid.emplace(kv.first, kv.second);
     std::map<std::string, std::vector<std::pair<int, int64_t>>> by_dtype;
@@ -2954,8 +2957,21 @@ void MslPlanned::Collect(const std::vector<Sym*>& roots) {
     if (s == nullptr || !seen.insert(s).second) return;
     if (s->kind == SymKind::kElem) {
       for (Sym* a : s->args) walk(a);
-    } else if (s->kind == SymKind::kPad || s->kind == SymKind::kRedReg) {
+    } else if (s->kind == SymKind::kPad || s->kind == SymKind::kRedReg ||
+               s->kind == SymKind::kPerm || s->kind == SymKind::kAccRed) {
+      // kPerm and kStack reach the emitters as the VALUE of a stacked write
+      // (`_emit_vector`'s write-target arms), so their operands are emitted
+      // and every invariant leaf under them has to be collected here.  While
+      // an invariant leaf was keyed by source alone this was invisible: an
+      // uncollected leaf simply resolved to whichever window of its source
+      // was collected -- the same silent wrongness, one level down.
       walk(s->inner);
+    } else if (s->kind == SymKind::kStack) {
+      walk(s->sbase);
+      for (const auto& kv : s->parts) walk(kv.second);
+    } else if (s->kind == SymKind::kAccDot) {
+      walk(s->lhs);
+      walk(s->rhs);
     } else if (s->kind == SymKind::kDot) {
       walk(s->data);
       const int sid = SourceId(s->weight->source);
@@ -2974,13 +2990,9 @@ void MslPlanned::Collect(const std::vector<Sym*>& roots) {
         }
       } else if (s->leaf == LeafKind::kArg) {
         const int64_t pos = s->source.carry;
-        if (state_args_.count(pos) == 0) {
-          const int sid = SourceId(s->source);
-          wholes_.emplace(sid, std::make_pair(s, absl::StrCat("w", sid)));
-        }
+        if (state_args_.count(pos) == 0) AddWhole(SourceId(s->source), s);
       } else if (s->leaf == LeafKind::kWhole) {
-        const int sid = SourceId(s->source);
-        wholes_.emplace(sid, std::make_pair(s, absl::StrCat("w", sid)));
+        AddWhole(SourceId(s->source), s);
       } else if (s->leaf == LeafKind::kUpdated) {
         MslDecline("nested update use");
       }
@@ -3031,6 +3043,55 @@ std::string MslPlanned::Src(int sid) const {
   auto it = packed_.find(sid);
   if (it == packed_.end()) return absl::StrCat("inp", sid);
   return absl::StrCat("(", it->second.first, " + ", it->second.second, "u)");
+}
+
+// What makes two loop-invariant loads the SAME load: one source, one window.
+std::string MslPlanned::WindowKey(int sid, const Sym* leaf) {
+  return absl::StrCat(sid, "|", Join(leaf->shape), "|", Join(leaf->strides),
+                      "|", leaf->offset);
+}
+
+// Register an invariant leaf, one entry per distinct window.  The first window
+// of a source keeps the plain `w<sid>` name, so every plan that reads each of
+// its sources at a single window generates exactly the source it did before.
+void MslPlanned::AddWhole(int sid, Sym* leaf) {
+  const std::string key = WindowKey(sid, leaf);
+  if (whole_index_.find(key) != whole_index_.end()) return;
+  std::vector<WholeEntry>& v = wholes_[sid];
+  std::string name = v.empty() ? absl::StrCat("w", sid)
+                               : absl::StrCat("w", sid, "_", v.size());
+  // The census signal for the nested-scan P0: a source read at more than one
+  // window is what the source-keyed map used to collapse.  Two windows can
+  // differ as KEYS and still address the same elements (unit dims a reshape
+  // left behind); only a difference in the addressed elements was wrong
+  // before, so the line says which -- "alias" is the wrongness, "benign" is
+  // an extra load of the same data.
+  if (!v.empty()) {
+    auto squeeze = [](const Sym* s) {
+      std::string out;
+      for (size_t i = 0; i < s->shape.size(); i++)
+        if (s->shape[i] != 1)
+          absl::StrAppend(&out, s->shape[i], ":",
+                          i < s->strides.size() ? s->strides[i] : 0, ",");
+      return out;
+    };
+    const Sym* first = v.front().leaf;
+    const bool alias =
+        first->offset != leaf->offset || squeeze(first) != squeeze(leaf);
+    Debug(absl::StrCat("msl invariant window: source ", sid, " window ",
+                       v.size(), " ", alias ? "ALIAS" : "benign", " (shape [",
+                       Join(leaf->shape), "] strides [", Join(leaf->strides),
+                       "] offset ", leaf->offset, " vs first offset ",
+                       first->offset, ")"));
+  }
+  whole_index_[key] = {sid, v.size()};
+  v.push_back(WholeEntry{leaf, std::move(name)});
+}
+
+const MslPlanned::WholeEntry& MslPlanned::Whole(const Sym* leaf) const {
+  auto it = whole_index_.find(WindowKey(SourceKey(leaf->source), leaf));
+  if (it == whole_index_.end()) MslDecline("invariant leaf not collected");
+  return wholes_.at(it->second.first)[it->second.second];
 }
 
 std::string MslPlanned::ReadName(const Sym* leaf) const {

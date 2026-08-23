@@ -322,6 +322,18 @@ class MslPlanned {
   void Collect(const std::vector<Sym*>& roots);
   int SourceId(const MslSrc& src);
 
+  // One loop-invariant load: the leaf that fixes the WINDOW to read, and the
+  // name the kernel gives that register.  See `wholes_` below.
+  struct WholeEntry {
+    Sym* leaf;
+    std::string name;
+  };
+
+  // The invariant-leaf window key, and the entry a leaf resolves to.
+  static std::string WindowKey(int sid, const Sym* leaf);
+  void AddWhole(int sid, Sym* leaf);
+  const WholeEntry& Whole(const Sym* leaf) const;
+
   // ---- state carried from analysis into emission
   SymArena arena_;
   const MslEnv* env_ = nullptr;
@@ -342,7 +354,23 @@ class MslPlanned {
   std::vector<ReadEntry> reads_;
   absl::flat_hash_map<std::string, size_t> read_index_;
 
-  std::map<int, std::pair<Sym*, std::string>> wholes_;
+  // The invariant ("whole") leaves, grouped by source and then by WINDOW.
+  //
+  // A leaf's identity is the slice of the buffer it addresses -- its shape,
+  // strides and offset -- and NOT its source alone.  One source can be read
+  // at many windows in a single body: the nested-loop unroll in `EvalOp`
+  // turns an inner scan over a captured sequence into one distinct slice per
+  // unrolled iteration, and two static slices of one captured tensor (a gate
+  // split, `w[0]` and `w[1]`) do it without any nesting at all.
+  // Keying by source id alone collapsed every such window onto the first one
+  // collected, so every unrolled iteration silently read the same slice --
+  // the nested-scan P0 (a `scan` inside a `scan` computed with the WRONG
+  // sequence element, at full magnitude and with no error anywhere).
+  // `reads_` above already keys by the whole window; this is the same
+  // discipline for the loop-invariant loads.
+  std::map<int, std::vector<WholeEntry>> wholes_;
+  // Window key -> (source id, index into `wholes_[sid]`).
+  absl::flat_hash_map<std::string, std::pair<int, size_t>> whole_index_;
   std::map<int, Sym*> weights_;
   std::map<int, std::vector<Sym*>> weight_dots_;
   std::map<std::string, int> source_ids_;

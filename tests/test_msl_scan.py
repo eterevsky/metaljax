@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from helpers import check
+from helpers import check, run_metal
 
 rng = np.random.default_rng(7)
 L, B, H = 12, 3, 5
@@ -447,3 +447,58 @@ def test_mixed_rank_carry_stabilizer_cell():
     check(jax.value_and_grad(lambda *a: f(*a)[1].sum(),
                              argnums=tuple(range(len(args)))), *args,
           rtol=1e-3, atol=1e-4)
+
+
+def test_nested_scan_reads_every_timestep():
+    """An inner scan over a CAPTURED sequence, nested in an outer scan.
+
+    The analyzer unrolls the statically-counted inner loop symbolically into
+    the outer loop's kernel, so `us[j]` becomes one loop-invariant load per
+    unrolled step -- each a different WINDOW of the same buffer.  Invariant
+    loads were keyed by source alone, so every window collapsed onto one and
+    every step read the same timestep.  Standalone msl scans stayed bit-exact
+    throughout, which is exactly why this needed nesting to show.
+
+    Decodable on purpose: with us[t] = 2**t the carry is the bitmask of the
+    timesteps actually read, so a stuck index is a wrong power of two rather
+    than drift.  Correct = 3 * (2**12 - 1) = 12285; the bug gave 36.
+    """
+    Ln, Bn, Hn = 12, 2, 8
+    us = np.tile((np.float32(2.0) ** np.arange(Ln, dtype=np.float32))
+                 [:, None, None], (1, Bn, Hn))
+    h0 = np.zeros((Bn, Hn), np.float32)
+    xs = np.zeros((3, Bn, Hn), np.float32)
+
+    def f(h0_, xs_, us_):
+        def outer(h, x):
+            return jax.lax.scan(lambda c, u: (c + u, None), h + x, us_)[0], None
+        return jax.lax.scan(outer, h0_, xs_)[0]
+
+    got = np.asarray(run_metal(f, h0, xs, us)[0])
+    assert got.min() == got.max() == 12285.0, (
+        f"nested scan read the wrong timesteps: {np.unique(got)[:4]}")
+    check(f, h0, xs, us)
+
+
+def test_nested_scan_over_captured_sequence():
+    """The gated-cell shape the P0 was found in: wrong by 4.2e-2 on values of
+    scale 6.3e-2, and wrong on the FIRST outer iteration already."""
+    Ln, Bn, Hn = 12, 4, 16
+    us = (rng.standard_normal((Ln, Bn, Hn)) * 0.1).astype(np.float32)
+    xs = (rng.standard_normal((2, Bn, Hn)) * 0.1).astype(np.float32)
+    h0 = (rng.standard_normal((Bn, Hn)) * 0.1).astype(np.float32)
+    wz = (rng.standard_normal(Hn) * 0.3).astype(np.float32)
+    wh = (rng.standard_normal(Hn) * 0.3).astype(np.float32)
+
+    def f(h0_, xs_, us_, wz_, wh_):
+        def cell(c, u):
+            z = jax.nn.sigmoid(u * wz_)
+            return z * c + (1.0 - z) * jnp.tanh(u * wh_), None
+
+        def outer(h, x):
+            return jax.lax.scan(cell, h + x, us_)[0], None
+        return jax.lax.scan(outer, h0_, xs_)[0]
+
+    check(f, h0, xs, us, wz, wh)
+    check(jax.value_and_grad(lambda *a: f(*a).sum(), argnums=(0, 3, 4)),
+          h0, xs, us, wz, wh, rtol=1e-4, atol=1e-5)
