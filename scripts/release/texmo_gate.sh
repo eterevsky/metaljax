@@ -4,19 +4,36 @@
 #   scripts/release/texmo_gate.sh [--smoke]
 #
 # Chains, strictly sequentially, holding the machine lock throughout:
-#   (a) scripts/texmo_check.py benchmarks/texmo-suite.csv
-#       whole-model vs jax-CPU on all 104 suite configurations.
-#       Baseline today: 96 ok + 8 ERROR on the tokens.32.raw_fold.* specs
-#       (missing tokenset in ~/texmo/tokens — environmental).  The wrapper
-#       classifies: raw_fold environment errors = warning; any other error,
-#       or any FAIL, = gate fail.
-#   (b) scripts/texmo_topconfs.py top_confs.jsonl --out notes/data/<dated>
-#       163-config perf + per-config correctness sweep.
+#   (a) plugin-native/texmo_gate.py benchmarks/texmo-suite.csv
+#       whole-model vs jax-CPU on every suite configuration, through the
+#       PJRT plugin.  Baseline: 106 ok, 0 decline, 0 FAIL/ERROR.
+#   (b) scripts/bench_texmo_pjrt.py top_confs.jsonl --out notes/data/<dated>
+#       223-config perf sweep, also through the plugin (the jax route).
 #   (c) scripts/texmo_topconfs_compare.py <anchor> <new>
-#       geomean of per-config metal ms/step ratios vs the 0.11.2 anchor
-#       notes/data/texmo-topconfs-final.jsonl.
+#       geomean of per-config metal ms/step ratios vs the anchor.
 #       Gate: geomean regression > TEXMO_GEOMEAN_TOL (default 3%) or any
 #       single config > TEXMO_CONFIG_TOL x slower (default 1.3).
+#
+# ROUTE + ANCHOR RE-BASELINE (0.11.6, the Stage-1 retirement).  Both legs
+# used to run Stage-1-only drivers -- scripts/texmo_check.py and
+# scripts/texmo_topconfs.py drove `metaljax.engine` in-process, so they
+# could not see a PJRT plugin at all and were deleted with the engine.
+# Consequences, decided with Oleg before the switch:
+#   * correctness moves to plugin-native/texmo_gate.py (same
+#     sensitivity-scaled tolerance, now over the plugin), 106/106;
+#   * perf moves to scripts/bench_texmo_pjrt.py, whose records are
+#     per-platform (`ms_step`/`platform`), not the retired dual-leg
+#     (`metal_ms_step`/`cpu_ms_step`) shape;
+#   * the 0.11.2-era anchor notes/data/texmo-topconfs-final.jsonl is
+#     RETIRED twice over: wrong route, and it covers the superseded
+#     163-config set (top_confs.jsonl became the 223-config 16k set at
+#     112ae10).  The anchor is now
+#     notes/data/topconfs16k-metal-2026-08-22.jsonl -- same route, same
+#     config set.
+#   * the suite-CSV (106-config) perf anchor, for runs that bench the
+#     suite rather than top_confs, is the 0.11.5 release native arm:
+#     $TEXMO_SUITE_ANCHOR (see below).  It still lives in the bench cache;
+#     commit it under notes/data/ with the next release's raw data.
 #
 # Wall time: (a) ~40-60 min, (b) ~1-1.5 h.
 #
@@ -36,18 +53,22 @@ SMOKE=0
 gate_init
 SUITE_CSV=${TEXMO_SUITE_CSV:-$MJ_ROOT/benchmarks/texmo-suite.csv}
 TOPCONFS=${TEXMO_TOPCONFS:-$MJ_ROOT/top_confs.jsonl}
-ANCHOR=${TEXMO_ANCHOR:-$MJ_ROOT/notes/data/texmo-topconfs-final.jsonl}
+ANCHOR=${TEXMO_ANCHOR:-$MJ_ROOT/notes/data/topconfs16k-metal-2026-08-22.jsonl}
+# Not used by this gate's compare leg; recorded so the suite-perf anchor
+# has one home.  (0.11.5 release native arm.)
+TEXMO_SUITE_ANCHOR=${TEXMO_SUITE_ANCHOR:-$HOME/.cache/metaljax-bench/logs/release-0.11.5/suite106-native.jsonl}
 NEW_JSONL=${TEXMO_OUT:-$MJ_ROOT/notes/data/texmo-topconfs-$GATE_DATE.jsonl}
 CHECK_STEPS=${TEXMO_CHECK_STEPS:-8}
 SUFFIX=""
-TOPCONF_ARGS=()
+CHECK_ARGS=()
+BENCH_ARGS=()
 
 if [ $SMOKE -eq 1 ]; then
   SUFFIX="-smoke"
   SUITE_CSV=${TEXMO_SUITE_CSV:-$HERE/smoke_texmo_configs.csv}
   NEW_JSONL=${TEXMO_OUT:-$GATE_DIR/texmo-topconfs-smoke.jsonl}
   CHECK_STEPS=${TEXMO_CHECK_STEPS:-2}
-  TOPCONF_ARGS=(--filter "${TEXMO_SMOKE_FILTER:-rnn.1.tanh-suffix.4-dense.1.tanh}")
+  BENCH_ARGS=(--only "${TEXMO_SMOKE_FILTER:-rnn.1.tanh-suffix.4-dense.1.tanh}")
   gate_say "SMOKE mode: csv=$SUITE_CSV steps=$CHECK_STEPS" \
            "filter=${TEXMO_SMOKE_FILTER:-rnn.1.tanh-suffix.4-dense.1.tanh}"
 fi
@@ -62,16 +83,16 @@ trap gate_unlock EXIT
 gate_lock
 T0=$(gate_now)
 
-gate_say "(a) texmo_check.py $SUITE_CSV ($CHECK_STEPS steps/chunk) -> $CHECK_LOG"
-(cd "$MJ_ROOT" && "$MJ_PY" scripts/texmo_check.py "$SUITE_CSV" "$CHECK_STEPS") \
-    > "$CHECK_LOG" 2>&1
+gate_say "(a) plugin-native/texmo_gate.py $SUITE_CSV ($CHECK_STEPS steps/chunk) -> $CHECK_LOG"
+(cd "$MJ_ROOT" && "$MJ_PY" plugin-native/texmo_gate.py "$SUITE_CSV" \
+    "$CHECK_STEPS" ${CHECK_ARGS[@]+"${CHECK_ARGS[@]}"}) > "$CHECK_LOG" 2>&1
 CHECK_RC=$?
 gate_say "    check rc=$CHECK_RC; $(grep -c '^ok' "$CHECK_LOG" 2>/dev/null) ok lines"
 
-gate_say "(b) texmo_topconfs.py -> $NEW_JSONL (log $TOP_LOG)"
-# ${TOPCONF_ARGS[@]+...}: bash 3.2 + set -u errors on an empty array expansion
-(cd "$MJ_ROOT" && "$MJ_PY" scripts/texmo_topconfs.py "$TOPCONFS" \
-    --out "$NEW_JSONL" ${TOPCONF_ARGS[@]+"${TOPCONF_ARGS[@]}"}) > "$TOP_LOG" 2>&1
+gate_say "(b) bench_texmo_pjrt.py -> $NEW_JSONL (log $TOP_LOG)"
+# ${BENCH_ARGS[@]+...}: bash 3.2 + set -u errors on an empty array expansion
+(cd "$MJ_ROOT" && "$MJ_PY" scripts/bench_texmo_pjrt.py "$TOPCONFS" \
+    --out "$NEW_JSONL" ${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}) > "$TOP_LOG" 2>&1
 TOP_RC=$?
 gate_say "    topconfs rc=$TOP_RC"
 

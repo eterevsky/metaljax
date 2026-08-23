@@ -9,7 +9,8 @@ run through BOTH dequantizations --
   * `keras_hub.src.utils.transformers.convert_gpt_oss`'s arithmetic E2M1
     decode (sign/exponent/mantissa masks), which is what the row does today;
   * `mxfp4_gpt_oss.np_dequant`'s table lookup, which is what the packed
-    loader's in-graph chain computes, and what `metaljax.qmm` verifies
+    loader's in-graph chain computes, and what the plugin's
+    quantized-matmul recognizer verifies
     against the E2M1 grid;
 
 -- and compared BIT for bit, in float32 and in the bfloat16 the row actually

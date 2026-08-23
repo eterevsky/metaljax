@@ -47,33 +47,6 @@ def test_dynamic_while_matches_cpu():
           rtol=1e-5, atol=1e-5)
 
 
-def test_dynamic_while_body_is_compiled():
-    """A dynamic loop's body must be a compiled graph, not op-by-op replay.
-
-    Asked of whichever engine ran the program: the claim is the same, but
-    the two record it in their own bookkeeping — the Python engine caches
-    the compiled body on the interpreter, the native tape compiles the
-    region in C++ and counts it.
-    """
-    from helpers import execute_module, from_buffer, lower_bytes
-    from metaljax import engine
-
-    x = rng.standard_normal(8).astype(np.float32)
-    before = None if engine.NATIVE is None else engine.NATIVE.stats()
-    ex, outs = execute_module(lower_bytes(_dynamic_while, x), (x,))
-    for o in outs:
-        from_buffer(o)          # read back: the loop runs before this returns
-    if before is not None and ex._native_prog:   # None = never asked (py)
-        after = engine.NATIVE.stats()
-        assert after["compiles"] > before["compiles"], \
-            "the body of a dynamic while was interpreted op by op"
-        return
-    interp = ex.interpreter
-    assert interp._body_cache, "no while body was executed"
-    assert any(compiled for _, _, compiled in interp._body_cache.values()), \
-        "the body of a dynamic while was interpreted op by op"
-
-
 # A compiled body's kernels are GENERATED AT EVAL, not by the call that
 # builds the graph. MLX fuses a wide elementwise body into a single Metal
 # kernel whose argument buffers are (non-constant inputs + outputs + up to
@@ -174,11 +147,10 @@ def test_remat():
 
 
 def test_equal_constant_outputs_compile():
-    # mx.compile dies (unordered_map::at) when two outputs bake to equal
-    # constants; the engine anchors non-input-derived outputs so the whole
-    # executable still compiles. Exercise the real runner path.
-    import mlx.core as mx
-    from metaljax import engine
+    # mx::compile dies (unordered_map::at) when two outputs bake to equal
+    # constants; the engine must anchor non-input-derived outputs so the
+    # whole executable still compiles and the values survive exactly.
+    from helpers import run_module
 
     mod = """
 module {
@@ -190,14 +162,10 @@ module {
   }
 }
 """
-    ex = engine.compile_program(mod.encode(), "mlir")
-    x = mx.array(np.array([1.0, 2.0], np.float32))
-    outs = list(ex.runner()(x))
-    mx.eval(*outs)
-    assert ex._can_compile  # must have taken the compiled path
-    np.testing.assert_array_equal(np.array(outs[0]), [2.0, 4.0])
-    assert float(outs[1].item()) == float(np.float32(0.999))
-    assert float(outs[2].item()) == float(np.float32(0.999))
+    y, a, b = run_module(mod, (np.array([1.0, 2.0], np.float32),))
+    np.testing.assert_array_equal(y, [2.0, 4.0])
+    assert float(a) == float(np.float32(0.999))
+    assert float(b) == float(np.float32(0.999))
 
 
 def test_scan_carrying_equal_constants():

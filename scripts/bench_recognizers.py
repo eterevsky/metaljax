@@ -8,11 +8,11 @@ environment's plugin choice is what is being measured:
     moe    a dense expert dispatch at decode (T=1) and at prefill
     sdpa   a softmax attention at a diffusion-ish and at a decode shape
 
-Each is run under three configurations of the SAME native plugin --
-recognizers on, recognizers off (`METALJAX_RECOGNIZE=0`), and (optionally) the
-Stage 1 trampoline -- which isolates exactly what the emit is worth: the
-programs, the shapes and the arithmetic are identical, only the rewrite
-differs.
+Each is run under two configurations of the SAME plugin -- recognizers on
+and recognizers off (`METALJAX_RECOGNIZE=0`) -- which isolates exactly what
+the emit is worth: the programs, the shapes and the arithmetic are
+identical, only the rewrite differs.  (A third leg used to measure the
+Stage 1 trampoline; that engine was retired in 0.11.6.)
 
 `jax.block_until_ready` is a no-op on this backend (CLAUDE.md item 9), so
 every timing loop is closed by `np.asarray` on one output.
@@ -190,8 +190,6 @@ def main():
     ap.add_argument("--reps", type=int, default=20)
     ap.add_argument("--only", default="")
     ap.add_argument("--child", default="")
-    ap.add_argument("--stage1", action="store_true",
-                    help="also measure the frozen Stage 1 trampoline")
     args = ap.parse_args()
 
     if args.child:
@@ -205,8 +203,6 @@ def main():
     configs = [("native+emits", {"METALJAX_PLUGIN_PATH": str(_DYLIB)}),
                ("native-emits", {"METALJAX_PLUGIN_PATH": str(_DYLIB),
                                  "METALJAX_RECOGNIZE": "0"})]
-    if args.stage1:
-        configs.append(("stage1", {}))
 
     rows = []
     for name in names:
@@ -237,8 +233,6 @@ def main():
             row["speedup_vs_no_emits"] = row["native-emits"] / row["native+emits"]
             print(f"{name:<24} {'speedup':<14} "
                   f"{row['speedup_vs_no_emits']:9.2f}x", flush=True)
-        if row.get("stage1") and row.get("native+emits"):
-            row["native_over_stage1"] = row["native+emits"] / row["stage1"]
         rows.append(row)
 
     if args.out:

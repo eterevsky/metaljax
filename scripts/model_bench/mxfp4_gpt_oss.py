@@ -15,7 +15,7 @@ This module keeps the checkpoint packed:
   * its `call` reconstructs the weight IN THE GRAPH: nibble unpack, a
     16-entry E2M1 table gather, and a multiply by the per-group
     power-of-two scale;
-  * metaljax's quantized-matmul recognizer (`metaljax.qmm`) matches that
+  * metaljax's quantized-matmul recognizer (in the plugin) matches that
     chain, verifies the values really are on the E2M1 grid with
     power-of-two group scales, repacks once into MLX's layout and replaces
     the whole chain with `mx.quantized_matmul(mode="mxfp4")`.

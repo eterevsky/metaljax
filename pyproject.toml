@@ -1,7 +1,7 @@
 [project]
 name = "metaljax"
-version = "0.11.5"
-description = "Experimental Metal backend for JAX on Apple silicon: PJRT plugin executing StableHLO on MLX"
+version = "0.11.6.dev0"
+description = "Experimental Metal backend for JAX on Apple silicon: a native PJRT plugin executing StableHLO on the GPU through a vendored MLX runtime"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -19,7 +19,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Environment :: GPU",
 ]
-dependencies = ["jax>=0.11,<0.12", "mlx>=0.32", "numpy", "ml_dtypes"]
+# No `mlx`: the wheel carries its own Metal runtime (a vendored, privately
+# install-named MLX build under metaljax/lib/mlx/) and no packaged module
+# imports the public one. numpy + ml_dtypes are the loader's callback
+# bridge's imports.
+dependencies = ["jax>=0.11,<0.12", "numpy", "ml_dtypes"]
 
 [project.urls]
 Repository = "https://github.com/eterevsky/metaljax"
@@ -32,26 +36,17 @@ metal = "jax_plugins.metal"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Wheel-only distribution: the plugin is a bazel-built dylib against a
+# pinned XLA workspace plus a vendored MLX runtime -- not something an sdist
+# can ship or compile at install time. (The Stage-1 trampoline, which could,
+# was retired in 0.11.6.)
 [tool.hatch.build.targets.wheel]
 packages = ["src/metaljax", "src/jax_plugins"]
-# The build hook compiles the plugin dylib into src/metaljax/lib/.
+# The build hook puts the plugin dylib into src/metaljax/lib/.
 artifacts = ["src/metaljax/lib/*.dylib"]
 
 [tool.hatch.build.targets.wheel.hooks.custom]
 path = "hatch_build.py"
-
-[tool.hatch.build.targets.sdist]
-include = [
-    "src",
-    "plugin/metal_pjrt.cc",
-    "plugin/build.sh",
-    "plugin/vendor",
-    "tests",
-    "scripts",
-    "hatch_build.py",
-    "README.md",
-    "LICENSE",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

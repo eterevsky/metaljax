@@ -12,14 +12,13 @@ that the expensive model rungs are only spent on hypotheses this cannot kill.
     JAX_PLATFORMS=metal,cpu python scripts/model_bench/row15_probe.py qwix
     JAX_PLATFORMS=metal,cpu python scripts/model_bench/row15_probe.py qwix --layers 36
 
-Stack under test: whatever `METALJAX_PLUGIN_PATH` selects (unset = Stage 1's
-`plugin/build/libmetal_pjrt.dylib`; a frozen native dylib = the native stack),
-exactly as `scripts/release/g5_model.sh` does it.
+Stack under test: whatever `METALJAX_PLUGIN_PATH` selects (unset = the
+installed plugin; a frozen dylib pins a specific build).
 
-`dots` is EXACT: an s8xs8->s32 contraction has one right answer, and both
-engines take `ops/linalg.py::_int_dot_via_f32` (chunk 1024, f32 GEMM per
-K-slice, i32 accumulation) whose whole correctness rests on MLX's f32 matmul
-being exact on integers below 2**24. That assumption has never been tested at
+`dots` is EXACT: an s8xs8->s32 contraction has one right answer, and the
+engine's integer dot goes through f32 (chunk 1024, f32 GEMM per K-slice,
+i32 accumulation) whose whole correctness rests on MLX's f32 matmul being
+exact on integers below 2**24. That assumption has never been tested at
 row-15 widths; the numpy reference here is computed in int64 and is not an
 approximation. `qwix` reproduces the row's real pattern — per-tensor dynamic
 absmax quantization around that dot — and reports the collapse statistics
@@ -313,7 +312,7 @@ def main():
                     help="metal only; the collapse criterion is intrinsic")
     args = ap.parse_args()
     log(f"row15_probe {args.probe} widths={args.widths} "
-        f"plugin={os.environ.get('METALJAX_PLUGIN_PATH', '(stage 1 default)')}")
+        f"plugin={os.environ.get('METALJAX_PLUGIN_PATH', '(installed default)')}")
     rc = {"dots": probe_dots, "qwix": probe_qwix, "big": probe_big}[args.probe](args)
     return 1 if rc else 0
 

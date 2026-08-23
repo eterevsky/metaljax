@@ -83,6 +83,9 @@ def _devices():
 
 @step("b: the Python engine is absent")
 def _no_engine():
+    # Vacuous in a clean 0.11.6 tree (the modules no longer exist); kept for
+    # one release to catch a stale install resurrecting them. DROP AFTER
+    # 0.11.6.
     for mod in ("metaljax.engine", "metaljax.interpreter"):
         assert mod not in sys.modules, f"{mod} was imported"
     print("  metaljax.engine imported: False (fully native)")

@@ -34,7 +34,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from helpers import check, run_metal, run_metal_device
+from helpers import check, run_metal
 
 F4 = jnp.float4_e2m1fn
 F6E2M3 = jnp.float6_e2m3fn
@@ -176,12 +176,13 @@ def test_fp6_arithmetic_stays_on_grid(dtype):
               lambda v: v.astype(dtype) * v.astype(dtype),
               lambda v: jnp.negative(v.astype(dtype))):
         packed = metal_pack(f, g, dtype)
-        # The DEVICE storage, before to_host narrows it: the claim is that
-        # narrowing loses nothing, so the two have to be read differently or
-        # the comparison is an array against itself.
-        (storage,) = run_metal_device(f, g)
+        # The device value BEFORE the wire narrows it, read by widening
+        # in-program (`astype(f32)` reads the f16 storage): the claim is
+        # that narrowing loses nothing, so the two have to be read
+        # differently or the comparison is an array against itself.
+        (wide,) = run_metal(lambda v, _f=f: _f(v).astype(jnp.float32), g)
         np.testing.assert_array_equal(
-            packed.astype(np.float32), storage.astype(np.float32),
+            packed.astype(np.float32), wide,
             err_msg="arithmetic result left the value grid")
 
 

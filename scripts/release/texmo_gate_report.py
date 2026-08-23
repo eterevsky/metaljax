@@ -1,23 +1,30 @@
 """Release gate step 3 — classify the texmo correctness + perf run.
 
 Consumes the three logs produced by scripts/release/texmo_gate.sh and the
-two topconfs JSONLs, applies the gate policy, writes a markdown block and a
+two benchmark JSONLs, applies the gate policy, writes a markdown block and a
 machine-readable record.
+
+Both legs run through the PJRT plugin since the Stage-1 retirement
+(0.11.6): correctness is `plugin-native/texmo_gate.py` (was
+`scripts/texmo_check.py`), perf is `scripts/bench_texmo_pjrt.py` (was
+`scripts/texmo_topconfs.py`).  The anchor re-baseline that came with the
+route change is documented in scripts/release/texmo_gate.sh.
 
 Policy
 ------
-correctness (scripts/texmo_check.py):
+correctness (plugin-native/texmo_gate.py):
   * any FAIL line                                   -> gate fail
-  * ERROR on a known-environmental config           -> warning
-    (spec matches TEXMO_KNOWN_ENV_SPEC *and* the message looks like a
-     missing tokenset.  This covered the 8 tokens.32.raw_fold.* configs
-     whose tokenset was absent from ~/texmo/tokens; commit 9ef5f58 taught
-     texmo_check.py to remap the renamed tokenset (.raw_fold -> .fold), so
-     the expected baseline is now 104 ok / 0 errors.  The classifier stays
-     as a safety net — it matches either spelling.)
-  * any other ERROR                                 -> gate fail
-performance (scripts/texmo_topconfs*.py):
-  * any check FAIL / error in the sweep             -> gate fail
+  * any ERROR                                       -> gate fail, unless it
+    is known-environmental (spec matches TEXMO_KNOWN_ENV_SPEC *and* the
+    message looks like a missing tokenset), which is a warning.  That
+    covered the 8 tokens.32.raw_fold.* configs whose tokenset was absent
+    from ~/texmo/tokens; the driver remaps the renamed tokenset
+    (.raw_fold -> .fold), so the expected baseline is 106 ok / 0 errors.
+    The classifier stays as a safety net — it matches either spelling.
+  * any `decline` (the plugin refusing a program by name) -> warning: a
+    coverage TODO, not a correctness regression.  The baseline is 0.
+performance (scripts/bench_texmo_pjrt.py):
+  * any error in the sweep                          -> gate fail
   * geomean(anchor/new metal ms/step) < 1 - TEXMO_GEOMEAN_TOL (default .03)
                                                     -> gate fail
   * any single config slower than TEXMO_CONFIG_TOL x (default 1.3)
@@ -45,8 +52,14 @@ KNOWN_ENV_MSG = os.environ.get(
 GEOMEAN_TOL = float(os.environ.get("TEXMO_GEOMEAN_TOL", "0.03"))
 CONFIG_TOL = float(os.environ.get("TEXMO_CONFIG_TOL", "1.3"))
 
-LINE_RE = re.compile(r"^(ok~?|FAIL|ERROR)\s+(\S+)\s+(.*)$")
-CHECK_SUM_RE = re.compile(r"SUMMARY:\s+(\d+) ok,\s+(\d+) FAIL,\s+(\d+) error")
+LINE_RE = re.compile(r"^(ok~?|decline|FAIL|ERROR)\s+(\S+)\s+(.*)$")
+# plugin-native/texmo_gate.py: "SUMMARY: N ok (M via sensitivity scaling),
+# D decline, F FAIL, E error, of T"
+CHECK_SUM_RE = re.compile(
+    r"SUMMARY:\s+(\d+) ok\s+\((\d+) via[^)]*\),\s+(\d+) decline,\s+"
+    r"(\d+) FAIL,\s+(\d+) error")
+# scripts/bench_texmo_pjrt.py: "SUMMARY: N ok, E error -> path"
+BENCH_SUM_RE = re.compile(r"SUMMARY:\s+(\d+) ok,\s+(\d+) error")
 
 
 def _load_comparator():
@@ -59,7 +72,7 @@ def _load_comparator():
 
 
 def parse_check(path):
-    rows = {"ok": [], "ok~": [], "FAIL": [], "ERROR": []}
+    rows = {"ok": [], "ok~": [], "decline": [], "FAIL": [], "ERROR": []}
     env_re = re.compile(KNOWN_ENV_SPEC)
     msg_re = re.compile(KNOWN_ENV_MSG)
     summary = None
@@ -81,22 +94,29 @@ def parse_check(path):
 
 
 def parse_topconfs(path):
+    """(summary tuple, error lines) from the bench log.
+
+    bench_texmo_pjrt writes one line per config; a failed config carries
+    its exception text in the ms_step column, so the error LINES are found
+    through the JSONL, not the log -- here we only take the summary and any
+    line that names a Python exception.
+    """
     txt = Path(path).read_text(errors="replace")
-    m = re.search(r"SUMMARY:\s+(\d+) ok,\s+(\d+) FAIL,\s+(\d+) error", txt)
-    fails = [l for l in txt.splitlines() if l.startswith("FAIL")]
-    errs = [l for l in txt.splitlines() if l.startswith("ERROR")]
-    return (tuple(int(x) for x in m.groups()) if m else None), fails, errs
+    m = BENCH_SUM_RE.search(txt)
+    errs = [l for l in txt.splitlines()
+            if re.search(r"\b(Error|Exception|UNIMPLEMENTED|Traceback)\b", l)]
+    return (tuple(int(x) for x in m.groups()) if m else None), [], errs
 
 
 def perf_gate(anchor, new):
     cmp_mod = _load_comparator()
-    old, cur = cmp_mod.load(anchor), cmp_mod.load(new)
+    old, cur = cmp_mod.load(anchor, "metal"), cmp_mod.load(new, "metal")
     keys = sorted(set(old) & set(cur), key=lambda k: old[k]["weights"])
-    ratios = [(k, old[k]["metal_ms_step"] / cur[k]["metal_ms_step"])
-              for k in keys
-              if old[k].get("metal_ms_step") and cur[k].get("metal_ms_step")]
-    cpu = [old[k]["cpu_ms_step"] / cur[k]["cpu_ms_step"] for k in keys
-           if old[k].get("cpu_ms_step") and cur[k].get("cpu_ms_step")]
+    ratios = [(k, old[k]["ms"] / cur[k]["ms"]) for k in keys
+              if old[k].get("ms") and cur[k].get("ms")]
+    cold, cnew = cmp_mod.load(anchor, "cpu"), cmp_mod.load(new, "cpu")
+    cpu = [cold[k]["ms"] / cnew[k]["ms"] for k in set(cold) & set(cnew)
+           if cold[k].get("ms") and cnew[k].get("ms")]
     gm = cmp_mod.geomean([r for _, r in ratios])
     gm_cpu = cmp_mod.geomean(cpu)
     worst = sorted(ratios, key=lambda kr: kr[1])[:8]
@@ -106,12 +126,10 @@ def perf_gate(anchor, new):
         "matched": len(ratios), "only_anchor": len(old) - len(keys),
         "only_new": len(cur) - len(keys),
         "geomean": gm, "geomean_cpu": gm_cpu,
-        "worst": [(list(k), r, old[k]["metal_ms_step"], cur[k]["metal_ms_step"])
-                  for k, r in worst],
-        "best": [(list(k), r, old[k]["metal_ms_step"], cur[k]["metal_ms_step"])
-                 for k, r in best],
-        "over_threshold": [(list(k), r, old[k]["metal_ms_step"],
-                            cur[k]["metal_ms_step"]) for k, r in over],
+        "worst": [(list(k), r, old[k]["ms"], cur[k]["ms"]) for k, r in worst],
+        "best": [(list(k), r, old[k]["ms"], cur[k]["ms"]) for k, r in best],
+        "over_threshold": [(list(k), r, old[k]["ms"], cur[k]["ms"])
+                           for k, r in over],
         "improved_5pct": sum(1 for _, r in ratios if r > 1.05),
         "regressed_5pct": sum(1 for _, r in ratios if r < 0.95),
     }
@@ -149,20 +167,23 @@ def main():
     env_errs = [r for r in check["ERROR"] if r.get("known_env")]
     bad_errs = [r for r in check["ERROR"] if not r.get("known_env")]
     if check["FAIL"]:
-        problems.append(f"texmo_check: {len(check['FAIL'])} FAIL")
+        problems.append(f"texmo_gate: {len(check['FAIL'])} FAIL")
     if bad_errs:
-        problems.append(f"texmo_check: {len(bad_errs)} unclassified ERROR")
+        problems.append(f"texmo_gate: {len(bad_errs)} unclassified ERROR")
     if env_errs:
-        warnings.append(f"texmo_check: {len(env_errs)} known-environmental "
+        warnings.append(f"texmo_gate: {len(env_errs)} known-environmental "
                         f"ERROR (raw_fold tokensets missing)")
+    if check["decline"]:
+        warnings.append(f"texmo_gate: {len(check['decline'])} decline "
+                        f"(plugin coverage TODO; baseline is 0)")
     if ns.check_rc != 0 and not (check["FAIL"] or check["ERROR"] or n_ok):
-        problems.append(f"texmo_check driver rc={ns.check_rc}")
+        problems.append(f"texmo_gate driver rc={ns.check_rc}")
 
     top_sum, top_fails, top_errs = parse_topconfs(ns.topconfs_log)
-    if top_fails:
-        problems.append(f"texmo_topconfs: {len(top_fails)} check FAIL")
-    if top_errs:
-        problems.append(f"texmo_topconfs: {len(top_errs)} error")
+    if top_sum and top_sum[1]:
+        problems.append(f"bench_texmo_pjrt: {top_sum[1]} error")
+    elif top_errs:
+        problems.append(f"bench_texmo_pjrt: {len(top_errs)} error line(s)")
 
     perf, perf_err = None, None
     try:
@@ -192,15 +213,17 @@ def main():
         L.append("")
     if ns.seconds:
         L.append(f"- wall: {float(ns.seconds) / 60:.1f} min")
-    L.append(f"- **correctness** (`texmo_check.py`): {n_ok} ok "
+    L.append(f"- **correctness** (`plugin-native/texmo_gate.py`): {n_ok} ok "
              f"({len(check['ok~'])} via sensitivity scaling), "
+             f"{len(check['decline'])} decline, "
              f"{len(check['FAIL'])} FAIL, {len(bad_errs)} unexpected error, "
              f"{len(env_errs)} known-environmental error"
-             + (f" · script summary line: {check_sum[0]} ok / {check_sum[1]} "
-                f"FAIL / {check_sum[2]} error" if check_sum else ""))
+             + (f" · script summary line: {check_sum[0]} ok / "
+                f"{check_sum[2]} decline / {check_sum[3]} FAIL / "
+                f"{check_sum[4]} error" if check_sum else ""))
     if top_sum:
-        L.append(f"- **perf sweep** (`texmo_topconfs.py`): {top_sum[0]} ok, "
-                 f"{top_sum[1]} FAIL, {top_sum[2]} error → `{ns.new}`")
+        L.append(f"- **perf sweep** (`scripts/bench_texmo_pjrt.py`): "
+                 f"{top_sum[0]} ok, {top_sum[1]} error → `{ns.new}`")
     if perf and perf["matched"]:
         L.append(f"- **geomean vs anchor** (`{Path(ns.anchor).name}`, old/new, "
                  f">1 = faster): **{perf['geomean']:.4f}x** over "
@@ -231,8 +254,18 @@ def main():
         L.append("")
         L.append("</details>")
         L.append("")
+    if check["decline"]:
+        L.append(f"<details><summary>Declines ({len(check['decline'])}) — "
+                 f"programs the plugin refused by name; a coverage TODO, "
+                 f"not a correctness regression</summary>")
+        L.append("")
+        for r in check["decline"]:
+            L.append(f"- `{r['name']}` `{r['spec']}` — {r['detail']}")
+        L.append("")
+        L.append("</details>")
+        L.append("")
     if top_fails or top_errs:
-        L.append("**Perf-sweep correctness problems:**")
+        L.append("**Perf-sweep problems:**")
         L.append("")
         for l in (top_fails + top_errs)[:20]:
             L.append(f"- `{l.strip()[:160]}`")
@@ -277,6 +310,7 @@ def main():
             "problems": problems,
             "warnings": warnings,
             "check": {"ok": n_ok, "fail": len(check["FAIL"]),
+                      "declines": [r["name"] for r in check["decline"]],
                       "env_errors": [r["name"] for r in env_errs],
                       "other_errors": [r["name"] for r in bad_errs],
                       "summary_line": check_sum},

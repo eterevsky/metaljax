@@ -150,11 +150,12 @@ def generate_path(backbone, n_new):
 
 
 def qmm_stats():
-    try:
-        from metaljax import qmm
-        return qmm.stats()
-    except Exception:
-        return {}
+    # The quantized-matmul recognizer moved into the plugin (C++) at the
+    # Stage-1 retirement and exposes no counter surface to Python, so this
+    # bench no longer reports pack/route telemetry. Deliberately explicit:
+    # the previous version swallowed the ImportError and silently returned
+    # {}, which reads identically to "the recognizer never fired".
+    return {"unavailable": "native plugin exposes no qmm counters"}
 
 
 def run(ns):

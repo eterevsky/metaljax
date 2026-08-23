@@ -1,8 +1,9 @@
-# plugin-native — the fully-native metaljax PJRT plugin (Stage 2)
+# plugin-native — the metaljax PJRT plugin
 
 An `xla::PjRtClient` subclass; XLA's `pjrt_c_api_wrapper_impl` manufactures the
-whole PJRT C API around it. No Python, no nanobind — unlike `plugin/`, which
-trampolines into `metaljax.engine`.
+whole PJRT C API around it. No Python, no nanobind. Since the Stage-1
+retirement (0.11.6) this is the only engine — the Python trampoline
+(`plugin/` + `metaljax.engine`) is gone.
 
 ```sh
 cd plugin-native
@@ -25,23 +26,22 @@ this plugin and through jax on the CPU backend (in a subprocess of its own,
 since a process with `JAX_PLATFORMS=metal` can see no other), and the CPU
 answer is the bar. `texmo_gate.py` is the same doctrine on real workloads —
 every configuration in `benchmarks/texmo-suite.csv` trains one chunk through
-both backends, compared with `scripts/texmo_check.py`'s sensitivity-scaled
-tolerance — and it is phase 2's standing gate: it exits nonzero if any
+both backends, compared with a sensitivity-scaled tolerance (inherited from
+the retired `scripts/texmo_check.py`) — and it is the standing gate: it exits
+nonzero if any
 configuration computes a different answer, while a program the plugin still
 declines is reported and forgiven.
 
-`METALJAX_DUMP_TAPE=1` prints the lowered tape, which is what a reviewer diffs
-against the Stage 1 lowering's; start such a diff from `METALJAX_DUMP_MODULE=1`
-(the module XLA's parse hands us is not the one jax printed — chlo is
-legalized and constants are hoisted).
+`METALJAX_DUMP_TAPE=1` prints the lowered tape; start reading it from
+`METALJAX_DUMP_MODULE=1` (the module XLA's parse hands us is not the one jax
+printed — chlo is legalized and constants are hoisted).
 
-The executor runtime (`../native`) builds here too, as
-`@metaljax_runtime//:runtime` — the same sources the nanobind extension
-compiles, shared through a `new_local_repository` whose build file is
-`third_party/metaljax_runtime/BUILD.runtime`. `CompileAndLoad` lowers the
-parsed StableHLO into one of its `Program`s and `Execute` replays it.
-`//metal:runtime_gil_free_test` builds a tape through the same C++ API and
-runs it on the GPU in a process with no interpreter in it.
+The executor runtime is `runtime/` — forked from the pre-PJRT `native/` tree
+at 6c2bb5e and diverged since; `native/` itself was deleted with the Stage-1
+retirement. `CompileAndLoad` lowers the parsed StableHLO into one of its
+`Program`s and `Execute` replays it. `//metal:runtime_gil_free_test` builds a
+tape through the same C++ API and runs it on the GPU in a process with no
+interpreter in it.
 
 The dylib exports two symbols, and `metal/exported_symbols.exp` is what holds it
 to exactly those: everything else — XLA, MLIR/LLVM, StableHLO, protobuf, absl —
@@ -54,14 +54,14 @@ contract, both load orders). The list is also why the dylib is 46 MB and not
 `src/jax_plugins/metal/__init__.py` keeps the registry of Python callables that
 `jax.debug.print` / `pure_callback` / `io_callback` lower to and installs a
 ctypes callback here, so the GIL enters this plugin inside a user callback and
-nowhere else. Its C ABI is `runtime/host_callback.h`. That symbol is also how
-`METALJAX_PLUGIN_PATH` tells the two plugins apart when the file has been
-copied under another name.
+nowhere else. Its C ABI is `runtime/host_callback.h`.
 
 XLA comes from the read-only `metaljax/xla` checkout via `local_repository`
-(pinned to jax 0.11.0's XLA revision); MLX comes from the venv's wheel via
-`third_party/mlx`. First build is ~7 minutes, everything after that is seconds
-(see `--disk_cache` in `.bazelrc`).
+(pinned to jax 0.11.0's XLA revision); MLX is our vendored build, staged in
+`src/metaljax/lib/mlx` by `scripts/vendor_mlx.sh` and picked up through
+`third_party/mlx` (`METALJAX_MLX_DIR` overrides the location — that is also
+the build-level A/B lever between MLX trees). First build is ~7 minutes,
+everything after that is seconds (see `--disk_cache` in `.bazelrc`).
 
 `METALJAX_VERIFY_COMPILE=1` runs every executable a SECOND time op by op and
 reports any output that differs from the compiled path — the one divergence

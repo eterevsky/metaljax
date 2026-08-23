@@ -69,11 +69,10 @@ namespace {
 // (notes/mlx-command-buffer-split.md).  This plugin is the only engine in its
 // process: nothing Python-side is even imported, so there is no second reader
 // to drift from, and leaving the cadences at their compiled-in defaults is
-// what would drift -- from every documented default in
-// src/metaljax/{interpreter,ops/control}.py, and from what a user setting the
-// variable gets on the Stage 1 plugin.
+// what would drift -- from every documented default the retired Stage 1
+// engine established and this plugin inherited.
 //
-// The defaults and the arithmetic below are copied from the module that owns
+// The defaults and the arithmetic below are copied from the module that owned
 // each one, and the comment there is the explanation.  They are not
 // preferences: the loop clear cadence is what keeps Metal's ~499k live-buffer
 // limit at bay in a multi-hour loop (CLAUDE.md items 11/14), which is a
@@ -100,11 +99,11 @@ bool EnvFlag(const char* name) {
   return v != nullptr && std::string(v) == "1";
 }
 
-// MLX's own budgets, which src/metaljax/__init__.py pins for the Stage 1
-// engine before `import mlx.core` and which nothing pinned here: this plugin
-// never imports that module, and until gather/scatter landed no program big
-// enough to split a command buffer ever lowered.  Both are CORRECTNESS, not
-// tuning:
+// MLX's own budgets.  THIS FILE OWNS THEM (0.11.6): they used to be pinned
+// by src/metaljax/__init__.py for the Stage 1 engine, which was retired
+// along with the rest of that package -- the measurements behind the
+// numbers are kept in CLAUDE.md and notes/mlx-command-buffer-split.md.
+// Both are CORRECTNESS, not tuning:
 //
 //  * `MLX_MAX_MB_PER_BUFFER`: splitting one eval across command buffers
 //    corrupts results in MLX 0.32 -- silently, and differently on every call
@@ -117,17 +116,15 @@ bool EnvFlag(const char* name) {
 //    tests/test_command_buffer.py replays it).
 //  * `MLX_METAL_GPU_ARCH`: the M5's f32 GEMM goes through the neural
 //    accelerators at ~4e-3 unless the kernel arch is pinned back a
-//    generation.  `src/jax_plugins/metal/__init__.py` sets this before
-//    dlopening us and is the one that matters for jax; repeating it keeps a
-//    C++ embedder (`//metal:runtime_gil_free_test`, anything linking this
-//    dylib directly) from silently getting the fast, inaccurate path.
+//    generation.  `src/jax_plugins/metal/__init__.py` also sets this before
+//    dlopening us (earlier, and visible from Python); setting it here too
+//    keeps a C++ embedder (`//metal:runtime_gil_free_test`, anything linking
+//    this dylib directly) from silently getting the fast, inaccurate path.
 //
 // MLX reads each one ONCE, from a function-local static, when it builds its
 // Metal device -- which happens at the first `mx::` call, inside this plugin
 // -- so a static initializer here lands early enough.  `overwrite = 0` is
 // Python's `os.environ.setdefault`: a value the user exported still wins.
-// KEEP IN SYNC with src/metaljax/__init__.py, which owns the numbers and the
-// measurements behind them.
 [[maybe_unused]] const bool kMlxEnvPinned = [] {
   // METALJAX_MLX_COMPILE_MODE=no_fuse|no_simplify|disabled: MLX's own compiler
   // mode, which has no environment variable of its own (`MLX_DISABLE_COMPILE`
@@ -589,7 +586,7 @@ MetalClient::CompileAndLoad(xla::MaybeOwningMlirModule module,
                             xla::CompileOptions options) {
   // The C-API wrapper hands us a PARSED module: `stablehlo.*`, already
   // upgraded from the VHLO portable artifact, so nothing here touches
-  // serialization (the whole of what src/metaljax/engine.py does by hand).
+  // serialization (which the retired Stage 1 engine did by hand).
   mlir::ModuleOp mlir_module = module.mlir_module();
   if (!mlir_module) {
     return absl::InvalidArgumentError(

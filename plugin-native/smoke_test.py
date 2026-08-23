@@ -66,8 +66,11 @@ def _devices():
     # jax prefixes "PJRT C API\n" to whatever the plugin reports.
     assert "metaljax-native-p0" in dev.client.platform_version, (
         "a different plugin answered: " + dev.client.platform_version)
-    # Nothing about this path may re-enter Python: the Stage 1 engine must
-    # never have been imported.
+    # Nothing about this path may re-enter Python.  The Stage 1 engine was
+    # DELETED in 0.11.6, so this now passes vacuously in a clean tree -- it
+    # is kept for one release as a resurrection guard (a stale editable
+    # install or a leftover site-packages copy would still trip it).
+    # DROP AFTER 0.11.6.
     assert "metaljax.engine" not in sys.modules, "the Python engine loaded"
     print("  metaljax.engine imported: False (fully native)")
 

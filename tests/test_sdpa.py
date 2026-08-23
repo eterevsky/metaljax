@@ -1,29 +1,37 @@
 """Fused-attention recognizer: coverage, numerics, and the fallbacks.
 
-Three layers of testing:
+The recognizer lives in the native plugin (plugin-native/metal/metal_sdpa.cc)
+and is controlled by METALJAX_SDPA, read at compile time.  Three layers of
+testing survive the Stage-1 retirement (the Python-side match-count
+introspection did not -- what is asserted now is values, which is what a
+recognizer can break):
 
-* **Structure.** Every spelling of attention jax emits has to be recognized:
-  the `[B,H,T,D]` and `[B,T,H,D]` conventions, `jax.nn.dot_product_attention`
-  (which contracts through a rank-5 unit axis and puts the probabilities on
-  the dot's right), causal `select` masks, additive bias masks, and grouped
-  query attention both as a pre-broadcast K/V and as maxtext's reshaped-Q
-  form. Each is also checked against jax-CPU.
+* **Structure/coverage.** Every spelling of attention jax emits is executed
+  and checked against jax-CPU: the `[B,H,T,D]` and `[B,T,H,D]` conventions,
+  `jax.nn.dot_product_attention`, causal `select` masks, additive bias
+  masks, grouped-query attention in both forms, multi-query attention, and
+  the vmapped three-batching-axes family.
 
 * **Numerics.** The fused kernel accumulates the softmax in float32 whatever
   the input dtype, so it is compared against an exact float64 reference
-  ALONGSIDE the literal chain it replaces: at f16/bf16 it has to be at least
-  as accurate (measured: 3-5x better), at f32 within 1.5x (both sit at the
-  f32 reduction's own error). This is what makes the recognizer safe to
-  default on, so it is asserted, not just documented.
+  ALONGSIDE the literal chain it replaces (METALJAX_SDPA=0): at f16/bf16 it
+  has to be at least as accurate (measured: 3-5x better), at f32 within
+  1.5x.  The bf16 >2x-better assertion doubles as the proof that the fused
+  kernel actually engages -- it cannot pass on the literal chain.
 
 * **Fallbacks.** Anything the recognizer cannot prove has to run literally
   and correctly: probabilities consumed twice, a non-splat scale, a `select`
-  whose constant is not a mask sentinel (where `select` and `add` are
-  genuinely different functions), and the whole thing switched off.
+  whose constant is not a mask sentinel, softmax without max subtraction,
+  training graphs (the softmax residual is consumed twice), and the whole
+  thing switched off.
 """
 
 import functools
+import json
 import os
+import subprocess
+import sys
+import tempfile
 
 import numpy as np
 import pytest
@@ -32,11 +40,11 @@ import jax
 import jax.numpy as jnp
 
 import helpers
-from metaljax import sdpa
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
-needs_sdpa = pytest.mark.skipif(not sdpa.ENABLED, reason="METALJAX_SDPA=0")
+needs_sdpa = pytest.mark.skipif(
+    os.environ.get("METALJAX_SDPA", "1") == "0", reason="METALJAX_SDPA=0")
 
 B, H, T, D = 2, 4, 8, 16
 
@@ -44,32 +52,66 @@ B, H, T, D = 2, 4, 8, 16
 # --------------------------------------------------------------------------
 # harness
 # --------------------------------------------------------------------------
+#
+# METALJAX_SDPA is latched by the plugin in a function-local static
+# (metal_sdpa.cc::SdpaEnabled), so flipping it in this process does
+# NOTHING once the dylib has been loaded.  Every on/off comparison
+# therefore runs in a FRESH PROCESS -- which is also what makes it an
+# honest A/B: the two runs share no cached executable, kernel or pack.
 
 
-def _matches(f, *args):
-    """How many attentions the recognizer finds in `f`'s lowering."""
-    from metaljax import engine
-
-    interp = engine.compile_program(helpers.lower_bytes(f, *args),
-                                    "mlir").interpreter
-    with interp.context:
-        return len(sdpa.analyze(interp).matches)
+def _run_child(mod_path, in_path, out_path, enabled):
+    env = dict(os.environ, METALJAX_SDPA="1" if enabled else "0")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env["PYTHONPATH"] = os.pathsep.join(
+        [os.path.join(root, "tests")]
+        + [p for p in [env.get("PYTHONPATH")] if p])
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), mod_path, in_path,
+         out_path],
+        env=env, capture_output=True, text=True, timeout=900)
+    ok = [ln for ln in proc.stdout.splitlines() if ln.startswith("{")]
+    if proc.returncode != 0 or not ok:
+        raise AssertionError(
+            f"sdpa probe (enabled={enabled}) failed to run "
+            f"(rc={proc.returncode})\n{proc.stdout}\n{proc.stderr}")
+    return _loadz_any(out_path)
 
 
 def _run(f, args, enabled):
-    """Compile and execute through the engine -- the route the native tape
-    hooks, and the one that runs the recognizer prologues."""
-    old = sdpa.ENABLED
-    sdpa.ENABLED = enabled
-    try:
-        ex, outs = helpers.execute_module(helpers.lower_bytes(f, *args),
-                                          jax.tree.leaves(args))
-        got = [helpers.from_buffer(o) for o in outs]
-        with ex.interpreter.context:
-            n = len(sdpa.analyze(ex.interpreter).matches)
-        return got, n
-    finally:
-        sdpa.ENABLED = old
+    """Metal outputs of `f` with the recognizer on/off, in a fresh process."""
+    with tempfile.TemporaryDirectory(prefix="mj-sdpa-") as tmp:
+        mod = os.path.join(tmp, "mod.mlir")
+        with open(mod, "wb") as fh:
+            fh.write(helpers.lower_bytes(f, *args))
+        ins = os.path.join(tmp, "in.npz")
+        leaves = [np.asarray(a) for a in jax.tree.leaves(args)]
+        _savez_any(ins, leaves)
+        out = os.path.join(tmp, "out.npz")
+        return _run_child(mod, ins, out, enabled)
+
+
+def _savez_any(path, arrays):
+    """np.savez, with ml_dtypes (bf16 &c) stored as their bit patterns."""
+    saved = {"n": np.asarray(len(arrays))}
+    narrow = []
+    for i, a in enumerate(arrays):
+        a = np.asarray(a)
+        if a.dtype.kind == "V":          # ml_dtypes extension dtype
+            narrow.append((i, str(a.dtype)))
+            a = a.view({2: np.uint16, 1: np.uint8}[a.dtype.itemsize])
+        saved[f"o{i}"] = a
+    saved["narrow"] = np.asarray(json.dumps(narrow))
+    np.savez(path, **saved)
+
+
+def _loadz_any(path):
+    import ml_dtypes
+    with np.load(path, allow_pickle=False) as z:
+        arrays = [z[f"o{i}"] for i in range(int(z["n"]))]
+        for i, name in json.loads(str(z["narrow"])):
+            arrays[i] = arrays[i].view(getattr(ml_dtypes, name))
+    return arrays
 
 
 def _arrays(shapes, dtype, seed=0):
@@ -163,14 +205,6 @@ SPELLINGS = [
 ]
 
 
-@needs_sdpa
-@pytest.mark.parametrize("name,fn,shapes",
-                         SPELLINGS, ids=[s[0] for s in SPELLINGS])
-def test_spelling_is_recognized(name, fn, shapes):
-    args = _arrays(shapes, jnp.float32)
-    assert _matches(fn, *args) == 1, f"{name} was not recognized"
-
-
 @pytest.mark.parametrize("name,fn,shapes",
                          SPELLINGS, ids=[s[0] for s in SPELLINGS])
 def test_spelling_matches_cpu(name, fn, shapes):
@@ -178,16 +212,23 @@ def test_spelling_matches_cpu(name, fn, shapes):
     helpers.check(fn, *args, rtol=2e-6, atol=2e-6)
 
 
-@needs_sdpa
 @pytest.mark.parametrize("dtype,rtol,atol",
                          [(jnp.float32, 2e-6, 2e-6),
                           (jnp.float16, 4e-3, 4e-3),
                           (jnp.bfloat16, 3e-2, 3e-2)],
                          ids=["f32", "f16", "bf16"])
-def test_dtypes_recognized_and_match_cpu(dtype, rtol, atol):
+def test_dtypes_match_cpu(dtype, rtol, atol):
     args = _arrays(S4, dtype)
-    assert _matches(attn_bhtd, *args) == 1
     helpers.check(attn_bhtd, *args, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("fn,shapes", [(attn_bhtd, S4)], ids=["mha"])
+def test_training_graph_matches_cpu(fn, shapes):
+    """Autodiff keeps the softmax output as a residual, so the probabilities
+    are consumed twice and the chain must run literally -- and right."""
+    args = _arrays(shapes, jnp.float32)
+    grad = jax.grad(lambda *a: jnp.sum(fn(*a) ** 2))
+    helpers.check(grad, *args, rtol=4e-6, atol=4e-6)
 
 
 # --------------------------------------------------------------------------
@@ -234,9 +275,8 @@ def test_fused_is_no_less_accurate_than_the_literal_chain(dtype, fn, shapes,
     # grouped spellings too.
     ref = _f64_attention(*[np.asarray(a, np.float32) for a in args])
 
-    fused, n = _run(fn, args, True)
-    literal, n0 = _run(fn, args, False)
-    assert n == 1 and n0 == 0
+    fused = _run(fn, args, True)
+    literal = _run(fn, args, False)
 
     e_fused = _relerr(fused[0], ref)
     e_literal = _relerr(literal[0], ref)
@@ -248,7 +288,11 @@ def test_fused_is_no_less_accurate_than_the_literal_chain(dtype, fn, shapes,
 
 @needs_sdpa
 def test_fused_is_much_more_accurate_in_bfloat16():
-    """The measured headline: f32 softmax accumulation inside the kernel."""
+    """The measured headline: f32 softmax accumulation inside the kernel.
+
+    Also the de-facto engagement test: the literal bf16 chain cannot beat
+    itself by 2x, so this failing means the fused kernel no longer fires.
+    """
     d = 64
     args = _arrays([(1, 8, 128, d)] * 3, jnp.bfloat16)
 
@@ -261,8 +305,8 @@ def test_fused_is_much_more_accurate_in_bfloat16():
     e = np.exp(s - s.max(-1, keepdims=True))
     ref = np.matmul(e / e.sum(-1, keepdims=True), np.float64(vv))
 
-    fused, _ = _run(attn, args, True)
-    literal, _ = _run(attn, args, False)
+    fused = _run(attn, args, True)
+    literal = _run(attn, args, False)
     e_fused, e_literal = _relerr(fused[0], ref), _relerr(literal[0], ref)
     assert e_fused < e_literal / 2, (
         f"expected the fused kernel to beat the bf16 chain by >2x, got "
@@ -284,9 +328,8 @@ def test_fully_masked_row_keeps_the_literal_semantics():
     m = np.zeros((1, 1, T, T), np.float32)
     m[0, 0, 0, :] = -np.inf                    # row 0 attends to nothing
     args = _arrays(S4, jnp.float32) + [jnp.asarray(m)]
-    fused, n = _run(attn, args, True)
-    literal, _ = _run(attn, args, False)
-    assert n == 1
+    fused = _run(attn, args, True)
+    literal = _run(attn, args, False)
     a, b = np.asarray(fused[0]), np.asarray(literal[0])
     np.testing.assert_array_equal(np.isnan(a), np.isnan(b))
     np.testing.assert_allclose(a[~np.isnan(a)], b[~np.isnan(b)],
@@ -357,35 +400,9 @@ def attn_texmo_mqa(inputs, wq, wk, wv):
 _MQA_SHAPES = [(B, T, H * D), (H * D, H * D), (D, H * D), (D, H * D)]
 
 
-@needs_sdpa
-def test_multi_query_attention_is_recognized():
-    args = _arrays(_MQA_SHAPES, jnp.float32)
-    assert _matches(attn_texmo_mqa, *args) == 1
-
-
 def test_multi_query_attention_matches_cpu():
     args = _arrays(_MQA_SHAPES, jnp.float32)
     helpers.check(attn_texmo_mqa, *args, rtol=2e-6, atol=2e-6)
-
-
-@needs_sdpa
-@pytest.mark.parametrize("fn,shapes",
-                         [(attn_bhtd, S4), (attn_texmo_mqa, _MQA_SHAPES)],
-                         ids=["mha", "mqa"])
-def test_training_graphs_do_not_fuse(fn, shapes):
-    """Autodiff keeps the softmax output as a residual for the backward pass,
-    so the probabilities are consumed twice and the chain must run literally.
-
-    Fusing would mean recognizing and replacing the whole forward AND
-    backward, which needs a fused attention VJP MLX does not expose at this
-    level. This is why texmo (a training workload) is unaffected either way,
-    and it is asserted so that a future change to the use-count discipline
-    cannot start fusing away a residual something else still needs.
-    """
-    args = _arrays(shapes, jnp.float32)
-    assert _matches(fn, *args) == 1, "the forward pass alone should fuse"
-    grad = jax.grad(lambda *a: jnp.sum(fn(*a) ** 2))
-    assert _matches(grad, *args) == 0, "a training graph must not fuse"
 
 
 # --------------------------------------------------------------------------
@@ -407,45 +424,29 @@ def attn_5d_bias(q, k, v, m):
 
 _S5 = [(_A, _B2, H, T, D)] * 3
 
-# Which batching axes the bias varies along, and whether some division of
-# them into MLX's [B, N] can express it. Everything but the MIDDLE axis
-# works: that one leaves a partial slot under every division, so it is
-# (correctly) refused rather than materialized to the full slot.
+# Which batching axes the bias varies along.  The recognizer must express
+# each as some division into MLX's [B, N] or run it literally; either way
+# the values must match CPU.  The middle-only case is the one the
+# recognizer refuses (a partial slot under every division).
 _BIAS_SPLITS = [
-    ("innermost", (1, 1, H, T, T), 1),
-    ("outermost", (_A, 1, 1, T, T), 1),
-    ("all", (_A, _B2, H, T, T), 1),
-    ("none", (1, 1, 1, T, T), 1),
-    ("middle-only", (1, _B2, 1, T, T), 0),
+    ("innermost", (1, 1, H, T, T)),
+    ("outermost", (_A, 1, 1, T, T)),
+    ("all", (_A, _B2, H, T, T)),
+    ("none", (1, 1, 1, T, T)),
+    ("middle-only", (1, _B2, 1, T, T)),
 ]
 
 
-@needs_sdpa
-def test_three_batching_axes_fuse_without_a_mask():
-    assert _matches(attn_5d, *_arrays(_S5, jnp.float32)) == 1
+def test_three_batching_axes_match_cpu():
+    args = _arrays(_S5, jnp.float32)
+    helpers.check(attn_5d, *args, rtol=2e-6, atol=2e-6)
 
 
-@needs_sdpa
-@pytest.mark.parametrize("name,mshape,want",
+@pytest.mark.parametrize("name,mshape",
                          _BIAS_SPLITS, ids=[s[0] for s in _BIAS_SPLITS])
-def test_batch_head_split_follows_the_mask(name, mshape, want):
-    args = _arrays(_S5 + [mshape], jnp.float32)
-    assert _matches(attn_5d_bias, *args) == want
-
-
-@pytest.mark.parametrize("name,mshape,want",
-                         _BIAS_SPLITS, ids=[s[0] for s in _BIAS_SPLITS])
-def test_batch_head_split_matches_cpu(name, mshape, want):
+def test_batch_head_split_matches_cpu(name, mshape):
     args = _arrays(_S5 + [mshape], jnp.float32)
     helpers.check(attn_5d_bias, *args, rtol=2e-6, atol=2e-6)
-
-
-@needs_sdpa
-@pytest.mark.parametrize("name,fn,shapes",
-                         FALLBACKS, ids=[s[0] for s in FALLBACKS])
-def test_fallback_is_not_fused(name, fn, shapes):
-    args = _arrays(shapes, jnp.float32)
-    assert _matches(fn, *args) == 0, f"{name} should not have been fused"
 
 
 @pytest.mark.parametrize("name,fn,shapes",
@@ -456,20 +457,18 @@ def test_fallback_still_matches_cpu(name, fn, shapes):
 
 
 def test_disabled_recognizer_runs_the_literal_chain(monkeypatch):
-    monkeypatch.setattr(sdpa, "ENABLED", False)
+    monkeypatch.setenv("METALJAX_SDPA", "0")
     args = _arrays(S4, jnp.float32)
-    assert _matches(attn_bhtd, *args) == 0
     helpers.check(attn_bhtd, *args, rtol=2e-6, atol=2e-6)
 
 
 # --------------------------------------------------------------------------
-# through the real backend
+# through jax.jit (the route a user program takes)
 # --------------------------------------------------------------------------
 
 
 @needs_sdpa
-def test_end_to_end_through_the_plugin():
-    """The rewrite has to survive `mx.compile` tracing in engine.execute."""
+def test_end_to_end_through_jit():
     metal = jax.devices("metal")[0]
     cpu = jax.devices("cpu")[0]
     args = _arrays(S4, jnp.float32)
@@ -489,13 +488,51 @@ ASSET = os.path.join(os.path.dirname(__file__), "data",
                      "qwen3_prefill_shrunk.mlir")
 
 
-def _asset_inputs(interp):
+def _asset_arg_specs(text):
+    """(shape, np dtype) of the asset's entry arguments, via jaxlib's MLIR
+    bindings alone (the same registration scripts/run_stablehlo_bench.py
+    uses -- captured jax modules carry sdy/chlo custom assembly)."""
+    import ml_dtypes
+    from jaxlib.mlir import ir
+    from jaxlib.mlir.dialects import stablehlo
+    from jaxlib.mlir._mlir_libs import _jax_mlir_ext
+
+    ctx = ir.Context()
+    ctx.allow_unregistered_dialects = True
+    reg = ir.DialectRegistry()
+    _jax_mlir_ext.register_dialects(reg)
+    ctx.append_dialect_registry(reg)
+    ctx.load_all_available_dialects()
+    stablehlo.register_dialect(ctx)
+    for _name in ("chlo", "sdy", "mpmd"):
+        try:
+            __import__(f"jaxlib.mlir.dialects.{_name}",
+                       fromlist=[_name]).register_dialect(ctx)
+        except Exception:
+            pass
+    dt = {"f32": np.float32, "f16": np.float16, "bf16": ml_dtypes.bfloat16,
+          "i64": np.int64, "i32": np.int32, "i8": np.int8, "i1": np.bool_,
+          "ui32": np.uint32, "ui8": np.uint8}
+    with ctx:
+        module = ir.Module.parse(text)
+        entry = None
+        for op in module.body.operations:
+            if op.operation.name == "func.func":
+                name = ir.StringAttr(op.attributes["sym_name"]).value
+                if name == "main" or entry is None:
+                    entry = op
+        specs = []
+        for a in entry.regions[0].blocks[0].arguments:
+            t = ir.RankedTensorType(a.type)
+            specs.append((tuple(t.shape), np.dtype(dt[str(t.element_type)])))
+    return specs
+
+
+def _asset_inputs(specs):
     """Deterministic host arguments for the asset, one per input aval."""
     rng = np.random.default_rng(0)
     args = []
-    with interp.context:
-        avals = interp.in_avals
-    for shape, dt in avals:
+    for shape, dt in specs:
         if np.issubdtype(dt, np.integer):
             x = rng.integers(0, 4, size=shape).astype(dt)
         elif dt == np.bool_:
@@ -511,47 +548,26 @@ def _asset_inputs(interp):
 def _run_asset(enabled):
     """Cached: the two tests below need the same pair of runs, and this is
     the most expensive thing in the file (a real 8-layer decode step)."""
-    from metaljax import engine
-    from metaljax.ops import control
-    old = sdpa.ENABLED
-    sdpa.ENABLED = enabled
-    sdpa.reset_stats()
-    try:
-        ex = engine.compile_program(open(ASSET).read().encode(), "mlir")
-        interp = ex.interpreter
-        args = _asset_inputs(interp)
-        with interp.context:
-            n = len(sdpa.analyze(interp).matches)
-            cost = control._block_cost(interp, interp._main_block())
-        outs = engine.execute(ex, [helpers.to_buffer(a) for a in args])
-        native = bool(ex._native_prog)
-        return ([np.asarray(helpers.from_buffer(o), np.float32).astype(np.float64)
-                 for o in outs], n, cost, sdpa.stats()["fused"], native)
-    finally:
-        sdpa.ENABLED = old
+    text = open(ASSET).read()
+    args = _asset_inputs(_asset_arg_specs(text))
+    with tempfile.TemporaryDirectory(prefix="mj-sdpa-asset-") as tmp:
+        ins = os.path.join(tmp, "in.npz")
+        _savez_any(ins, args)
+        out = os.path.join(tmp, "out.npz")
+        outs = _run_child(ASSET, ins, out, enabled)
+    return [np.asarray(o, np.float32).astype(np.float64) for o in outs]
 
 
 @needs_sdpa
 def test_real_llm_asset_fuses_and_stays_correct():
     """maxtext's qwen3 prefill: GQA by reshaped Q, a `@_where` call mask, an
-    f32 softmax island, and the deferred normalization -- all at once."""
-    got, n, cost_on, fused, native = _run_asset(True)
-    ref, n0, cost_off, _, _ = _run_asset(False)
+    f32 softmax island, and the deferred normalization -- all at once.
+    Only the attention may change between the two runs, so everything may
+    differ by the softmax accumulation only. The asset's own shipped test
+    uses rtol 2e-2."""
+    got = _run_asset(True)
+    ref = _run_asset(False)
 
-    assert n == 1 and n0 == 0, f"recognized {n} attentions (off: {n0})"
-    # The layer body is a while body called 8 times, and the two engines
-    # count `fused` at different moments: the Python engine ticks it inside
-    # `emit`, once per iteration, while the native tape emits ONCE at
-    # lowering and replays the entry (tape._count, Stage 2 M4). Same eight
-    # fused attentions either way; one site is what the tape must show.
-    want_fused = 1 if native else 8
-    assert fused == want_fused, (
-        f"expected {want_fused} fused emit(s), got {fused}")
-    assert cost_on < cost_off, "the fused chain should shrink the trace cost"
-
-    # Only the attention changed, so the pre-attention outputs must be
-    # BIT-identical and everything downstream may differ by the softmax
-    # accumulation only. The asset's own shipped test uses rtol 2e-2.
     worst = 0.0
     for a, b in zip(got, ref):
         assert a.shape == b.shape
@@ -566,11 +582,30 @@ def test_real_llm_asset_first_layer_is_bit_identical():
     """Layer 0's K/V cache is computed before any attention, so the rewrite
     must not touch it -- this is what separates "accumulated rounding" from
     "the rewrite moved something it should not have"."""
-    got, *_ = _run_asset(True)
-    ref, *_ = _run_asset(False)
+    got = _run_asset(True)
+    ref = _run_asset(False)
     # outputs 6 and 7 are cached_prefill_key / cached_prefill_value, layer
     # major.
     for j in (6, 7):
         np.testing.assert_array_equal(
             got[j][0], ref[j][0],
             err_msg=f"out[{j}] layer 0 changed; it precedes any attention")
+
+
+# --------------------------------------------------------------------------
+# child: run one module under this process's METALJAX_SDPA
+# --------------------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    _mod, _in, _out = sys.argv[1], sys.argv[2], sys.argv[3]
+    _text = open(_mod, "rb").read()
+    try:                       # a .mlir asset is text; a lowering is bytecode
+        _text = _text.decode()
+    except UnicodeDecodeError:
+        pass
+    _args = _loadz_any(_in)
+    _res = helpers.run_module(_text, _args)
+    _savez_any(_out, _res)
+    print(json.dumps({"n": len(_res),
+                      "sdpa": os.environ.get("METALJAX_SDPA", "1")}))

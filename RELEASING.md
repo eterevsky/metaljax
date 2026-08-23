@@ -4,10 +4,11 @@ Two halves: the **release gates** (steps 0–5 — prove the tree is good, get
 Oleg's greenlight) and the **upload mechanics** (steps 5.5–7 — build, smoke,
 publish).
 
-One wheel covers all supported Pythons: the PJRT dylib is built against
-CPython's limited API (>=3.12), so artifacts are
-`metaljax-X.Y.Z-py3-none-macosx_14_0_arm64.whl` + an sdist (which
-compiles the plugin at install time; needs Xcode CLT).
+One wheel covers all supported Pythons — `metaljax-X.Y.Z-py3-none-macosx_14_0_arm64.whl`
+— because the PJRT plugin embeds no CPython at all. **Wheel only, no
+sdist**: the plugin is built with bazel against a pinned XLA workspace and
+links our vendored MLX runtime, none of which an sdist could compile at
+install time.
 
 ---
 
@@ -16,7 +17,7 @@ compiles the plugin at install time; needs Xcode CLT).
 ### 0. Preflight
 
 - Working tree clean (`git status`), everything intended for the release
-  committed — the sdist packages `src/`, `scripts/`, `tests/`.
+  committed.
 - Version bumped in **both** places:
   - `pyproject.toml` → `[project] version`
   - `src/metaljax/__init__.py` → `__version__`
@@ -31,7 +32,18 @@ cd /Users/oleg/metaljax
 .venv/bin/python -m pytest tests/
 ```
 
-All green, no skips you did not expect.
+All green, no skips you did not expect. Baseline: **484 tests** (483
+passed + 1 xfail, the `stablehlo.dot` decline). Everything runs through
+the plugin, so pin the binary under test with `METALJAX_PLUGIN_PATH` when
+it matters.
+
+Then the plugin's own suites (they are the differential ones):
+
+```bash
+.venv/bin/python plugin-native/execute_test.py
+.venv/bin/python plugin-native/ingest_test.py
+cd plugin-native && bazel test //... && cd ..
+```
 
 ### 2–4. Release gates (overnight, one command)
 
@@ -80,19 +92,26 @@ sign-off.
 
 #### Step 3 — texmo (`scripts/release/texmo_gate.sh`, ~2 h)
 
-1. `scripts/texmo_check.py ~/texmo/benchmarks/m5-metal.csv` — whole-model
-   correctness vs jax-CPU over all 104 suite configurations. Baseline:
-   **104 ok**. (It was 96 ok + 8 errors on the `tokens.32.raw_fold.*` specs
-   until commit `9ef5f58` taught the driver to remap the renamed tokenset,
-   `.raw_fold` → `.fold`.) The wrapper still classifies a missing-tokenset
-   error on those specs as a warning; **any other error, or any FAIL = gate
-   fail**.
-2. `scripts/texmo_topconfs.py top_confs.jsonl --out notes/data/texmo-topconfs-<date>.jsonl`
-   — 163-config perf + correctness sweep.
+1. `plugin-native/texmo_gate.py benchmarks/texmo-suite.csv` — whole-model
+   correctness vs jax-CPU over every suite configuration, through the
+   plugin. Baseline: **106 ok, 0 decline**. A `decline` (the plugin
+   refusing a program by name) is a coverage TODO → warning; **any FAIL or
+   unexpected ERROR = gate fail**.
+2. `scripts/bench_texmo_pjrt.py top_confs.jsonl --out notes/data/texmo-topconfs-<date>.jsonl`
+   — 223-config perf sweep, same route.
 3. `scripts/texmo_topconfs_compare.py <anchor> <new>` against
-   `notes/data/texmo-topconfs-final.jsonl` (the 0.11.2 anchor).
+   `notes/data/topconfs16k-metal-2026-08-22.jsonl`.
    Gate: geomean regression > 3 % (`TEXMO_GEOMEAN_TOL`) or any single config
    more than 1.3× slower (`TEXMO_CONFIG_TOL`).
+
+Both legs were re-pointed at the PJRT route in 0.11.6 (the Stage-1
+drivers `texmo_check.py` / `texmo_topconfs.py` could not see a plugin at
+all), and the anchors were re-baselined with them: the old
+`texmo-topconfs-final.jsonl` is retired twice over — wrong route, and it
+covers the superseded 163-config set (`top_confs.jsonl` became the
+223-config 16k set at `112ae10`). The suite-CSV perf anchor, for runs that
+bench the 106 suite configs rather than top_confs, is the 0.11.5 release
+native arm (`TEXMO_SUITE_ANCHOR`).
 
 Commit the new topconfs JSONL under `notes/data/`.
 
@@ -148,23 +167,30 @@ raw log. Oleg greenlights TestPyPI from it.
 ### 5.5 Build and local smoke
 
 ```bash
-rm -rf dist
-uv build
-uvx twine check dist/*
+scripts/build_native_wheel.sh          # --dylib <path> to pin another build
+uvx twine check ~/.cache/metaljax-bench/wheels-vendored/native/*.whl
 ```
 
-The wheel tag must be `py3-none-macosx_14_0_arm64` (the hatch build hook
-in `hatch_build.py` compiles the dylib and sets it).
+The script is a thin wrapper around `uv build` plus the checks that matter:
+it defaults the plugin to the **frozen gated binary**
+(`~/.cache/metaljax-bench/logs/mlx-vendoring/frozen-path.txt`, release rule
+1), and afterwards asserts that no Stage-1 module reappeared in the wheel
+and that the dylib inside it is bit-identical to that binary.
+`hatch_build.py` refuses to build at all if `metaljax.__version__` and the
+pyproject version disagree (they drifted once). Expect **12 files** and
+~65 MB: the loader, `metaljax/__init__.py`, the plugin, and the vendored
+MLX runtime (`libmlx_metaljax`, `libjaccl_metaljax`, `mlx.metallib`,
+`VENDOR_STAMP`). The tag must be `py3-none-macosx_14_0_arm64`.
 
 Install the wheel **non-editable** into a fresh venv on a *different* Python
-than the one that built it — do this on **3.12 and 3.14** (the limited-API
-build has broken on exactly one version before: the `PyObject_CallMethod`
-`'#'`-format ABI bug only showed on 3.12):
+than the one that built it — do this on **3.12 and 3.14**, and note that
+neither venv should have `mlx` in it: the wheel carries its own:
 
 ```bash
+W=$(ls ~/.cache/metaljax-bench/wheels-vendored/native/*.whl)
 for PY in 3.12 3.14; do
   uv venv --python $PY /tmp/mj-check-$PY
-  uv pip install -p /tmp/mj-check-$PY/bin/python dist/*.whl
+  uv pip install -p /tmp/mj-check-$PY/bin/python "$W"
   JAX_PLATFORMS=metal /tmp/mj-check-$PY/bin/python -c \
     "import jax, jax.numpy as jnp; print(jax.devices()); print(2 * jnp.array([1,2,3]))"
 done
@@ -173,7 +199,8 @@ done
 ### 6. TestPyPI (only with Oleg's explicit approval)
 
 ```bash
-uv publish --index testpypi --token <testpypi-token>
+uv publish --index testpypi --token <testpypi-token> \
+  ~/.cache/metaljax-bench/wheels-vendored/native/*.whl
 uv venv --python 3.13 /tmp/mj-testpypi
 uv pip install -p /tmp/mj-testpypi/bin/python \
   --index-url https://test.pypi.org/simple/ \
@@ -212,3 +239,20 @@ project-scoped token after the first upload).
 | `MODEL_REGRESS_TOL` | 0.10 | per-row model regression threshold |
 | `MODEL_REGRESS_FAIL` | 1 | whether a regression fails the gate (0 = warn) |
 | `MODEL_TOKEN_KNOWN` | `gemma4-e2b-bf16,llama31-8b-bf16` | certified-benign token divergences |
+| `METALJAX_PLUGIN_PATH` | the frozen gated dylib | which plugin every gate step measures (`gatelib.sh` pins it; export it yourself to override) |
+| `TEXMO_ANCHOR` | `notes/data/topconfs16k-metal-2026-08-22.jsonl` | perf anchor for the 223-config top_confs sweep |
+| `TEXMO_SUITE_ANCHOR` | 0.11.5 `suite106-native.jsonl` | perf anchor for the 106-config suite CSV |
+
+## A/B-ing the MLX runtime
+
+The Stage-1-era trick — swap the venv's `mlx` wheel and re-run — died with
+the Python engine: the plugin links its MLX by private install name. The
+replacement is a BUILD-level A/B, which is what the vendoring battery used
+for its row-1 comparison: point the bazel workspace at another MLX tree
+with `METALJAX_MLX_DIR` (a public pip layout works, as does a second
+vendored build), rebuild the plugin, and pin each resulting dylib with
+`METALJAX_PLUGIN_PATH` when measuring.
+
+```bash
+METALJAX_MLX_DIR=/path/to/other/mlx bazel build //metal:libmetal_pjrt_native.dylib
+```

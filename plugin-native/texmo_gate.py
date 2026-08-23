@@ -6,8 +6,9 @@ ManagerJax model, lowers ONE jitted training chunk (forward + backward +
 optimizer, scanned over a few steps) to StableHLO, and then runs that module
 BOTH ways: on the jax CPU backend, and through this plugin's
 `compile_and_load` + `execute`.  Every output leaf -- updated weights,
-optimizer state, per-step losses -- is compared with `scripts/texmo_check.py`'s
-tolerance discipline, which scales the bar with the model's own measured 1-ULP
+optimizer state, per-step losses -- is compared with the retired
+`scripts/texmo_check.py`'s tolerance discipline (inlined here when Stage 1
+was retired), which scales the bar with the model's own measured 1-ULP
 sensitivity (an ill-conditioned training step amplifies cross-backend rounding
 identically on both sides, so a fixed tolerance would be meaningless).
 
@@ -25,14 +26,13 @@ Three outcomes per configuration, and only one of them fails the gate:
 * `FAIL` / `ERROR` -- it computed a different answer, or the harness could not
   measure it.  Either is a nonzero exit.
 
-Why it is shaped as two processes: `scripts/texmo_check.py` drives
-`metaljax.engine` directly and pins `jax_platforms` to cpu at import, so it
-cannot exercise this plugin at all.  A child process per configuration builds
-the model and the CPU reference (importing texmo_check for the suite reader and
-the dataset), writes the module and the arrays to a scratch directory, and this
-process -- the one holding the plugin -- executes and compares.  The artifacts
-are deleted as they are consumed: a whole suite's weights, optimizer state and
-references at once would be tens of gigabytes.
+Why it is shaped as two processes: the CPU reference must come from a process
+that never loaded this plugin (jax picks its backend once, at first use).  A
+child process per configuration builds the model and the CPU reference under
+JAX_PLATFORMS=cpu, writes the module and the arrays to a scratch directory,
+and this process -- the one holding the plugin -- executes and compares.  The
+artifacts are deleted as they are consumed: a whole suite's weights, optimizer
+state and references at once would be tens of gigabytes.
 """
 
 import argparse
@@ -60,11 +60,7 @@ _REASON = re.compile(r"metaljax-native: ([^\n]*)")
 
 
 def configs_from_csv(path):
-    """scripts/texmo_check.py's reader, replicated rather than imported.
-
-    Importing it would pin `jax_platforms` to cpu in THIS process, which is the
-    one that has to see the plugin.  The child does import it.
-    """
+    """The suite-CSV reader (inherited from the retired texmo_check.py)."""
     seen = {}
     with open(path) as f:
         for row in csv.DictReader(f):
@@ -105,16 +101,28 @@ def configs_from_jsonl(path):
 
 def dump_one(out_dir, spec, batch, length, nsteps, precision="fp32"):
     """Module text, inputs, CPU reference and 1-ULP sensitivity, to disk."""
-    sys.path.insert(0, str(_REPO / "scripts"))
-    import texmo_check as tc          # sets jax_platforms=cpu at import
+    # The suite dataset, exactly as the retired scripts/texmo_check.py built
+    # it (inlined at the Stage-1 retirement): texmo itself on sys.path, the
+    # shared tokens dir, pride.txt as the training set.  This child runs
+    # under JAX_PLATFORMS=cpu (the parent sets it), which is what the old
+    # texmo_check import-time platform pin used to achieve.
+    texmo_dir = pathlib.Path(os.environ.get(
+        "TEXMO_DIR", pathlib.Path.home() / "texmo"))
+    sys.path.insert(0, str(texmo_dir))
 
     import jax
     import jax.numpy as jnp
     import ml_dtypes
     from texmo.configuration import Configuration
+    from texmo.dataset import DataSet
     from texmo.manager_jax import ManagerJax
     from texmo.precision import Precision
     from texmo.spec_parser import parse_model2
+    from texmo.tokens import set_tokens_dir
+
+    jax.config.update("jax_enable_x64", False)  # matches texmo.py
+    set_tokens_dir(str(texmo_dir / "tokens"))
+    train_set = DataSet(path=str(texmo_dir / "data" / "pride.txt"))
 
     conf = Configuration(
         parse_model2(spec, precision=Precision(precision)),
@@ -122,7 +130,7 @@ def dump_one(out_dir, spec, batch, length, nsteps, precision="fp32"):
         decay=1.0, cosine=False,
     )
     manager = ManagerJax(conf=conf, system="metaljax-gate",
-                         dataset=tc.train_set, test_sample_len=64,
+                         dataset=train_set, test_sample_len=64,
                          test_batch=8)
     tokens_name = manager.model_def.input.tokens_name
     data = manager.dataset.sample_tokens(

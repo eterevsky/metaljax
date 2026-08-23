@@ -1,15 +1,16 @@
 """Persistent-kernel scan codegen: correctness vs the CPU backend.
 
-These scans qualify for msl_scan's generated kernels (elementwise bodies);
-`check` compares against jax-CPU, so any codegen bug shows up as a mismatch,
-and any recognizer gap silently falls back to the interpreter (still passing,
-but covered by the explicit fallback test below).
+Exercises the native PJRT plugin's MSL scan codegen numerically: these scans
+qualify for the generated kernels (elementwise / small-matvec bodies), and
+`check` compares against jax-CPU, so any codegen bug shows up as a mismatch
+while any recognizer gap silently falls back to the regular loop path (still
+passing). Plan-introspection tests were removed at the Stage-1 retirement —
+plan modes and caches are not observable through PJRT.
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from helpers import check
 
@@ -248,85 +249,10 @@ def test_rectangular_coop_dots():
           rtol=1e-3, atol=1e-4)
 
 
-# ---- coop preference + input packing (0.4.3) ----
-
-F16 = 16
-W16 = (rng.standard_normal((F16, F16)) * 0.25).astype(np.float32)
-X16 = (rng.standard_normal((L, B, F16)) * 0.3).astype(np.float32)
-H16 = rng.standard_normal((B, F16)).astype(np.float32)
-
-
-def _mgru16(xs, h0, w):
-    def cell(h, x):
-        g = jax.nn.sigmoid(x + h @ w)
-        nh = (1 - g) * h + g * jnp.tanh(x)
-        return nh, nh
-    return jax.lax.scan(cell, h0, xs)
-
-
-def _plan_modes(f, *args):
-    """Run through a fresh executable; return the MSL plan modes built."""
-    from helpers import execute_module, from_buffer, lower_bytes
-
-    ex, outs = execute_module(lower_bytes(f, *args), jax.tree.leaves(args))
-    for o in outs:
-        from_buffer(o)          # settle: plans are built as the loop runs
-    return [p.mode for p in ex.interpreter._msl_cache.values()
-            if p is not None]
-
-
-def test_coop_preferred_for_square_16wide_cell():
-    # F=16 square dots used to pick vector mode (one thread per batch
-    # lane, no latency hiding — 5-8x slower); coop must be preferred and
-    # match CPU.
-    check(_mgru16, X16, H16, W16, rtol=1e-4, atol=1e-5)
-    check(jax.value_and_grad(lambda a, b, c: _mgru16(a, b, c)[1].sum(),
-                             argnums=(0, 1, 2)), X16, H16, W16,
-          rtol=1e-3, atol=1e-4)
-    modes = _plan_modes(_mgru16, X16, H16, W16)
-    assert "coop" in modes, modes
-
-
-def test_coop_pref_off_restores_vector(monkeypatch):
-    from metaljax import msl_scan
-    monkeypatch.setattr(msl_scan, "_COOP_PREF", False)
-    check(_mgru16, X16, H16, W16, rtol=1e-4, atol=1e-5)
-    modes = _plan_modes(_mgru16, X16, H16, W16)
-    assert modes and "coop" not in modes, modes
-
-
-def test_coop_flip_falls_back_to_vector(monkeypatch):
-    # If the preferred coop build dies in emission, build_plan must retry
-    # the old vector pick rather than losing the plan entirely.
-    from metaljax import msl_scan
-
-    def boom(self):
-        raise msl_scan._Unsupported("synthetic coop emitter gap")
-
-    monkeypatch.setattr(msl_scan.Plan, "_emit_coop", boom)
-    check(_mgru16, X16, H16, W16, rtol=1e-4, atol=1e-5)
-    modes = _plan_modes(_mgru16, X16, H16, W16)
-    assert modes and all(m == "vector" for m in modes), modes
-
-
-def test_input_packing_low_trigger(monkeypatch):
-    # Force packing on ordinary plans: results must be unchanged (packing
-    # only relocates buffers; offsets are static per plan).
-    from metaljax import msl_scan
-    monkeypatch.setattr(msl_scan, "_PACK_TRIGGER", 2)
-    check(affine_scan, A, X, H0)
-    check(jax.value_and_grad(
-        lambda a, x, h: affine_scan(a, x, h)[1].sum(),
-        argnums=(0, 1, 2)), A, X, H0)
-    check(_mgru16, X16, H16, W16, rtol=1e-4, atol=1e-5)
-    check(jax.value_and_grad(lambda a, b, c: _mgru16(a, b, c)[1].sum(),
-                             argnums=(0, 1, 2)), X16, H16, W16,
-          rtol=1e-3, atol=1e-4)
-
-
 def test_many_input_cell_packs_over_limit():
     # A body with enough distinct captured tensors to blow Metal's 31-
-    # binding cap without packing; must still take the MSL path and match.
+    # binding cap without input packing; must stay correct whichever path
+    # (packed kernel or fallback) the plugin takes.
     ws = [(rng.standard_normal((H,)) * 0.1
            + (1.0 if i % 2 else 0.9)).astype(np.float32)
           for i in range(30)]
@@ -341,19 +267,15 @@ def test_many_input_cell_packs_over_limit():
         return jax.lax.scan(cell, h0, xs)
 
     check(f, X, H0, *ws, rtol=1e-4, atol=1e-5)
-    modes = _plan_modes(f, X, H0, *ws)
-    assert modes, "expected an MSL plan (packing should rescue the bindings)"
 
 
-def test_packing_with_sliced_weight_window(monkeypatch):
+def test_packing_with_sliced_weight_window():
     # A single sliced gate makes the dot read a non-canonical WINDOW of
-    # the fused weight; weight normalization materializes just the view
-    # (numel 25 of a 50-element buffer here), and run() concatenates
-    # that view into the pool. Pool slots must be sized by the VIEW —
-    # sizing by the source buffer shifts every later member (silent
-    # corruption, found in review).
-    from metaljax import msl_scan
-    monkeypatch.setattr(msl_scan, "_PACK_TRIGGER", 2)
+    # the fused weight (numel 25 of a 50-element buffer here); weight
+    # normalization must size by the VIEW, not the source buffer —
+    # sizing by the source shifts every later pool member (silent
+    # corruption, found in review of the Python engine; same hazard in
+    # the native packer).
     Wf = (rng.standard_normal((H, 2 * H)) * 0.3).astype(np.float32)
 
     def f(xs, h0, w):
@@ -392,8 +314,6 @@ def test_matrix_state_outer_and_matvec():
     check(jax.value_and_grad(lambda a, b, c: f(a, b, c)[1].sum(),
                              argnums=(0, 1, 2)), Q, K2, C0,
           rtol=1e-3, atol=1e-4)
-    assert _plan_modes(f, Q, K2, C0), \
-        "matrix-state cell fell off the MSL path"
 
 
 def test_vmapped_scan_scalar_stacked_output():
@@ -457,7 +377,6 @@ def test_carry_permutation_is_a_parallel_assignment():
 
     s = [np.float32(v) for v in (1.0, 2.0, 3.0, 4.0)]
     check(rot_scalars, *s)
-    assert _plan_modes(rot_scalars, *s) == ["scalar"]
 
     # scalar mode: two array carries, one a bare move of the other
     def swap_arrays(xs, h0, h1):
@@ -468,9 +387,8 @@ def test_carry_permutation_is_a_parallel_assignment():
 
     H1 = rng.standard_normal((B, H)).astype(np.float32)
     check(swap_arrays, X, H0, H1)
-    assert _plan_modes(swap_arrays, X, H0, H1) == ["scalar"]
 
-    # vector / coop modes: same move alongside a matvec cell
+    # vector / coop widths: same move alongside a matvec cell
     def swap_matvec(xs, h0, h1, w):
         def cell(c, x):
             p, q = c
@@ -478,13 +396,12 @@ def test_carry_permutation_is_a_parallel_assignment():
             return (q, nh), nh
         return jax.lax.scan(cell, (h0, h1), xs)
 
-    for width, mode in ((4, "vector"), (F16, "coop")):
+    for width in (4, 16):
         w = (rng.standard_normal((width, width)) * 0.25).astype(np.float32)
         xs = (rng.standard_normal((L, B, width)) * 0.3).astype(np.float32)
         a0 = rng.standard_normal((B, width)).astype(np.float32)
         b0 = rng.standard_normal((B, width)).astype(np.float32)
         check(swap_matvec, xs, a0, b0, w, rtol=1e-4, atol=1e-5)
-        assert _plan_modes(swap_matvec, xs, a0, b0, w) == [mode]
 
 
 def test_mixed_rank_carry_stabilizer_cell():
@@ -530,44 +447,3 @@ def test_mixed_rank_carry_stabilizer_cell():
     check(jax.value_and_grad(lambda *a: f(*a)[1].sum(),
                              argnums=tuple(range(len(args)))), *args,
           rtol=1e-3, atol=1e-4)
-
-
-def test_metal_build_failure_falls_back(monkeypatch):
-    # Any generated kernel Metal's compiler rejects must degrade to the
-    # compiled-graph path instead of killing the program: engine.execute
-    # disables msl_scan for that executable and re-runs it (the program is
-    # pure). Runs through the real backend — the recovery lives there.
-    monkeypatch.setenv("METALJAX_MSL_FORCE_BUILD_FAIL", "1")
-
-    def f(a, x, h0):
-        return affine_scan(a, x, h0)
-
-    metal = jax.devices("metal")[0]
-    jf = jax.jit(f)
-    with jax.default_device(metal):
-        got = jax.tree.leaves(jf(A, X, H0))
-        # ...and again on the same executable: the blacklisted plan must
-        # stay blacklisted instead of being rebuilt (and re-failing).
-        again = jax.tree.leaves(jf(A, X, H0))
-    with jax.default_device(jax.devices("cpu")[0]):
-        want = jax.tree.leaves(jax.jit(f)(A, X, H0))
-    for g, g2, w in zip(got, again, want):
-        np.testing.assert_allclose(np.asarray(g), np.asarray(w),
-                                   rtol=1e-5, atol=1e-6)
-        np.testing.assert_allclose(np.asarray(g2), np.asarray(w),
-                                   rtol=1e-5, atol=1e-6)
-
-
-def test_register_write_width_guard():
-    # Unit-level cover for the invalid-MSL form of the same bug: the
-    # register loop variable `r` exists only when the TARGET is wider
-    # than one register, so an R>1 value may only be written into an
-    # R-wide target ("use of undeclared identifier 'r'" otherwise).
-    from metaljax.msl_scan import _Unsupported, _reg_src
-
-    assert _reg_src("v0", 2, 2, "w") == "v0[r]"
-    assert _reg_src("v0", 1, 4, "w") == "v0"    # scalar broadcast is fine
-    assert _reg_src("v0", 1, 1, "w") == "v0"
-    for R, tgt in ((2, 1), (2, 4), (4, 2)):
-        with pytest.raises(_Unsupported):
-            _reg_src("v0", R, tgt, "w")

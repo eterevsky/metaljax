@@ -9,9 +9,12 @@ then run them here on cpu / metal / cuda with identical seeded inputs.
   python run_stablehlo_bench.py m.mlir --platform cpu --check ref.npz
 
 Emits one JSON line on stdout (prefix RESULT:) with timing and status; all
-diagnostics go to stderr. Timing is wall time per execute with device sync —
-set METALJAX_SYNC=1 for the metal platform (jax.block_until_ready is a no-op
-there; this script refuses to time metal without it).
+diagnostics go to stderr. Timing is wall time per execute with device sync:
+every output is forced through numpy, because `block_until_ready` is a no-op
+on the metal plugin (its PJRT events are born ready) and a loop that only
+blocks would measure dispatch. This is the `force()` discipline of
+scripts/bench_texmo_pjrt.py; the Stage-1-only METALJAX_SYNC knob it used to
+demand died with that engine.
 """
 
 import argparse
@@ -51,7 +54,7 @@ def parse_arg_types(text):
     # and without it this parse dies before any benchmark runs — which is what
     # kept notes/data/qwen3_8b_prefill_36layer.mlir, the 8B command-buffer
     # canary, from being re-run since 2026-08-03.  Same registration the
-    # engine does in src/metaljax/_ir.py::make_context.
+    # plugin does natively (plugin-native ingest registers the same dialects).
     # chlo for the same reason: `chlo.square` and friends survive into captured
     # jax modules, and they parse in custom assembly too.
     for _name in ("chlo", "sdy", "mpmd"):
@@ -167,10 +170,6 @@ def main():
     import jax
     from jax._src.lib import xla_client as xc
 
-    if args.platform == "metal" and os.environ.get("METALJAX_SYNC") != "1":
-        raise SystemExit("set METALJAX_SYNC=1: block_until_ready is a no-op "
-                         "on the metal plugin, timings would be meaningless")
-
     dev = jax.devices(args.platform)[0]
 
     t0 = time.perf_counter()
@@ -186,17 +185,29 @@ def main():
 
     dargs = gen_inputs(in_specs, args.seed, device=dev)
 
+    def force(outs):
+        """Settle every output, and MEAN it.
+
+        `block_until_ready` is a no-op on the metal plugin -- its PJRT
+        events are born ready and execute is async -- so a loop that only
+        blocks measures dispatch, not work. Reading one element through
+        numpy is what actually waits (the same `force()` discipline
+        scripts/bench_texmo_pjrt.py uses). Cheap: one element per output,
+        not the whole buffer.
+        """
+        for o in outs:
+            o.block_until_ready()          # honest on cpu/cuda, free here
+            np.asarray(o.reshape(-1)[:1] if o.ndim else o)
+
     try:
         for _ in range(max(1, args.warmup)):
             outs = exe.execute(dargs)
-            for o in outs:
-                o.block_until_ready()
+            force(outs)
         times = []
         for _ in range(args.reps):
             t0 = time.perf_counter()
             outs = exe.execute(dargs)
-            for o in outs:
-                o.block_until_ready()
+            force(outs)
             times.append((time.perf_counter() - t0) * 1000)
     except Exception as e:
         res["status"] = "run_error"

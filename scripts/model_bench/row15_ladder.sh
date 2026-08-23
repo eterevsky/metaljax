@@ -35,8 +35,10 @@ D=$L/ladder.log
 say() { echo "[$(date '+%F %T')] $*" | tee -a "$D"; }
 has() { case ",$STEPS," in *",$1,"*) return 0;; *) return 1;; esac; }
 
-# The stacks under test: unset = Stage 1 (plugin/build/libmetal_pjrt.dylib),
-# a frozen dylib = the native plugin.  Same selection g5_model.sh uses.
+# The plugin under test: a frozen dylib pins a specific gated build; unset
+# uses whatever is installed.  (This ladder once ran every rung twice, native
+# vs the Stage-1 trampoline; Stage 1 was retired in 0.11.6, and row 15 itself
+# was FIXED by the vendored-MLX fence patch -- see the header.)
 NATIVE=${ROW15_NATIVE_DYLIB:-$(cat "$HOME/.cache/metaljax-bench/logs/release-0.11.5/frozen-path.txt" 2>/dev/null)}
 
 w=0
@@ -88,9 +90,9 @@ run() {  # run <tag> <budget_gb> <env...> -- <cmd...>
 # `A1` is the same rung without the `big` arms, which the 0.11.5 release gate
 # already ran to completion (H5 refuted there — notes/release-gates-0.11.5.md).
 if has A || has A1; then
-  for stack in native stage1; do
-    envs=(JAX_PLATFORMS=metal,cpu METALJAX_DEBUG=1)
-    [ "$stack" = native ] && envs+=(METALJAX_PLUGIN_PATH="$NATIVE")
+  for stack in native; do
+    envs=(JAX_PLATFORMS=metal,cpu METALJAX_DEBUG=1
+          METALJAX_PLUGIN_PATH="$NATIVE")
     run "A-dots-$stack" 25 "${envs[@]}" -- \
       "$BENCH" scripts/model_bench/row15_probe.py dots
     # 4 layers at 8B widths is ~3.2 GB of weights per backend; climb the
@@ -127,9 +129,8 @@ if has B; then
   run "B-cpu-ref" 70 JAX_PLATFORMS=cpu -- \
     "$BENCH" scripts/run_stablehlo_bench.py "$ASSET" --platform cpu \
       --reps 1 --warmup 1 --save-out "$L/B-cpu-ref.npz"
-  for stack in native stage1; do
-    envs=(JAX_PLATFORMS=metal,cpu METALJAX_SYNC=1)
-    [ "$stack" = native ] && envs+=(METALJAX_PLUGIN_PATH="$NATIVE")
+  for stack in native; do
+    envs=(JAX_PLATFORMS=metal,cpu METALJAX_PLUGIN_PATH="$NATIVE")
     run "B-metal-$stack" 70 "${envs[@]}" -- \
       "$BENCH" scripts/run_stablehlo_bench.py "$ASSET" --platform metal \
         --reps 3 --warmup 1 --save-out "$L/B-metal-$stack.npz" \
@@ -141,7 +142,7 @@ if has B; then
         --check "$L/B-cpu-ref.npz"
   done
   if [ "${ROW15_RAISED:-0}" = 1 ]; then
-    run "B-metal-native-mb2048" 70 JAX_PLATFORMS=metal,cpu METALJAX_SYNC=1 \
+    run "B-metal-native-mb2048" 70 JAX_PLATFORMS=metal,cpu \
       METALJAX_PLUGIN_PATH="$NATIVE" MLX_MAX_MB_PER_BUFFER=2048 -- \
       "$BENCH" scripts/run_stablehlo_bench.py "$ASSET" --platform metal \
         --reps 3 --warmup 1 --check "$L/B-cpu-ref.npz"
@@ -184,20 +185,12 @@ if has D; then
 fi
 
 # ---------------------------------------------------------------- rung Dp
-# PROVENANCE.  Same day, same checkpoint, same harness, three engines:
-# native (rung C above), Stage 1's Python engine as it stands today, and
-# 0.11.2's `src/metaljax` on PYTHONPATH in front of it -- the last release
-# before the C++ migration.  Clean on 0.11.2 makes this ours and recent;
-# collapsed on 0.11.2 makes it old and structural.
-if has Dp; then
-  run "Dp-stage1-today" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
-    GUARD_RSS_GB=105 METALJAX_DEBUG=1 -- \
-    "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b --decode 3
-  [ -d "$V0112/src/metaljax" ] || { say "missing $V0112 -- see notes/row15-wrong-output"; exit 2; }
-  run "Dp-0.11.2-src" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
-    GUARD_RSS_GB=105 PYTHONPATH="$V0112/src" -- \
-    "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b --decode 3
-fi
+# RETIRED (0.11.6).  The provenance rung ran the same checkpoint on Stage 1's
+# Python engine and on 0.11.2's `src/metaljax`, to date the corruption.  Both
+# engines are gone, and the question they were asked is answered: row 15 was
+# MLX's dropped cross-command-buffer fence, fixed in the vendored
+# libmlx_metaljax (notes/mlx-patch-diagnosis.md), and the row now runs
+# correctly at 401.4 ms/tok (STATUS fn 35/36).
 
 # ---------------------------------------------------------------- rung Ref
 # The missing ground truth.  Every metal arm so far produced a DIFFERENT first
@@ -250,13 +243,6 @@ if has Rate; then
     METALJAX_PLUGIN_PATH="$NATIVE" -- \
     "$MAXT" scripts/model_bench/row15_forensics.py --bench maxtext-qwix-int8 \
       --prefill-reps 10 --decode 3 --probe-decode
-  # Same ten draws on Stage 1: the provenance arm produced garbage of a
-  # DIFFERENT shape (plausible-magnitude tokens, not a collapse), and a rate
-  # says whether that is a different bug or the same lottery drawn elsewhere.
-  run "Rate-stage1" 92 JAX_PLATFORMS=metal,cpu KMP_DUPLICATE_LIB_OK=TRUE \
-    GUARD_RSS_GB=105 -- \
-    "$MAXT" scripts/model_bench/row15_forensics.py --bench qwix-int8-qwen3-8b \
-      --prefill-reps 10 --decode 3
 fi
 
 say "ladder $STEPS complete"

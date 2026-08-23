@@ -9,8 +9,6 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from metaljax import compile_options as copts
-
 
 def _metal():
     return jax.devices("metal")[0]
@@ -59,6 +57,8 @@ def test_compile_options_accepts_xla_flags():
             "xla_embed_ir_in_executable": True,
             "xla_dump_max_hlo_modules": 200,
             "xla_gpu_auto_spmd_partitioning_memory_budget_ratio": 0.5,
+            # A string-valued option must not be mistaken for a bad bool.
+            "xla_dump_to": "",
         })(1.0)
 
 
@@ -87,24 +87,3 @@ def test_effort_levels_are_not_env_overrides():
             "exec_time_optimization_effort": 0.0})(1.0)
         jax.jit(lambda x: x * 2.0, compiler_options={
             "optimization_level": jconfig.EffortLevel.O1.value})(1.0)
-
-
-def test_option_proto_parser_round_trip():
-    from jaxlib import xla_client as xc
-    co = xc.CompileOptions()
-    want = [("xla_embed_ir_in_executable", True),
-            ("xla_dump_max_hlo_modules", 200),
-            ("xla_gpu_auto_spmd_partitioning_memory_budget_ratio", 0.5),
-            ("xla_dump_to", "/tmp/metaljax-test")]
-    co.env_option_overrides = list(want)
-    got = copts.parse_env_option_overrides(co.SerializeAsString())
-    assert sorted(got) == sorted(want)
-
-
-def test_string_option_values_are_not_type_checked_away():
-    """xla_dump_to takes an arbitrary path: it must not be mistaken for a
-    malformed bool."""
-    from jaxlib import xla_client as xc
-    co = xc.CompileOptions()
-    co.env_option_overrides = [("xla_dump_to", "/tmp/metaljax-test")]
-    assert copts.validate(co.SerializeAsString())

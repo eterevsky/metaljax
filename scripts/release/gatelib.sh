@@ -8,6 +8,21 @@ MJ_ROOT=/Users/oleg/metaljax
 MJ_PY=$MJ_ROOT/.venv/bin/python
 MJ_LOCK=/tmp/metaljax-bench.lock
 
+# The plugin every gate step measures.  Release rule 1 -- every number in a
+# release table comes from THE release binary -- used to rest on whatever
+# happened to sit in src/metaljax/lib/; naming it here makes the gated
+# binary a fact of the run instead of an implication.  Point
+# METALJAX_PLUGIN_PATH at the frozen dylib for a release gate (the default
+# below is the last frozen path recorded by the vendoring battery); export
+# METALJAX_PLUGIN_PATH yourself to override, or set it empty to accept
+# whatever the environment resolves.
+if [ -z "${METALJAX_PLUGIN_PATH+set}" ]; then
+  _MJ_FROZEN=$(cat "$HOME/.cache/metaljax-bench/logs/mlx-vendoring/frozen-path.txt" 2>/dev/null)
+  if [ -n "$_MJ_FROZEN" ] && [ -e "$_MJ_FROZEN" ]; then
+    export METALJAX_PLUGIN_PATH=$_MJ_FROZEN
+  fi
+fi
+
 # Dated gate directory.  Override the whole path with RELEASE_GATE_DIR, or
 # just the date component with GATE_DATE (e.g. GATE_DATE=2026-08-04-rerun).
 GATE_DATE=${GATE_DATE:-$(date +%F)}

@@ -1,0 +1,103 @@
+From: metaljax <oleg@eterevsky.com>
+Date: Sat, 23 Aug 2026 09:40:00 +0200
+Subject: [PATCH] eval: signal attached events when the walk exits by throwing
+
+`eval_impl(async=true)` attaches a per-stream `Event` to every array it
+visits and signals those events only in a tail loop AFTER the walk. Any
+exception raised from a primitive's eval -- a Metal library that will not
+build is the case we hit -- escapes before that tail runs, so every array
+already visited keeps an attached event at a value nothing will ever
+signal. `array::wait()` waits on it with `waitUntilSignaledValue(value,
+-1)`, i.e. no timeout, so the next blocking `eval` of any of those arrays
+hangs the process forever. A reportable error becomes an unkillable wedge.
+
+Minimal repro (macOS, Metal), hangs at the last line before this change:
+
+    import mlx.core as mx
+
+    a = mx.array([1.0, 2.0, 3.0]) * 2.0          # lazy; the kernel's INPUT
+    bad = mx.fast.metal_kernel(
+        name="bad", input_names=["x"], output_names=["out"],
+        source="  _this_identifier_does_not_exist;")
+    out = bad(inputs=[a], grid=(1, 1, 1), threadgroup=(1, 1, 1),
+              output_shapes=[(3,)], output_dtypes=[mx.float32])[0]
+
+    try:
+        mx.async_eval([a, out])                  # walks `a`, then throws
+    except Exception as exc:
+        print("threw as expected:", exc)
+
+    mx.eval(a)                                   # <-- waits forever
+    print("reached")
+
+`a` is walked (and evaluated) before the kernel's build failure, so it is
+left `status=evaluated` with an unsignaled event; the `eval(a)` that
+follows takes the "nothing unscheduled" path in `eval` and blocks in
+`array::wait()`.
+
+The fix is symmetric with what the Metal backend already does for the
+other half of this problem -- `CommandEncoder::commit`'s completion
+handler signals the events of a command buffer that failed, with the
+comment "Metal won't signal the events for us on error, manually signal
+them to avoid infinite waiting". This is the same guarantee for a failure
+raised on the HOST, mid-walk: a scope guard signals the events on an
+exceptional exit and is dismissed once the tail loop is reached, so the
+normal path is unchanged. It swallows secondary failures deliberately --
+it runs while an exception is already propagating and the caller is owed
+that one.
+
+Only `async_eval` can create the poisoned arrays (the attachment is
+`if (async)`-guarded), but the guard covers both paths for free.
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -225,6 +225,40 @@
+   }
+ 
+   std::set<Stream> open_streams;
++
++  // The events attached below are signaled by the tail loop after the walk.
++  // If the walk exits by THROWING -- a Metal library that will not build, an
++  // allocation the device refuses -- that loop never runs, and every array
++  // the walk has already visited keeps an attached event at a value nothing
++  // will ever signal. `array::wait()` waits on it with no timeout
++  // (`waitUntilSignaledValue(value, -1)`), so the next `eval` of any of
++  // those arrays hangs the process: a reportable error becomes a wedge.
++  //
++  // This guard signals them on the way out and is dismissed once the tail
++  // loop is reached, so the normal path is exactly what it was. It swallows
++  // secondary failures deliberately: it runs while an exception is already
++  // propagating, and the caller is owed THAT one.
++  struct AbandonedEvents {
++    std::set<Stream>* streams;
++    std::unordered_map<uint32_t, Event>* events;
++    ~AbandonedEvents() {
++      if (streams == nullptr) {
++        return;
++      }
++      try {
++        for (auto& s : *streams) {
++          if (auto e = events->find(s.index); e != events->end()) {
++            e->second.signal(s);
++          }
++          if (s.device == Device::gpu) {
++            gpu::finalize(s);
++          }
++        }
++      } catch (...) {
++      }
++    }
++  } abandoned{&open_streams, &events};
++
+   while (!tape.empty()) {
+     auto arr = std::move(tape.back());
+     tape.pop_back();
+@@ -306,6 +340,9 @@
+     }
+   }
+ 
++  // The walk finished: the tail below is what signals the events now.
++  abandoned.streams = nullptr;
++
+   // Signal the event in its stream
+   for (auto& s : open_streams) {
+     if (auto e = events.find(s.index); e != events.end()) {

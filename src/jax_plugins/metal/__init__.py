@@ -1,7 +1,11 @@
 """jax_plugins entry for the metaljax Metal PJRT plugin.
 
 jax discovers this via the `jax_plugins` namespace package and calls
-initialize() at backend-discovery time.
+initialize() at backend-discovery time.  The plugin is the fully-native
+dylib (an xla::PjRtClient; plugin-native/): since the Stage-1 retirement
+(0.11.6) there is no other engine, and nothing here imports the `metaljax`
+package -- the loader locates its lib/ directory with find_spec, so no
+Python is pulled into the process beyond this module.
 """
 
 import ctypes
@@ -12,139 +16,69 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# The Stage 1 plugin, which trampolines into metaljax.engine (Python), and
-# the Stage 2 one, which is a self-contained xla::PjRtClient. A wheel carries
-# exactly one of them (chosen at wheel-build time by METALJAX_WHEEL_PLUGIN);
-# the released wheel carries the trampoline.
-_TRAMPOLINE_DYLIB = "libmetal_pjrt.dylib"
 _NATIVE_DYLIB = "libmetal_pjrt_native.dylib"
 
 
 def _library_path() -> Path | None:
     env = os.environ.get("METALJAX_PLUGIN_PATH")
-    if env:
-        return Path(env)
-    # Packaged location (works for wheel and editable installs alike).
-    try:
-        import metaljax
-        p = Path(metaljax.__file__).parent / "lib" / _TRAMPOLINE_DYLIB
-        if p.exists():
-            return p
-    except ImportError:
-        pass
-    # Repo layout fallback: <root>/src/jax_plugins/metal/__init__.py
-    root = Path(__file__).resolve().parents[3]
-    p = root / "plugin" / "build" / _TRAMPOLINE_DYLIB
-    return p if p.exists() else None
-
-
-def _is_native_dylib(path: Path) -> bool:
-    """Whether this dylib is the Stage 2 plugin, asked of the file itself.
-
-    The callback-bridge symbol is the marker: the trampoline plugin does not
-    export it, and dlopening a plugin is what jax is about to do anyway.
-    """
-    try:
-        return hasattr(ctypes.CDLL(str(path)),
-                       "metaljax_native_set_callback_trampoline")
-    except OSError:
-        return False
-
-
-def _native_library_path() -> Path | None:
-    """The bundled fully-native plugin, if this install carries one.
-
-    Deliberately locates metaljax/lib/ with find_spec instead of importing
-    metaljax: on the native path nothing may pull the Stage 1 Python engine
-    into the process (it is exactly what the native plugin exists to
-    replace, and importing it would run the whole interpreter/ops import
-    tree for nothing).
-    """
-    env = os.environ.get("METALJAX_PLUGIN_PATH")
-    if env:  # an explicit override always wins, whichever plugin it names
-        p = Path(env)
-        if not p.exists():
-            return None
-        # Which plugin an override names is decided by the file's own
-        # exports, not only by its name: a COPY of the native dylib under
-        # another name (which is how a measurement pins a build) would
-        # otherwise register through the Stage 1 branch, pulling the Python
-        # engine into the process and leaving the callback bridge
-        # uninstalled -- a wrong measurement rather than an error.
-        return p if p.name == _NATIVE_DYLIB or _is_native_dylib(p) else None
+    if env:  # an explicit override always wins (measurements pin builds this
+        p = Path(env)             # way, often under a frozen file name)
+        return p if p.exists() else None
+    # Packaged location (wheel and editable installs alike), found WITHOUT
+    # importing metaljax.
     try:
         spec = importlib.util.find_spec("metaljax")
     except (ImportError, ValueError):
-        return None
-    locations = getattr(spec, "submodule_search_locations", None)
-    if not locations:
-        return None
-    p = Path(next(iter(locations))) / "lib" / _NATIVE_DYLIB
+        spec = None
+    locations = getattr(spec, "submodule_search_locations", None) if spec else None
+    if locations:
+        p = Path(next(iter(locations))) / "lib" / _NATIVE_DYLIB
+        if p.exists():
+            return p
+    # Repo layout fallback: <root>/src/jax_plugins/metal/__init__.py, with
+    # the plugin freshly built by bazel.
+    root = Path(__file__).resolve().parents[3]
+    p = root / "plugin-native" / "bazel-bin" / "metal" / _NATIVE_DYLIB
     return p if p.exists() else None
 
 
 def initialize():
-    native = _native_library_path()
-    if native is not None:
-        _initialize_native(native)
-        return
     path = _library_path()
-    if path is None or not path.exists():
-        logger.warning("metaljax plugin dylib not found; run plugin/build.sh")
+    if path is None:
+        logger.warning(
+            "metaljax native plugin dylib not found; install the wheel or "
+            "build it (cd plugin-native && bazel build "
+            "//metal:libmetal_pjrt_native.dylib)")
         return
+    # The MLX precision default, repeated from the plugin's own static
+    # initializer (plugin-native/metal/metal_client.cc, which owns the
+    # numbers): MLX reads it when it initializes its Metal device, and
+    # setting it before jax dlopens the dylib below keeps the ordering
+    # obvious from the Python side too.
+    if os.environ.get("METALJAX_MATMUL_PRECISION", "highest") == "highest":
+        os.environ.setdefault("MLX_METAL_GPU_ARCH", "applegpu_g16g")
     import jax._src.xla_bridge as xb
 
     # Keep CPU (priority 0) as the default backend; select metal explicitly
     # via JAX_PLATFORMS=metal / jax.config.update('jax_platforms', 'metal')
     # or jax.devices('metal').
     xb.register_plugin("metal", priority=-1, library_path=str(path))
-    _register_linalg_lowerings()
-
-
-def _initialize_native(path: Path) -> None:
-    """Register the Stage 2 plugin, and the linalg lowerings it now serves.
-
-    The metaljax_* custom calls below were Stage 1's alone until P9; the
-    native plugin implements them on Accelerate's LAPACK
-    (plugin-native/runtime/host_lapack.cc), so registering them is what makes
-    eigh/svd/eig/schur/hessenberg/tridiagonal reach a backend at all -- with
-    no rule for platform `metal`, jax refuses at TRACE time, before the plugin
-    ever sees a module.
-
-    P13 completed the pair. The callback lowerings stash their Python callable
-    in a registry of THIS module rather than Stage 1's (which is the very
-    interpreter this plugin exists to replace), reachable from the dylib
-    through the C trampoline `_install_native_callbacks` installs; and
-    donation, whose XLA contract the plugin now implements, is on.
-    """
-    # The MLX precision default that src/metaljax/__init__.py applies for
-    # the Stage 1 engine, repeated here because that module is not imported
-    # on this path. MLX reads it when it initializes its Metal device --
-    # inside the plugin, at client-create time -- so it must be set before
-    # jax dlopens the dylib below. Keep the two copies in sync.
-    if os.environ.get("METALJAX_MATMUL_PRECISION", "highest") == "highest":
-        os.environ.setdefault("MLX_METAL_GPU_ARCH", "applegpu_g16g")
-    import jax._src.xla_bridge as xb
-
-    xb.register_plugin("metal", priority=-1, library_path=str(path))
     _register_linalg_lowerings(callbacks=_install_native_callbacks(path),
                                donation=True)
 
 
 # --------------------------------------------------------------------------
-# the native plugin's callback bridge (P13)
+# the plugin's callback bridge (P13)
 # --------------------------------------------------------------------------
 #
 # jax's debug.print / debug.callback / pure_callback / io_callback lower, on
 # every backend, to something that eventually calls the user's Python. The
-# Stage 1 plugin trampolines into metaljax.engine and can simply call it; the
 # native plugin holds no interpreter, so the callable stays HERE, in the
 # registry below, and the dylib reaches it through one C function pointer.
 #
 # ctypes is what makes that safe: a CFUNCTYPE callback acquires the GIL for the
 # duration of the call and releases it after, so the GIL enters the native
-# engine only inside a user callback -- which is the same contract
-# native/bindings.cc gives the Stage 1 extension.
+# engine only inside a user callback.
 _NATIVE_CALLBACKS: list = []
 # The ctypes callback object: freeing it would leave the dylib holding a
 # dangling function pointer.
@@ -224,8 +158,7 @@ def _install_native_callbacks(path: Path):
                     f"the program declares {nout}")
             for i in range(nout):
                 dst = view(outs[i])
-                # The declared shape and dtype win, exactly as
-                # metaljax.ops.callbacks._run_callback casts to its specs.
+                # The declared shape and dtype win.
                 dst[...] = np.asarray(outputs[i]).reshape(dst.shape)
             return 0
         except BaseException as e:   # noqa: BLE001 - it becomes a PJRT error
@@ -246,12 +179,12 @@ def _install_native_callbacks(path: Path):
     return register
 
 
-def _register_linalg_lowerings(callbacks=True, donation=True):
+def _register_linalg_lowerings(callbacks=None, donation=True):
     """eigh/svd/eig have no generic StableHLO lowering — jax only
     registers per-platform rules, and those reject bf16/f16 outright
     (LAPACK routine tables). Emit our own custom_calls instead, with the
-    primitive's declared result types; metaljax.ops.lapack implements
-    them on the host (upcasting halves to f32)."""
+    primitive's declared result types; the plugin implements them on
+    Accelerate's LAPACK (plugin-native/runtime/host_lapack.cc)."""
     try:
         from jax._src.interpreters import mlir
         from jax._src.lax import linalg as ll
@@ -353,11 +286,12 @@ def _register_linalg_lowerings(callbacks=True, donation=True):
         mlir.register_lowering(ll.eigh_p, eigh_rule, platform="metal")
         mlir.register_lowering(ll.svd_p, svd_rule, platform="metal")
         mlir.register_lowering(ll.eig_p, eig_rule, platform="metal")
-        if callbacks:
-            # True: the Stage 1 registry (metaljax.ops.callbacks). A callable:
-            # the native plugin's, installed by _install_native_callbacks.
-            _register_callback_lowerings(
-                mlir, None if callbacks is True else callbacks)
+        if callbacks is not None:
+            # `callbacks` is the plugin's registrar, installed by
+            # _install_native_callbacks; None (no bridge in the dylib)
+            # leaves the callback lowerings unregistered so jax refuses
+            # debug.print at TRACE time with its own message.
+            _register_callback_lowerings(mlir, callbacks)
 
         # Buffer donation: jax only sets up input-output aliasing for
         # platforms in this list. With metal added, donate_argnums marks
@@ -382,21 +316,16 @@ def _register_linalg_lowerings(callbacks=True, donation=True):
         logger.warning("metaljax: linalg lowering registration failed: %s", e)
 
 
-def _register_callback_lowerings(mlir, register=None):
+def _register_callback_lowerings(mlir, register):
     """jax.debug.print / debug_callback / pure_callback on metal: stash
-    the Python callable in a registry and emit a metaljax_callback custom
-    call with its index (we run in-process, so whoever holds the registry
-    can just call it). `register` is that registry's registrar; None means
-    Stage 1's, in metaljax.ops.callbacks."""
+    the Python callable in this module's registry and emit a
+    metaljax_callback custom call with its index (we run in-process, so
+    whoever holds the registry can just call it)."""
     from functools import partial
     from jax._src import debugging
 
     def emit_callback(ctx, args, callback, with_results=True):
-        if register is not None:
-            idx = register(callback)
-        else:
-            from metaljax.ops import callbacks as cb_mod
-            idx = cb_mod.register_callback(callback)
+        idx = register(callback)
         out_types = ([mlir.aval_to_ir_type(ctx.module_context, a)
                       for a in ctx.avals_out] if with_results else [])
         op = mlir.custom_call(

@@ -1,19 +1,13 @@
-"""Quantized-matmul recognizer: exact repacking, rewriting, and fallbacks.
+"""Quantized-matmul recognizer, tested through the native PJRT plugin.
 
-Two layers of testing:
-
-* `pack_exact` against a numpy reference, including the bit-exactness matrix
-  measured on MLX 0.32 (zero point 0 is exact for any f32 scale; a general
-  zero point is exact only when the scale has few enough mantissa bits that
-  `scale * (2**(b-1) + zp)` is representable -- always true for the bf16/f16
-  scales real quantizers emit).
-
-* The recognizer end to end THROUGH THE REAL BACKEND (the packing prologue
-  lives in engine.execute, so the bare Interpreter used by `helpers.check`
-  never exercises it). Every case is checked against jax-CPU *and* against an
-  exactly-dequantized float32 reference: the rewrite accumulates in f32 over
-  an exactly reconstructed weight, so it lands closer to the exact answer
-  than the literal bf16 chain does.
+Every case drives plain JAX (`jax.jit` on the metal device, `device_put`)
+and is checked against jax-CPU *and* against an exactly-dequantized float32
+reference: the rewrite accumulates in f32 over an exactly reconstructed
+weight, so it lands closer to the exact answer than the literal bf16 chain
+does. The native recognizer reads METALJAX_QMM / METALJAX_QMM_SCALES /
+METALJAX_QMM_BLOCK / METALJAX_QMM_BUILD_CACHE / METALJAX_QMM_BATCH; with
+the rewrite off (METALJAX_QMM=0) the numeric comparisons here still hold
+-- the literal chain must be right too.
 
 The layer graphs are hand-built copies of what keras 3.15 emits for
 `Dense.quantize("int4")` (sub-channel, block_size=128, asymmetric with a
@@ -21,7 +15,15 @@ zero point and a `g_idx` group ramp), its per-channel variant
 (block_size=-1, symmetric, scale divides the OUTPUT) and `EinsumDense`
 (`btd,dnh->btnh`, kernel reshaped right before the dot) -- keras is not
 installed in this venv.
+
+The Python-introspection tests (pack_exact/pack_codes bit-exactness,
+_regroup clustering, stats counters, trace-budget and build-cache
+internals) were removed at the Stage-1 retirement: the Python engine is
+gone, the recognizer is re-implemented in C++ inside the plugin, and only
+its numeric behavior is observable from here.
 """
+
+import os
 
 import numpy as np
 import pytest
@@ -29,19 +31,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from metaljax import qmm
-
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
-
-# METALJAX_QMM=0 turns the whole rewrite off: the numeric comparisons below
-# still run (the literal chain must be right too), the ones that assert the
-# rewrite happened do not.
-needs_qmm = pytest.mark.skipif(not qmm.QMM_ENABLED, reason="METALJAX_QMM=0")
-# METALJAX_QMM_BUILD_CACHE=0 turns off cross-executable pack reuse; the tests
-# that assert a reuse happened have nothing to say then (the ones that assert
-# a MISS still do, and stay on).
-needs_build_cache = pytest.mark.skipif(
-    not qmm._MAX_BUILT, reason="METALJAX_QMM_BUILD_CACHE=0")
 
 
 def _metal():
@@ -50,125 +40,6 @@ def _metal():
 
 def _cpu():
     return jax.devices("cpu")[0]
-
-
-# --------------------------------------------------------------------------
-# packing
-# --------------------------------------------------------------------------
-
-
-def np_pack_codes(codes, bits):
-    """packlib.py's generic bit-stream reference (any `bits`)."""
-    c = np.ascontiguousarray(codes.astype(np.uint64))
-    k = c.shape[-1]
-    words = k * bits // 32
-    flat = c.reshape(-1, k)
-    out = np.zeros((flat.shape[0], words), dtype=np.uint64)
-    for i in range(k):
-        w0, off = divmod(i * bits, 32)
-        v = flat[:, i]
-        out[:, w0] |= (v << np.uint64(off)) & np.uint64(0xFFFFFFFF)
-        if off + bits > 32:
-            out[:, w0 + 1] |= v >> np.uint64(32 - off)
-    return out.astype(np.uint32).reshape(*c.shape[:-1], words)
-
-
-@pytest.mark.parametrize("bits", [4, 8])
-@pytest.mark.parametrize("shape", [(1, 32), (5, 128), (3, 4, 64)])
-def test_pack_codes_matches_reference(bits, shape):
-    import mlx.core as mx
-    rng = np.random.default_rng(0)
-    codes = rng.integers(0, 1 << bits, size=shape).astype(np.uint32)
-    got = np.array(qmm.pack_codes(mx.array(codes), bits))
-    np.testing.assert_array_equal(got, np_pack_codes(codes, bits))
-
-
-def _scale_kind(kind, shape, rng):
-    s = (rng.random(shape).astype(np.float32) + 0.5) * 0.03
-    if kind == "pow2":
-        return np.exp2(rng.integers(-8, 2, size=shape)).astype(np.float32)
-    if kind == "bf16":
-        import ml_dtypes
-        return s.astype(ml_dtypes.bfloat16).astype(np.float32)
-    return s  # arbitrary f32
-
-
-@pytest.mark.parametrize("bits", [4, 8])
-@pytest.mark.parametrize("gs", [32, 64, 128])
-@pytest.mark.parametrize("zp_kind", ["zero", "const", "random"])
-@pytest.mark.parametrize("scale_kind", ["pow2", "bf16", "f32"])
-def test_pack_exact(bits, gs, zp_kind, scale_kind):
-    """`dequantize(pack_exact(...))` vs float32 `scale * (code - zp)`."""
-    import mlx.core as mx
-    rng = np.random.default_rng(bits * 100 + gs)
-    n, k = 16, 256
-    lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
-    codes = rng.integers(lo, hi + 1, size=(n, k)).astype(np.int32)
-    codes[0, :4] = [lo, hi, 0, -1]  # force the extremes in
-    ng = k // gs
-    scale = _scale_kind(scale_kind, (n, ng), rng)
-    if zp_kind == "zero":
-        zp = np.zeros((n, ng), np.int32)
-    elif zp_kind == "const":
-        zp = np.full((n, ng), 3, np.int32)
-    else:
-        zp = rng.integers(lo, hi + 1, size=(n, ng)).astype(np.int32)
-
-    want = scale.repeat(gs, axis=1) * (codes.astype(np.float32)
-                                       - zp.repeat(gs, axis=1).astype(np.float32))
-    w, s, b = qmm.pack_exact(mx.array(codes), mx.array(scale), mx.array(zp),
-                             bits)
-    got = np.array(mx.dequantize(w, s, b, group_size=gs, bits=bits))
-    assert got.shape == want.shape
-    exact = bool(np.all(got == want))
-    # Measured on MLX 0.32 (report-mlxq section 2): the dequant is a single
-    # FMA, so it is bit-exact whenever the folded bias is representable --
-    # always for zp == 0 (a power-of-two multiple of the scale) and for any
-    # zp when the scale has few mantissa bits.
-    if zp_kind == "zero" or scale_kind in ("pow2", "bf16"):
-        assert exact, np.abs(got - want).max()
-    else:
-        rel = np.abs(got - want).max() / np.abs(want).max()
-        assert rel < 1e-5, rel
-
-
-@pytest.mark.parametrize("shift", [0, 8, -20])
-def test_pack_exact_arbitrary_code_offset(shift):
-    """MLX's q_hat is unsigned, so any integer shift works as long as the
-    bias undoes it -- that is what lets a [0, 15] code range pack at 4 bits."""
-    import mlx.core as mx
-    import ml_dtypes
-    rng = np.random.default_rng(2)
-    codes = rng.integers(-8, 8, size=(4, 128)).astype(np.int32) + shift
-    # bf16-precision scales, as every real quantizer emits: the bias
-    # `scale * offset` is then representable for ANY integer offset, which
-    # is what makes the reconstruction exact off the power-of-two grid.
-    scale = ((rng.random((4, 1)).astype(np.float32) + 0.5) * 0.1).astype(
-        ml_dtypes.bfloat16).astype(np.float32)
-    want = scale * codes.astype(np.float32)
-    w, s, b = qmm.pack_exact(mx.array(codes), mx.array(scale), None, 4,
-                             offset=-int(codes.min()))
-    got = np.array(mx.dequantize(w, s, b, group_size=128, bits=4))
-    np.testing.assert_array_equal(got, want)
-
-
-def test_pack_exact_keeps_source_dtype_when_lossless():
-    import mlx.core as mx
-    if qmm._SCALE_WIDTH != "auto":
-        pytest.skip("METALJAX_QMM_SCALES overrides the width policy")
-    rng = np.random.default_rng(1)
-    codes = rng.integers(-8, 8, size=(8, 128)).astype(np.int32)
-    scale = np.exp2(rng.integers(-6, 0, size=(8, 1))).astype(np.float32)
-    # zp == 0: bias = -8*scale is exact in bf16, so the narrow form is kept.
-    w, s, b = qmm.pack_exact(mx.array(codes), mx.array(scale), None, 4,
-                             scale_dtype=mx.bfloat16)
-    assert s.dtype == mx.bfloat16 and b.dtype == mx.bfloat16
-    # a zero point that makes the bias unrepresentable in bf16 widens to f32
-    scale = (rng.random((8, 1)).astype(np.float32) + 1.0)
-    zp = np.full((8, 1), 3, np.int32)
-    w, s, b = qmm.pack_exact(mx.array(codes), mx.array(scale), mx.array(zp), 4,
-                             scale_dtype=mx.bfloat16)
-    assert s.dtype == mx.float32 and b.dtype == mx.float32
 
 
 # --------------------------------------------------------------------------
@@ -258,16 +129,11 @@ def _run(f, args, device):
         return np.asarray(jax.jit(f)(*moved)).astype(np.float32)
 
 
-def _compare(f, args, exact, packs=1, perms=None):
+def _compare(f, args, exact):
     """Run on metal + CPU; both must match the exact f32 dequant reference,
     and metal must be no worse than CPU."""
-    qmm.reset_stats()
     got = _run(f, args, _metal())
     want = _run(f, args, _cpu())
-    if qmm.QMM_ENABLED:
-        assert qmm.stats()["packs"] == packs, qmm.stats()
-        if perms is not None:
-            assert qmm.stats()["perms"] == perms, qmm.stats()
     scale = np.abs(exact).max()
     err_metal = np.abs(got - exact).max() / scale
     err_cpu = np.abs(want - exact).max() / scale
@@ -276,7 +142,7 @@ def _compare(f, args, exact, packs=1, perms=None):
     # rewrite is not WORSE than the literal chain the CPU backend runs.
     # (Only under the default scale policy: METALJAX_QMM_SCALES=source
     # deliberately trades up to ~2x of this error for scale traffic.)
-    if qmm._SCALE_WIDTH == "auto":
+    if os.environ.get("METALJAX_QMM_SCALES", "auto") == "auto":
         assert err_metal <= err_cpu * 1.5 + 1e-6, (err_metal, err_cpu)
     np.testing.assert_allclose(got, want, rtol=2e-2, atol=1e-2 * scale)
     return err_metal, err_cpu
@@ -378,20 +244,6 @@ def test_group_permuting_g_idx_is_still_exact():
 # --------------------------------------------------------------------------
 
 
-def _canonical_scale_map(group_of_row, n, h, d=4):
-    """The [N, K] scale map the recognizer materializes for `btnh,nhd->btd`.
-
-    Canonical column j = hi * n + ni (h-major, the reversed contracting-dim
-    pairing) reads storage row r = ni * h + hi (n-major, keras' layout).
-    """
-    import mlx.core as mx
-    j = np.arange(n * h)
-    r = (j % n) * h + (j // n)
-    scale = np.arange(1, group_of_row.max() + 2, dtype=np.float32)[:, None]
-    scale = scale * np.arange(1, d + 1, dtype=np.float32)[None, :]   # [ng, d]
-    return mx.array(scale[group_of_row][r].T)                    # [d, K]
-
-
 def _out_proj_case(n, h, d, block=128, seed=70, g_idx=None):
     rows = n * h
     q, packed, scale, zero, g_idx, wref = _quantize(
@@ -405,27 +257,22 @@ def _out_proj_case(n, h, d, block=128, seed=70, g_idx=None):
     return args, exact
 
 
-@needs_qmm
 def test_einsum_out_projection_interleaved_groups():
     """The gemma/keras attention output projection: groups interleaved by the
     reversed contracting-dim pairing. Used to fall back; now regroups."""
     n, h, d = 8, 32, 96
     args, exact = _out_proj_case(n, h, d)
-    _compare(lambda *a: einsum_out_proj(*a, n=n, h=h, d=d), args, exact,
-             perms=1)
+    _compare(lambda *a: einsum_out_proj(*a, n=n, h=h, d=d), args, exact)
 
 
-@needs_qmm
 @pytest.mark.parametrize("n,h,block", [(4, 64, 128), (16, 32, 64),
                                        (2, 128, 128)])
 def test_einsum_out_projection_shapes(n, h, block):
     d = 64
     args, exact = _out_proj_case(n, h, d, block=block, seed=80 + n)
-    _compare(lambda *a: einsum_out_proj(*a, n=n, h=h, d=d), args, exact,
-             perms=1)
+    _compare(lambda *a: einsum_out_proj(*a, n=n, h=h, d=d), args, exact)
 
 
-@needs_qmm
 def test_interleaved_groups_in_a_decode_loop():
     """The same layer inside a data-dependent while: the permutation has to
     travel into the compiled body with the packed weights."""
@@ -448,27 +295,17 @@ def test_interleaved_groups_in_a_decode_loop():
 
     args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
             jnp.asarray(g_idx), jnp.asarray(x), jnp.int32(steps))
-    qmm.reset_stats()
     dev = _metal()
     with jax.default_device(dev):
         moved = [jax.device_put(a, dev) for a in args]
         jf = jax.jit(f)
         got = np.asarray(jf(*moved)).astype(np.float32)
-        # blocked == 0: an interleaved weight is packed from a whole
-        # evaluation whatever METALJAX_QMM_BLOCK says, because the
-        # permutation is a property of the entire contraction axis.
-        assert qmm.stats() == {"recognized": 1, "packs": 1, "fallbacks": 0,
-                               "perms": 1, "mxfp4": 0, "batched": 0,
-                               "shared": 0, "blocked": 0, "build_hits": 0,
-                               "build_declines": 0}, \
-            qmm.stats()
         got2 = np.asarray(jf(*moved)).astype(np.float32)
     np.testing.assert_array_equal(got, got2)
     want = _run(f, args, _cpu())
     np.testing.assert_allclose(got, want, rtol=3e-2, atol=3e-2)
 
 
-@needs_qmm
 def test_second_weight_set_with_a_different_permutation():
     """Two weight sets whose groups interleave DIFFERENTLY through one
     executable. The permutation travels as a graph input, so the second
@@ -480,13 +317,6 @@ def test_second_weight_set_with_a_different_permutation():
     alt = (np.arange(rows) % 2).astype(np.float32)
     parts = [_out_proj_case(n, h, d, seed=100),
              _out_proj_case(n, h, d, seed=110, g_idx=alt)]
-    # The premise: the recognizer really does derive two different
-    # permutations for these (checked on the maps it would build).
-    perms = [qmm._regroup(rows, (_canonical_scale_map(g, n, h), None))
-             for g in (np.arange(rows) // 128, alt.astype(np.int64))]
-    assert all(p is not None for p in perms)
-    assert not np.array_equal(*perms)
-    qmm.reset_stats()
     dev = _metal()
     f = jax.jit(lambda *a: einsum_out_proj(*a, n=n, h=h, d=d))
     outs = []
@@ -494,84 +324,12 @@ def test_second_weight_set_with_a_different_permutation():
         for args, _exact in parts:
             moved = [jax.device_put(a, dev) for a in args]
             outs.append(np.asarray(f(*moved)).astype(np.float32))
-    assert qmm.stats()["packs"] == 2 and qmm.stats()["perms"] == 2, qmm.stats()
     for (args, exact), got in zip(parts, outs):
         np.testing.assert_allclose(got, exact, rtol=3e-2,
                                    atol=3e-2 * np.abs(exact).max())
     assert not np.allclose(outs[0], outs[1])
 
 
-def _maps(scale, zero=None):
-    import mlx.core as mx
-    return (mx.array(scale),
-            None if zero is None else mx.array(zero))
-
-
-def test_regroup_clusters_interleaved_columns():
-    """The clustering itself: stride-interleaved groups become runs."""
-    import mlx.core as mx
-    rng = np.random.default_rng(120)
-    k, ngroups, rows = 256, 2, 8
-    order = np.arange(k) % ngroups          # stride-2 interleave
-    gvals = rng.standard_normal((rows, ngroups)).astype(np.float32)
-    scale = gvals[:, order]
-    zero = np.arange(ngroups, dtype=np.float32)[order] * np.ones((rows, 1),
-                                                                 np.float32)
-    smap, zmap = _maps(scale, zero)
-    assert qmm._pick_group(k, smap, zmap) is None
-    perm = qmm._regroup(k, (smap, zmap))
-    assert perm is not None
-    assert sorted(perm.tolist()) == list(range(k))
-    pi = mx.array(perm)
-    assert qmm._pick_group(k, qmm._take_k(smap, pi),
-                           qmm._take_k(zmap, pi)) == 128
-
-
-def test_regroup_merges_duplicate_group_columns():
-    """Two groups whose scale AND zero columns are identical cluster into one
-    double-length run. Harmless: every value in the run is equal, so any
-    group size dividing it reconstructs exactly."""
-    import mlx.core as mx
-    rng = np.random.default_rng(121)
-    k, rows = 384, 8
-    gvals = rng.standard_normal((rows, 3)).astype(np.float32)
-    gvals[:, 2] = gvals[:, 0]               # group 2 duplicates group 0
-    order = np.arange(k) % 3
-    smap, zmap = _maps(gvals[:, order])
-    perm = qmm._regroup(k, (smap, zmap))
-    assert perm is not None
-    pi = mx.array(perm)
-    permuted = qmm._take_k(smap, pi)
-    assert qmm._pick_group(k, permuted, None) == 128
-    # the merged run is 256 long and constant, so the pack is still exact
-    want = np.array(smap)[:, perm]
-    np.testing.assert_array_equal(np.array(permuted), want)
-
-
-def test_regroup_rejects_uneven_runs():
-    """Cluster lengths with no common legal group size -> no permutation."""
-    rng = np.random.default_rng(122)
-    k, rows = 256, 4
-    ids = np.concatenate([np.zeros(129), np.ones(127)]).astype(np.int64)
-    gvals = rng.standard_normal((rows, 2)).astype(np.float32)
-    smap, _ = _maps(gvals[:, ids])
-    assert qmm._regroup(k, (smap, None)) is None
-    # ... and a map whose every column differs
-    smap, _ = _maps(rng.standard_normal((rows, k)).astype(np.float32))
-    assert qmm._regroup(k, (smap, None)) is None
-
-
-def test_regroup_short_circuits_on_already_grouped_maps():
-    """An already-contiguous map must keep the identity (no-take) path."""
-    rng = np.random.default_rng(123)
-    k, rows = 256, 4
-    gvals = rng.standard_normal((rows, 2)).astype(np.float32)
-    smap, _ = _maps(np.repeat(gvals, 128, axis=1))
-    assert qmm._pick_group(k, smap, None) == 128
-    assert qmm._regroup(k, (smap, None)) is None
-
-
-@needs_qmm
 def test_identity_permutation_is_the_zero_overhead_path():
     """A dot whose groups are already contiguous carries no permutation."""
     rows, cols = 256, 128
@@ -582,7 +340,7 @@ def test_identity_permutation_is_the_zero_overhead_path():
     args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
             jnp.asarray(g_idx), jnp.asarray(x))
     exact = x.astype(np.float32) @ wref
-    _compare(lambda *a: dense_sub(*a, columns=cols), args, exact, perms=0)
+    _compare(lambda *a: dense_sub(*a, columns=cols), args, exact)
 
 
 # --------------------------------------------------------------------------
@@ -591,13 +349,9 @@ def test_identity_permutation_is_the_zero_overhead_path():
 
 
 def _fallback_case(f, args, exact):
-    """Recognized structurally, then rejected by a first-execute check."""
-    qmm.reset_stats()
+    """Recognized structurally, then rejected by a first-execute check --
+    the literal chain must still be numerically right."""
     got = _run(f, args, _metal())
-    st = qmm.stats()
-    assert st["packs"] == 0, st
-    if qmm.QMM_ENABLED:
-        assert st["fallbacks"] >= 1, st
     want = _run(f, args, _cpu())
     np.testing.assert_allclose(got, want, rtol=2e-2,
                                atol=1e-2 * np.abs(exact).max())
@@ -616,7 +370,7 @@ def test_shuffled_g_idx_is_regrouped():
     args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
             jnp.asarray(g_idx), jnp.asarray(x))
     _compare(lambda *a: dense_sub(*a, columns=cols), args,
-             x.astype(np.float32) @ wref, perms=1)
+             x.astype(np.float32) @ wref)
 
 
 def test_fallback_uneven_group_sizes():
@@ -685,7 +439,6 @@ def test_integer_zero_point_subtraction_without_wrap_is_rewritten():
     _compare(f, args, exact)
 
 
-@needs_qmm
 def test_fallback_dequantized_weight_used_twice():
     """A second consumer of the reconstructed weight means it is materialized
     anyway: the candidate is dropped at analysis time (never even packed)."""
@@ -703,39 +456,11 @@ def test_fallback_dequantized_weight_used_twice():
 
     args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
             jnp.asarray(g_idx), jnp.asarray(x))
-    qmm.reset_stats()
     got = _run(f, args, _metal())
-    st = qmm.stats()
-    assert st["packs"] == 0 and st["recognized"] == 0, st
     want = _run(f, args, _cpu())
     np.testing.assert_allclose(got, want, rtol=2e-2, atol=1e-1)
 
 
-def test_disabled_by_env(monkeypatch):
-    """METALJAX_QMM=0 leaves the literal chain in place."""
-    rows, cols = 128, 64
-    q, packed, scale, zero, g_idx, wref = _quantize(rows, cols, 64, "bfloat16",
-                                                    seed=18)
-    x = (np.random.default_rng(19).standard_normal((2, rows)) * 0.4).astype("bfloat16")
-    args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
-            jnp.asarray(g_idx), jnp.asarray(x))
-    # METALJAX_QMM=0 maps to QMM_ENABLED (the quantized-recognizer gate);
-    # qmm.ENABLED is the shared prologue gate that MoE also rides on. On the
-    # merged tree sdpa's overlap check reaches qmm.analyze even when the
-    # prologue is off, so the recognizer gate is the one that must hold.
-    monkeypatch.setattr(qmm, "QMM_ENABLED", False)
-    monkeypatch.setattr(qmm, "ENABLED", False)
-    qmm.reset_stats()
-    got = _run(lambda *a: dense_sub(*a, columns=cols), args, _metal())
-    assert qmm.stats() == {"recognized": 0, "packs": 0, "fallbacks": 0,
-                           "perms": 0, "mxfp4": 0, "batched": 0,
-                           "shared": 0, "blocked": 0, "build_hits": 0,
-                           "build_declines": 0}
-    want = _run(lambda *a: dense_sub(*a, columns=cols), args, _cpu())
-    np.testing.assert_allclose(got, want, rtol=2e-2, atol=1e-1)
-
-
-@needs_qmm
 def test_new_weight_buffers_repack_without_stale_results():
     """A second set of weights through the SAME executable must not reuse
     the first pack (the packed arrays travel as compiled-graph inputs)."""
@@ -745,14 +470,12 @@ def test_new_weight_buffers_repack_without_stale_results():
     x = (np.random.default_rng(24).standard_normal((2, rows)) * 0.4).astype("bfloat16")
     dev = _metal()
     f = jax.jit(lambda *a_: dense_sub(*a_, columns=cols))
-    qmm.reset_stats()
     outs = []
     with jax.default_device(dev):
         for part in (a, b):
             args = [jax.device_put(v, dev) for v in
                     (part[1], part[2], part[3], part[4], x)]
             outs.append(np.asarray(f(*args)).astype(np.float32))
-    assert qmm.stats()["packs"] == 2, qmm.stats()
     for part, got in zip((a, b), outs):
         exact = x.astype(np.float32) @ part[5]
         np.testing.assert_allclose(got, exact, rtol=2e-2,
@@ -765,11 +488,11 @@ def test_new_weight_buffers_repack_without_stale_results():
 # --------------------------------------------------------------------------
 
 
-@needs_qmm
 def test_decode_loop_packs_once_and_matches_cpu():
     """The keras sampler shape: a data-dependent while whose body holds the
     quantized layer. The weights are loop-invariant free captures, so the
-    pack must happen once for the whole loop, not once per step."""
+    pack must serve every step of the loop -- and a second whole call --
+    without drifting."""
     rows = cols = 128
     q, packed, scale, zero, g_idx, wref = _quantize(rows, cols, 128, "bfloat16",
                                                     seed=20)
@@ -785,318 +508,20 @@ def test_decode_loop_packs_once_and_matches_cpu():
 
     args = (jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
             jnp.asarray(g_idx), jnp.asarray(x), jnp.int32(steps))
-    qmm.reset_stats()
     dev = _metal()
     with jax.default_device(dev):
         # Place the weights once, as a real decode loop does, then step.
         moved = [jax.device_put(a, dev) for a in args]
         jf = jax.jit(f)
         got = np.asarray(jf(*moved)).astype(np.float32)
-        # `steps` iterations of a chain that would otherwise be repacked per
-        # step, plus a second whole call: still exactly one pack.
-        assert qmm.stats()["packs"] == 1, qmm.stats()
         got2 = np.asarray(jf(*moved)).astype(np.float32)
-    assert qmm.stats()["packs"] == 1, qmm.stats()
     np.testing.assert_array_equal(got, got2)
     want = _run(f, args, _cpu())
     np.testing.assert_allclose(got, want, rtol=3e-2, atol=3e-2)
 
 
-def _run_program(f, args):
-    """Compile and execute through the engine directly, so the test can see
-    the executable's own compile decision (what METALJAX_DEBUG prints as
-    `exec ...: compile=True`)."""
-    from helpers import lower_bytes
-    from metaljax import dtypes as mdt
-    from metaljax import engine
-
-    ex = engine.compile_program(lower_bytes(f, *args), "mlir")
-    bufs = []
-    for a in jax.tree.leaves(args):
-        arr = np.asarray(a)
-        bufs.append(engine.MetalBuffer(mdt.to_mx(arr),
-                                       engine._NP_TO_ENUM[arr.dtype],
-                                       list(arr.shape)))
-    outs = engine.execute(ex, bufs)
-    return ex, [mdt.to_np(o.data) for o in outs]
-
-
-@needs_qmm
-def test_trace_budget_restored_by_the_rewrite():
-    """Stacked quantized layers whose literal cost blows the trace budget
-    still compile once their reconstruction chains are absorbed."""
-    from metaljax.interpreter import COMPILE_ENABLED
-    from metaljax.ops import control
-
-    if not COMPILE_ENABLED:
-        pytest.skip("METALJAX_COMPILE=0: nothing is traced")
-
-    rows = cols = 64
-    layers = 12
-    parts = [_quantize(rows, cols, 64, "bfloat16", seed=30 + i)
-             for i in range(layers)]
-    x = (np.random.default_rng(31).standard_normal((1, rows)) * 0.3).astype("bfloat16")
-
-    def f(ws, x_):
-        h = x_
-        for packed_, scale_, zero_, g_ in ws:
-            h = jnp.tanh(dense_sub(packed_, scale_, zero_, g_, h, cols)
-                         * jnp.bfloat16(0.2))
-        return h
-
-    ws = [(jnp.asarray(p[1]), jnp.asarray(p[2]), jnp.asarray(p[3]),
-           jnp.asarray(p[4])) for p in parts]
-    args = (ws, jnp.asarray(x))
-
-    # The literal chain costs ~85 units per layer, the rewritten one ~5.
-    budget = control._TRACE_BUDGET
-    try:
-        control._TRACE_BUDGET = layers * 20
-        qmm.reset_stats()
-        ex, outs = _run_program(f, args)
-        assert qmm.stats()["packs"] == layers, qmm.stats()
-        assert ex._can_compile is True   # the whole main still fits
-        qmm.reset_stats()
-        try:
-            qmm.ENABLED = False
-            plain, outs_plain = _run_program(f, args)
-        finally:
-            qmm.ENABLED = True
-        assert plain._can_compile is False  # ... and would not without this
-    finally:
-        control._TRACE_BUDGET = budget
-    want = _run(f, args, _cpu())
-    np.testing.assert_allclose(outs[0].astype(np.float32), want,
-                               rtol=5e-2, atol=5e-2)
-    np.testing.assert_allclose(outs_plain[0].astype(np.float32), want,
-                               rtol=5e-2, atol=5e-2)
-
-
-@needs_qmm
-def test_trace_budget_restored_for_interleaved_groups():
-    """The real regression this fixes: a decode body of attention-projection
-    layers whose groups are interleaved stayed EAGER because every one of
-    them fell back to the literal chain."""
-    from metaljax.interpreter import COMPILE_ENABLED
-    from metaljax.ops import control
-
-    if not COMPILE_ENABLED:
-        pytest.skip("METALJAX_COMPILE=0: nothing is traced")
-
-    n, h = 8, 32                     # two interleaved groups per layer
-    d = n * h                        # square: the layers stack
-    layers = 10
-    parts = [_quantize(n * h, d, 128, "bfloat16", seed=140 + i)
-             for i in range(layers)]
-    x = (np.random.default_rng(141).standard_normal((1, 2, n, h))
-         * 0.3).astype("bfloat16")
-
-    def f(ws, x_):
-        hs = x_
-        for packed_, scale_, zero_, g_ in ws:
-            y = einsum_out_proj(packed_, scale_, zero_, g_, hs, n, h, d)
-            hs = jnp.reshape(jnp.tanh(y * jnp.bfloat16(0.2)), (1, 2, n, h))
-        return hs
-
-    ws = [(jnp.asarray(p[1]), jnp.asarray(p[2]), jnp.asarray(p[3]),
-           jnp.asarray(p[4])) for p in parts]
-    args = (ws, jnp.asarray(x))
-
-    budget = control._TRACE_BUDGET
-    try:
-        control._TRACE_BUDGET = layers * 20
-        qmm.reset_stats()
-        ex, outs = _run_program(f, args)
-        assert qmm.stats()["packs"] == layers, qmm.stats()
-        assert qmm.stats()["perms"] == layers, qmm.stats()
-        assert ex._can_compile is True
-        qmm.reset_stats()
-        try:
-            qmm.ENABLED = False
-            plain, outs_plain = _run_program(f, args)
-        finally:
-            qmm.ENABLED = True
-        assert plain._can_compile is False
-    finally:
-        control._TRACE_BUDGET = budget
-    want = _run(f, args, _cpu())
-    np.testing.assert_allclose(outs[0].astype(np.float32), want,
-                               rtol=5e-2, atol=5e-2)
-    np.testing.assert_allclose(outs_plain[0].astype(np.float32), want,
-                               rtol=5e-2, atol=5e-2)
-
-
-@needs_qmm
-def test_cost_model_charges_the_fused_dot():
-    """The recognized chain must not count toward the trace budget.
-
-    Interpreter-direct on purpose, and it is not a route around the engine:
-    nothing here EXECUTES. The two interpreters are parsed IR that
-    `_block_cost` is asked about, and one of them has its recognizer state
-    replaced by hand — which is the literal-cost baseline, not a program
-    anyone runs.
-    """
-    import io
-    from metaljax.interpreter import Interpreter
-    from metaljax.ops import control
-
-    rows = cols = 128
-    q, packed, scale, zero, g_idx, wref = _quantize(rows, cols, 128, "bfloat16",
-                                                    seed=40)
-    x = (np.random.default_rng(41).standard_normal((1, rows)) * 0.3).astype("bfloat16")
-    lowered = jax.jit(lambda *a: dense_sub(*a, columns=cols)).lower(
-        jnp.asarray(packed), jnp.asarray(scale), jnp.asarray(zero),
-        jnp.asarray(g_idx), jnp.asarray(x))
-    buf = io.BytesIO()
-    lowered.compiler_ir().operation.write_bytecode(buf)
-
-    interp = Interpreter(buf.getvalue())
-    plain = Interpreter(buf.getvalue())
-    plain._qmm = qmm.State()          # analysis disabled: literal cost
-    with interp.context:
-        st = qmm.analyze(interp)
-        fused = control._block_cost(interp, interp._main_block())
-    with plain.context:
-        literal = control._block_cost(plain, plain._main_block())
-    assert len(st.matches) == 1
-    assert fused <= 8, fused
-    assert literal > 60, literal
-
-
 # --------------------------------------------------------------------------
-# row-blocked packing
-# --------------------------------------------------------------------------
-
-
-def _packs_of(monkeypatch, f, args, block_elems):
-    """Run `f` on metal with a given block size; return the packs it built.
-
-    Both pack tables are cleared first: two runs of the same weight produce
-    identical packs, which `_share` would otherwise ALIAS -- and comparing an
-    array against itself proves nothing. `args` are host arrays so that each
-    run's `device_put` lands on fresh buffers and really repacks (which is
-    also what keeps `_BUILT` from answering the second run).
-    """
-    built = []
-    orig = qmm._build_pack
-
-    def spy(interp, m, argv, leaves):
-        pk = orig(interp, m, argv, leaves)
-        built.append([np.array(a) for a in pk.arrays()])
-        return pk
-
-    qmm._SHARED.clear()
-    qmm._BUILT.clear()
-    monkeypatch.setattr(qmm, "_BLOCK_ELEMS", block_elems)
-    monkeypatch.setattr(qmm, "_build_pack", spy)
-    qmm.reset_stats()
-    out = _run(f, args, _metal())
-    monkeypatch.undo()
-    return built, out, qmm.stats()
-
-
-def _affine_grouped(rows, k, gs, seed, interleave):
-    """An `[N, K]` sub-channel weight with the group axis SPLIT out.
-
-    What a packed checkpoint stores: codes `[N, K/gs, gs]` (or, interleaved,
-    `[N, gs, K/gs]`) and one scale/zero pair per group, broadcast over the
-    group and reshaped back to `[N, K]`. Unlike keras' own layout -- which
-    stores K first, and so cannot be blocked by rows at all -- this
-    contracts the LAST axis, which is what the blocked pack applies to.
-    `interleave` puts the group axis INSIDE, scattering each group's columns
-    across K at stride K/gs.
-    """
-    rng = np.random.default_rng(seed)
-    ng = k // gs
-    q = rng.integers(-8, 8, size=(rows, k)).astype(np.int8)
-    scale = ((rng.random((rows, ng)).astype(np.float32) + 0.5) * 0.05)
-    zero = rng.integers(-3, 4, size=(rows, ng)).astype(np.int8)
-    g = (np.arange(k) % ng) if interleave else (np.arange(k) // gs)
-    ref = (np.take(scale, g, axis=1)
-           * (q.astype(np.float32) - np.take(zero, g, axis=1)))
-    return q, scale, zero, ref
-
-
-def _affine_chain(q, scale, zero, x, interleave):
-    n, k = q.shape
-    ng = scale.shape[1]
-    # The group index is the LAST axis of the split when the groups are
-    # interleaved (K = within * ng + group) and the middle one when they are
-    # contiguous (K = group * gs + within).
-    split = (n, k // ng, ng) if interleave else (n, ng, k // ng)
-    axis = 1 if interleave else 2
-    qg = jnp.reshape(q, split).astype(x.dtype)
-    s = jnp.expand_dims(scale.astype(x.dtype), axis)
-    z = jnp.expand_dims(zero.astype(x.dtype), axis)
-    w = jnp.reshape((qg - z) * s, (n, k))
-    return jnp.einsum("tk,nk->tn", x, w)
-
-
-@needs_qmm
-def test_blocked_affine_pack_is_bit_identical(monkeypatch):
-    """Packing an affine weight block by block is packing, exactly.
-
-    Same claim as the MXFP4 side (tests/test_qmm_mxfp4.py): the codes, the
-    per-group scale and bias tables and the dot's result must be the same
-    bits as a whole evaluation gives. The affine path walks the code subtree
-    TWICE when blocked -- the offset that makes the codes unsigned is one
-    number for the whole weight -- so this also pins that the second walk
-    sees what the first did.
-    """
-    n, k, gs, t = 256, 128, 64, 3
-    q, scale, zero, ref = _affine_grouped(n, k, gs, 21, interleave=False)
-    x = (np.random.default_rng(22).standard_normal((t, k))
-         * 0.3).astype("bfloat16")
-    args = (q, scale, zero, x)
-
-    def f(*a):
-        return _affine_chain(*a, interleave=False)
-
-    whole, out_w, st_w = _packs_of(monkeypatch, f, args, 1 << 40)
-    small, out_b, st_b = _packs_of(monkeypatch, f, args, 1 << 10)
-    assert st_w["packs"] == st_b["packs"] == 1, (st_w, st_b)
-    assert st_w["blocked"] == 0 and st_b["blocked"] == 1, (st_w, st_b)
-    for a, b in zip(whole[0], small[0]):
-        assert a.dtype == b.dtype and a.shape == b.shape
-        np.testing.assert_array_equal(a, b)
-    np.testing.assert_array_equal(out_w, out_b)
-    exact = np.asarray(x, np.float32) @ ref.T
-    np.testing.assert_allclose(out_b, exact, rtol=3e-2, atol=3e-2)
-
-
-@needs_qmm
-def test_blocked_affine_falls_back_when_groups_interleave(monkeypatch):
-    """Groups scattered along K: the blocked pass gives up, the pack stands.
-
-    The permutation that un-interleaves them is a property of the whole
-    contraction axis, so no single block of rows can find it. `_NotBlockable`
-    sends the weight back to a whole evaluation, where `_regroup` does --
-    and the packed weight is the one the unblocked path would have produced
-    anyway.
-    """
-    n, k, gs, t = 128, 128, 64, 2
-    q, scale, zero, ref = _affine_grouped(n, k, gs, 23, interleave=True)
-    x = (np.random.default_rng(24).standard_normal((t, k))
-         * 0.3).astype("bfloat16")
-    args = (q, scale, zero, x)
-
-    def f(*a):
-        return _affine_chain(*a, interleave=True)
-
-    whole, out_w, st_w = _packs_of(monkeypatch, f, args, 1 << 40)
-    small, out_b, st_b = _packs_of(monkeypatch, f, args, 1 << 8)
-    assert st_w["packs"] == st_b["packs"] == 1, (st_w, st_b)
-    assert st_w["perms"] == st_b["perms"] == 1, (st_w, st_b)
-    assert st_b["blocked"] == 0 and st_b["fallbacks"] == 0, st_b
-    for a, b in zip(whole[0], small[0]):
-        np.testing.assert_array_equal(a, b)
-    np.testing.assert_array_equal(out_w, out_b)
-    exact = np.asarray(x, np.float32) @ ref.T
-    np.testing.assert_allclose(out_b, exact, rtol=3e-2, atol=3e-2)
-
-
-# --------------------------------------------------------------------------
-# the cross-executable build cache
+# the cross-executable build cache (numeric behavior only)
 # --------------------------------------------------------------------------
 
 
@@ -1107,59 +532,6 @@ def _on_device(weights):
     dev = _metal()
     with jax.default_device(dev):
         return [jax.device_put(v, dev) for v in weights]
-
-
-def _two_executables(monkeypatch, moved, shapes, cols, const=None,
-                     cache=True, clear=True):
-    """Run one weight set through several executables; return their packs.
-
-    Each shape is a separate jitted function, i.e. a separate executable with
-    its own `State` and its own fresh `Match`es -- which is what keras-hub
-    produces (one generate program per sequence length) and what the build
-    cache exists for. The functions are HELD: a pack lives as long as some
-    Match holds it, and the cache is weak, so dropping the first executable
-    would legitimately cost a rebuild.
-    """
-    if clear:
-        qmm._SHARED.clear()
-        qmm._BUILT.clear()
-    qmm.reset_stats()
-    if not cache:
-        monkeypatch.setattr(qmm, "_build_key", lambda *_a: (None, ()))
-
-    cold, hits = [], []
-    orig_build, orig_cached = qmm._build_pack, qmm._cached_build
-
-    def build_spy(interp, m, argv, leaves):
-        pk = orig_build(interp, m, argv, leaves)
-        cold.append([np.array(a) for a in pk.arrays()])
-        return pk
-
-    def cached_spy(key, keyleaves, leaves):
-        pk = orig_cached(key, keyleaves, leaves)
-        if pk is not None:
-            hits.append([np.array(a) for a in pk.arrays()])
-        return pk
-
-    monkeypatch.setattr(qmm, "_build_pack", build_spy)
-    monkeypatch.setattr(qmm, "_cached_build", cached_spy)
-
-    dev = _metal()
-    fns, outs = [], []
-    with jax.default_device(dev):
-        for t in shapes:
-            x = (np.random.default_rng(100 + t).standard_normal((t, cols[0]))
-                 * 0.4).astype("float32")
-            if const is None:
-                f = jax.jit(lambda *a: dense_sub(*a, columns=cols[1]))
-            else:
-                f = jax.jit(lambda *a: _scaled_sub(*a, columns=cols[1],
-                                                   const=const))
-            fns.append(f)
-            outs.append((x, np.asarray(f(*moved, jax.device_put(x, dev)))))
-    st = qmm.stats()
-    monkeypatch.undo()
-    return cold, hits, outs, st, fns
 
 
 def _scaled_sub(packed, scale, zero, g_idx, x, columns, const):
@@ -1176,62 +548,19 @@ def _scaled_sub(packed, scale, zero, g_idx, x, columns, const):
     return x @ ((w.astype(x.dtype) - z.astype(x.dtype)) * s)
 
 
-@needs_qmm
-@needs_build_cache
-def test_second_executable_reuses_the_pack(monkeypatch):
-    """One weight set, three executables: one build and two reuses.
-
-    And the reused arrays are the ones a cold build produces, bit for bit --
-    checked against a run of the same three programs with the cache declined,
-    so the reference really was built rather than looked up.
-    """
-    rows, cols = 128, 64
-    part = _quantize(rows, cols, 64, "float32", seed=41)
-    moved = _on_device(part[1:5])
-    exact_w = part[5]
-    shapes = (2, 5, 3)
-
-    cold, hits, outs, st, _fns = _two_executables(
-        monkeypatch, moved, shapes, (rows, cols), cache=False)
-    assert st["packs"] == len(shapes), st
-    assert st["build_hits"] == 0, st
-    for other in cold[1:]:
-        for a, b in zip(cold[0], other):
-            np.testing.assert_array_equal(a, b)
-
-    got, hits, outs, st, _fns = _two_executables(
-        monkeypatch, moved, shapes, (rows, cols))
-    assert st["packs"] == 1, st
-    assert st["build_hits"] == len(shapes) - 1, st
-    assert len(hits) == len(shapes) - 1
-    for reused in hits:
-        assert len(reused) == len(cold[0])
-        for a, b in zip(cold[0], reused):
-            assert a.dtype == b.dtype and a.shape == b.shape
-            np.testing.assert_array_equal(a, b)
-
-    for x, out in outs:
-        exact = x @ exact_w
-        np.testing.assert_allclose(out, exact, rtol=1e-5,
-                                   atol=1e-5 * np.abs(exact).max())
-
-
-@needs_qmm
-def test_different_weight_content_misses_the_build_cache(monkeypatch):
+def test_different_weight_content_misses_the_build_cache():
     """Same shapes, same dtypes, different bytes: identity has to catch it.
 
     The fingerprint cannot -- the two graphs ARE the same graph. What
     separates them is that the second execute hands the recognizer different
-    buffers, and the key names buffers by identity.
+    buffers; a stale cache hit would come back as the wrong numbers, which
+    are asserted per weight set.
     """
     rows, cols = 128, 64
     a = _quantize(rows, cols, 64, "float32", seed=42)
     b = _quantize(rows, cols, 64, "float32", seed=43)
     x = (np.random.default_rng(44).standard_normal((2, rows))
          * 0.4).astype("float32")
-    qmm._SHARED.clear()
-    qmm._BUILT.clear()
-    qmm.reset_stats()
     dev = _metal()
     f = jax.jit(lambda *a_: dense_sub(*a_, columns=cols))
     outs = []
@@ -1240,9 +569,6 @@ def test_different_weight_content_misses_the_build_cache(monkeypatch):
             moved = [jax.device_put(v, dev)
                      for v in (part[1], part[2], part[3], part[4], x)]
             outs.append(np.asarray(f(*moved)))
-    st = qmm.stats()
-    assert st["build_hits"] == 0, st
-    assert st["packs"] == 2, st
     for part, got in zip((a, b), outs):
         exact = x @ part[5]
         np.testing.assert_allclose(got, exact, rtol=1e-5,
@@ -1250,32 +576,29 @@ def test_different_weight_content_misses_the_build_cache(monkeypatch):
     assert not np.allclose(outs[0], outs[1])
 
 
-@needs_qmm
-def test_one_different_constant_misses_the_build_cache(monkeypatch):
+def test_one_different_constant_misses_the_build_cache():
     """Same buffers, same shapes, one attribute apart.
 
-    A wrong hit here would be silent: both graphs pack to a legal weight, so
-    only the numbers say which one came back. They are asserted per variant.
+    A wrong hit would be silent: both graphs pack to a legal weight, so
+    only the numbers say which one came back. The first executable is HELD
+    so any pack it built stays live while the second variant runs over the
+    very same buffers; each variant's output is asserted against its own
+    exact reference.
     """
     rows, cols = 128, 64
     part = _quantize(rows, cols, 64, "float32", seed=45)
     moved = _on_device(part[1:5])
-    outs = {}
+    x = (np.random.default_rng(46).standard_normal((2, rows))
+         * 0.4).astype("float32")
+    dev = _metal()
     held = []
-    for i, const in enumerate((2.0, 3.0)):
-        # The second variant runs against the FIRST one's cache entry, over
-        # the very same buffers (and against its still-live pack, which
-        # `held` keeps alive) -- clearing in between, or placing the weights
-        # again, would make the miss vacuous.
-        _cold, hits, got, st, fns = _two_executables(
-            monkeypatch, moved, (2,), (rows, cols), const=const,
-            clear=(i == 0))
-        held.append(fns)
-        assert st["build_hits"] == 0, (const, st)
-        assert st["packs"] == 1, (const, st)
-        assert hits == []
-        outs[const] = got[0]
-    for const, (x, out) in outs.items():
-        exact = x @ (part[5] * const)
-        np.testing.assert_allclose(out, exact, rtol=1e-5,
-                                   atol=1e-5 * np.abs(exact).max())
+    with jax.default_device(dev):
+        xd = jax.device_put(x, dev)
+        for const in (2.0, 3.0):
+            f = jax.jit(lambda *a, c=const: _scaled_sub(*a, columns=cols,
+                                                        const=c))
+            held.append(f)
+            out = np.asarray(f(*moved, xd))
+            exact = x @ (part[5] * const)
+            np.testing.assert_allclose(out, exact, rtol=1e-5,
+                                       atol=1e-5 * np.abs(exact).max())
