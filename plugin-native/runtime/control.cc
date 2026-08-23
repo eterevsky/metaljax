@@ -47,7 +47,22 @@ std::vector<mx::array> run_chunked(Program* body,
     flat.insert(flat.end(), caps.begin(), caps.end());
     if (body->may_compile(static_cast<int>(repeat))) {
       g_stats.compiled_calls++;
-      return body->compiled(static_cast<int>(repeat))(flat);
+      std::vector<mx::array> out =
+          body->compiled(static_cast<int>(repeat))(flat);
+      // The probe this path was missing. Every other caller of a compiled
+      // graph settles its first call (`BodyRunner::bind`, `run_recovering`,
+      // and `MslPlan::run` for a kernel launched outside a trace); a chunk
+      // went straight to the async submission below, so a chunk graph MLX
+      // could not build -- including a generated kernel traced into it --
+      // failed inside `mx::async_eval`, which abandons the events it had
+      // already attached and wedges the next blocking eval forever
+      // (Program::prove_compiled). It fails HERE now, where the catch below
+      // already knows what to do with it: stop chunking, replay single-step.
+      //
+      // Once per variant per program: the loop's later chunks and every
+      // later execute of the same executable skip straight past it.
+      body->prove_compiled(static_cast<int>(repeat), out);
+      return out;
     }
     std::vector<mx::array> out = v;
     for (int64_t r = 0; r < repeat; r++) out = run_body(body, out, caps, false);
@@ -60,7 +75,7 @@ std::vector<mx::array> run_chunked(Program* body,
     if ((i + 1) % sync_every == 0) {
       loop_flush(vals, sync_every * K * cost);
     } else {
-      mx::async_eval(vals);
+      loop_submit(vals);
     }
   }
   const int64_t rem = trip % K;
@@ -279,7 +294,7 @@ void Program::run_while(const Entry& e,
         if (i % hard_every == 0) {
           loop_flush(vals, period * cost);
         } else {
-          mx::async_eval(vals);
+          loop_submit(vals);
           loop_account(period * cost);
         }
       }
@@ -401,7 +416,7 @@ void Program::run_while(const Entry& e,
     vals = std::move(next);                  // (1) release the old carry
     std::vector<mx::array> pending(vals);
     pending.push_back(pred);
-    mx::async_eval(pending);                 // (2) submit, do not wait
+    loop_submit(pending);                    // (2) submit, do not wait
     g_stats.pipelined_steps++;
     loop_account(cost);                      // (3) same cadence, same clears
   }

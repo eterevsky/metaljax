@@ -189,6 +189,61 @@ def _msl_nested(h0, xs, w):
     return jax.lax.scan(outer, h0, xs)
 
 
+def _msl_chunked(h0, xs, us, wz, wh):
+    """The 0.11.6 WEDGE SHAPE: a generated kernel traced into a CHUNKED
+    replay.
+
+    The outer scan is too long to unroll (trip 256 > kUnrollMax), so it runs
+    eagerly and -- being pure and cheap -- replays kmax iterations per
+    compiled graph; the inner scan is an msl cell, so each chunk graph holds
+    a kernel MLX has not built yet.  Chunk 0 was the one compiled call
+    nothing settled before submitting: under METALJAX_MSL_FORCE_BUILD_FAIL
+    the build failed inside `mx::async_eval`, which abandons the per-stream
+    events it had already attached, and the next blocking eval waited on one
+    of them forever (`Event::wait`, no timeout).  `wzp`/`whp` are lazy
+    captures AND results on purpose: they are what the failed walk visits
+    first and what a caller reads back last.
+
+    Driven by the "a forced kernel-build failure never wedges" contract, not
+    by `_cases()`, and that is deliberate: with the kernel force-failed the
+    answer comes from the interpreted loop and matches the CPU, but with the
+    kernel RUNNING this shape is subject to a separate, pre-existing bug --
+    an msl scan nested inside an outer scan computes wrong values on HEAD
+    (standalone msl scans are bit-exact; even ONE outer iteration is wrong;
+    independent of METALJAX_COMPILE).  Reported for its own fix; a case here
+    would fail for that reason and say nothing about the wedge.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    wzp = jnp.tanh(wz) * 0.5
+    whp = jnp.tanh(wh) * 0.5
+
+    def outer(h, x):
+        def cell(c, u):
+            z = jax.nn.sigmoid(u * wzp)
+            return z * c + (1.0 - z) * jnp.tanh(u * whp), None
+        return jax.lax.scan(cell, h + x, us)[0], None
+
+    return jax.lax.scan(outer, h0, xs)[0], wzp, whp
+
+
+def _wedge_args():
+    """The wedge shape's inputs, identical in every arm that computes it."""
+    return [_rand((4, 16), 88), _rand((256, 4, 16), 89) * np.float32(0.1),
+            _rand((12, 4, 16), 90) * np.float32(0.1), _rand((16,), 91),
+            _rand((16,), 92)]
+
+
+def run_wedge_probe(path):
+    """Compute the wedge shape and write the answers (a child entry point)."""
+    import jax
+
+    out = jax.jit(_msl_chunked)(*_wedge_args())
+    flat = [np.asarray(x) for x in jax.tree_util.tree_leaves(out)]
+    np.savez(path, **{f"a{i}": a for i, a in enumerate(flat)})
+
+
 def _cases():
     import jax
     import jax.numpy as jnp
@@ -4827,6 +4882,16 @@ def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
     environment the dylib reads at load).  Bit-identity is reported, not
     demanded: a compile decision or a generated kernel changes which MLX
     kernels run, and the bar is each case's own CPU tolerance.
+
+    The child runs under a TIMEOUT, and that is a contract, not politeness.
+    An engine that submits work MLX has not proved it can build hands a
+    failure to `mx::async_eval`, which abandons the events it has attached
+    and leaves the next blocking eval waiting on one of them forever -- the
+    0.11.6 wedge, whose live shape is "msl kernel in a chunked replay" above
+    and whose arm is METALJAX_MSL_FORCE_BUILD_FAIL.  A wedge must be a
+    reported FAILURE here; without the timeout it would be a test run that
+    never ends, which is how it stayed latent the first time.  The budget is
+    minutes against a child that takes seconds: only a hang can reach it.
     """
     print(f"\n{title}")
     print("-" * 62)
@@ -4834,10 +4899,16 @@ def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
                                                     "arm-" + tag))
     child = dict(os.environ)
     child.update(env_extra)
-    proc = subprocess.run(
-        [sys.executable, str(pathlib.Path(__file__).resolve()), "--eager-arm",
-         str(path)],
-        env=child, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).resolve()),
+             "--eager-arm", str(path)],
+            env=child, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        print(f"{'the arm':<32} {'-':>12}  FAIL: the child WEDGED "
+              f"(no exit in 900s -- Event::wait?)")
+        failures.append(f"{tag} wedged")
+        return
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout + proc.stderr)
         print(f"{'the arm':<32} {'-':>12}  FAIL: the child failed")
@@ -4879,6 +4950,16 @@ def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--reference":
         write_reference(sys.argv[2])
+        return 0
+    if len(sys.argv) > 2 and sys.argv[1] == "--wedge-probe":
+        # The wedge shape, computed once (see the contract that drives it).
+        # The platform is whatever the caller put in the environment: this
+        # same entry point produces the CPU answer and the forced-failure
+        # metal answer, which is what makes comparing them meaningful.
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        run_wedge_probe(sys.argv[2])
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--msl-modes":
         # The mode census: run the msl cases through the plugin with
@@ -5262,6 +5343,67 @@ def main():
         print(f"{label + ' linalg (no CPU rule)':<32} {'':>12}  {detail}")
         if not ok:
             failures.append(f"{label} linalg")
+
+    # ------------------------------------------------------------------
+    # A forced kernel-build failure must never WEDGE the process (0.11.6).
+    #
+    # The shape is `_msl_chunked`: a generated kernel traced into a CHUNKED
+    # replay, which was the one compiled call nothing settled before handing
+    # it to `mx::async_eval`.  MLX attaches a per-stream event to every array
+    # such a walk visits and signals them only after it finishes, so a build
+    # failure raised mid-walk left those events attached and unsignaled, and
+    # the next blocking eval waited on one forever (`Event::wait` ->
+    # `waitUntilSignaledValue(..., -1)`).  Observed 2026-08-22; the stack is
+    # in ~/.cache/metaljax-bench/logs/event-wedge/.
+    #
+    # Two things are asserted, and the first is the point: the child EXITS.
+    # A wedge cannot be caught in-process -- it is an unkillable wait on a
+    # shared event -- so the test is a child under a timeout, and a
+    # regression shows up as "WEDGED" rather than as a suite that never
+    # finishes.  Second, the answer survives the recovery: with every
+    # generated kernel rejected, the interpreted loop each entry carries
+    # alongside must produce what the CPU produces.
+    print("\nthe no-wedge contract")
+    print("-" * 62)
+    label = "a rejected kernel never wedges"
+    probe = ref_path.with_name(ref_path.name.replace("reference", "wedge"))
+    cpu_probe = probe.with_suffix(".cpu.npz")
+    try:
+        cpu_child = dict(os.environ)
+        cpu_child["JAX_PLATFORMS"] = "cpu"
+        cpu_child.pop("METALJAX_PLUGIN_PATH", None)
+        subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).resolve()),
+             "--wedge-probe", str(cpu_probe)],
+            env=cpu_child, capture_output=True, text=True, check=True,
+            timeout=900)
+        forced = dict(os.environ)
+        forced["METALJAX_MSL_FORCE_BUILD_FAIL"] = "1"
+        subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).resolve()),
+             "--wedge-probe", str(probe)],
+            env=forced, capture_output=True, text=True, check=True,
+            timeout=900)
+        got, want = np.load(probe), np.load(cpu_probe)
+        worst = max(
+            float(np.abs(got[k].astype(np.float64)
+                         - want[k].astype(np.float64)).max())
+            for k in want.files)
+        ok = worst < 1e-5
+        detail = (f"ok (worst {worst:.1e})" if ok else
+                  f"FAIL: recovered answer is wrong ({worst:.1e})")
+    except subprocess.TimeoutExpired:
+        ok, detail = False, "FAIL: WEDGED (no exit in 900s -- Event::wait?)"
+    except BaseException as exc:  # noqa: BLE001
+        ok, detail = False, f"FAIL: {str(exc).splitlines()[0][:90]}"
+    print(f"{label:<32} {'':>12}  {detail}")
+    if not ok:
+        failures.append("no-wedge contract")
+    for p in (probe, cpu_probe):
+        try:
+            p.unlink()
+        except OSError:
+            pass
 
     try:
         ref_path.unlink()

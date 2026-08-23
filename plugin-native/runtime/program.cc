@@ -223,7 +223,18 @@ std::vector<mx::array> Program::call(const std::vector<mx::array>& inputs,
   if (in_trace) return interpret(inputs, true);
   if (compile_ && !compile_disabled_) {
     g_stats.compiled_calls++;
-    return compiled(1)(inputs);
+    std::vector<mx::array> outs = compiled(1)(inputs);
+    // A REGION's compiled graph -- an if/case branch -- is called in the
+    // middle of an eager main, and the next thing that main reaches may be
+    // an eager flush that SUBMITS it (runtime.cc `loop_submit`). So its
+    // first call is settled here, for the reason prove_compiled gives.
+    //
+    // Not while an msl plan is unproven: settle_msl owns that eval, and a
+    // generated kernel that fails to build is retired rather than blamed on
+    // the graph that traced it (run_recovering makes the same exception, and
+    // the submission rule covers the window it leaves).
+    if (t_msl_pending.empty()) prove_compiled(1, outs);
+    return outs;
   }
   return interpret(inputs, false);
 }

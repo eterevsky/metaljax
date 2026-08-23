@@ -335,6 +335,7 @@ void debug_line(const std::string& line);
 void debug_print(const std::string& msg);
 void flush_eval(const std::vector<mx::array>& arrays, bool hard);
 void loop_eval(const std::vector<mx::array>& arrays);
+void loop_submit(const std::vector<mx::array>& arrays);
 void loop_account(int64_t cost_units);
 void loop_flush(const std::vector<mx::array>& arrays, int64_t cost_units);
 void ingest_account(int64_t bytes);
@@ -643,6 +644,24 @@ class Program {
   // compiled variants and never build another.
   void drop_compiled();
 
+  // Settle the FIRST call of a compiled variant, once, with a blocking eval
+  // (compile.cc). A compiled call only BUILDS a graph; MLX generates the
+  // fused Metal kernels -- and any msl kernel traced into it -- at EVAL. So
+  // until one call has been evaluated, the variant may still fail to build,
+  // and WHERE that failure surfaces is the whole point: raised from a
+  // blocking eval it is an exception the recovery ladder catches, raised
+  // from `mx::async_eval` it leaves MLX's per-stream events attached to
+  // every array the abandoned walk had already visited and never signals
+  // them, so the next blocking eval of one of those arrays waits forever
+  // (`Event::wait` -> `waitUntilSignaledValue(..., -1)`). That is the 0.11.6
+  // wedge, and this is the rule that makes it unreachable: nothing unproven
+  // is ever submitted asynchronously (runtime.cc `loop_submit`).
+  //
+  // Costs one host-device sync per variant per program LIFETIME -- an
+  // executable's shapes are fixed, so one buildable call proves every later
+  // one, and the steady state runs the `proven` compare and nothing else.
+  void prove_compiled(int repeat, const std::vector<mx::array>& outs);
+
   bool compiled_dropped() const { return compile_disabled_; }
   bool no_chunk() const { return no_chunk_; }
   void set_no_chunk() { no_chunk_ = true; }
@@ -781,6 +800,12 @@ class Program {
   struct Compiled {
     std::uintptr_t id = 0;
     std::function<std::vector<mx::array>(const std::vector<mx::array>&)> fn;
+    // Has one call of this variant been SETTLED by a blocking eval? Until it
+    // has, the graph is only built, never run: MLX generates the fused Metal
+    // kernels at eval, so a library that will not build is still ahead of us.
+    // See prove_compiled -- the rule is what keeps such a failure out of an
+    // ASYNC submission, where it wedges the process rather than reporting.
+    bool proven = false;
   };
 
   int nslots_;

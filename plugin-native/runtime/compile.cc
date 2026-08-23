@@ -97,6 +97,26 @@ void Program::drop_compiled() {
   g_stats.compile_drops++;
 }
 
+// The first call of a compiled variant, settled. Declared in program.h,
+// where the rule it enforces is written out: nothing that can still fail to
+// BUILD may be handed to `mx::async_eval`, because a build failure raised
+// inside an async walk abandons MLX's per-stream events unsignaled and the
+// next blocking eval of an array that walk had visited never returns.
+//
+// Deliberately not wrapped in a try: the caller's ladder is what decides
+// what a failure means (a chunk that cannot be built stops being chunked, a
+// main tape falls back to the eager path), and every one of them is
+// positioned to catch this. `proven` is set only on success, so a variant
+// that threw is probed again if it is ever called again -- it will not be:
+// every caller retires it.
+void Program::prove_compiled(int repeat,
+                             const std::vector<mx::array>& outs) {
+  auto it = compiled_.find(repeat);
+  if (it == compiled_.end() || it->second.proven) return;
+  mx::eval(outs);
+  it->second.proven = true;
+}
+
 // Drop every compiled graph in this program and its regions: a compiled
 // trace that embedded a now-dead kernel would keep calling it. The
 // compile DECISION stands (disable_msl clears `_compiled` and no more) --

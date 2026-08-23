@@ -56,7 +56,11 @@ void flush_eval(const std::vector<mx::array>& arrays, bool hard) {
     if (hard) {
       mx::eval(arrays);
     } else {
-      mx::async_eval(arrays);
+      // ...through the submission rule, not straight to `mx::async_eval`:
+      // an eager main can reach this flush holding a kernel traced into a
+      // compiled REGION, which is unproven until the call settles. See
+      // loop_submit.
+      loop_submit(arrays);
     }
     return;
   } catch (const std::exception& e) {
@@ -299,6 +303,39 @@ void loop_eval(const std::vector<mx::array>& arrays) {
     mx::clear_cache();
     mx::eval(arrays);
   }
+}
+
+// The NON-blocking half, and the one place a submission decides to block.
+//
+// `mx::async_eval` walks the graph attaching a per-stream event to every
+// array it visits and signals those events only in a tail loop AFTER the
+// walk. An exception thrown mid-walk -- a generated kernel whose Metal
+// library will not build is the case on file -- escapes before that tail, so
+// every array already visited keeps an attached event that nothing will ever
+// signal, and the next blocking eval of one of them waits forever
+// (`Event::wait` -> `waitUntilSignaledValue(..., -1)`: no timeout). A
+// reportable error becomes a process wedge, which the no-panic contract
+// forbids as squarely as a panic.
+//
+// Everything that CAN fail to build is proven by a blocking eval before it
+// gets here (`Program::prove_compiled`, `BodyRunner`'s probe, `MslPlan::run`'s
+// first launch) -- except a kernel TRACED into a compiled graph, which cannot
+// be evaluated where it is traced and stays unproven until `settle_msl`
+// settles the call. While one of those is outstanding this submits
+// synchronously: a blocking eval attaches no events (MLX's attachment is
+// `if (async)`-guarded), so a build failure raised from it is an exception
+// and nothing more.
+//
+// The cost on the happy path is `empty()` on a thread-local vector. The list
+// is non-empty only between tracing a NEW kernel and settling it -- once per
+// plan per process, since `settle_msl` validates it -- so a steady state
+// never blocks here.
+void loop_submit(const std::vector<mx::array>& arrays) {
+  if (!t_msl_pending.empty()) {
+    loop_eval(arrays);
+    return;
+  }
+  mx::async_eval(arrays);
 }
 
 // The bookkeeping half: charge a sync point's work against the op-unit
