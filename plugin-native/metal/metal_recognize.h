@@ -67,6 +67,16 @@ struct QmmMatch {
   mlir::Value codes;
   mlir::Value zero;
   mlir::Value scale;
+  // MLX's native affine form is `scales * q + biases` with an ARBITRARY float
+  // bias per group, not `scale * (q - zero)` with an integer zero point -- and
+  // the two are not interchangeable: matching slopes forces `zero = -bias/
+  // scale`, which is not an integer, and rounding it costs up to half a
+  // quantization step.  When this is set, `zero` holds that bias MAP instead
+  // of a zero point: it is the same shape, rides the same blocking/regrouping
+  // machinery, and only the two places that interpret it differ (the
+  // integrality checks are skipped and the pack's biases are the map itself,
+  // shifted by whatever offset made the codes unsigned).
+  bool add_bias = false;
   // The reshape/transpose chain between the reconstruction and the dot.
   std::vector<mlir::Operation*> post;
   // The per-channel form: the graph divides the OUTPUT by a broadcast scale.
@@ -95,6 +105,17 @@ struct QmmMatch {
   // function of exactly these buffers, which is what makes it cacheable and
   // what says when it has to be rebuilt.
   std::vector<int> arg_indices;
+  // Just the CODES subtree's arguments.  A checkpoint that already ships
+  // MLX's packing (mlx-community's, say) is unpacked in the graph only so the
+  // recognizer can verify it, and repacks to bytes identical to the argument
+  // it came from; when that is provably so the pack aliases the argument
+  // instead of allocating a second copy of the whole model.
+  std::vector<int> code_args;
+  // Likewise for the scale and zero/bias subtrees.  These packs are a
+  // sixteenth of the codes but they are RETAINED for the life of the
+  // executable, which at 235B parameters is 7 GB apiece.
+  std::vector<int> scale_args;
+  std::vector<int> zero_args;
 
   // Filled by the pack build, on concrete buffers.
   int64_t gs = 0, bits = 0;

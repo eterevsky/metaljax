@@ -229,14 +229,17 @@
     },
     {
       "id": "aspirational-235b-3bit",
-      "path": "mlx_only",
+      "path": "keras_lm",
       "model": "mlx-community/Qwen3-235B-A22B-Instruct-2507-3bit",
+      "preset": "hf://mlx-community/Qwen3-235B-A22B-Instruct-2507-3bit",
       "size_gb": 102.9,
       "backends": [
+        "metaljax",
         "mlx"
       ],
-      "status": "blocked-metaljax",
-      "note": "TRACKED: fits mlx-lm (103 GB, verified); 4-bit is 132 GB and does NOT fit; metaljax needs packed quantized storage"
+      "arch": "Qwen3MoeCausalLM",
+      "native_quant": "mlx3bit",
+      "note": "mlx-community affine 3-bit (group 64), loaded PACKED via scripts/model_bench/qwen3_moe_mlx3bit.py and fused to mx.quantized_matmul/gather_qmm at bits=3. The engine aliases the already-MLX-packed codes and maps, so the 96 GiB of weights is held once. 4-bit is 132 GB and does NOT fit. METALJAX_BENCH_NATIVE_QUANT=0 disables the packed path (and does not fit)."
     }
   ]
 }

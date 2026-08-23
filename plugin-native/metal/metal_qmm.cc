@@ -89,6 +89,19 @@ const bool kBatch = !EnvOff("METALJAX_QMM_BATCH");
 // qmm.py `_GROUP_SIZES`, largest first (gs=32 measured 1.8x slower at decode).
 constexpr int64_t kGroupSizes[3] = {128, 64, 32};
 constexpr int64_t kMinGroup = 32;
+// The narrowest affine storage the packer will choose (METALJAX_QMM_MIN_BITS).
+// `bits` is read off the observed code range, not off a checkpoint's
+// declaration, so a genuinely 3-bit weight (codes in [0, 7]) would otherwise
+// be stored at 4 and cost a third more memory than it has to -- which for a
+// 96 GB checkpoint is the difference between fitting and not.  Raise this to 4
+// to restore the pre-0.11.6 choice if a 3-bit kernel ever measures worse than
+// the 4-bit one for a weight that could use either.
+const int64_t kMinBits = [] {
+  const char* v = std::getenv("METALJAX_QMM_MIN_BITS");
+  if (v == nullptr) return int64_t{3};
+  const int64_t n = std::atoll(v);
+  return n >= 3 && n <= 8 ? n : int64_t{3};
+}();
 // OCP MXFP4: one shared power-of-two scale per 32 elements, a 4-bit E2M1
 // element.  The magnitudes are indexed by the low three bits of the code.
 constexpr float kE2M1Mags[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
@@ -494,6 +507,19 @@ void Finish(const llvm::DenseMap<mlir::Value, int>& main_args,
   }
   m->arg_indices.assign(args.begin(), args.end());
   std::sort(m->arg_indices.begin(), m->arg_indices.end());
+  // The codes subtree on its own: a strict subset of what Closure just walked,
+  // so it cannot reach anything the call above did not already accept.
+  auto subtree_args = [&](mlir::Value v, std::vector<int>* out) {
+    if (v == nullptr) return;
+    llvm::DenseSet<mlir::Operation*> sops;
+    absl::flat_hash_set<int> sargs;
+    Closure({v}, main_args, &sops, &sargs, {});
+    out->assign(sargs.begin(), sargs.end());
+    std::sort(out->begin(), out->end());
+  };
+  subtree_args(m->codes, &m->code_args);
+  subtree_args(m->scale, &m->scale_args);
+  subtree_args(m->zero, &m->zero_args);
   m->ops.assign(ops.begin(), ops.end());
   // Ops that MUST end up skipped for the rewrite to be a win: everything
   // between the affine reconstruction and the dot.  If some other consumer
@@ -555,6 +581,28 @@ std::unique_ptr<QmmMatch> TryAffineSide(
   mlir::Value qop = dot->getOperand(qside);
   std::vector<mlir::Operation*> post;
   mlir::Value base = Strip(qop, /*shape_ops=*/true, /*converts=*/true, &post);
+  // MLX's native affine form wraps the multiply in an add: `scales*q +
+  // biases`.  Peel it here and remember the bias; everything below -- the
+  // code parse, the scale, the blocking, the regrouping -- is the same.
+  mlir::Operation* addop = nullptr;
+  mlir::Value bias;
+  if (mlir::Operation* head = Owner(base);
+      head != nullptr && OpName(head) == "stablehlo.add") {
+    for (int i = 0; i < 2; i++) {
+      mlir::Value cand = Strip(head->getOperand(i), /*shape_ops=*/false,
+                               /*converts=*/true, nullptr);
+      mlir::Operation* mo = Owner(cand);
+      if (mo != nullptr && OpName(mo) == "stablehlo.multiply") {
+        base = cand;
+        addop = head;
+        bias = head->getOperand(1 - i);
+        break;
+      }
+    }
+    if (addop == nullptr) Bail("the operand adds no multiply");
+    if (!IsFloatEl(bias))
+      Bail(absl::StrCat("bias element type ", ElName(bias)));
+  }
   mlir::Operation* mul = Owner(base);
   if (mul == nullptr || OpName(mul) != "stablehlo.multiply")
     Bail("the operand is not a multiply");
@@ -572,6 +620,7 @@ std::unique_ptr<QmmMatch> TryAffineSide(
   if (!have) {
     // No integer operand: MXFP4's grid is non-uniform, so its codes have
     // become floats before the scale is applied.
+    if (addop != nullptr) Bail("mxfp4 codes carry no additive bias");
     mlir::Value values;
     SplitScaled(mul, &values, &scale);
     if (!HasIntLeaf(values)) Bail("the scaled operand holds no integer codes");
@@ -583,13 +632,23 @@ std::unique_ptr<QmmMatch> TryAffineSide(
     m->has_sub_range = parsed.has_range;
     m->sub_lo = parsed.lo;
     m->sub_hi = parsed.hi;
+    if (addop != nullptr) {
+      // `scale*(q - zero) + bias` is representable but nothing emits it, and
+      // guessing which of the two the map is would be a silent wrong answer.
+      if (m->zero != nullptr)
+        Bail("both a zero point and an additive bias");
+      m->zero = bias;
+      m->add_bias = true;
+    }
   }
   if (!IsFloatEl(scale))
     Bail(absl::StrCat("scale element type ", ElName(scale)));
   m->scale = scale;
   for (mlir::Operation* o : post)
     if (IsShapeOp(OpName(o))) m->post.push_back(o);
-  Finish(main_args, donated, m.get(), dot, {qop}, dot, qside, {mul}, {});
+  std::vector<mlir::Operation*> required{mul};
+  if (addop != nullptr) required.push_back(addop);
+  Finish(main_args, donated, m.get(), dot, {qop}, dot, qside, required, {});
   return m;
 }
 
@@ -882,6 +941,15 @@ class RowSource {
   }
 
   bool blocked() const { return step_ > 0; }
+
+  // @main's concrete argument buffers, for the alias check below.
+  const mx::array* Arg(int i) const {
+    if (ctx_.args == nullptr || i < 0 ||
+        i >= static_cast<int>(ctx_.args->size()))
+      return nullptr;
+    return &(*ctx_.args)[i];
+  }
+  int64_t lead() const { return lead_; }
 
   void unblock() {
     step_ = 0;
@@ -1252,27 +1320,78 @@ int64_t PickGroupHeads(int64_t k, const mx::array& scale_heads,
 // qmm.py `pack_codes`: unsigned codes `[..., K]` -> uint32 words.  MLX packs
 // each row of the last axis as one contiguous little-endian bit stream, LSB
 // first: element i occupies bits [i*bits, (i+1)*bits).
+//
+// For a bits that divides 32 every element sits inside one word and the stream
+// is a word-at-a-time affair.  For a sub-byte width that does NOT divide 32 --
+// 3 and 5 and 6, which MLX quantizes and dequantizes natively -- elements
+// STRADDLE word boundaries, so the unit of packing is the smallest run of
+// codes that fills a whole number of words: lcm(32, bits) bits, i.e.
+// `32/gcd` codes into `bits/gcd` words.  Both cases are the same loop; a
+// power-of-two width simply has chunk_words == 1 and no straddling half.
+// Verified against `mx::quantize` output bit for bit (execute_test's
+// `qmm 3-bit` differential).
 mx::array PackCodes(const mx::array& codes, int64_t bits) {
-  if (32 % bits) Bail("pack_codes: bits does not divide 32");
-  const int64_t per = 32 / bits;
+  if (bits <= 0 || bits > 32) Bail("pack_codes: bits out of range");
+  const int64_t g = std::gcd(int64_t{32}, bits);
+  const int64_t chunk_codes = 32 / g;   // codes that fill a whole word run
+  const int64_t chunk_words = bits / g; // words those codes fill exactly
   const int64_t k = codes.shape().back();
-  if (k % per) Bail("pack_codes: K is not a multiple of the packing factor");
+  if (k % chunk_codes)
+    Bail("pack_codes: K is not a multiple of the packing factor");
   mx::Shape s(codes.shape().begin(), codes.shape().end() - 1);
-  s.push_back(static_cast<mx::ShapeElem>(k / per));
-  s.push_back(static_cast<mx::ShapeElem>(per));
+  s.push_back(static_cast<mx::ShapeElem>(k / chunk_codes));
+  s.push_back(static_cast<mx::ShapeElem>(chunk_codes));
   mx::array c = mx::reshape(mx::astype(codes, mx::uint32), s);
   const int axis = static_cast<int>(c.ndim()) - 1;
-  mx::array mask = U32((1u << bits) - 1);
-  std::optional<mx::array> out;
-  for (int64_t i = 0; i < per; i++) {
+  mx::array mask =
+      U32(bits == 32 ? ~uint32_t{0} : ((uint32_t{1} << bits) - 1));
+  std::vector<std::optional<mx::array>> words(chunk_words);
+  auto fold = [&](int64_t w, mx::array v) {
+    words[w] = words[w].has_value() ? mx::bitwise_or(*words[w], v) : v;
+  };
+  for (int64_t i = 0; i < chunk_codes; i++) {
     // Defensive mask: an out-of-range code would otherwise spill into the NEXT
     // element's bits and corrupt an unrelated weight.
     mx::array v =
         mx::bitwise_and(mx::take(c, static_cast<int>(i), axis), mask);
-    if (i) v = mx::left_shift(v, U32(static_cast<uint32_t>(i * bits)));
-    out = out.has_value() ? mx::bitwise_or(*out, v) : v;
+    const int64_t bitpos = i * bits;
+    const int64_t w0 = bitpos / 32, off = bitpos % 32;
+    fold(w0, off ? mx::left_shift(v, U32(static_cast<uint32_t>(off))) : v);
+    // The straddling remainder: the high `off + bits - 32` bits belong to the
+    // next word.  Only reachable when bits does not divide 32.
+    if (off + bits > 32)
+      fold(w0 + 1, mx::right_shift(v, U32(static_cast<uint32_t>(32 - off))));
   }
-  return *out;
+  for (int64_t w = 0; w < chunk_words; w++)
+    if (!words[w].has_value()) Bail("pack_codes: word run left a hole");
+  if (chunk_words == 1) return *words[0];
+  // Interleave: chunk-major, word-minor, which is what a flat bit stream is.
+  std::vector<mx::array> ws;
+  ws.reserve(chunk_words);
+  for (auto& w : words) ws.push_back(*w);
+  mx::Shape os(codes.shape().begin(), codes.shape().end() - 1);
+  os.push_back(static_cast<mx::ShapeElem>(k * bits / 32));
+  return mx::reshape(mx::stack(ws, axis), os);
+}
+
+// A pack array that turns out to be bit-identical to the single @main argument
+// its subtree reads can BE that argument: same values, one allocation.  The
+// equality test is the whole safety argument -- nothing here trusts a
+// checkpoint's claim about its own layout, it compares the bytes -- and a
+// mismatch simply keeps the freshly built copy.
+template <typename Src>
+std::optional<mx::array> TryAliasArray(const mx::array& built,
+                                       const std::vector<int>& args,
+                                       const Src& src) {
+  if (args.size() != 1) return std::nullopt;
+  const mx::array* a = src.Arg(args[0]);
+  if (a == nullptr || a->dtype() != built.dtype() || a->size() != built.size())
+    return std::nullopt;
+  mx::array want = mx::reshape(*a, built.shape());
+  mx::array same = mx::all(mx::equal(built, want));
+  mx::eval(same);
+  if (!same.item<bool>()) return std::nullopt;
+  return want;
 }
 
 bool Lossless(const mx::array& x, mx::Dtype dt) {
@@ -1286,14 +1405,20 @@ bool Lossless(const mx::array& x, mx::Dtype dt) {
 // UNSIGNED q_hat, so shifting the codes by any integer offset that makes them
 // non-negative works as long as the shift is undone in the bias.
 void ScaleBias(const mx::array& scales, const mx::array* zeros, int64_t offset,
-               std::optional<mx::Dtype> scale_dtype, mx::array* out_scales,
-               mx::array* out_biases) {
+               std::optional<mx::Dtype> scale_dtype, bool zero_is_bias,
+               mx::array* out_scales, mx::array* out_biases) {
   mx::array s32 = mx::astype(mx::contiguous(scales), mx::float32);
   mx::array z32 = zeros == nullptr
                       ? mx::array(0.0f, mx::float32)
                       : mx::astype(mx::contiguous(*zeros), mx::float32);
-  mx::array b32 = mx::negative(mx::multiply(
-      s32, mx::add(z32, mx::array(static_cast<float>(offset), mx::float32))));
+  const mx::array off(static_cast<float>(offset), mx::float32);
+  // `zero_is_bias`: the graph already computes `scales*q + bias`, so the pack's
+  // bias IS that map -- less whatever the offset added to the codes, since MLX
+  // dequantizes the SHIFTED code (`s*(q + offset) + b'` must equal `s*q + b`,
+  // hence `b' = b - s*offset`).  Otherwise the classic zero-point form.
+  mx::array b32 = zero_is_bias
+                      ? mx::subtract(z32, mx::multiply(s32, off))
+                      : mx::negative(mx::multiply(s32, mx::add(z32, off)));
   if (scale_dtype.has_value() && *scale_dtype != mx::float32 &&
       kScaleWidth != "f32") {
     // Keep the source (bf16/f16) width when nothing is lost by it: it halves
@@ -1599,7 +1724,9 @@ Pack BuildAffine(const QmmMatch& m, RowSource& src) {
     have_range = true;
   }
   int64_t bits;
-  if (hi - lo < 16) {
+  if (hi - lo < 8 && kMinBits <= 3) {
+    bits = 3;
+  } else if (hi - lo < 16) {
     bits = 4;
   } else if (hi - lo < 256) {
     bits = 8;
@@ -1704,7 +1831,12 @@ Pack BuildAffine(const QmmMatch& m, RowSource& src) {
       scales = GroupHeads(scales, gs / g0);
       if (zeros.has_value()) zeros = GroupHeads(*zeros, gs / g0);
     }
-    if (zeros.has_value()) {
+    if (zeros.has_value() && m.add_bias) {
+      // A bias map is an arbitrary float by construction -- there is nothing
+      // to check for integrality, and the wrap argument below cannot apply
+      // because the graph never subtracts it in integer arithmetic.
+      zeros = mx::astype(*zeros, mx::float32);
+    } else if (zeros.has_value()) {
       // In f32 throughout: the zero map may be an integer tensor, and MLX
       // refuses to compare one against out-of-range literals.
       zeros = mx::astype(*zeros, mx::float32);
@@ -1729,28 +1861,116 @@ Pack BuildAffine(const QmmMatch& m, RowSource& src) {
     if (zeros.has_value()) mx::eval(*zeros);
   }
 
-  std::vector<mx::array> ws;
-  for (auto [blo, bhi] : src.blocks()) {
-    {
-      mx::array codes = src.Rows(m.codes, blo, bhi);
-      if (perm.has_value()) codes = TakeK(codes, *perm);
-      ws.push_back(PackCodes(
-          mx::add(mx::astype(mx::contiguous(codes), mx::int32),
-                  mx::array(static_cast<int>(offset), mx::int32)),
-          bits));
+  // A source ALREADY in MLX's layout repacks to bytes identical to the
+  // argument it came from, and allocating those bytes twice doubles the model
+  // -- at 3 bits a 96 GB checkpoint packs to another 96 GB, and nothing that
+  // big fits twice on this machine.  So look for a single uint32 argument with
+  // exactly the packed shape, verify every block against it, and hand back the
+  // argument itself.  The comparison is what makes this safe: this is not a
+  // declaration we trust, it is a claim we check block by block, and a single
+  // differing word falls back to the copy below.
+  std::optional<mx::array> alias;
+  const int64_t words = m.K * bits / 32;
+  const int64_t rows = m.K > 0 ? Prod(m.rshape) / m.K : 0;
+  // Rows per index of the blocked (leading) axis: `blocks()` counts in the
+  // leading axis, the pack counts in ROWS, and for a batched weight those
+  // differ by the middle dimensions.
+  int64_t rpl = 0;
+  if (!perm.has_value() && offset == 0 && m.code_args.size() == 1 &&
+      m.rshape.size() >= 2 && src.lead() > 0 && rows > 0 &&
+      rows % src.lead() == 0) {
+    const mx::array* a = src.Arg(m.code_args[0]);
+    if (a != nullptr && a->dtype() == mx::uint32 && a->size() == rows * words) {
+      rpl = rows / src.lead();
+      // EXACTLY the shape `Cat(ws)` produces -- [rows, words] -- because that
+      // is what `Join` and the emitter are written against.  Handing back the
+      // argument's own shape instead silently reshapes the weight, and the
+      // pack then disagrees with its scale map (which is built the normal
+      // way): quantized_matmul rejects the pair, deep inside MLX, on a model
+      // that took forty minutes to load.
+      alias = mx::reshape(*a, mx::Shape{static_cast<mx::ShapeElem>(rows),
+                                        static_cast<mx::ShapeElem>(words)});
     }
-    src.Drop(m.codes);
-    mx::eval(ws.back());
+  }
+
+  std::vector<mx::array> ws;
+  bool aliased = false;
+  if (alias.has_value()) {
+    aliased = true;
+    for (auto [blo, bhi] : src.blocks()) {
+      mx::array packed = PackCodes(
+          mx::astype(mx::contiguous(src.Rows(m.codes, blo, bhi)), mx::int32),
+          bits);
+      mx::Shape start{static_cast<mx::ShapeElem>(blo * rpl), 0};
+      mx::Shape stop{static_cast<mx::ShapeElem>(bhi * rpl),
+                     static_cast<mx::ShapeElem>(words)};
+      mx::array want = mx::reshape(mx::slice(*alias, start, stop),
+                                   packed.shape());
+      mx::array same = mx::all(mx::equal(packed, want));
+      mx::eval(same);
+      src.Drop(m.codes);
+      if (!same.item<bool>()) {
+        aliased = false;
+        break;
+      }
+    }
+    if (aliased)
+      Debug(absl::StrCat(m.name, " packs by ALIAS (the argument is already ",
+                         "in MLX's layout; no second copy)"));
+  }
+  if (!aliased) {
+    ws.clear();
+    for (auto [blo, bhi] : src.blocks()) {
+      {
+        mx::array codes = src.Rows(m.codes, blo, bhi);
+        if (perm.has_value()) codes = TakeK(codes, *perm);
+        ws.push_back(PackCodes(
+            mx::add(mx::astype(mx::contiguous(codes), mx::int32),
+                    mx::array(static_cast<int>(offset), mx::int32)),
+            bits));
+      }
+      src.Drop(m.codes);
+      mx::eval(ws.back());
+    }
   }
   mx::array out_scales = mx::array(0.0f);
   mx::array out_biases = mx::array(0.0f);
   ScaleBias(scales, zeros.has_value() ? &*zeros : nullptr, offset, scale_dtype,
-            &out_scales, &out_biases);
+            m.add_bias, &out_scales, &out_biases);
   // Materialize: a lazy packed weight would pin the whole reconstruction graph
   // (and its full-size intermediates) for the life of the cache.
   mx::eval(out_scales, out_biases);
-  Pack pk{Join(Cat(ws), m), Join(out_scales, m), Join(out_biases, m), perm, gs,
-          bits, 0};
+  // The scale and bias maps get the same treatment as the codes.  Their
+  // BUILD is cheap (one weight's worth of heads), but what they cost is what
+  // they RETAIN, and a checkpoint that already ships MLX's per-group maps
+  // hands us arrays we would otherwise store twice.
+  if (!perm.has_value()) {
+    int n = 0;
+    if (auto s = TryAliasArray(out_scales, m.scale_args, src)) {
+      out_scales = *s;
+      n++;
+    }
+    if (offset == 0 && m.add_bias) {
+      if (auto b = TryAliasArray(out_biases, m.zero_args, src)) {
+        out_biases = *b;
+        n++;
+      }
+    }
+    if (n > 0)
+      Debug(absl::StrFormat("%s aliases %d of its scale/bias maps", m.name, n));
+  }
+  mx::array codes_pack = aliased ? *alias : Cat(ws);
+  // The codes pack and its scale map are built by two different routes and
+  // MLX only compares them once it is deep inside quantized_matmul, on a
+  // model that may have taken an hour to load.  Check the contract here, where
+  // the error can still name which weight broke it.
+  if (codes_pack.ndim() != 2 || codes_pack.shape()[0] != rows ||
+      codes_pack.shape()[1] != words)
+    Bail(absl::StrFormat(
+        "pack shape [%s] is not the expected [%d, %d] (rows x words)",
+        absl::StrJoin(codes_pack.shape(), ", "), rows, words));
+  Pack pk{Join(codes_pack, m), Join(out_scales, m), Join(out_biases, m), perm,
+          gs, bits, 0};
   return pk;
 }
 

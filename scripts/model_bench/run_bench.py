@@ -111,14 +111,26 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
         print("[bench] native MXFP4 loading: "
               f"{'on' if mxfp4_gpt_oss.install() else 'OFF (env override)'}",
               flush=True)
+    elif native == "mlx3bit":
+        # mlx-community's affine 3-bit: uint32 codes packed as a bit STREAM
+        # (elements straddle word boundaries), bf16 scales AND biases. The
+        # engine repacks it to bytes identical to the file and then aliases
+        # the argument, so the 96 GB checkpoint is held once, not twice.
+        import qwen3_moe_mlx3bit
+        print("[bench] native MLX 3-bit loading: "
+              f"{'on' if qwen3_moe_mlx3bit.install() else 'OFF (env override)'}",
+              flush=True)
     elif native:
         raise ValueError(f"unknown native_quant {native!r}")
 
     cls = getattr(keras_hub.models, bench["arch"])
+    # keras-hub wants an "hf://" preset; the mlx arm of the same row wants the
+    # bare repo id for mlx-lm. Rows that need both carry "preset".
+    preset = bench.get("preset") or bench["model"]
     t0 = time.monotonic()
     retry_tokenizer = False
     try:
-        lm = cls.from_preset(bench["model"])
+        lm = cls.from_preset(preset)
     except ValueError as e:
         # Checkpoints that renamed keras-hub's hardcoded special tokens
         # (DeepSeek R1 distills drop Qwen's <|endoftext|>): rebuild the
@@ -142,8 +154,8 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
         from adapter_keras_extra import _bpe_tokenizer_with_eos_alias
         pre_cls = cls.preprocessor_cls
         tok, _ = _bpe_tokenizer_with_eos_alias(pre_cls.tokenizer_cls,
-                                               bench["model"])
-        backbone = cls.backbone_cls.from_preset(bench["model"])
+                                               preset)
+        backbone = cls.backbone_cls.from_preset(preset)
         lm = cls(backbone=backbone, preprocessor=pre_cls(tokenizer=tok))
     if stream:
         # Any variable the checkpoint did not cover gets its real random
