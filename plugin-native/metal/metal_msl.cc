@@ -72,6 +72,16 @@ struct MslFlags {
   bool inlane_dots = true;
   int64_t pack_trigger = 30;
   bool wnorm = true;
+  // bf16 dot weights of at most this many elements (per source) are fed to
+  // the kernel as an f32 copy, materialized once per call instead of the
+  // dot loop's per-element (float)W[off].  MEASURED OFF (2026-08-22): the
+  // suspected in-loop conversion cost is zero on this compiler -- the
+  // dumped tc106 bwd kernel runs 7.86us/launch in BOTH dtypes standalone,
+  // and with the real bf16 cliff fixed (contended 16-bit scatter-add,
+  // scatter_add_wide) the conversion measures neutral to -3% (tc146,
+  // per-call astype overhead).  The knob remains for retesting on other
+  // silicon/OS: METALJAX_MSL_BF16_WCONV=<max elems>, 0 = off.
+  int64_t bf16_wconv = 0;
   std::string volatile_mode = "t";
   std::string t_decl = "  volatile uint t = t_;";
   // The MJDBG_* probes msl_scan.py carries, so an investigation can bisect a
@@ -113,6 +123,7 @@ const MslFlags& Flags() {
     out->inlane_dots = EnvFlag("METALJAX_MSL_INLANE", true);
     out->pack_trigger = EnvInt("METALJAX_MSL_PACK_TRIGGER", 30);
     out->wnorm = EnvFlag("METALJAX_MSL_WNORM", true);
+    out->bf16_wconv = EnvInt("METALJAX_MSL_BF16_WCONV", 0);
     const char* vol = std::getenv("METALJAX_MSL_VOLATILE");
     out->volatile_mode = vol == nullptr ? "t" : std::string(vol);
     if (out->volatile_mode == "1") out->volatile_mode = "t";
@@ -2816,6 +2827,36 @@ MslPlanned::MslPlanned(const MslEnv& env, mlir::Block& body,
       std::vector<MslRole> new_widx;
       for (int64_t p : perm) new_widx.push_back(widx0[p]);
       for (Sym* d : ds) d->widx = new_widx;
+    }
+  }
+
+  // bf16 dot weights fed as a per-call f32 copy (OFF by default -- see the
+  // flag): flip the leaf to f32 -- the emitters and the packing pools
+  // follow the dtype -- and the launch materializes the copy (bf16->f32 is
+  // exact, so outputs are bit-identical).  f32 plans are untouched (the
+  // pass only ever sees bf16 leaves).
+  if (Flags().bf16_wconv > 0) {
+    for (const auto& kv : weight_dots_) {
+      const int sid = kv.first;
+      if (kv.second.empty() || kv.second[0]->weight->dtype != "bf16") continue;
+      // Read elsewhere at its own dtype (a time-indexed read or an
+      // elementwise whole): the buffer cannot change type under it.  The
+      // wholes_ overlap is already a decline; the reads_ one is caution.
+      bool elsewhere = wholes_.count(sid) != 0;
+      for (const ReadEntry& r : reads_) elsewhere = elsewhere || r.sid == sid;
+      if (elsewhere) continue;
+      // Distinct windows of one source are distinct interned leaves; the
+      // gate charges their total.
+      std::set<const Sym*> leaves;
+      int64_t elems = 0;
+      for (Sym* d : kv.second)
+        if (leaves.insert(d->weight).second)
+          elems += MslNumel(d->weight->shape);
+      if (elems > Flags().bf16_wconv) continue;
+      for (Sym* d : kv.second) d->weight->dtype = "f32";
+      wconv.push_back(sid);
+      Debug(absl::StrCat("msl bf16 wconv: source ", sid, " (", elems,
+                         " elems) converted to f32 per call"));
     }
   }
 

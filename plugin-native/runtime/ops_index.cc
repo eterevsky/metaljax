@@ -138,11 +138,11 @@ mx::array scatter_by(int64_t method, const mx::array& a,
                      const std::vector<int>& axes) {
   switch (method) {
     case 0: return mx::scatter(a, idx, u, axes);
-    case 1: return mx::scatter_add(a, idx, u, axes);
+    case 1: return scatter_add_wide(a, idx, u, axes);
     case 2: return mx::scatter_prod(a, idx, u, axes);
     case 3: return mx::scatter_max(a, idx, u, axes);
     case 4: return mx::scatter_min(a, idx, u, axes);
-    case 5: return mx::scatter_add(a, idx, mx::negative(u), axes);
+    case 5: return scatter_add_wide(a, idx, mx::negative(u), axes);
     default: throw std::invalid_argument("tape: bad scatter method");
   }
 }

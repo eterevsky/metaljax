@@ -99,6 +99,9 @@ class MslPlan {
   int nhidden_ = 0, ncarry_ = 0;
   std::vector<Norm> norms_;
   std::vector<int> unpacked_, state_pos_, stacked_pos_, passthrough_;
+  // Sources fed to the kernel as f32 whatever their buffer's dtype (bf16
+  // dot weights, converted once per call): the layout's optional tail.
+  std::vector<int> conv_f32_;
   std::vector<Pack> packs_;
   std::vector<std::pair<int, int64_t>> counters_;
   std::vector<std::pair<int, std::vector<AccNode>>> acc_;

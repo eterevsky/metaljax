@@ -64,12 +64,19 @@ std::vector<mx::array> MslPlan::run(const std::vector<mx::array>& carries,
   bufs.reserve(srcs.size());
   for (size_t i = 0; i < srcs.size(); i++) {
     const Norm& n = norms_[i];
-    if (!n.on) {
-      bufs.push_back(srcs[i]);
-      continue;
+    mx::array b = srcs[i];
+    if (n.on) {
+      mx::array v = mx::as_strided(srcs[i], n.shape, n.strides, n.offset);
+      b = mx::contiguous(mx::transpose(v, n.perm));
     }
-    mx::array v = mx::as_strided(srcs[i], n.shape, n.strides, n.offset);
-    bufs.push_back(mx::contiguous(mx::transpose(v, n.perm)));
+    // A source the kernel expects f32 (a bf16 weight, `conv_f32_`): EXACT,
+    // and paid once per call instead of per element per timestep in the
+    // kernel's dot loops.
+    if (b.dtype() != mx::float32 &&
+        std::find(conv_f32_.begin(), conv_f32_.end(), static_cast<int>(i)) !=
+            conv_f32_.end())
+      b = mx::astype(b, mx::float32);
+    bufs.push_back(std::move(b));
   }
 
   // ...and its `feed`: the unpacked sources, then one pooled buffer per
@@ -221,6 +228,9 @@ void MslPlan::parse(const std::vector<int64_t>& layout) {
     for (int64_t t = 0; t < nterms; t++) terms.push_back(parse_node(c));
     acc_.emplace_back(pos, std::move(terms));
   }
+  // Optional tail (the native lowering, and only when non-empty): sources
+  // the kernel expects converted to f32.  Stage 1's writer ends above.
+  if (!c.done()) conv_f32_ = c.vec();
   if (!c.done()) throw std::invalid_argument("msl: layout has trailing data");
   if (out_shapes_.size() !=
       stacked_pos_.size() + static_cast<size_t>(nhidden_) +
@@ -243,6 +253,7 @@ void MslPlan::parse(const std::vector<int64_t>& layout) {
   for (int s : unpacked_) source(s);
   for (const Pack& p : packs_)
     for (int s : p.sids) source(s);
+  for (int s : conv_f32_) source(s);
 }
 
 AccNode MslPlan::parse_node(Cursor& c) {

@@ -661,6 +661,23 @@ def _cases():
          lambda e, t: jax.grad(lambda a: (a[t] ** 2).sum())(e),
          [np.arange(24, dtype=f).reshape(6, 4),
           np.array([0, 3, 5, 2, 3], np.int32)], *EXACT),
+        # CONTENDED 16-bit scatter-add (the topconfs16k bf16 residual,
+        # 2026-08-22): MLX's Metal atomics are f32-only, and the emulated
+        # 16-bit path is ~33x slower under contention -- an embedding
+        # backward is exactly that shape.  The engine accumulates these in
+        # f32 with one rounding at the end (order-nondeterministic on GPU
+        # anyway), so the CPU's per-update bf16 rounding differs by a few
+        # ULP of the colliding sums; positive updates keep that relative.
+        ("scatter add bf16 (contended)", lambda x, i, u: x.at[i].add(u),
+         [bf(np.zeros((4, 3), f)), np.arange(64, dtype=np.int32) % 4,
+          bf(np.abs(_rand((64, 3), 60)))], *BF16DOT),
+        ("scatter add f16 (contended)", lambda x, i, u: x.at[i].add(u),
+         [np.zeros((4, 3), np.float16), np.arange(64, dtype=np.int32) % 4,
+          np.abs(_rand((64, 3), 61)).astype(np.float16)], *BF16DOT),
+        ("embedding gradient bf16 (contended scatter-add through AD)",
+         lambda e, t: jax.grad(lambda a: (a[t] ** 2).sum())(e),
+         [bf(np.arange(24, dtype=f).reshape(6, 4) / 24.0),
+          np.arange(64, dtype=np.int32) % 6], *BF16DOT),
         # Empty updates: the handler returns the OPERAND array, so the tape
         # aliases the slot and the output-copy rule has to notice.
         ("scatter with empty updates", lambda x, i, u: x.at[i].add(u),

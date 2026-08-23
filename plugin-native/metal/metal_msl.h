@@ -271,6 +271,10 @@ class MslPlanned {
   std::map<int, MslNorm> weight_norms;
   std::vector<int> unpacked;
   std::vector<MslPackGroup> pack_groups;
+  // Sources the kernel expects CONVERTED to f32 (bf16 dot weights): the leaf
+  // dtype was flipped at plan time, and the launch materializes an f32 copy
+  // once per call instead of the dot loop converting per element per timestep.
+  std::vector<int> wconv;
 
   // Diagnostics only (METALJAX_DEBUG).
   int64_t num_packed = 0;

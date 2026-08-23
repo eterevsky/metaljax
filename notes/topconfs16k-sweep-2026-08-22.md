@@ -138,3 +138,62 @@ in `Event::wait()` (stack on file). Unreachable on the final build but a
 no-panic-contract concern → follow-up task filed.
 
 Logs: `~/.cache/metaljax-bench/logs/bf16-msl/`.
+
+## 5. RESIDUAL CLOSED (2026-08-23): it was never the weight loads --
+## contended 16-bit scatter-add in the embedding backward
+
+The 8 rows at 2-4.2x were attributed in §4 to per-element bf16 weight-load
+conversion in the msl dot loops.  DISPROVEN by direct measurement: the
+dumped tc106 bwd kernel runs 7.86 us/launch in BOTH dtypes standalone
+(bfloat registers + per-op rounding cost nothing measurable on this
+compiler), and feeding per-call f32 weight copies recovered only ~13% of
+the gap (tc106 1.14->0.99 ms; tc146 unchanged).
+
+Real mechanism: every bad row has `emb.N`; every fine cell row is one-hot.
+MLX's Metal atomics are f32-only (`atomic_fetch_add`); 16-bit dtypes pack
+TWO values per `atomic<uint>` and CAS-loop per update
+(`mlx_atomic_update_and_store`, atomic.h) -- adjacent columns share an
+atomic word and every collision retries.  An embedding backward is the
+worst case: tc106 = 16384 update rows onto a 32x8 table.  Measured 33x:
+355.8 us (bf16) vs 10.6 (f32) per scatter-add; f16 identical; UNcontended
+16-bit scatter-add is fine (15.9 vs 16.6 us row-wise).
+
+Fix (runtime): `scatter_add_wide` -- 16-bit float scatter-adds upcast
+operand+updates to f32, accumulate with native float atomics, one rounding
+back (METALJAX_SCATTER_ADD_F32=0 reverts).  Numerics: collision-free
+scatters stay bit-identical (one rounding either way); colliding slots
+round once instead of per update -- strictly more accurate than jax-CPU's
+sequential per-update rounding, and the GPU order was already
+nondeterministic (jax-CUDA-like), so no bit contract existed there.
+Measured deviation vs CPU: 2 bf16 ULP at 64 collisions (execute_test's new
+contended cases).  Applied at all three engine scatter-add sites (scatter,
+scatter-sub, windowed-scatter add); set/prod/max/min and int dtypes
+untouched; f32 short-circuits.
+
+Weight-conversion machinery (built for the disproven hypothesis) kept
+behind METALJAX_MSL_BF16_WCONV, DEFAULT 0: post-fix it measures neutral
+(tc106) to -3% (tc146), and at large F it is strongly negative -- gru.512
+b32/l128 bf16 runs 10.83 ms/step vs fp32 16.94 (bf16 1.56x FASTER,
+weight-streaming-bound), and forcing the conversion drops it to 16.71
+(+54%).  The gate question is settled from both ends: off.
+
+Validation (final build, default knobs): affected 8 rows all 0.95-1.04x
+their fp32 ratios (tc106 4.16->1.00); full bf16 leg geomean 0.911 vs the
+§4 leg with 0/223 real regressions (tc009's 1.13 disproven: standalone
+1.0033, in its historical ~0.99 band -- the §4 in-suite 0.8925 was the
+outlier); bf16/fp32 geomean 1.086 -> **0.9885** (n=221; w>=1000: 0.9715)
+-- bf16 is now net FASTER than fp32 on this set.  suite-106 fp32 geomean
+1.0115 vs the §4 arm, all 7 >1.10 excursions disproven standalone
+(0.83-1.06, the suite-context trap; worst pair big12/big14 land on the old
+values to 3 digits).  texmo_gate bf16 20/20 (first rows) + 30/30 (emb
+rows); execute_test green incl. 3 new contended scatter-add cases;
+ingest_test, bazel test green.
+
+Remaining bf16-slower tail, PRE-EXISTING (pre==now to 2 digits, no emb,
+untouched by the fix): tc174 1.43x (bits.4.oh, rnn.32+rglru.8 composite),
+tc195/198/202 ~1.2x (hexbpe.oh rnn.32 b256/l64), tc027 1.19x (b1/l4096
+dispatch-bound).  Suspected: MLX bf16 matmul tail shapes on 32-wide
+one-hot projections + fixed per-step convert boundaries; not scatter.
+Not pursued here.
+
+Logs: `~/.cache/metaljax-bench/logs/bf16-wconv/`.

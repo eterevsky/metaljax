@@ -413,7 +413,7 @@ bool Program::step_reduce(const Entry& e,
                                  : mx::zeros(flat_total, dt);
       std::vector<mx::array> idxs{idx};
       std::vector<int> sax{0};
-      base = comb == 0   ? mx::scatter_add(base, idxs, upd, sax)
+      base = comb == 0   ? scatter_add_wide(base, idxs, upd, sax)
              : comb == 1 ? mx::scatter_max(base, idxs, upd, sax)
                          : mx::scatter_min(base, idxs, upd, sax);
       base = mx::reshape(base, x.shape());

@@ -160,6 +160,17 @@ mx::Dtype unsigned_of(const mx::Dtype& d);
 mx::array weak(double v, const mx::array& a);
 mx::array weak_int(int64_t v, const mx::array& a);
 mx::array fresh_copy(const mx::array& a);
+// mx::scatter_add, with 16-bit float operands accumulated in f32: MLX's
+// Metal kernels have no bf16/f16 atomic add (only f32), and the emulated
+// path is ~33x slower under contention -- an embedding table's backward is
+// EXACTLY that (every token's gradient lands on one of a few rows).  The op
+// is order-nondeterministic on GPU for floats anyway (like jax-CUDA), so no
+// bit contract is broken; one rounding at the end is strictly more accurate
+// than rounding per colliding update.  METALJAX_SCATTER_ADD_F32=0 restores
+// the native-dtype path.
+mx::array scatter_add_wide(const mx::array& a,
+                           const std::vector<mx::array>& idx,
+                           const mx::array& u, const std::vector<int>& axes);
 mx::array total_order_key(const mx::array& x);
 
 // The complex64 rearrangements (C99 Annex G where MLX's kernels are naive).

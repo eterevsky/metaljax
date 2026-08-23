@@ -5591,6 +5591,17 @@ absl::StatusOr<Lowering::MslLowered> Lowering::LowerMslPlan(
   }
   layout.push_back(static_cast<int64_t>(plan.acc_plans.size()));
   layout.insert(layout.end(), acc.begin(), acc.end());
+  // Trailing, and only when non-empty (Stage 1's writer ends at the
+  // accumulators, and an all-f32 plan's layout stays byte-identical): the
+  // UNPACKED sources the kernel expects converted to f32 (bf16 dot weights,
+  // `MslPlanned::wconv`).  A packed one already converts in the pool feed --
+  // its group's dtype followed the flipped leaf.
+  std::vector<int64_t> conv;
+  for (int sid : plan.wconv)
+    if (std::find(plan.unpacked.begin(), plan.unpacked.end(), sid) !=
+        plan.unpacked.end())
+      conv.push_back(sid);
+  if (!conv.empty()) MslVec(&layout, conv);
 
   std::vector<std::string> names_in, names_out;
   for (int i : plan.unpacked) names_in.push_back(absl::StrCat("inp", i));

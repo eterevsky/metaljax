@@ -9,6 +9,8 @@
 #include "program.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -251,6 +253,24 @@ mx::array weak(double v, const mx::array& a) {
 // arrays whose dtype can hold the literal, which is every use below.
 mx::array weak_int(int64_t v, const mx::array& a) {
   return mx::array(v, a.dtype());
+}
+
+// Rationale at the declaration (program.h): 16-bit float scatter-add runs
+// through MLX's emulated atomics, ~33x slower than f32 under contention
+// (an embedding backward); accumulate wide, round once.
+mx::array scatter_add_wide(const mx::array& a,
+                           const std::vector<mx::array>& idx,
+                           const mx::array& u, const std::vector<int>& axes) {
+  static const bool wide = [] {
+    const char* v = std::getenv("METALJAX_SCATTER_ADD_F32");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  const mx::Dtype dt = a.dtype();
+  if (!wide || (dt != mx::bfloat16 && dt != mx::float16))
+    return mx::scatter_add(a, idx, u, axes);
+  return mx::astype(mx::scatter_add(mx::astype(a, mx::float32), idx,
+                                    mx::astype(u, mx::float32), axes),
+                    dt);
 }
 
 // An array with the same bits in a buffer of its own. MLX has no such op:
