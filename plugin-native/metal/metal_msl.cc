@@ -68,7 +68,13 @@ struct MslFlags {
   // A phase-2 divergence from msl_scan.py, measured: see the width cap below.
   int64_t coop_max_f = 1024;
   bool coop_pref = true;
-  int64_t coop_pref_min_f = 8;
+  // 8 was 0.4.3's conservative bound ("F<=4 coop pocket unmeasured");
+  // measured 2026-08-26 (topconfs16k regressions tc038/tc044/tc046, all
+  // F=4 square cells): coop wins at every probed batch (4..64) and length
+  // (256..1024) by 1.8-2.4x, so the bound now admits F=4.  F<4 stays
+  // vector: a 2-thread threadgroup has no coop story, and no config with a
+  // square F<4 cell has ever been measured to lose.
+  int64_t coop_pref_min_f = 4;
   bool inlane_dots = true;
   int64_t pack_trigger = 30;
   bool wnorm = true;
@@ -119,7 +125,7 @@ const MslFlags& Flags() {
     out->coop_cap = EnvInt("METALJAX_MSL_COOP_CAP", 2200000);
     out->coop_max_f = EnvInt("METALJAX_MSL_COOP_MAX_F", 1024);
     out->coop_pref = EnvFlag("METALJAX_MSL_COOP_PREF", true);
-    out->coop_pref_min_f = EnvInt("METALJAX_MSL_COOP_MIN_F", 8);
+    out->coop_pref_min_f = EnvInt("METALJAX_MSL_COOP_MIN_F", 4);
     out->inlane_dots = EnvFlag("METALJAX_MSL_INLANE", true);
     out->pack_trigger = EnvInt("METALJAX_MSL_PACK_TRIGGER", 30);
     out->wnorm = EnvFlag("METALJAX_MSL_WNORM", true);

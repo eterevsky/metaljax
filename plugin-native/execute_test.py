@@ -162,6 +162,32 @@ def _msl_rnn_grad(h0, xs, w):
     return jax.grad(loss)(w)
 
 
+def _msl_rnn_rect(h0, xs, w, u):
+    """A matvec cell with a RECTANGULAR input projection (10 % 4 != 0): the
+    coop flip requires every dot dim to be a multiple of the state width, so
+    this cell stays in `vector` mode even now that the flip admits F=4
+    (2026-08-26) -- the census's vector coverage lives here."""
+    import jax
+    import jax.numpy as jnp
+
+    def step(h, x):
+        h = jnp.tanh(x @ u + h @ w)
+        return h, h
+    return jax.lax.scan(step, h0, xs)
+
+
+def _msl_rnn_rect_grad(h0, xs, w, u):
+    """...and its weight gradients, so vector-mode loop fission keeps a case
+    after the F=4 square cells moved to coop."""
+    import jax
+    import jax.numpy as jnp
+
+    def loss(w, u):
+        _, hs = _msl_rnn_rect(h0, xs, w, u)
+        return jnp.sum(hs * hs * 0.5)
+    return jax.grad(loss, argnums=(0, 1))(w, u)
+
+
 def _msl_gru(h0, xs, wz, wr, wn):
     """Three gates over one state width: the coop-over-vector flip of 0.4.3
     (square dots, F >= 8) picks threadgroup mode for this."""
@@ -597,12 +623,24 @@ def _cases():
         ("msl affine cell, backward", _msl_mingru_grad,
          [_rand((4, 16), 64), _rand((24, 4, 16), 65), _rand((16,), 66),
           _rand((16,), 67)], *DOT),
-        ("msl vector matvec cell", _msl_rnn,
+        # Square F=4 cells: vector mode until 2026-08-26, when the coop
+        # flip's bound came down to 4 (measured 1.8-2.4x on the topconfs16k
+        # tc038/tc044/tc046 regressions).  The "msl coop flip at F=4"
+        # contract below asserts the mode; these rows pin the answer.
+        ("msl square F=4 cell (coop flip)", _msl_rnn,
          [_rand((4, 4), 68), _rand((16, 4, 4), 69),
           _rand((4, 4), 70) * f(0.3)], *DOT),
-        ("msl vector cell, weight grad", _msl_rnn_grad,
+        ("msl square F=4 cell, weight grad", _msl_rnn_grad,
          [_rand((4, 4), 71), _rand((16, 4, 4), 72),
           _rand((4, 4), 73) * f(0.3)], *DOT),
+        # ...and the rectangular cell that CANNOT flip (10 % 4 != 0), which
+        # is where the census's vector coverage now lives.
+        ("msl vector matvec cell (rect dot)", _msl_rnn_rect,
+         [_rand((4, 4), 940), _rand((16, 4, 10), 941),
+          _rand((4, 4), 942) * f(0.3), _rand((10, 4), 943) * f(0.3)], *DOT),
+        ("msl vector cell, weight grads (rect dot)", _msl_rnn_rect_grad,
+         [_rand((4, 4), 944), _rand((16, 4, 10), 945),
+          _rand((4, 4), 946) * f(0.3), _rand((10, 4), 947) * f(0.3)], *DOT),
         ("msl coop matvec cell", _msl_rnn,
          [_rand((8, 64), 74), _rand((12, 8, 64), 75),
           _rand((64, 64), 76) * f(0.1)], *DOT),
@@ -630,9 +668,13 @@ def _cases():
         ("msl bf16 affine cell, backward", _msl_mingru_grad,
          [bf(_rand((4, 16), 464)), bf(_rand((24, 4, 16), 465)),
           bf(_rand((16,), 466)), bf(_rand((16,), 467))], *BF16DOT),
-        ("msl bf16 vector matvec cell", _msl_rnn,
+        ("msl bf16 square F=4 cell (coop flip)", _msl_rnn,
          [bf(_rand((4, 4), 468)), bf(_rand((16, 4, 4), 469)),
           bf(_rand((4, 4), 470) * f(0.3))], *BF16DOT),
+        ("msl bf16 vector matvec cell (rect dot)", _msl_rnn_rect,
+         [bf(_rand((4, 4), 948)), bf(_rand((16, 4, 10), 949)),
+          bf(_rand((4, 4), 950) * f(0.3)), bf(_rand((10, 4), 951) * f(0.3))],
+         *BF16DOT),
         ("msl bf16 coop cell, weight grad", _msl_rnn_grad,
          [bf(_rand((8, 32), 471)), bf(_rand((12, 8, 32), 472)),
           bf(_rand((32, 32), 473) * f(0.1))], *BF16GRAD),
@@ -4904,8 +4946,49 @@ def _p21_msl(subprocess, pathlib, re):
                            f"(saw {sorted(set(modes))})")
         return True, f"{len(modes)} bf16 kernels: {', '.join(sorted(set(modes)))}"
 
+    def the_f4_flip_fires():
+        """The coop flip at F=4 (2026-08-26): square F=4 cells ran vector
+        mode -- batch-only lanes, ONE simdgroup, weights re-read per timestep
+        -- because 0.4.3's bound (F >= 8) left the F<=4 pocket unmeasured.
+        Measured on the topconfs16k regressions (tc038 rnn.4 2.0x, tc044
+        mgru.4 2.4x, tc046 1.8x, the latter two now BEAT jax-CPU), the bound
+        admits F=4.  Pinned here: the flip fires by default, the knob
+        restores the old policy, and the two modes agree on the answer."""
+        def run(env_extra):
+            child = dict(os.environ)
+            child["METALJAX_DEBUG"] = "1"
+            child.update(env_extra)
+            proc = subprocess.run(
+                [sys.executable, str(pathlib.Path(__file__).resolve()),
+                 "--msl-f4-coop"], env=child, capture_output=True, text=True)
+            if proc.returncode != 0:
+                return None, (proc.stderr or proc.stdout).splitlines()[-1][:80]
+            modes = re.findall(r"msl_scan: compiled plan .*?mode=(\w+)",
+                               proc.stderr)
+            out = re.search(r"F4 COOP CHECKSUM ([-\d.e+]+)", proc.stdout)
+            return (modes, out.group(1) if out else None), None
+
+        flip, err = run({})
+        if err: return False, err
+        old, err = run({"METALJAX_MSL_COOP_MIN_F": "8"})
+        if err: return False, err
+        if "coop" not in flip[0] or "vector" in flip[0]:
+            return False, f"default planned {flip[0]}, wanted coop only"
+        if "vector" not in old[0] or "coop" in old[0]:
+            return False, (f"COOP_MIN_F=8 planned {old[0]}, wanted vector "
+                           "only")
+        d = abs(float(flip[1]) - float(old[1]))
+        rel = d / max(abs(float(old[1])), 1e-30)
+        # The two modes contract the recurrent dot in different orders; the
+        # bar catches a wrong kernel, not an accumulation order.
+        if rel > 1e-4:
+            return False, f"coop vs vector answers differ by {rel:.2e}"
+        return True, (f"F=4 flips to coop (vector under COOP_MIN_F=8), "
+                      f"answers agree to {rel:.1e}")
+
     return [("msl covers its three modes", modes_are_covered),
             ("METALJAX_MSL=0 builds no kernel", the_kill_switch_kills),
+            ("msl coop flip at F=4", the_f4_flip_fires),
             ("msl coop width cap (F>=1024)", the_width_cap_holds),
             ("msl loop charged as one kernel",
              a_planned_loop_is_charged_as_one_kernel),
@@ -5035,6 +5118,21 @@ def main():
         w = _rand((1024, 1024), 923) * np.float32(0.02)
         _, hs = jax.jit(_msl_rnn)(h0, xs, w)
         print(f"WIDE COOP CHECKSUM {float(np.asarray(hs).sum()):.9e}")
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--msl-f4-coop":
+        # The F=4 coop flip (2026-08-26): the same square cell fwd + weight
+        # grad the case list carries, alone, so the parent can read the modes
+        # out of the narration and compare the checksum across knob settings.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        h0 = _rand((4, 4), 68)
+        xs = _rand((16, 4, 4), 69)
+        w = _rand((4, 4), 70) * np.float32(0.3)
+        _, hs = jax.jit(_msl_rnn)(h0, xs, w)
+        g = jax.jit(_msl_rnn_grad)(h0, xs, w)
+        s = float(np.asarray(hs).sum()) + float(np.asarray(g).sum())
+        print(f"F4 COOP CHECKSUM {s:.9e}")
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--msl-bytes":
         # P23: one gru cell fat enough that its body traffic dwarfs its
