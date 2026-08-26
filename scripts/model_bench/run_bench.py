@@ -171,6 +171,13 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
             # Multimodal wrappers carry never-built vision layers in
             # text-only use; the language backbone is the decode path.
             lm.backbone.quantize(quant)
+    # Pin the documented contract: token_ids are GREEDY tokens. keras-hub's
+    # from_preset auto-compiles with sampler="top_k" (k=5, seeded per
+    # process from Python's `random` — task.py:59, causal_lm.py:69), so
+    # stock generate() was stochastic until 2026-08-26; token comparisons
+    # recorded before then sampled top-5 draws, not argmax chains, and the
+    # captured 64 ids start with the ~50-token prompt.
+    lm.compile(sampler="greedy")
     load_s = time.monotonic() - t0
 
     # token count of the prompt, for prefill bookkeeping
