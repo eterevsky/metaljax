@@ -1,10 +1,11 @@
 // metaljax native engine — the recognizer emits (M4).
 //
-// These are not StableHLO ops: src/metaljax/tape.py resolves a recognizer's
-// plan (metaljax.interpreter._rewrite_plan) at lowering time and asks for
+// These are not StableHLO ops: src/metaljax/tape.py (Stage 1, deleted
+// 0.11.6, ef5774d; now metal/metal_lowering.cc) resolved a recognizer's
+// plan (metaljax.interpreter._rewrite_plan) at lowering time and asked for
 // them by pseudo-name, and the chain of literal ops each one replaces never
 // reaches the tape at all. Each handler is a transliteration of the `emit`
-// in the Python module that owns the recognizer -- qmm, sdpa, moe -- and the
+// in the Python module that owned the recognizer -- qmm, sdpa, moe -- and the
 // differential tests compare output BYTES against those very functions, so a
 // drift is a failure and not a tolerance question.
 
@@ -137,9 +138,9 @@ bool Program::step_emit(const Entry& e,
 
     case kSdpaMask: {
       // metaljax.sdpa._mask_array, the cache MISS body. The cache itself
-      // is this entry: tape.py emits one per distinct mask key, at the
+      // is this entry: tape.py emitted one per distinct mask key, at the
       // first attention that reads it, and every later root reads the
-      // slot — which is what `env`'s tuple-keyed entry does in Python.
+      // slot — which is what `env`'s tuple-keyed entry did in Python.
       // attrs [kind (0 select, 1 additive), dtype, scaled?];
       // fattrs [const * mul, mul].
       int64_t kind = at[0];

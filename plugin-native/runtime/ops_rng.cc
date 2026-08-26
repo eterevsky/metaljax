@@ -1,4 +1,5 @@
-// metaljax native engine — rng_bit_generator (src/metaljax/ops/rng.py).
+// metaljax native engine — rng_bit_generator (ported from Stage 1's
+// src/metaljax/ops/rng.py, deleted 0.11.6, ef5774d).
 //
 // Nothing here is "an implementation of philox": it is XLA's, transliterated
 // from the Python handler that was reverse-engineered from

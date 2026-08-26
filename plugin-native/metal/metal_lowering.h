@@ -8,10 +8,11 @@ integer slots, attributes become the integer vectors the C++ handlers decode
 with a `Cursor`, and constants cross to the device here, once.
 
 The attribute layouts are NOT invented here.  Every one of them is the layout
-src/metaljax/tape.py already writes and native/ops_*.cc already reads, because
-both plugins share one executor: a disagreement would be a wrong answer rather
-than a build error.  Where this file and tape.py could drift, tape.py is the
-specification and the handler's `Cursor` reads are the ground truth.
+Stage 1's src/metaljax/tape.py (deleted 0.11.6, ef5774d) already wrote and
+native/ops_*.cc (now runtime/) already read, because both plugins shared one
+executor: a disagreement would be a wrong answer rather than a build error.
+While tape.py lived, where this file and it could drift, tape.py was the
+specification; the handler's `Cursor` reads remain the ground truth.
 
 The discipline is Stage 1's, unchanged: anything outside the supported set
 declines the WHOLE program, naming the op, so a gap is a missing feature and
@@ -71,8 +72,8 @@ struct LoweredProgram {
   int64_t num_entries = 0;
   int64_t num_copies = 0;
   // The outputs the copy list EXEMPTS because every argument they may alias
-  // is donated (engine.py `_dealias`: "aliasing is exactly what donation
-  // licenses"), each with those arguments.  Donation is retractable per CALL
+  // is donated (Stage 1 engine.py `_dealias`: "aliasing is exactly what
+  // donation licenses"), each with those arguments.  Donation is retractable per CALL
   // through `non_donatable_input_indices`, and an output aliasing a retracted
   // argument has to be copied after all -- which is `RunOnce`'s job, since
   // only the call knows.  Empty on every program that donates nothing.

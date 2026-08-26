@@ -141,7 +141,7 @@ const std::shared_ptr<const LoweredProgram>& MetalLoadedExecutable::Tape(
   if (fused_ != nullptr) {
     // The pack is a pure function of the buffers its reconstruction read: a
     // call that hands over the same arrays reuses it, and one that does not
-    // has to repack (qmm.py `_Pack.matches`).
+    // has to repack (Stage 1 qmm.py `_Pack.matches`).
     bool same = true;
     for (size_t i = 0; i < fused_->pack_args.size() && same; i++) {
       const int a = fused_->pack_args[i];

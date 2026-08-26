@@ -57,7 +57,7 @@ void check_close(float got, float want, const std::string& what) {
 
 // The registry, read as the plain C++ table it now is.  Looking the opcodes
 // up by name rather than spelling the enum is the point: it is the same
-// lookup src/metaljax/tape.py does, minus the dict.
+// lookup src/metaljax/tape.py did, minus the dict.
 int opcode(const std::string& name) {
   for (const auto& kv : metaljax::opcodes())
     if (kv.first == name) return kv.second;

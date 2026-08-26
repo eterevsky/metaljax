@@ -170,7 +170,8 @@ class MetalLoadedExecutable final : public xla::PjRtLoadedExecutable {
   // anything, the plain one otherwise (P17).  Packing needs concrete buffers,
   // so the fused tape is built at the FIRST call and kept -- and rebuilt when
   // a later call hands over different weights, up to a bound past which
-  // repacking costs more than the chain it replaces (qmm.py `_MAX_REPACKS`).
+  // repacking costs more than the chain it replaces (Stage 1 qmm.py
+  // `_MAX_REPACKS`).
   const std::shared_ptr<const LoweredProgram>& Tape(
       const std::vector<mlx::core::array>& inputs) const;
 

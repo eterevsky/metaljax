@@ -1,22 +1,25 @@
 // metaljax native engine — the tape and its interface (Stage 2).
 //
-// src/metaljax/tape.py lowers an analyzed executable's main block into one
-// of these Programs: a flat op tape with SSA slots resolved to indices,
+// In Stage 1, src/metaljax/tape.py (deleted 0.11.6, ef5774d) lowered an
+// analyzed executable's main block into one of these Programs; today
+// metal/metal_lowering.cc writes the same format: a flat op tape with SSA
+// slots resolved to indices,
 // attributes decoded to integers, and constants already sitting on the
 // device. `run` then walks it with no MLIR, no Python and no GIL — the
 // point of the milestone, since decode is Python-dispatch-bound (~120 ms
 // per token at gemma-31B scale, notes/cpp-migration-plan.md).
 //
-// The op set is small and grows monotonically. Anything tape.py cannot
-// lower declines the WHOLE program, which then runs on the Python engine
-// exactly as before, so a missing op is a performance question and never a
+// The op set is small and grows monotonically. Anything tape.py could not
+// lower declined the WHOLE program, which then ran on the Python engine
+// exactly as before, so a missing op was a performance question and never a
 // correctness one. Every handler here is a transliteration of the Python
-// handler in src/metaljax/ops/: where those carry a dtype branch or a
+// handler in src/metaljax/ops/: where those carried a dtype branch or a
 // zero-size guard, so does this file, because the differential test
 // compares output BYTES and both engines call the same MLX kernels.
 //
-// C++ owns the opcode enum. Python asks for it via `opcodes()` and an op
-// name that is not in the dict declines — so adding an op here is what
+// C++ owns the opcode enum. The tape builder asks for it by name (Stage 1's
+// Python via `opcodes()`, metal_lowering.cc via `Opcode`) and an op
+// name that is not in the table declines — so adding an op here is what
 // makes it reachable, and there is no second table to forget.
 //
 // --- where the code lives -------------------------------------------------
@@ -27,9 +30,9 @@
 // translation unit below it except `bindings.cc` and `metaljax_native.cc` --
 // the tape is a plain C++ library that a process without an interpreter links
 // and runs. Everything else is one translation unit per concern, and the op
-// families mirror src/metaljax/ops/ one for one --
-// the handlers ARE transliterations of those modules, so keeping the split
-// identical is what lets a reader put the two engines side by side:
+// families mirror Stage 1's src/metaljax/ops/ (deleted 0.11.6, ef5774d) one
+// for one -- the handlers ARE transliterations of those modules, so keeping
+// the split identical is what let a reader put the two engines side by side:
 //
 //   program.cc          Program itself: slots, the environment, the walk
 //                       over the tape, and the recovery that wraps a run
@@ -114,15 +117,15 @@ enum Op : int {
   // control flow (M3): each carries its regions as sub-Programs
   kWhile, kIf, kCase,
   // recognizer emits (M4): a REWRITTEN program's roots. These are not
-  // StableHLO ops — src/metaljax/tape.py resolves the recognizer's plan
-  // (metaljax.interpreter._rewrite_plan) at lowering time and asks for
-  // them by the pseudo-names below, exactly as it does for the argmax
+  // StableHLO ops — src/metaljax/tape.py resolved the recognizer's plan
+  // (metaljax.interpreter._rewrite_plan) at lowering time and asked for
+  // them by the pseudo-names below, exactly as it did for the argmax
   // reduce. The absorbed ops never reach the tape at all.
   kQmm, kSdpa, kSdpaMask,
   kMoeEIdx, kMoeTIdx, kMoeGather, kMoeConcat, kMoeView, kMoeDot, kMoeTail,
   // M5b: a counted loop msl_scan planned into one generated Metal kernel,
-  // and a site where the handler computes on the HOST. Both are lowered by
-  // src/metaljax/tape.py; the pseudo-names below are how it asks for them.
+  // and a site where the handler computes on the HOST. Both were lowered by
+  // src/metaljax/tape.py; the pseudo-names below are how it asked for them.
   kMslScan, kHostCall,
   // Ordered-effect tokens: no data, only order (dtypes.token_value).
   kToken,
@@ -184,10 +187,11 @@ mx::array csqrt(const mx::array& z);
 // --------------------------------------------------------------------------
 //
 // Every cadence below is a MEASURED value with a crash or a corruption story
-// behind it (see src/metaljax/interpreter.py and ops/control.py, which own
-// the comments). None of them is re-derived here: `configure` copies them in
-// from the Python modules that parse the environment, so the two engines can
-// never drift apart on a number the command-buffer lottery is pinned to.
+// behind it (src/metaljax/interpreter.py and ops/control.py, deleted with
+// Stage 1, owned the comments). None of them is re-derived here: `configure`
+// copies them in from the tape builder that parses the environment, so the
+// two sides can never drift apart on a number the command-buffer lottery is
+// pinned to.
 
 struct Config {
   int64_t eager_flush_bytes = 1024LL << 20;   // METALJAX_EAGER_FLUSH_MB
@@ -478,7 +482,7 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //                        is_max, comb]   comb: 0 add 1 or 2 and
 //                       (the select is a compare, the scatter an add/or/and:
 //                        both bodies are read structurally at lowering, as
-//                        ops/reduction.py reads them)
+//                        ops/reduction.py read them)
 //   <index plan>        n, then n quads (kind, a, b, operand axis):
 //                       kind 0 = index-vector component `a`, clamped to
 //                       [0, b]; kind 1 = an iota of length `a` at batch
@@ -509,9 +513,9 @@ class MslPlan;
 
 // The handler of an op that computes off the device (LAPACK, jax's callbacks:
 // ops/callbacks.py). The tape holds it as an opaque callable and knows nothing
-// about what is on the other side -- today the nanobind adapter wraps a Python
-// handler into one of these and takes the GIL INSIDE the wrapper, which is the
-// whole of what a host call costs the interpreter-free core.
+// about what is on the other side -- in Stage 1 the nanobind adapter wrapped a
+// Python handler into one of these and took the GIL INSIDE the wrapper, which
+// was the whole of what a host call cost the interpreter-free core.
 using HostFn =
     std::function<std::vector<mx::array>(const std::vector<mx::array>&)>;
 
@@ -528,7 +532,7 @@ struct Entry {
   // An emulated dtype code whose grid every result of this entry is rounded
   // onto, or -1. Applied by `Program::step`, once, AFTER the family handler
   // has written its results -- deliberately not inside the handlers. The
-  // Python engine spends this rule at three sites (the unary wrapper, the
+  // Python engine spent this rule at three sites (the unary wrapper, the
   // binary wrapper and `_convert`, ops/elementwise.py `_regrid` and
   // `_maybe_wrap4`), and a per-site flag here would be a rule a new handler
   // can forget: forgetting it is a WRONG ANSWER, not a decline, since the
@@ -548,7 +552,8 @@ struct Entry {
 // Sequential reader for the attribute vectors the M4 emits carry: they are
 // long enough (three shape recipes for one attention) that positional
 // indices would be unreadable on both sides. The layouts are documented
-// beside each handler; tape.py writes them in the same order.
+// beside each handler; tape.py wrote them in this order, and
+// metal_lowering.cc still does.
 class Cursor {
  public:
   explicit Cursor(const std::vector<int64_t>& at) : at_(at) {}
@@ -609,16 +614,16 @@ class Program {
   // is: it could be one of the program's own constants (which the Program
   // holds for the life of the executable, so two calls would share a
   // buffer) or an input's array reaching an output through no-ops. Which
-  // ones those are is a static property tape.py works out; making the copy
+  // ones those are is a static property tape.py worked out; making the copy
   // here is XLA's no-alias contract, the half object identity cannot
   // express across the language boundary.
   void set_outputs(std::vector<int> outs, std::vector<int> copies);
 
   // Whether this program's tape is traced through mx::compile, and which of
-  // its outputs need anchoring when it is. BOTH decided in Python: the cost
-  // and byte estimators that gate compilation live there (ops/control.py),
-  // and re-deriving them here would be a second opinion nothing keeps in
-  // step with the first.
+  // its outputs need anchoring when it is. BOTH decided by the tape builder:
+  // the cost and byte estimators that gate compilation live there (Stage 1's
+  // ops/control.py, now metal_lowering.cc), and re-deriving them here would
+  // be a second opinion nothing keeps in step with the first.
   void set_compile(bool on, std::vector<int> anchors, int64_t max_repeat);
 
   std::vector<mx::array> run(std::vector<mx::array> inputs);

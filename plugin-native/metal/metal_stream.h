@@ -14,7 +14,8 @@ namespace metaljax {
 
 // Give this thread a cross-thread-evaluable default MLX stream, once.
 //
-// src/metaljax/engine.py's `bind_thread`, transliterated, and for the same
+// Stage 1 engine.py's `bind_thread` (deleted 0.11.6, ef5774d),
+// transliterated, and for the same
 // reason: MLX streams are thread-LOCAL and the default one is thread-BOUND, so
 // a graph built on one thread can only be evaluated there -- and if the owning
 // thread has exited, MLX throws where nothing catches and std::terminate takes

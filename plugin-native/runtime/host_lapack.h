@@ -9,7 +9,8 @@
 // This header is the line between the two halves.  The PLUGIN reads the IR —
 // which target, which flags, what result types — and asks for a handler; the
 // implementation (host_lapack.cc) knows only arrays and calls Accelerate.
-// `src/metaljax/ops/lapack.py` is the specification for both: the semantics
+// `src/metaljax/ops/lapack.py` (Stage 1, deleted 0.11.6, ef5774d) was the
+// specification for both: the semantics
 // here are that module's, handler for handler, including the ones that exist
 // to match XLA rather than LAPACK (a singular triangular solve divides through
 // to +-inf/nan instead of failing, a non-positive-definite cholesky is all

@@ -1,6 +1,7 @@
 /* metaljax: fully-native PJRT plugin for Apple-silicon GPUs (Stage 2).
 
-`src/metaljax/moe.py`, as a pass over the parsed StableHLO.
+Stage 1's `src/metaljax/moe.py` (deleted 0.11.6, ef5774d), as a pass over the
+parsed StableHLO.
 
 The dense mixture-of-experts dispatch every jax MoE lowers to -- run all `E`
 experts, then null the `E - K` contributions the router never selected --

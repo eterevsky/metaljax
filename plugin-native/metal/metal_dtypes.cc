@@ -29,7 +29,8 @@ namespace mx = mlx::core;
 
 namespace {
 
-// The emulated element types, in src/metaljax/dtypes.py `EMULATED` order --
+// The emulated element types, in the `EMULATED` order of Stage 1's
+// src/metaljax/dtypes.py (deleted 0.11.6, ef5774d) --
 // which is also the order of the runtime's own grid table, though nothing
 // depends on that: both sides key by NAME.  `sem` is nullptr for the two
 // integer grids, whose encoding is the low nibble and needs no float

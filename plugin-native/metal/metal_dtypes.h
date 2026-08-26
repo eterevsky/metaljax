@@ -4,8 +4,8 @@ One element-type table, read three ways: by the transfer path (PJRT wire type
 -> device storage), by the lowering (MLIR element type -> the tape's dtype
 code) and by the executable's result metadata (MLIR element type -> PJRT wire
 type).  There is deliberately no second table: the tape's codes come from
-`metaljax::dtype_codes()` at run time, keyed by the same names
-src/metaljax/tape.py gates on, so a type the runtime cannot hold declines the
+`metaljax::dtype_codes()` at run time, keyed by the same names Stage 1's
+src/metaljax/tape.py gated on, so a type the runtime cannot hold declines the
 program instead of being guessed at here.
 
 Licensed under the Apache License, Version 2.0.
@@ -47,7 +47,7 @@ struct WireType {
 std::optional<WireType> WireTypeOf(xla::PrimitiveType type);
 
 // The emulated grids, keyed by the same MLIR element names src/metaljax/
-// dtypes.py's `EMULATED` uses.  A "kind" is an index into that table; the
+// dtypes.py's `EMULATED` used.  A "kind" is an index into that table; the
 // encode/decode pair is llvm::APFloat's, which is the same specification
 // ml_dtypes implements and is what the host transfer needs to agree with.
 int EmulatedKindOfName(const std::string& name);
@@ -63,7 +63,7 @@ int EmulatedBits(int kind);
 float EmulatedDecode(int kind, uint8_t code);
 uint8_t EmulatedEncode(int kind, float value);
 
-// The element-type name src/metaljax/tape.py keys the dtype table by -- the
+// The element-type name src/metaljax/tape.py keyed the dtype table by -- the
 // MLIR type as printed ("i1", "ui8", "bf16", "complex<f32>").  Spelled out
 // rather than printed so that a type nobody thought about (a quantized or
 // sub-byte element) falls out as nullopt instead of matching by accident.

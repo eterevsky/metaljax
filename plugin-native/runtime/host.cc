@@ -1,5 +1,5 @@
-// metaljax native engine — the entries that leave the tape
-// (src/metaljax/ops/callbacks.py).
+// metaljax native engine — the entries that leave the tape (ported from
+// Stage 1's src/metaljax/ops/callbacks.py, deleted 0.11.6, ef5774d).
 //
 // Two of them. A host call is the one place a native run reaches back out of
 // the tape: the LAPACK targets, jax's debug/pure/io callbacks, anything whose

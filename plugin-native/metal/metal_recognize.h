@@ -2,21 +2,22 @@
 
 The recognizers, as passes over the parsed StableHLO.
 
-Stage 1 rewrites three graph shapes into one MLX call each -- a dequantize-
+Stage 1 rewrote three graph shapes into one MLX call each -- a dequantize-
 then-matmul chain into `quantized_matmul`, a softmax attention into
 `fast::scaled_dot_product_attention`, an expert dispatch into `gather_qmm` --
-and `src/metaljax/{qmm,sdpa,moe}.py` are the specification of what may be
-rewritten.  This header is the phase-2 shape of that: the ANALYSIS produces a
-plan of absorbed ops and roots, the lowering consults the plan, and the
-executor's M4 emits (runtime/emits.cc) run what comes out.  Nothing about the
-rewrite is re-invented here; where this and the Python could drift, the Python
-is the specification and `runtime/emits.cc`'s `Cursor` reads are the ground
-truth for the encoding.
+and `src/metaljax/{qmm,sdpa,moe}.py` (deleted 0.11.6, ef5774d) were the
+specification of what may be rewritten.  This header is the phase-2 shape of
+that: the ANALYSIS produces a plan of absorbed ops and roots, the lowering
+consults the plan, and the executor's M4 emits (runtime/emits.cc) run what
+comes out.  Nothing about the rewrite was re-invented here; while both
+engines lived, where this and the Python could drift, the Python was the
+specification; `runtime/emits.cc`'s `Cursor` reads remain the ground truth
+for the encoding.
 
 Two rules the whole file exists to keep:
 
-* A half-matched pattern lowers as ORDINARY ops.  Every rejection is a
-  `_Reject` in the Python and a `nullopt`/skip here, and the consequence is a
+* A half-matched pattern lowers as ORDINARY ops.  Every rejection was a
+  `_Reject` in the Python and is a `nullopt`/skip here, and the consequence is a
   correct slow program -- never a wrong fused one.
 * Packing needs concrete buffers, so it happens once, at the first execute,
   and the packed arrays travel as trailing INPUTS of the tape (never as
@@ -238,7 +239,7 @@ struct MoeMatch {
   std::string name;
 
   // What the first-execute check reads: the rank-3 routing-score operand of
-  // the product, and where its three axes are.  `moe.py` verifies the same
+  // the product, and where its three axes are.  `moe.py` verified the same
   // identity on SYNTHETIC logits; this plugin has no way to substitute an
   // input into a callee's frame, so it checks the same identity on the REAL
   // ones -- see `VerifyMoe`.

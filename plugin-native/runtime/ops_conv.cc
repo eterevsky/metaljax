@@ -1,4 +1,5 @@
-// metaljax native engine — convolution (src/metaljax/ops/conv.py).
+// metaljax native engine — convolution (ported from Stage 1's
+// src/metaljax/ops/conv.py, deleted 0.11.6, ef5774d).
 //
 // One StableHLO op with four executions behind it, and which one runs is a
 // static property of the result dtype and the spatial rank that the lowering
@@ -36,7 +37,7 @@ namespace {
 // rounds it towards zero where Python's floors -- after the `+ 1` and the
 // `max(0, ...)` that is one window versus none. (The same trap the
 // reduce_window plan documents; here it is on the runtime side, because
-// ops/conv.py computes these sizes from the array rather than from the IR.)
+// ops/conv.py computed these sizes from the array rather than from the IR.)
 int floor_div(int a, int b) {
   int q = a / b, r = a % b;
   if (r != 0 && ((r < 0) != (b < 0))) q--;

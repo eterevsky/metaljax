@@ -1,8 +1,8 @@
 // metaljax native engine — jax's host callbacks (P13).  See host_callback.h.
 //
-// `src/metaljax/ops/callbacks.py::_run_callback` is the specification: the
-// operands cross as numpy arrays, the callable's results are reshaped and cast
-// to the DECLARED result types, and a callback that returns nothing (every
+// `src/metaljax/ops/callbacks.py::_run_callback` (Stage 1, deleted 0.11.6,
+// ef5774d) was the specification: the operands cross as numpy arrays, the
+// callable's results are reshaped and cast to the DECLARED result types, and a callback that returns nothing (every
 // `jax.debug.print`) hands back an empty list.  The difference here is only in
 // who does the converting — there, numpy; here, a staging copy on each side of
 // a C function pointer.

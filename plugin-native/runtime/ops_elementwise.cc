@@ -1,8 +1,9 @@
-// metaljax native engine — elementwise ops (src/metaljax/ops/elementwise.py).
+// metaljax native engine — elementwise ops (ported from Stage 1's
+// src/metaljax/ops/elementwise.py, deleted 0.11.6, ef5774d).
 //
 // Unary and binary maps, comparison, select/clamp, the dtype convert, the
 // complex64 accessors and the FFT, and the SWAR bit counts. Each handler is
-// a transliteration of the Python one: where that table carries a dtype
+// a transliteration of the Python one: where that table carried a dtype
 // branch, so does the switch below, because the differential test compares
 // output BYTES and both engines call the same MLX kernels.
 

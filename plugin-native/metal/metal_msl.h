@@ -4,12 +4,13 @@ msl_scan, natively: a counted loop whose body is a per-lane computation
 becomes ONE generated Metal kernel -- a thread per lane, the carries in
 registers, the whole time loop inside the shader.
 
-`src/metaljax/msl_scan.py` is the specification, class for class and check
+`src/metaljax/msl_scan.py` (Stage 1, deleted 0.11.6, ef5774d) was the
+specification, class for class and check
 for check.  What this file holds is the PLANNING half: the symbolic IR the
 loop body is evaluated into, the classification of each carry, the mode
 choice, and the three emitters that generate MSL.  The LAUNCH half already
-exists and is shared with Stage 1 -- `runtime/msl.cc`'s `MslPlan` -- so the
-product of a plan is exactly what `src/metaljax/tape.py::_lower_msl` writes:
+existed and was shared with Stage 1 -- `runtime/msl.cc`'s `MslPlan` -- so the
+product of a plan is exactly what `src/metaljax/tape.py::_lower_msl` wrote:
 a kernel source, a binding order, a geometry, and the little recipe that
 turns the kernel's outputs back into the loop's carries.
 
@@ -127,7 +128,7 @@ struct MslRole {
 struct Sym {
   SymKind kind;
   MslShape shape;
-  // The dtype names src/metaljax/tape.py spells ("f32", "i1", "ui32"), plus
+  // The dtype names src/metaljax/tape.py spelled ("f32", "i1", "ui32"), plus
   // msl_scan.py's own "int" for a counter.
   std::string dtype;
 
@@ -285,8 +286,8 @@ class MslPlanned {
   //
   // `fired` records which of the two late heuristics the build used, so
   // `BuildMslPlan` can retry without them when it throws -- msl_scan.py's
-  // `_last_flipped` / `_last_inlane`, which are module globals there because
-  // that engine is single-threaded.  They are set the MOMENT the heuristic
+  // `_last_flipped` / `_last_inlane`, which were module globals there because
+  // that engine was single-threaded.  They are set the MOMENT the heuristic
   // fires, since the build may throw long afterwards.
   struct Fired {
     bool flipped = false;
@@ -423,7 +424,7 @@ bool MslDebug();
 
 // msl_scan.py `build_plan`: a plan for this loop body, or nullptr when it does
 // not qualify.  Never throws: every decline is caught here, which is the
-// contract `_msl_plan_for` has with the rest of the engine.  `why` receives
+// contract `_msl_plan_for` had with the rest of the engine.  `why` receives
 // the decline message when there is no plan.
 std::shared_ptr<MslPlanned> BuildMslPlan(const MslEnv& env, mlir::Block& body,
                                          int64_t counter_pos, int64_t trip,

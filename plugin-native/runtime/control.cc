@@ -1,4 +1,5 @@
-// metaljax native engine — control flow (src/metaljax/ops/control.py).
+// metaljax native engine — control flow (ported from Stage 1's
+// src/metaljax/ops/control.py, deleted 0.11.6, ef5774d).
 //
 // while, if and case, and the machinery a while needs: chunked replays of a
 // compiled body, the pipelined dynamic loop that keeps the device a token
@@ -181,10 +182,11 @@ class BodyRunner {
 
 }  // namespace
 
-// ops/control.py _while, transliterated. Every branch here has a comment
+// ops/control.py _while, transliterated. Every branch here had a comment
 // in that file explaining what it is for; the policy numbers (cost,
 // cadence, chunk size, which bodies may be compiled) are computed by the
-// same Python estimators and arrive in `attrs`.
+// same estimators (Stage 1's Python ones, now metal_lowering.cc's ports)
+// and arrive in `attrs`.
 void Program::run_while(const Entry& e,
                         std::vector<std::optional<mx::array>>& env,
                         bool in_trace) const {

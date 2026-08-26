@@ -85,9 +85,9 @@ const NamedOp kOpNames[] = {
     {"stablehlo.count_leading_zeros", kClz},
     {"stablehlo.constant", kConstant},
     {"stablehlo.reduce", kReduce},
-    // ops/reduction.py reads ONE stablehlo.reduce two ways depending on the
+    // ops/reduction.py read ONE stablehlo.reduce two ways depending on the
     // body — the single-operand monoid and the (values, indices) pair jax
-    // lowers argmax/argmin to. tape.py decides which, then asks for the
+    // lowers argmax/argmin to. tape.py decided which, then asked for the
     // opcode by this pseudo-name; C++ still owns both enum values.
     {"stablehlo.reduce.arg_pair", kArgReduce},
     // ...and a third way: a body neither table recognizes runs on whole
@@ -104,8 +104,9 @@ const NamedOp kOpNames[] = {
     // a select tree over several key pairs rather than one compare. A
     // different execution shape (successive stable argsorts threaded through
     // a permutation), so a different opcode -- and a pseudo-name, like the
-    // conv, because src/metaljax/tape.py has no lowering for it and must
-    // keep declining the shape to the Python engine.
+    // conv, because Stage 1's src/metaljax/tape.py (deleted 0.11.6, ef5774d)
+    // had no lowering for it and kept declining the shape to the Python
+    // engine.
     {"metaljax.lex_sort", kLexSort},
     // chlo.top_k survives a direct jax lowering; through a portable
     // artifact it arrives already decomposed into the sort above. Both
@@ -130,19 +131,19 @@ const NamedOp kOpNames[] = {
     {"stablehlo.select_and_scatter", kSelectAndScatter},
     {"stablehlo.rng_bit_generator", kRng},
     // ops/conv.py, ported for phase 2 (P7) — under a PSEUDO-NAME, and that
-    // is load-bearing. A tape builder with no `_lower_*` of its own emits an
-    // op it finds in this table with an EMPTY attribute vector (tape.py's
+    // is load-bearing. A tape builder with no `_lower_*` of its own emitted
+    // an op it found in this table with an EMPTY attribute vector (tape.py's
     // `handler(...) if handler else ([], None)`), and this handler reads a
-    // long one. src/metaljax/tape.py has no convolution lowering, so
-    // `stablehlo.convolution` must stay absent from the table: Stage 1 keeps
+    // long one. src/metaljax/tape.py had no convolution lowering, so
+    // `stablehlo.convolution` stayed absent from the table: Stage 1 kept
     // declining the op to the Python engine, at compile time, where it
-    // belongs. The phase-2 plugin knows the layout and asks by this name.
+    // belonged. The phase-2 plugin knows the layout and asks by this name.
     {"metaljax.conv", kConv},
     {"stablehlo.while", kWhile},
     {"stablehlo.if", kIf},
     {"stablehlo.case", kCase},
     // M4 recognizer emits. Pseudo-names: a build that predates a given
-    // emit simply does not offer it, and tape.py declines the program —
+    // emit simply does not offer it, and tape.py declined the program —
     // which is why there is no version negotiation anywhere else.
     {"metaljax.qmm", kQmm},
     {"metaljax.sdpa", kSdpa},

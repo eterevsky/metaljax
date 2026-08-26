@@ -1,5 +1,5 @@
-// metaljax native engine — indexed reads and writes
-// (src/metaljax/ops/gather.py, ops/sort.py).
+// metaljax native engine — indexed reads and writes (ported from Stage 1's
+// src/metaljax/ops/gather.py and ops/sort.py, deleted 0.11.6, ef5774d).
 //
 // StableHLO's gather and scatter go STRAIGHT to MLX's primitives: one index
 // array per indexed operand axis, all of the index batch shape, built by the
@@ -31,7 +31,7 @@ namespace {
 
 // Component `j` of the coordinate vector. `split` is false when
 // index_vector_dim == rank, where the whole array is the single component --
-// ops/gather.py's `index_arrays` reads it exactly this way.
+// ops/gather.py's `index_arrays` read it exactly this way.
 mx::array index_component(const mx::array& starts, bool split, int ivd,
                           int j) {
   if (!split) return starts;
@@ -166,8 +166,9 @@ bool Program::step_index(const Entry& e,
       // That is the shape every top_k lowers to — jax's chlo.top_k
       // decomposition is `sort(values, iota)` under a strict TOTALORDER
       // GT — and it is what a plain jnp.sort/argsort emits too. A
-      // comparator that computes a key first is declined in tape.py,
-      // where the structural recognizer lives.
+      // comparator that computes a key first is declined at lowering
+      // (tape.py then, metal_lowering.cc now), where the structural
+      // recognizer lives.
       // attrs [dim, descending?, key operand, key kind] (kinds beside
       // `sort_key` above)
       int dim = static_cast<int>(at[0]);
@@ -286,8 +287,8 @@ bool Program::step_index(const Entry& e,
       // lowering; here the indices are built and clamped, the updates are
       // put into MLX's [index batch dims, operand-rank slice] layout, and
       // XLA's OOB-DROP is applied by one of the two strategies tape.py
-      // chose between (it chooses from static sizes, so both engines
-      // choose alike).
+      // chose between (it chose from static sizes, so both engines
+      // chose alike).
       Cursor c(at);
       int64_t method = c.next();
       int64_t strategy = c.next();
@@ -308,7 +309,7 @@ bool Program::step_index(const Entry& e,
       upd = mx::astype(mx::reshape(upd, c.shp()), in(0).dtype());
       if (method == 6) {
         // A complex MULTIPLY, which is not componentwise: ops/gather.py
-        // rewrites it into the apply path -- gather the current values,
+        // rewrote it into the apply path -- gather the current values,
         // combine, and SET the result -- and the lowering only takes this
         // arm when the op declares its indices unique, which is what makes
         // one write per slot the same as the combiner. The gather reads the
@@ -443,7 +444,7 @@ bool Program::step_index(const Entry& e,
       };
       if (is_complex(in(0).dtype())) {
         // MLX has no complex scatter kernels: write the two PARTS and
-        // recombine, which ops/gather.py does by recursing on
+        // recombine, which ops/gather.py did by recursing on
         // `mx.real`/`mx.imag`. Exact for the componentwise combiners, and
         // the lowering declines the rest. The neutral in `payload` is the
         // part's (f32), for the same reason.

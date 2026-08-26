@@ -1,6 +1,7 @@
 /* metaljax: fully-native PJRT plugin for Apple-silicon GPUs (Stage 2).
 
-`src/metaljax/sdpa.py`, as a pass over the parsed StableHLO: the analysis that
+Stage 1's `src/metaljax/sdpa.py` (deleted 0.11.6, ef5774d), as a pass over
+the parsed StableHLO: the analysis that
 reads a softmax attention out of the graph and fills a `SdpaMatch` for the
 lowering to emit as one `mx::fast::scaled_dot_product_attention`.
 
@@ -1770,8 +1771,8 @@ bool SdpaEnabled() {
 // callee therefore emit two fused attentions over their own operands.
 //
 // Only sdpa widens.  qmm and moe deliberately keep the @main-rooted walk their
-// Stage 1 counterparts have (`qmm.py`/`moe.py` both walk
-// `_walk_blocks(interp._main_block())`): what the two stacks must agree on
+// Stage 1 counterparts had (`qmm.py`/`moe.py` both walked
+// `_walk_blocks(interp._main_block())`): what the two stacks had to agree on
 // above all is the set of matches, because BlockCost is computed from it and
 // the compile decision is computed from that.
 void AnalyzeSdpa(mlir::func::FuncOp fn, RewritePlan* plan) {

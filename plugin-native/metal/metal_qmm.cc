@@ -1,8 +1,9 @@
 /* metaljax: fully-native PJRT plugin for Apple-silicon GPUs (Stage 2).
 
-`src/metaljax/qmm.py`, as a pass over the parsed StableHLO.
+Stage 1's `src/metaljax/qmm.py` (deleted 0.11.6, ef5774d), as a pass over the
+parsed StableHLO.
 
-The two halves are the Python module's two halves, and neither is re-designed
+The two halves are the Python module's two halves, and neither was re-designed
 here: `AnalyzeQmm` is its structural matching (`_try_affine`, `_try_perchannel`,
 `_finish`, `_prune`) and touches no value; `BuildQmmPacks` is its first-execute
 verification and packing (`_build_affine_pack`, `_build_mxfp4_pack`), on the

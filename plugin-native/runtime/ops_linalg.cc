@@ -1,12 +1,13 @@
-// metaljax native engine — contractions (src/metaljax/ops/linalg.py).
+// metaljax native engine — contractions (ported from Stage 1's
+// src/metaljax/ops/linalg.py, deleted 0.11.6, ef5774d).
 //
 // dot_general, in its three arms. Which one runs is a static property of the
 // operand dtypes that tape.py resolved; all three are here because MLX's
 // matmul is float-only, so an integer dot is either exact f32 K-chunks or a
 // materialized outer product summed in integer arithmetic.
 //
-// (The rest of ops/linalg.py -- the LAPACK targets -- computes on the host
-// and reaches the tape as a host call; see host.cc.)
+// (The rest of ops/linalg.py -- the LAPACK targets -- computed on the host
+// and reached the tape as a host call; still the case here, see host.cc.)
 
 #include "program.h"
 

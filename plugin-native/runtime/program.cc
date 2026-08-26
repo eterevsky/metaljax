@@ -204,7 +204,7 @@ std::vector<mx::array> Program::run(std::vector<mx::array> inputs) {
     // one array, and nanobind hands each of them a fresh Python wrapper,
     // so engine.execute's `seen_out` pass cannot see the
     // duplicate. (Input aliasing is a static property of the program and
-    // is handled where it belongs — tape.py declines the shapes of
+    // is handled where it belongs — tape.py declined the shapes of
     // forwarding that would reach here.)
     for (size_t i = 1; i < outs.size(); i++) {
       for (size_t j = 0; j < i; j++) {

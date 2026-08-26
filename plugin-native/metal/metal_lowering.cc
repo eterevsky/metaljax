@@ -77,7 +77,7 @@ const absl::flat_hash_map<std::string, int>& OpcodeTable() {
 // Ops whose whole lowering is "look the opcode up and bind the results": no
 // attributes to resolve, and a C++ handler that branches on nothing but the
 // operand dtypes (which is what its Python counterpart in
-// src/metaljax/ops/elementwise.py does too).  Spelled out rather than derived
+// src/metaljax/ops/elementwise.py did too).  Spelled out rather than derived
 // from the registry, because the registry also holds names whose handler READS
 // an attribute vector -- reaching one of those with an empty vector would be
 // an out-of-bounds read, not a decline.
@@ -159,7 +159,7 @@ bool IsViewOp(absl::string_view name) {
          name == "stablehlo.bitcast_convert";
 }
 
-// tape.py `_scatter_noop`: whether ops/gather.py `_scatter` hands the operand
+// tape.py `_scatter_noop`: whether ops/gather.py `_scatter` handed the operand
 // straight back.  Empty updates apply nothing, and a zero-size operand drops
 // every update as out of bounds.  The result IS the operand array, so the
 // tape aliases the slot (and the taints ride along) rather than emitting an
@@ -185,7 +185,7 @@ bool IsControlOp(absl::string_view name) {
 
 // An ordered-effect token is not a tensor and carries no data; it crosses the
 // runtime boundary -- and lives in the executor's environment -- as the EMPTY
-// BOOL array `src/metaljax/dtypes.py::token_value` builds, which is also the
+// BOOL array `src/metaljax/dtypes.py::token_value` built, which is also the
 // buffer jax's runtime hands in for a token parameter
 // (`dispatch.RuntimeTokenSet`: `np.zeros(0, np.bool_)`).  Sequencing is the
 // tape's own order, so a token is an ordinary value here and the two ops that
@@ -404,7 +404,7 @@ std::vector<int64_t> OptI64List(mlir::Operation* op, llvm::StringRef name,
 }
 
 // The element-type name of a value, as src/metaljax/tape.py's `_element`
-// spells it ("i1", "ui32", "bf16", "complex<f32>").
+// spelled it ("i1", "ui32", "bf16", "complex<f32>").
 std::optional<std::string> ElementName(mlir::Value v) {
   auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
   if (!t) return std::nullopt;
@@ -486,8 +486,8 @@ absl::StatusOr<WindowPlanOut> BuildWindowPlan(
     any_neg = any_neg || lo < 0 || hi < 0;
   }
   if (any_pad) {
-    // ops/reduction.py raises here: mx::pad has no negative widths, and a
-    // crop-then-window rewrite is not what the Python engine computes.
+    // ops/reduction.py raised here: mx::pad has no negative widths, and a
+    // crop-then-window rewrite is not what the Python engine computed.
     if (any_neg) return Decline("reduce_window negative padding");
     attrs.push_back(1);
     attrs.push_back(rank);
@@ -539,10 +539,10 @@ absl::StatusOr<WindowPlanOut> BuildWindowPlan(
 // sort comparators (src/metaljax/ops/sort.py)
 // --------------------------------------------------------------------------
 //
-// tape.py lowers only the comparator that IS a bare compare, because the
-// Python ENGINE evaluates the other shape -- a comparator that computes a KEY
+// tape.py lowered only the comparator that IS a bare compare, because the
+// Python ENGINE evaluated the other shape -- a comparator that computes a KEY
 // from its argument pair -- by running the block's code on whole arrays, and
-// tape.py has no way to hand a block to that opcode.  This plugin has no
+// tape.py had no way to hand a block to that opcode.  This plugin has no
 // Python engine behind it, so the recognizer is ported instead: the key chain
 // is elementwise scalar code, and elementwise scalar code lowered into the
 // ENCLOSING frame computes the same key on the whole operand.  What the
@@ -596,8 +596,8 @@ std::vector<mlir::Operation*> Cone(mlir::Value root, mlir::Block& block) {
 // trees): a boolean decision tree over compares of the key pairs, plus the
 // float canonicalization and the complex part reads its compares are fed.
 //
-// ops/sort.py checks none of this -- it reads the tree's argument
-// DEPENDENCIES and trusts the shape, because jax emits exactly two.  The
+// ops/sort.py checked none of this -- it read the tree's argument
+// DEPENDENCIES and trusted the shape, because jax emits exactly two.  The
 // check exists because the arm's whole execution is inferred rather than
 // evaluated: an ascending lexicographic sort is what a tree of LT/EQ/NE
 // decisions means, and a tree holding a GT would be silently mis-ordered
@@ -1742,8 +1742,8 @@ bool WhileTraceable(LowerContext& ctx, mlir::Operation* op) {
       // else said compile" -- which is what makes its debug line mean
       // something.  `trip <= kUnrollMax` is asked FIRST: it is the runtime's
       // own refusal, and a deliberate DIVERGENCE from ops/control.py, whose
-      // `_while_traceable` has the budget tests only (Stage 1's engine
-      // recovers from the refusal more cheaply than this one).
+      // `_while_traceable` had the budget tests only (Stage 1's engine
+      // recovered from the refusal more cheaply than this one).
       ok = trip <= kUnrollMax &&
            trip * BlockCost(ctx, body) <= kTraceBudget &&
            BlockIsPure(ctx, body) &&
@@ -1801,7 +1801,7 @@ std::vector<int> UnderivedOutputs(mlir::Block& block,
 
 // The two aliasing taints of one slot, in the frame that owns it: which of
 // the frame's ARGUMENTS its array may be, and whether it may view a constant
-// the Program holds for the life of the executable.  tape.py keeps the first
+// the Program holds for the life of the executable.  tape.py kept the first
 // as a set rather than a flag because a region maps its outputs' taints back
 // through the parent's operands -- a loop that forwards a carry untouched has
 // to be recognized as its own input on the other side of the frame.
@@ -1945,7 +1945,7 @@ class Lowering {
   absl::Status LowerOp(mlir::Operation* op);
   // The recognizer roots (M4's emits): one fused entry in place of the whole
   // chain the match absorbed.  The attribute layout is the one
-  // runtime/emits.cc reads and src/metaljax/tape.py writes.
+  // runtime/emits.cc reads and src/metaljax/tape.py wrote.
   absl::Status LowerQmm(mlir::Operation* op, const QmmMatch& m);
   absl::Status LowerSdpa(mlir::Operation* op, const SdpaMatch& m);
   absl::Status LowerMoe(mlir::Operation* op, const MoeMatch& m);
@@ -1966,7 +1966,7 @@ class Lowering {
 
   // M5b: a counted loop msl_scan planned into one generated Metal kernel, as
   // the launch recipe `runtime/msl.cc` parses -- the transliteration of
-  // src/metaljax/tape.py's `_lower_msl`, whose comments are the spec.  The
+  // src/metaljax/tape.py's `_lower_msl`, whose comments were the spec.  The
   // extra input slots are the arrays the kernel reads (carries of this loop
   // and values of this frame), and the taints are what the kernel alone
   // implies about the carries when the interpreted fallback did not lower.
@@ -2058,7 +2058,7 @@ class Lowering {
                                                const std::vector<int64_t>& dims,
                                                mlir::Block& body, int64_t rank);
   // Scatter emits itself: its drop strategy may carry a neutral VALUE, which
-  // is a payload rather than an attribute (tape.py returns one too).
+  // is a payload rather than an attribute (tape.py returned one too).
   absl::Status LowerScatter(mlir::Operation* op);
 
   // Whether MLX may hand this op's operand array back as its result (an
@@ -2422,8 +2422,8 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerBroadcastInDim(
   for (size_t i = 1; i < dims.size(); i++)
     if (dims[i] < dims[i - 1]) ascending = false;
   if (!ascending) {
-    // Stable, because tape.py's `sorted(range(n), key=...)` is: the two
-    // builders must produce the same permutation, and StableHLO's uniqueness
+    // Stable, because tape.py's `sorted(range(n), key=...)` was: the two
+    // builders had to produce the same permutation, and StableHLO's uniqueness
     // rule for broadcast_dimensions is a verifier's promise, not this file's.
     std::stable_sort(perm.begin(), perm.end(), [&](int64_t a, int64_t b) {
       return dims[a] < dims[b];
@@ -2707,9 +2707,9 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDynamicUpdateSlice(
 }
 
 // The tape's dtype code for an element-type NAME.  The dtype table is the
-// runtime's, keyed by the names src/metaljax/tape.py gates on, so a handler
+// runtime's, keyed by the names src/metaljax/tape.py gated on, so a handler
 // that needs the code of a type no VALUE has (popcnt's unsigned twin) asks
-// for it the same way tape.py's `_dtype_code` does.
+// for it the same way tape.py's `_dtype_code` did.
 std::optional<int> CodeForName(absl::string_view name) {
   static const auto* codes = [] {
     auto* m = new absl::flat_hash_map<std::string, int>();
@@ -2786,7 +2786,7 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerBitcastConvert(
   // A bitcast reads BITS, so the storage has to BE the logical bit pattern.
   // i4/ui4 are the one emulated pair this can reconstruct (whole nibbles);
   // the f8/f6/f4 grids hold VALUES in a wider float, so their bit patterns
-  // simply do not exist on this device (ops/shape.py raises the same way).
+  // simply do not exist on this device (ops/shape.py raised the same way).
   int64_t ib = 8 * static_cast<int64_t>(src->size());
   int64_t ob = 8 * static_cast<int64_t>(dst->size());
   // `CheckValue` has already run on both, so both names exist.
@@ -3086,7 +3086,7 @@ absl::StatusOr<IndexPlan> BuildIndexPlan(
     plan.batch_shape.push_back(idx_shape[static_cast<size_t>(i)]);
   }
   // index_vector_dim == rank means the whole array IS one component, which is
-  // the shape ops/gather.py's `index_arrays` builds too.
+  // the shape ops/gather.py's `index_arrays` built too.
   plan.split = ivd != idx_rank;
   const int64_t k = plan.split ? idx_shape[static_cast<size_t>(ivd)] : 1;
   if (static_cast<int64_t>(smap.size()) != k)
@@ -3559,16 +3559,16 @@ std::optional<mx::array> CombinerNeutral(int64_t method, mx::Dtype dt) {
 //    axis and at 0 elsewhere, which is XLA's window rule for the windowed
 //    dims and for the partial windows on free dims alike;
 //  * XLA's OOB-DROP semantics, of which MLX has none, through the same two
-//    strategies ops/gather.py picks between, chosen from the same static
-//    sizes so the two engines cannot pick differently.
+//    strategies ops/gather.py picked between, chosen from the same static
+//    sizes so the two engines could not pick differently.
 absl::Status Lowering::LowerScatter(mlir::Operation* op) {
   if (op->getNumOperands() != 3 || op->getNumResults() != 1)
     return Decline("variadic scatter");
   // MLX has no complex GPU scatter kernels at all, so the entry scatters the
   // REAL and IMAGINARY parts separately and recombines them, exactly as
-  // ops/gather.py `_scatter` does by recursing on `mx.real`/`mx.imag`. Sound
+  // ops/gather.py `_scatter` did by recursing on `mx.real`/`mx.imag`. Sound
   // only for a componentwise combiner -- set, add and subtract are; multiply
-  // is not (the Python handler sends it to the apply path, which this plugin
+  // is not (the Python handler sent it to the apply path, which this plugin
   // declines), and there is no order on complex for max/min.
   const bool complex_parts = IsComplexElement(op->getOperand(0));
   ASSIGN_OR_RETURN(std::vector<int64_t> op_shape, Dims(op->getOperand(0)));
@@ -3586,8 +3586,8 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
       // jax's `scatter_apply` / `.at[i].apply(f)`: the body is elementwise
       // code over (current value, update), and running it on the GATHERED
       // values and SETTING the result equals the scatter only while no two
-      // updates land on the same slot.  ops/gather.py takes that arm under
-      // the op's `unique_indices` and otherwise applies the updates ONE AT A
+      // updates land on the same slot.  ops/gather.py took that arm under
+      // the op's `unique_indices` and otherwise applied the updates ONE AT A
       // TIME in row-major order -- because a computed body need be neither
       // associative nor idempotent, so a duplicate index really does mean
       // f(f(x)).  Both arms are here, chosen by the same flag, and the
@@ -3608,7 +3608,7 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
   // empty (`tensor<0xi32>`) and the single update lands on the whole array.
   // XLA's OOB rule has nothing to test and MLX's primitives want at least one
   // index array, so the whole op degenerates to its combiner -- which is what
-  // ops/gather.py computes too, by way of an empty index tuple.  jax reaches
+  // ops/gather.py computed too, by way of an empty index tuple.  jax reaches
   // this through `jax.experimental.sparse` on a 0-d array, where the
   // reduction over the updates has already happened before the scatter.
   if (op_shape.empty()) {
@@ -3642,7 +3642,7 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
   }
 
   if (complex_parts && method_code == 2) {
-    // MULTIPLY is the one combiner ops/gather.py rewrites rather than
+    // MULTIPLY is the one combiner ops/gather.py rewrote rather than
     // splitting: `method = "apply"`, which gathers the current values,
     // combines them with the updates and SETS the result -- and that equals
     // the combiner only while no two updates land on the same slot.
@@ -3665,7 +3665,7 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
              method_code != 5 && method_code != 7 && method_code != 8) {
     // An APPLY body is componentwise by construction -- it bottoms out in a
     // SET, which is -- so it needs no arm of its own, exactly as
-    // ops/gather.py's complex branch lets `"apply"` through.
+    // ops/gather.py's complex branch let `"apply"` through.
     return Decline(absl::StrCat("complex scatter ", CombinerName(combiner)));
   }
 
@@ -3940,8 +3940,8 @@ absl::Status Lowering::LowerConstant(mlir::Operation* op) {
   } else if (numel > 1 && dense.isSplat()) {
     // One value, broadcast from a ONE-ELEMENT buffer -- never materialized,
     // which is what keeps a splat's device cost independent of its shape
-    // (ops/elementwise.py `_constant`, and the note there on the 127 GB of
-    // retained splat coefficients that made it necessary).
+    // (ops/elementwise.py `_constant`, whose note on the 127 GB of
+    // retained splat coefficients is what made it necessary).
     llvm::ArrayRef<char> raw = dense.getRawData();
     if (raw.size() != item)
       return Decline("a splat constant whose raw element is the wrong size");
@@ -4287,7 +4287,7 @@ absl::Status Lowering::LowerSort(mlir::Operation* op) {
   if (!cmp_op) {
     // The two lexicographic select trees, recognized STRUCTURALLY -- the tree
     // is never evaluated, only read for which operand pairs it decides on,
-    // exactly as ops/sort.py reads its argument dependencies.  Both are
+    // exactly as ops/sort.py read its argument dependencies.  Both are
     // ascending, and both mean an execution the one-argsort entry cannot
     // express: the multi-key sort threads a permutation through successive
     // stable argsorts (`kLexSort`), and the complex sort keys on the packed
@@ -4327,8 +4327,8 @@ absl::Status Lowering::LowerSort(mlir::Operation* op) {
     // `_lex_sorted(ins, num_keys, dim)`.  The keys are the FIRST operands, in
     // order -- a tree that decides on any other set is not the shape jax
     // emits and is declined.  One key and not complex declines too, which is
-    // ops/sort.py's behaviour (its `ks.pop()` empties the set before the
-    // lexicographic test reads it) and is unreachable from jax: a single-key
+    // ops/sort.py's behaviour (its `ks.pop()` emptied the set before the
+    // lexicographic test read it) and is unreachable from jax: a single-key
     // sort gets a bare compare, not a tree.
     bool leading = keys.size() > 1 && keys.size() <= op->getNumOperands();
     for (size_t i = 0; i < keys.size() && leading; i++)
@@ -4815,8 +4815,8 @@ absl::Status Lowering::LowerApproxTopK(mlir::Operation* op) {
   int64_t kind = 0;
   if (IsComplexElement(op->getOperand(0)))
     return Decline("ApproxTopK on complex");
-  // ops/sort.py `approx_top_k` keys through `_sort_key`, not through the bare
-  // totalOrder key `_top_k` uses -- so the canonicalizing float kind (4).
+  // ops/sort.py `approx_top_k` keyed through `_sort_key`, not through the bare
+  // totalOrder key `_top_k` used -- so the canonicalizing float kind (4).
   if (IsFloatElement(op->getOperand(0))) kind = 4;
   else if (IsBoolElement(op->getOperand(0))) kind = 2;
 
@@ -4844,7 +4844,7 @@ absl::Status Lowering::LowerCollective(mlir::Operation* op,
   for (mlir::Value v : op->getOperands()) RETURN_IF_ERROR(CheckValue(v));
   for (mlir::Value v : op->getResults()) RETURN_IF_ERROR(CheckValue(v));
 
-  // `replica_groups` is [num_groups, group_size]; ops/collectives.py reads the
+  // `replica_groups` is [num_groups, group_size]; ops/collectives.py read the
   // last dimension.  Absent (the two id ops, collective_permute) means one.
   if (auto groups =
           op->getAttrOfType<mlir::DenseIntElementsAttr>("replica_groups")) {
@@ -5317,7 +5317,7 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
 }
 
 // --------------------------------------------------------------------------
-// msl_scan plans (M5b), as src/metaljax/tape.py's `_lower_msl` writes them
+// msl_scan plans (M5b), as src/metaljax/tape.py's `_lower_msl` wrote them
 // --------------------------------------------------------------------------
 //
 // `Plan.run`, resolved statically: its `bufs` loop becomes a list of slots
@@ -5831,7 +5831,7 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   }
 
   // A rank-0 dynamic slice or update has no index operands and nothing to
-  // slice: ops/shape.py hands the operand array straight back, so this is an
+  // slice: ops/shape.py handed the operand array straight back, so this is an
   // alias like the ones above (tape.py `_rank0_passthrough`).
   if (name == "stablehlo.dynamic_slice" && op->getNumOperands() == 1) {
     ASSIGN_OR_RETURN(int s, Slot(op->getOperand(0)));
@@ -5844,7 +5844,7 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
     return absl::OkStatus();
   }
   // Empty updates or a zero-size operand: the same kind of alias, and it sits
-  // here -- ahead of the dtype checks -- exactly where tape.py's does.
+  // here -- ahead of the dtype checks -- exactly where tape.py's did.
   if (name == "stablehlo.scatter" && IsScatterNoop(op)) {
     ASSIGN_OR_RETURN(int s, Slot(op->getOperand(0)));
     Alias(op->getResult(0), s);
@@ -6627,7 +6627,7 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
   lowered.num_copies = static_cast<int64_t>(copies.size());
   built.program->set_outputs(built.outputs, copies);
 
-  // Whether the WHOLE tape traces through mx::compile (engine.py
+  // Whether the WHOLE tape traces through mx::compile (Stage 1 engine.py
   // `MetalExecutable.runner`, P5).  Two independent budgets: `cost` bounds how
   // many ops one trace may hold, and so the Metal live-buffer count; the byte
   // gate bounds how much those buffers HOLD, which op count says nothing about
@@ -6798,7 +6798,7 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
   pctx.blocked_cone = blocked_cone;
   absl::Status packed = BuildQmmPacks(&plan, pctx);
   if (!packed.ok()) return packed;
-  // ...and the router check, which is a value question too (moe.py's is in
+  // ...and the router check, which is a value question too (moe.py's was in
   // the same eager prologue, for the same reason: it syncs with the host).
   absl::Status verified = VerifyMoe(&plan, eval);
   if (!verified.ok()) return verified;

@@ -1,6 +1,7 @@
-// metaljax native engine — element types (src/metaljax/dtypes.py).
+// metaljax native engine — element types (ported from Stage 1's
+// src/metaljax/dtypes.py, deleted 0.11.6, ef5774d).
 //
-// The table Python gates on, the predicates every handler branches on, the
+// The table Python gated on, the predicates every handler branches on, the
 // weak-literal rule that keeps a ported expression's dtype (and therefore
 // its BITS) identical to the Python engine's, and the complex64
 // rearrangements: MLX's complex kernels compute the naive formulas, which
@@ -24,7 +25,7 @@ namespace {
 // all) declines the program.
 //
 // The EMULATED entries at the end are the one place where the code's dtype
-// is not the type's own bits: dtypes.py stores an i4 in an int8, an f8 in a
+// is not the type's own bits: dtypes.py stored an i4 in an int8, an f8 in a
 // float16 and E8M0's exponent range in a float32, holding the VALUE rather
 // than the encoding. `dtype_of` therefore answers with the storage, which is
 // what every handler wants, and the one question that needs the logical

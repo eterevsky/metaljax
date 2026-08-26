@@ -1,4 +1,5 @@
-// metaljax native engine — shape and layout ops (src/metaljax/ops/shape.py).
+// metaljax native engine — shape and layout ops (ported from Stage 1's
+// src/metaljax/ops/shape.py, deleted 0.11.6, ef5774d).
 //
 // Reshape, transpose, broadcast, slice/pad/reverse, the dynamic slice pair
 // and the bitcast -- every one of them a rearrangement whose shapes tape.py

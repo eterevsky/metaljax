@@ -4,8 +4,9 @@
 // NUMBER behind it belongs to Python (config.cc copies them in): what lives
 // in this file is the mechanism -- when a replay blocks, what it evaluates,
 // when it hands buffers back to the OS, and how it recovers from Metal's
-// live-buffer limit. src/metaljax/interpreter.py and ops/control.py own the
-// comments that explain the values themselves.
+// live-buffer limit. Stage 1's src/metaljax/interpreter.py and ops/control.py
+// (deleted 0.11.6, ef5774d) owned the comments that explained the values
+// themselves.
 
 #include "program.h"
 

@@ -1,7 +1,9 @@
-// metaljax native engine — msl_scan launches (src/metaljax/msl_scan.py).
+// metaljax native engine — msl_scan launches (ported from Stage 1's
+// src/metaljax/msl_scan.py, deleted 0.11.6, ef5774d).
 //
 // The planning -- pattern match, mode choice, MSL generation -- is compile
-// time work and stays in Python; what lives here is the LAUNCH and the
+// time work and lives in the tape builder (Stage 1's msl_scan.py, now
+// metal/metal_msl*.cc); what lives here is the LAUNCH and the
 // recipe that turns a kernel's outputs back into the loop's carries
 // (MslPlan), the tape entry that dispatches one (Program::run_msl, which
 // falls back to the interpreted loop the entry still carries), and the

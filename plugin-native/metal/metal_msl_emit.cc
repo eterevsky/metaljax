@@ -1,10 +1,11 @@
-/* metaljax: msl_scan's three emitters, natively (src/metaljax/msl_scan.py).
+/* metaljax: msl_scan's three emitters, natively (ported from Stage 1's
+src/metaljax/msl_scan.py, deleted 0.11.6, ef5774d).
 
 `Plan._emit` (scalar/affine), `Plan._emit_vector` and `Plan._emit_coop`, line
-for line.  Everything they generate is a string, so the transliteration is
-readable against the Python side by side -- which is the point: a generated
+for line.  Everything they generate is a string, so the transliteration was
+readable against the Python side by side -- which was the point: a generated
 kernel that differs by an index expression is silent wrongness, and the only
-defence is that the two engines emit the same shader.
+defence was that the two engines emitted the same shader.
 
 Licensed under the Apache License, Version 2.0.
 ==============================================================================*/

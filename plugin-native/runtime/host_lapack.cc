@@ -1,6 +1,7 @@
 // metaljax native engine — the host linalg family, on Accelerate's LAPACK.
 //
-// `src/metaljax/ops/lapack.py`, handler for handler, with numpy/scipy replaced
+// Stage 1's `src/metaljax/ops/lapack.py` (deleted 0.11.6, ef5774d), handler
+// for handler, with numpy/scipy replaced
 // by the LAPACK that ships in Accelerate.framework.  Three things carry over
 // verbatim because they are XLA's semantics rather than LAPACK's, and a test
 // notices each of them:

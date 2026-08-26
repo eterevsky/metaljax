@@ -1,4 +1,5 @@
-// metaljax native engine — reductions (src/metaljax/ops/reduction.py).
+// metaljax native engine — reductions (ported from Stage 1's
+// src/metaljax/ops/reduction.py, deleted 0.11.6, ef5774d).
 //
 // Four shapes of the same op. A monoid reduce goes straight to MLX; the
 // (values, indices) pair jax lowers argmax/argmin to carries XLA's NaN rule,
@@ -19,7 +20,7 @@ namespace metaljax {
 namespace {
 
 // Reduce monoids, resolved at lowering time from the body op and the input
-// element type (ops/reduction.py picks _BOOL_REDUCERS vs _REDUCERS on the
+// element type (ops/reduction.py picked _BOOL_REDUCERS vs _REDUCERS on the
 // dtype, which is static in the IR).
 mx::array reduce_apply(int64_t kind, const mx::array& x,
                        const std::vector<int>& axes) {
