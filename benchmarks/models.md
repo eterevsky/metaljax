@@ -12,28 +12,28 @@ Cells: metaljax warm decode ms/token (or the row's noted metric);
 version's commit. Full per-run tables live in STATUS.md; raw JSONL in
 notes/data/. Append a column per release / major optimization.*
 
-| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 |
-|---|---|---:|---:|---:|---:|---:|
-| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | **235.5** |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | **92.3** |
-| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | **43.5** |
-| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | **27.2** |
-| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | **57.9** |
-| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | **54.5** |
-| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | **21.7** |
-| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | **29.7** ᴳ |
-| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | **210.3** ᴳ |
-| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | **1871.1** ᴳ |
-| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | **16.35** |
-| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ |
-| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | **78.0** |
-| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | **31.77** |
-| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | **401.4** ᵛ |
-| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | **88.37** |
-| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | **1231.3 / 5696.8** |
-| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | **370.7** |
-| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | **460.2** |
-| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ |
+| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 | 0.11.6 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | **235.2** |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | **92.1** |
+| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | **43.3** |
+| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | **27.2** |
+| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | **57.6** |
+| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | **54.3** |
+| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | **21.3** |
+| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | **29.4** ᴳ |
+| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | **211.0** ᴳ |
+| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | **1948.2** ᴳ |
+| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | 16.35 | **16.35** |
+| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | **91.3** ᴳ |
+| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | **78.0** |
+| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | **31.85** |
+| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | **381.7** ᵛ |
+| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | **88.31** |
+| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | **1234.7 / 4974.9** |
+| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | **369.2** |
+| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | **463.4** |
+| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ | **66.3** ᴳ |
 
 Notes:
 
@@ -228,3 +228,10 @@ Notes:
   variance disposition, rows 3/8 suite-context brackets, row 10 spread,
   row 18 drift, row 15 first timing) in STATUS.md footnote 36; full report
   `~/.cache/metaljax-bench/logs/regate-0.11.5/models/`.
+- **0.11.6** (2026-08-27 release gate): every cell from the release binary
+  `frozen-0.11.6-dde2d668` (tree `83ff94f`), one guarded process per cell.
+  ALL 20 rows now produce numbers — rows 12 and 20 for the first time
+  (run at documented raised memory envelopes; shipped defaults unchanged).
+  Zero regressions standing; token agreement under the greedy contract
+  (Qwen3-8B and Llama-8B now EXACT vs CPU). Named items in STATUS.md
+  footnote 37; full report `~/.cache/metaljax-bench/logs/gate-0.11.6/`.

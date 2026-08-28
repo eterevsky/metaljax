@@ -288,9 +288,9 @@ Full training steps (fwd + bwd + AdamW), f32, M5 Max, via
 
 | workload | jax CPU | **metaljax** | torch MPS | torch CPU |
 |---|---:|---:|---:|---:|
-| transformer d256 L4 T256 b32 | 174.3 | **30.2** | 30.0 | 209.3 |
-| transformer d512 L4 T256 b64 | — | **153.9** | 151.7 | — |
-| GRU.256 T256 b256 (scan) | 256.6 | **53.5** | 48.2¹ | — |
+| transformer d256 L4 T256 b32 | 156.6 | **30.6** | 30.0 | 209.3 |
+| transformer d512 L4 T256 b64 | 1059.9 | **159.4** | 151.7 | — |
+| GRU.256 T256 b256 (scan) | 255.9 | **53.5** | 48.2¹ | — |
 
 ¹ torch uses its hand-fused `nn.GRU` kernel; metaljax generates its
 kernel from the StableHLO loop body and lands within 10%.
@@ -316,15 +316,17 @@ after it. `METALJAX_COMPILE=0` disables compilation, `METALJAX_MSL=0`
 disables kernel codegen, `METALJAX_TRACE_BUDGET` (default 20000 ops)
 caps trace sizes, and `METALJAX_DEBUG=1` logs loop/compile decisions.
 
-On a 104-config language-model training suite (dense, GRU/LSTM-family,
-and linear-RNN cells from tens of weights to several million), 84
-configs train faster on metal than on the M5's CPU cores; **every**
-config above 10k weights wins (median 3–6.6x faster), and 41 of 104
-outpace an RTX 4090 running jax-CUDA. Only sub-10k-weight models remain
-CPU territory (kernel-dispatch floor). Every optimization is gated by a
-whole-model correctness sweep: one jitted training chunk per suite
-config executed on both backends from identical inputs, every output
-leaf compared.
+On the 106-config language-model training suite (dense, GRU/LSTM-family,
+and linear-RNN cells from tens of weights to several million; 0.11.6
+release gate), 86 configs train faster on metal than on the M5's CPU
+cores: **every** production-size and mid-size config wins (34/34 and
+30/30, median 3x and 6.1x faster) — only the sub-millisecond
+kernel-codegen microbenchmarks remain partly CPU territory
+(kernel-dispatch floor). An earlier 104-config sweep also measured 41
+configs outpacing an RTX 4090 running jax-CUDA. Every optimization is
+gated by a whole-model correctness sweep: one jitted training chunk per
+suite config executed on both backends from identical inputs, every
+output leaf compared (106/106 at this release).
 
 ### openxla/xla benchmark suite
 
@@ -336,22 +338,37 @@ outputs cross-checked against the CPU results):
 
 | benchmark | jax CPU (M5 Max) | **metaljax** | RTX 4090 |
 |---|---:|---:|---:|
-| gemma3_1b_flax_call | 80.1 | **42.5** | 4.0 |
-| gemma3_4b_flax_call | 666.9 | **81.5** | 11.2 |
-| gemma3_12b_flax_call | 2187.9 | **172.7** | —¹ |
-| gemma2_2b_keras_jax | 158.0 | **17.5** | 10.9 |
-| gemma4_2b_bf16 | 512.0 | **16.9** | 2.5 |
-| maxtext 2.5B train step | 101066 | **10618**² | —¹ |
+| gemma3_1b_flax_call | 84.6 | **35.3**² | 4.0 |
+| gemma3_4b_flax_call | 586.5 | **68.8**² | 11.2 |
+| gemma3_12b_flax_call | 2178.3 | **153.1**² | —¹ |
+| gemma2_2b_keras_jax | 156.9³ | 2.7³ | 10.9 |
+| gemma4_2b_bf16 | 505.8³ | 2.8³ | 2.5 |
+| maxtext 2.5B train step | 101066 | **11606**⁴ | —¹ |
 
 ¹ exceeds the 4090's 24 GB VRAM; the M5's 128 GB unified memory runs
 gemma3_12b (23.5 GB of bf16 weights) where the discrete GPU cannot.
-² compiled whole-graph after working around an MLX limitation (equal
-constant-valued outputs break MLX's graph compiler); ~10× CPU.
+² the imported modules contain one plain `stablehlo.dot` (the logits
+matmul), which the native plugin declines by design (jax never emits
+it); measured with that one op rewritten to the equivalent
+`dot_general`, validated end-to-end against CPU references from the
+pristine modules.
+³ VACUOUS under the suite's seeded inputs (found at the 0.11.6
+re-measure): both are generate-loop programs whose while-loop runs zero
+iterations, so no forward pass executes on any backend — the cells
+measure loop-condition + state-copy overhead only, and one output is a
+bit-exact passthrough of the input ids. Kept for completeness; earlier
+releases' 17.5/16.9 ms cells were Stage-1 dispatch on the same empty
+program.
+⁴ compiled whole-graph; ~9× CPU. +9 % vs the July-era 10618 cell, which
+predates the memory governor and the 0.11.x engine work — the drift is
+named in the 0.11.6 gate record (the governor's pacing is what buys the
+no-panic contract).
 
-Correctness vs CPU on identical inputs: gemma2/gemma4 outputs bit-exact;
-the gemma3 family diverges ≤3.6% in bf16 KV-cache tensors (a few bf16
-ULPs across 26+ layers) — the 4090 shows the same divergence class vs
-CPU (≤4.2%), so that's cross-backend bf16 numerics, not a backend bug.
+Correctness vs CPU on identical inputs: the gemma3 family diverges
+≤3.8 % in bf16 KV-cache tensors (a few bf16 ULPs across 26+ layers) —
+the 4090 shows the same divergence class vs CPU (≤4.2 %), so that's
+cross-backend bf16 numerics, not a backend bug. maxtext NaN placement
+matches CPU exactly on all 11 NaN-carrying outputs.
 
 ### Gemma 4 end-to-end inference
 
@@ -366,25 +383,28 @@ device-active for metaljax, weight footprint for CPU.
 
 | model | dtype / backend | decode ms/tok | tok/s | warmup | memory |
 |---|---|---:|---:|---:|---:|
-| gemma-4-31B-it | bf16 **metaljax** | **374** | 2.68 | 9 s | 65 GB |
+| gemma-4-31B-it | bf16 **metaljax** | **235.2** | 4.25 | 6.2 s | 66 GB |
 | gemma-4-31B-it | f32 metaljax | —¹ | | | 123 GB |
 | gemma-4-31B-it | f32 jax CPU | —¹ | | | 123 GB |
-| gemma-4-12B-it | bf16 **metaljax** | **189** | 5.28 | 6 s | 25 GB |
-| gemma-4-12B-it | f32 **metaljax** | **254** | 3.93 | 6 s | 50 GB |
-| gemma-4-12B-it | f32 jax CPU | 938 | 1.07 | 11 s | 48 GB |
+| gemma-4-12B-it | bf16 **metaljax** | **92.1** | 10.9 | 6.3 s | 25 GB |
+| gemma-4-12B-it | f32 metaljax² | 254 | 3.93 | 6 s | 50 GB |
+| gemma-4-12B-it | f32 jax CPU² | 938 | 1.07 | 11 s | 48 GB |
 
 ¹ f32 weights alone are 122.8 GB: metaljax loads them but decode —
 which streams every weight byte per token — pages a 128 GB machine into
 the ground (the CPU attempt took the whole OS with it). bf16 is the
 only way to run the 31B locally; bf16 on the CPU backend is omitted
 because XLA:CPU upcasts bf16 matmuls to f32 internally.
+² measured at 0.11.0 (the Stage-1 engine); kept for the dtype/backend
+comparison. The bf16 rows are the 0.11.6 release-gate cells (native
+engine, greedy decode, tokens exact vs CPU on the 12B-class rows) —
+the full 20-model release table lives in `STATUS.md` and
+`benchmarks/models.md`.
 
-These are the numbers of the Stage 1 (Python) engine, which is where the
-project's per-token dispatch overhead lived: ~120 ms/token of them was
-dtype-independent host-side work, which is why f32 cost only 1.34× bf16
-rather than the 2× pure bandwidth predicts. The native engine that
-replaced it removes that overhead — see `STATUS.md` for the current
-per-model table (gemma4-12B bf16 at 92.3 ms/tok, 31B at 235.5).
+The Stage 1 (Python) engine these tables originally showcased carried
+~120 ms/token of dtype-independent host dispatch; the native engine
+that replaced it in 0.11.5 removed that overhead (31B: 374 → 235.2,
+12B: 189 → 92.1).
 
 ## Known limitations
 

@@ -31,28 +31,28 @@ metric per cell: LLM rows = warm decode ms/token; vision = forward ms;
 diffusion = ms/step; training = ms/step. ✗ = established impossible
 (with the measured reason).*
 
-| # | benchmark | jax CPU | metaljax | metaljax-native (0.11.5 ³⁶) | mlx-lm | torch-MPS | llama.cpp |
+| # | benchmark | jax CPU | metaljax | metaljax-native (0.11.6 ³⁷) | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|---|
-| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | **235.5** ³⁶ | 137 | 148.7 | 111.2 ²⁰ |
-| 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | **92.3** ³⁶ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
-| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **43.5** ³⁶ (53 GB) | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
-| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | **27.2** ³⁶ | 10.5 ¹⁵ | — | — |
-| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.9** ³⁶ | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
-| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.5** ³⁶ | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
-| 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **21.7** ³⁶ (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
-| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | **29.7** ³³ ³⁶ (73 GB) | **13.7** | — | — |
-| 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | **210.3** ³⁶ (67 GB) | 131.8 | — | — |
-| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | **1871.1** ³³ ³⁶ (89–91 GB) | **10.6** | — | — |
-| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | **16.35** ³⁶ | — | — | — |
-| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | not run (PAUSED ¹⁷) | **52.8** (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **78.0** ³⁶ | — | — | — |
-| 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **31.77** ³⁶ (9.2 GB) | — | — | — |
-| 15 | *qwix-int8 Qwen3-8B* | 2118 (coherent) | ✗ MLX command-buffer bug ⁸ | ✅ **401.4** ³⁵ ³⁶ (73 GB; 10/10 deterministic, vendored MLX) | — | — | — |
-| 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | **88.37** ³⁶ | — | 29.8 (b32: 591) | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512², 5141 @1024² ⁹ | **1231.3** @512², **5696.8** @1024² ³⁶ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
-| 18 | LoRA E2B train (ms/step) | 2048 | **407** | **370.7** ³⁶ | — | 135.6 ¹⁰ | — |
-| 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | **460.2** ³⁶ | — | — | — |
-| 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | ✗ clean decline ³⁶ | **28.0** (102.9 GB, load 12 s) | — | — |
+| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | **235.2** ³⁷ | 137 | 148.7 | 111.2 ²⁰ |
+| 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | **92.1** ³⁷ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **43.3** ³⁷ (53 GB) | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
+| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | **27.2** ³⁷ | 10.5 ¹⁵ | — | — |
+| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.6** ³⁷ (tokens EXACT vs CPU) | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
+| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.3** ³⁷ (tokens EXACT vs CPU) | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
+| 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **21.3** ³⁷ (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
+| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | **29.4** ³³ ³⁷ (73 GB) | **13.7** | — | — |
+| 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | **211.0** ³⁷ (67 GB) | 131.8 | — | — |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | **1948.2** ³³ ³⁷ (89 GB) | **10.6** | — | — |
+| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | **16.35** ³⁷ | — | — | — |
+| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **91.3** ³⁷ (93 GB, 110 GiB envelope) | **52.8** (93.4 GB) | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **78.0** ³⁷ | — | — | — |
+| 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **31.85** ³⁷ (9.2 GB) | — | — | — |
+| 15 | *qwix-int8 Qwen3-8B* | 2118 (coherent) | ✗ MLX command-buffer bug ⁸ | ✅ **381.7** ³⁵ ³⁷ (73 GB; 10/10 deterministic) | — | — | — |
+| 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | **88.31** ³⁷ | — | 29.8 (b32: 591) | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512², 5141 @1024² ⁹ | **1234.7** @512², **4974.9** @1024² ³⁷ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
+| 18 | LoRA E2B train (ms/step) | 2048 | **407** | **369.2** ³⁷ | — | 135.6 ¹⁰ | — |
+| 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | **463.4** ³⁷ | — | — | — |
+| 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **66.3** ³⁷ (100 GB, 110/114 envelope) | **28.0** (102.9 GB, load 12 s) | — | — |
 
 **Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
 (143.6→16.4 GB); Llama-8B 228→58.6 (127→16.1 GB); gpt-oss 2090→220.4
@@ -681,3 +681,45 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
       numerics attestation the vendored MLX has).
     - **Row 20**: clean harness decline re-attested (exit 1, nothing
       executed, 0 GB touched).
+37. **The 0.11.6 release column** (2026-08-27 release gate; full artifacts
+    `~/.cache/metaljax-bench/logs/gate-0.11.6/`). Every cell from the
+    release binary `frozen-0.11.6-dde2d668` (tree `83ff94f`), one guarded
+    process per cell, machine lock held. Verdict: PASS — zero regressions
+    standing (all in-sequence excursions adjudicated standalone), zero
+    panics/wedges, two clean governor refusals (both documented below).
+    **ALL 20 ROWS NOW PRODUCE NUMBERS.** Named items, per release rule 2:
+    - **Rows 12 and 20, first release cells, at documented raised memory
+      envelopes** (shipped defaults unchanged; Oleg-approved, set before
+      the runs, never raised after a breach). Row 12: 91.3 ms/tok at
+      `METALJAX_MEM_SYS_MB=METALJAX_MEM_BUDGET_MB=112640` (110 GiB), peak
+      93 GB, 0 refusals. Row 20: 66.3 ms/tok at 110/114 GiB, load 320.5 s
+      + ~104 min pack/build wave, peak 100 GB; its attempt 1 was a clean
+      governor refusal at 118.8 GB claimed vs the 114 line — retried once
+      on a 13 GB-clean baseline, envelope unchanged.
+    - **Row 10**: attempt 1 clean refusal at a 16.7 GB machine baseline
+      (the row needs ~13 GB-clean); sanctioned retry completed at 1948.2
+      (+4.1% vs 0.11.5, attributed to governor pacing at the higher
+      baseline; decode text identical to the 0.11.5 run).
+    - **Row 1 variance** (standing footnote): canonical cell 235.2
+      (0.999× the 0.11.5 cell, same measurement mode); the standalone
+      confirm read 292.3, inside the known 261–297 machine-state band
+      (fn 36). Bimodality unchanged; not a regression.
+    - **Rows 3/8/17b**: cells are standalone values (43.3 / 29.4 /
+      4974.9); in-sequence reads (46.7 / 32.2 / 6177.2) named as spread —
+      the fn-36 suite-context class.
+    - **Token agreement, first release under the GREEDY contract**
+      (9f69ee8): **Qwen3-8B and Llama-3.1-8B are EXACT vs CPU, 64/64 —
+      first release with exact matches**; the certified-benign divergence
+      list tightens to {gemma4-E2B-bf16} (token 51). gemma4-E2B-int4's
+      agreement is VACUOUS (both backends emit the same degenerate
+      single-token loop — a keras int4 PTQ artifact, not a metaljax bug).
+    - **The 0.11.5 release-note item "fused-attention recognizer
+      nondeterminism on rows 5/7" is REFUTED on this binary**: gpt-oss-20b
+      3/3 independent-process greedy draws token-identical, Qwen3-8B 2/2
+      and CPU-exact, recognizer emits ON. The 0.11.5 evidence was top-k(5)
+      sampling with a per-process random seed (see 9f69ee8); the
+      `METALJAX_RECOGNIZE=0` workaround was unnecessary.
+    - **Row 15**: 381.7 ms/tok (0.95× the 0.11.5 cell) with the full
+      forensics re-pass: 10/10 first-token 12095, 0 collapses, coherent.
+    - Row 17 @1024²: 4974.9 = 0.87× — an improvement with its 4975–6177
+      spread named (fn 36 class).
