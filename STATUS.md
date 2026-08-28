@@ -14,6 +14,11 @@ drift both stacks share reads 1.0× in the first and shows up only in the second
 row 19 read "1.01×" through two passes while both stacks sat 2.2× off the
 anchor. Rows 7/13/14/16/18/19 re-measured — footnote 30.*
 
+*Updated 2026-08-28: the Stage-1 (Python engine) column is REMOVED — the
+engine was retired in 0.11.6 (ef5774d); its cells live on in git history
+and in models.md's 0.11.1–0.11.2 columns. The metaljax column below is
+the native plugin at the 0.11.6 release gate.*
+
 *Updated 2026-08-12 (later): the native column is **re-measured with the P17
 recognizer emits** on the relinked plugin — footnote 27. Rows 3/5/6/14/16/17
 moved to 0.95–1.13× of Stage 1 (three of them past it); row 7 is now blocked on
@@ -31,40 +36,39 @@ metric per cell: LLM rows = warm decode ms/token; vision = forward ms;
 diffusion = ms/step; training = ms/step. ✗ = established impossible
 (with the measured reason).*
 
-| # | benchmark | jax CPU | metaljax | metaljax-native (0.11.6 ³⁷) | mlx-lm | torch-MPS | llama.cpp |
-|---|---|---|---|---|---|---|---|
-| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | **235.2** ³⁷ | 137 | 148.7 | 111.2 ²⁰ |
-| 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | **92.1** ³⁷ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
-| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **43.3** ³⁷ (53 GB) | **17.0** | — | — ²⁰ |
-| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | **27.2** ³⁷ | 10.5 ¹⁵ | — | — |
-| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.6** ³⁷ | 30.4 | 38.1 | — ²⁰ |
-| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.3** ³⁷ | 29.4 | 35.5 | — ²⁰ |
-| 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **21.3** ³⁷ (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
-| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | **29.4** ³³ ³⁷ (73 GB) | **13.7** | — | — |
-| 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | **211.0** ³⁷ (67 GB) | 131.8 | — | — |
-| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | **1948.2** ³³ ³⁷ (89 GB) | 10.6 ᵖ | — | — |
-| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | **16.35** ³⁷ | — | — | — |
-| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **91.3** ³⁷ (93 GB) | **52.8** (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **78.0** ³⁷ | — | — | — |
-| 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **31.85** ³⁷ (9.2 GB) | — | — | — |
-| 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ MLX command-buffer bug ⁸ | **381.7** ³⁵ ³⁷ (73 GB) | — | — | — |
-| 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | **88.31** ³⁷ | — | 29.8 (b32: 591) | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512², 5141 @1024² ⁹ | **1234.7** @512², **4974.9** @1024² ³⁷ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
-| 18 | LoRA E2B train (ms/step) | 2048 | **407** | **369.2** ³⁷ | — | 135.6 ¹⁰ | — |
-| 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | **463.4** ³⁷ | — | — | — |
-| 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **66.3** ³⁷ (100 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
+| # | benchmark | jax CPU | metaljax (0.11.6 ³⁷) | mlx-lm | torch-MPS | llama.cpp |
+|---|---|---|---|---|---|---|
+| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **235.2** ³⁷ | 137 | 148.7 | 111.2 ²⁰ |
+| 2 | gemma4-12B bf16 | 315 (f32) | **92.1** ³⁷ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **43.3** ³⁷ (53 GB) | **17.0** | — | — ²⁰ |
+| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **27.2** ³⁷ | 10.5 ¹⁵ | — | — |
+| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **57.6** ³⁷ | 30.4 | 38.1 | — ²⁰ |
+| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **54.3** ³⁷ | 29.4 | 35.5 | — ²⁰ |
+| 7 | gpt-oss-20b | ✗ ⁴ | **21.3** ³⁷ (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
+| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | **29.4** ³³ ³⁷ (73 GB) | **13.7** | — | — |
+| 9 | R1-Distill-32B | ✗ 131 GB | **211.0** ³⁷ (67 GB) | 131.8 | — | — |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | **1948.2** ³³ ³⁷ (89 GB) | 10.6 ᵖ | — | — |
+| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.35** ³⁷ | — | — | — |
+| 12 | Mixtral 8×7B bf16 | ✗ | **91.3** ³⁷ (93 GB) | **52.8** (93.4 GB) | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | **78.0** ³⁷ | — | — | — |
+| 14 | maxtext qwix-int8 0.6B | 143.4 | **31.85** ³⁷ (9.2 GB) | — | — | — |
+| 15 | *qwix-int8 Qwen3-8B* | 2118 | **381.7** ³⁵ ³⁷ (73 GB) | — | — | — |
+| 16 | SigLIP 2 (fwd b1 ms) | 533 | **88.31** ³⁷ | — | 29.8 (b32: 591) | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | **1234.7** @512², **4974.9** @1024² ³⁷ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
+| 18 | LoRA E2B train (ms/step) | 2048 | **369.2** ³⁷ | — | 135.6 ¹⁰ | — |
+| 19 | maxtext train 0.6B (ms/step) | 1402 | **463.4** ³⁷ | — | — | — |
+| 20 | *aspirational* 235B-A22B 3-bit | ✗ | **66.3** ³⁷ (100 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
 
-**Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
+**Splat-fix before/after (HISTORICAL, 2026-08-02, Stage-1 engine):** Qwen3-8B 268→60.3 ms/tok
 (143.6→16.4 GB); Llama-8B 228→58.6 (127→16.1 GB); gpt-oss 2090→220.4
 (224→41.8 GB). All three now beat jax-CPU 3.4–3.7×.
 
-**mlx-lm gap band (same Metal library underneath — the C++-rewrite
-target):** bf16 dense decode 1.7–2.6× (Qwen3-8B 60.4 vs 30.4; Llama
-57.3 vs 29.4; 12B 97.1 vs 58.3; 31B 350 vs 137); gpt-oss 2.5×
-(22.2 vs 8.8 — MXFP4 quantized_matmul + expert gather on both sides,
-footnote 23); MoE 2.6× (44.3 vs 17.0, decode gather landed — footnote
-16). llama.cpp leads mlx-lm a further ~1.25× on bf16 — the kernel
-frontier. metaljax prefill trails ~6×; load ~20–30×.
+**mlx-lm gap band (same Metal library underneath — the optimization
+target):** bf16 dense decode 1.6–1.9× (Qwen3-8B 57.6 vs 30.4; Llama
+54.3 vs 29.4; 12B 92.1 vs 58.3; 31B 235.2 vs 137); gpt-oss 2.4×
+(21.3 vs 8.8 — native MXFP4 both sides); MoE 2.5× (43.3 vs 17.0);
+3-bit 2.4× (66.3 vs 28.0). llama.cpp leads mlx-lm a further ~1.25× on
+bf16 — the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
 
 ## Footnotes
 
