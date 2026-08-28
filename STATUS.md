@@ -47,7 +47,7 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 7 | gpt-oss-20b | ✗ ⁴ | **21.3** ³⁷ (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | **29.4** ³³ ³⁷ (73 GB) | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | **211.0** ³⁷ (67 GB) | 131.8 | — | — |
-| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | **1948.2** ³³ ³⁷ (89 GB) | 10.6 ᵖ | — | — |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | **1948.2** ³³ ³⁷ ³⁸ (89 GB) | 10.5 | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.35** ³⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | **91.3** ³⁷ (93 GB) | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | **78.0** ³⁷ | — | — | — |
@@ -224,9 +224,9 @@ bf16 — the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     fair game, different quantization is not. The Q8/Q4-only rows
     (26B-A4B, Qwen3-8B, Llama-8B) therefore show no llama.cpp cell; the
     kept cells are BF16 (rows 1/2), native MXFP4 (row 7, both sides) and
-    3-bit (row 20, both sides). ᵖ = comparator precision not yet
-    verified in writing (row 10's mlx-lm cell; being confirmed as part
-    of the row-10 optimization work).
+    3-bit (row 20, both sides). Row 10's mlx-lm cell verified
+    2026-08-28: mlx-lm 0.31.3 on the ORIGINAL bf16 repo, 10.5 ms/tok,
+    31.4 GB active — like-for-like with our bf16 maxtext row.
 21. Release-gate token audit: greedy streams metal-vs-CPU are exact on
     12B, Qwen3-8B, E2B-int4, and the maxtext rows; E2B-bf16 and
     Llama-8B diverge at their FIRST generated token via certified
@@ -735,3 +735,15 @@ bf16 — the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
       forensics re-pass: 10/10 first-token 12095, 0 collapses, coherent.
     - Row 17 @1024²: 4974.9 = 0.87× — an improvement with its 4975–6177
       spread named (fn 36 class).
+38. **Row 10 post-0.11.6 fix (HEAD, ships next release)**: the 184× gap
+    was jax's `lax.ragged_dot` DENSE fallback — maxtext's non-Pallas MoE
+    path contracts every token against all 64 experts at padded width
+    (~910× inflated FLOPs). A new engine-side recognizer
+    (`metal_ragged.cc`, commit 6590c05) rewrites the fingerprint to one
+    `gather_mm` over the real rows: decode **1948.2 → 113.9 ms/tok**
+    (17.1×), prefill 2028 → 186 ms, decode text bit-identical, rows
+    11/14 unregressed. The release column above keeps the 0.11.6-gated
+    1948.2 per release rule 1; 113.9 is the HEAD number. Remaining gap
+    to mlx-lm's 10.5 is launch-bound decode (the ~16 ms maxtext-harness
+    floor is row 11's entire cell), owned by the decode-loop fusion
+    campaign. Diagnosis: notes/row10-ragged-dot-2026-08-28.md.
