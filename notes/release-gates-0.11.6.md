@@ -23,7 +23,7 @@ lock-held phases, 2026-08-27; artifacts under
 
 ## The model table (vs 0.11.5)
 
-See `benchmarks/models.md` (0.11.6 column) and `STATUS.md` footnote 37 for
+See `models.md` (0.11.6 column) and `STATUS.md` footnote 37 for
 the cells and per-row detail. Headlines: all 19 comparable rows within
 noise (worst +4.1 % = row 10 with cause named; best 0.87× = row 17@1024²
 with spread named); row 12 = **91.3 ms/tok** and row 20 = **66.3 ms/tok**,

@@ -9,7 +9,7 @@ That campaign ended in kernel panic #8 (footnote 25); the empty native cells
 were never attempted.*
 
 *Updated 2026-08-13: the native column now carries **two** ratios — vs Stage 1
-measured the same day, and vs the 0.11.3 anchor (`benchmarks/models.md`). A
+measured the same day, and vs the 0.11.3 anchor (`models.md`). A
 drift both stacks share reads 1.0× in the first and shows up only in the second;
 row 19 read "1.01×" through two passes while both stacks sat 2.2× off the
 anchor. Rows 7/13/14/16/18/19 re-measured — footnote 30.*
@@ -37,22 +37,22 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | **92.1** ³⁷ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
 | 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **43.3** ³⁷ (53 GB) | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
 | 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | **27.2** ³⁷ | 10.5 ¹⁵ | — | — |
-| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.6** ³⁷ (tokens EXACT vs CPU) | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
-| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.3** ³⁷ (tokens EXACT vs CPU) | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
+| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.6** ³⁷ | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
+| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.3** ³⁷ | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
 | 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **21.3** ³⁷ (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | **29.4** ³³ ³⁷ (73 GB) | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | **211.0** ³⁷ (67 GB) | 131.8 | — | — |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | **1948.2** ³³ ³⁷ (89 GB) | **10.6** | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | **16.35** ³⁷ | — | — | — |
-| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **91.3** ³⁷ (93 GB, 110 GiB envelope) | **52.8** (93.4 GB) | — | — |
+| 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **91.3** ³⁷ (93 GB) | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **78.0** ³⁷ | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **48.5** ²² | **31.85** ³⁷ (9.2 GB) | — | — | — |
-| 15 | *qwix-int8 Qwen3-8B* | 2118 (coherent) | ✗ MLX command-buffer bug ⁸ | ✅ **381.7** ³⁵ ³⁷ (73 GB; 10/10 deterministic) | — | — | — |
+| 15 | *qwix-int8 Qwen3-8B* | 2118 | ✗ MLX command-buffer bug ⁸ | **381.7** ³⁵ ³⁷ (73 GB) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **93.4** | **88.31** ³⁷ | — | 29.8 (b32: 591) | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | 1389 @512², 5141 @1024² ⁹ | **1234.7** @512², **4974.9** @1024² ³⁷ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
 | 18 | LoRA E2B train (ms/step) | 2048 | **407** | **369.2** ³⁷ | — | 135.6 ¹⁰ | — |
 | 19 | maxtext train 0.6B (ms/step) | 1402 | **440** ¹¹ | **463.4** ³⁷ | — | — | — |
-| 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **66.3** ³⁷ (100 GB, 110/114 envelope) | **28.0** (102.9 GB, load 12 s) | — | — |
+| 20 | *aspirational* 235B-A22B 3-bit | ✗ | ✗ needs packed-quant storage | **66.3** ³⁷ (100 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
 
 **Splat-fix before/after (measured today):** Qwen3-8B 268→60.3 ms/tok
 (143.6→16.4 GB); Llama-8B 228→58.6 (127→16.1 GB); gpt-oss 2090→220.4

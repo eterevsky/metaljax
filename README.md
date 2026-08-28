@@ -399,7 +399,7 @@ because XLA:CPU upcasts bf16 matmuls to f32 internally.
 comparison. The bf16 rows are the 0.11.6 release-gate cells (native
 engine, greedy decode, tokens exact vs CPU on the 12B-class rows) —
 the full 20-model release table lives in `STATUS.md` and
-`benchmarks/models.md`.
+`models.md`.
 
 The Stage 1 (Python) engine these tables originally showcased carried
 ~120 ms/token of dtype-independent host dispatch; the native engine

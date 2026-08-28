@@ -3,7 +3,7 @@
     .venv/bin/python scripts/release/model_gate_report.py \
         --raw ~/.cache/metaljax-bench/logs/final_run.jsonl \
         --merged OUT.jsonl --tokens-log OUT.log \
-        --ledger benchmarks/models.md [--md OUT.md] [--json OUT.json]
+        --ledger models.md [--md OUT.md] [--json OUT.json]
 
 Three jobs:
 
@@ -20,7 +20,7 @@ Three jobs:
    QUANT_ROWS policy set (int4/int8) are informational.
 
 3. TIMING TABLE.  Compares each benchmark against the newest column of
-   benchmarks/models.md (transposed ledger: benchmark rows, run columns).
+   models.md (transposed ledger: benchmark rows, run columns).
 
 Exit: 0 pass, 1 gate fail, 2 harness error.
 """
@@ -46,7 +46,7 @@ REGRESS_FAIL = os.environ.get("MODEL_REGRESS_FAIL", "1") == "1"
 TOKEN_KNOWN = set(filter(None, os.environ.get(
     "MODEL_TOKEN_KNOWN", "gemma4-e2b-bf16,llama31-8b-bf16").split(",")))
 
-# benchmarks/models.md row number -> (bench id in final_run.sh, metric field).
+# models.md row number -> (bench id in final_run.sh, metric field).
 # Rows absent from this map are not produced by final_run.sh (blocked cells:
 # 8, 9, 10, 12, 15, 17, 20) and are reported as "not in this run".
 # UPDATE THIS MAP whenever final_run.sh's row list or models.md changes.

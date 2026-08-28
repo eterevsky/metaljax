@@ -10,7 +10,7 @@
 #   (b) scripts/model_bench/compare_tokens.py on the merged file
 #       (bf16 rows must agree with CPU token-for-token; QUANT_ROWS are
 #        informational per notes/int8-divergence-verdict.md)
-#   (c) per-row timing table vs the newest column of benchmarks/models.md,
+#   (c) per-row timing table vs the newest column of models.md,
 #       flagging rows regressed > MODEL_REGRESS_TOL (default 10%) and rows
 #       that newly fail
 #
@@ -95,7 +95,7 @@ SECS=$(gate_elapsed "$T0" "$T1")
 "$MJ_PY" "$MJ_ROOT/scripts/release/model_gate_report.py" \
     --raw "$RAW" --merged "$MERGED" --tokens-log "$TOK_LOG" \
     --run-log "$RUN_LOG" --run-rc "$RUN_RC" \
-    --ledger "$MJ_ROOT/benchmarks/models.md" \
+    --ledger "$MJ_ROOT/models.md" \
     --seconds "$SECS" --md "$MD" --json "$JSON" \
     $([ $SMOKE -eq 1 ] && echo --smoke)
 RRC=$?

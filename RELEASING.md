@@ -125,7 +125,7 @@ Wraps `scripts/model_bench/final_run.sh` unmodified, then audits:
   CPU. Certified-benign tie-flip rows (`gemma4-e2b-bf16`, `llama31-8b-bf16`
   — STATUS.md footnote 21) are warnings; a divergence on any other row is a
   gate fail (`MODEL_TOKEN_KNOWN` to adjust);
-- per-row timing table vs the newest column of `benchmarks/models.md`,
+- per-row timing table vs the newest column of `models.md`,
   flagging rows regressed > 10 % (`MODEL_REGRESS_TOL`) and rows newly
   failing.
 
@@ -149,7 +149,7 @@ Update, in this order:
 - `STATUS.md` — the per-benchmark rows with the new numbers/footnotes.
 - `benchmarks/texmo.md` — append a column/row for this run (geomean vs the
   previous anchor, checks, raw file).
-- `benchmarks/models.md` — append the new run column (transposed ledger:
+- `models.md` — append the new run column (transposed ledger:
   benchmark rows, run columns). The gate's per-row table is the source.
 - `README.md` — headline numbers.
 - `notes/data/` — commit the raw JSONLs the gates produced.
