@@ -35,14 +35,14 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 |---|---|---|---|---|---|---|---|
 | 1 | gemma4-31B bf16 | ✗ f32=123 GB | **350** | **235.2** ³⁷ | 137 | 148.7 | 111.2 ²⁰ |
 | 2 | gemma4-12B bf16 | 315 (f32) | **97.1** | **92.1** ³⁷ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
-| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **43.3** ³⁷ (53 GB) | **17.0** | — | 7.9 (Q4 QAT) ²⁰ |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **44.3** (51.6 GB) ¹⁶ | **43.3** ³⁷ (53 GB) | **17.0** | — | — ²⁰ |
 | 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **29.5** ²¹ | **27.2** ³⁷ | 10.5 ¹⁵ | — | — |
-| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.6** ³⁷ | 30.4 | 38.1 | 15.7 (Q8) ²⁰ |
-| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.3** ³⁷ | 29.4 | 35.5 | 15.4 (Q8) ²⁰ |
+| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **60.4** | **57.6** ³⁷ | 30.4 | 38.1 | — ²⁰ |
+| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **57.3** ²¹ | **54.3** ³⁷ | 29.4 | 35.5 | — ²⁰ |
 | 7 | gpt-oss-20b | ✗ ⁴ | **22.2** (23.9 GB, MXFP4 + expert gather) ²³ | **21.3** ³⁷ (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | ✗ warmup transients ¹⁷ | **29.4** ³³ ³⁷ (73 GB) | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | **217.7** (65.5 GB) ¹⁷ | **211.0** ³⁷ (67 GB) | 131.8 | — | — |
-| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | **1948.2** ³³ ³⁷ (89 GB) | **10.6** | — | — |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | ✗ guard-killed @122 GB ⁶ | **1948.2** ³³ ³⁷ (89 GB) | 10.6 ᵖ | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.0** ⁷ | **16.35** ³⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | ✗ keras load ¹⁷ | **91.3** ³⁷ (93 GB) | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | 85.0 @ 2.7 GB ¹⁸ | **78.0** ³⁷ | — | — | — |
@@ -215,6 +215,14 @@ frontier. metaljax prefill trails ~6×; load ~20–30×.
     mlx-lm ~1.25x on bf16 — the kernel frontier on this hardware.
     Deferred rows (35B/R1/Mixtral llama.cpp cells) dropped as
     redundant with the covered comparison classes.
+    LIKE-FOR-LIKE RULE (Oleg, 2026-08-28): cross-framework cells appear
+    only at the SAME precision as the metaljax cell — custom kernels are
+    fair game, different quantization is not. The Q8/Q4-only rows
+    (26B-A4B, Qwen3-8B, Llama-8B) therefore show no llama.cpp cell; the
+    kept cells are BF16 (rows 1/2), native MXFP4 (row 7, both sides) and
+    3-bit (row 20, both sides). ᵖ = comparator precision not yet
+    verified in writing (row 10's mlx-lm cell; being confirmed as part
+    of the row-10 optimization work).
 21. Release-gate token audit: greedy streams metal-vs-CPU are exact on
     12B, Qwen3-8B, E2B-int4, and the maxtext rows; E2B-bf16 and
     Llama-8B diverge at their FIRST generated token via certified
