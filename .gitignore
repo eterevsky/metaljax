@@ -18,3 +18,4 @@ native/build/
 # bazel convenience symlinks for the native PJRT plugin workspace
 plugin-native/bazel-*
 plugin-native/.bazelrc.user
+test-pypi.txt
