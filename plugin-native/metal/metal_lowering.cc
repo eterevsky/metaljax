@@ -1336,7 +1336,9 @@ int64_t ScatterCost(LowerContext& ctx, mlir::Operation* op) {
 // (they merge into one State in the Python, which charges the pair 2), 3 for a
 // fused attention.  0 = not a root.
 int64_t RootCostUnit(const RewritePlan& plan, mlir::Operation* op) {
-  if (plan.qmm_roots.count(op) || plan.moe_roots.count(op)) return 2;
+  if (plan.qmm_roots.count(op) || plan.moe_roots.count(op) ||
+      plan.ragged_roots.count(op))
+    return 2;
   if (plan.sdpa_roots.count(op)) return 3;
   return 0;
 }
@@ -1415,6 +1417,14 @@ int64_t RootExtraBytes(const RewritePlan& plan, mlir::Operation* op) {
   auto mo = plan.moe_roots.find(op);
   if (mo != plan.moe_roots.end() && mo->second != nullptr)
     return MoeEmitBytes(*mo->second);
+  auto ra = plan.ragged_roots.find(op);
+  if (ra != plan.ragged_roots.end() && ra->second != nullptr) {
+    // The gather materializes the pre-pad [m, n] rows and the tiny index
+    // vectors; the masked [g, M, k] broadcasts it absorbs are never written,
+    // and the weight reads allocate nothing.
+    const RaggedMatch& m = *ra->second;
+    return m.m * m.n * 4 + m.m * 16;
+  }
   return 0;
 }
 
@@ -1949,6 +1959,7 @@ class Lowering {
   absl::Status LowerQmm(mlir::Operation* op, const QmmMatch& m);
   absl::Status LowerSdpa(mlir::Operation* op, const SdpaMatch& m);
   absl::Status LowerMoe(mlir::Operation* op, const MoeMatch& m);
+  absl::Status LowerRagged(mlir::Operation* op, const RaggedMatch& m);
   // One node of the pair-space plan, as one tape entry; `slots` holds the
   // slot each earlier node landed in.
   absl::StatusOr<int> LowerMoeNode(const MoeMatch& m, const MoeNode& node,
@@ -2590,6 +2601,35 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDotGeneral(
                           dn.getRhsContractingDimensions().end());
   ASSIGN_OR_RETURN(std::vector<int64_t> lhs, Dims(op->getOperand(0)));
   ASSIGN_OR_RETURN(std::vector<int64_t> rhs, Dims(op->getOperand(1)));
+
+  // The contraction PAIRS may be jointly reordered without changing the
+  // result: both operands flatten their K axes in pair order, so any one
+  // permutation applied to both is the same sum.  Order them so the BIGGER
+  // operand's contracting dims come out ascending: its canonical transpose
+  // is then likelier to be a no-op, and the emitter's reshape after a
+  // non-trivial transpose materializes a copy of the whole operand (jax's
+  // ragged_dot fallback lists (k, g) against a [g, k, n] weight stack and
+  // re-materialized 369 MB of experts per dot before this).  Batch pairs
+  // stay put — their order IS the output layout.
+  if (lc.size() > 1) {
+    int64_t lsize = 1, rsize = 1;
+    for (int64_t d : lhs) lsize *= d;
+    for (int64_t d : rhs) rsize *= d;
+    const std::vector<int64_t>& key = rsize >= lsize ? rc : lc;
+    std::vector<size_t> order(lc.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    std::sort(order.begin(), order.end(),
+              [&](size_t a, size_t b) { return key[a] < key[b]; });
+    std::vector<int64_t> lc2, rc2;
+    lc2.reserve(lc.size());
+    rc2.reserve(rc.size());
+    for (size_t i : order) {
+      lc2.push_back(lc[i]);
+      rc2.push_back(rc[i]);
+    }
+    lc = std::move(lc2);
+    rc = std::move(rc2);
+  }
 
   auto holds = [](const std::vector<int64_t>& xs, int64_t v) {
     for (int64_t x : xs) if (x == v) return true;
@@ -5705,6 +5745,18 @@ absl::Status Lowering::Inline(mlir::Operation* op, llvm::StringRef attr) {
   if (block.getNumArguments() != op->getNumOperands())
     return Decline(absl::StrCat("callee @", name, " arity mismatch"));
   for (unsigned i = 0; i < op->getNumOperands(); i++) {
+    // An operand a recognizer absorbed was never computed and has no slot,
+    // and the absorption discipline proved that nothing in the callee reads
+    // the corresponding argument (metal_ragged.cc's call-aware use rule).
+    // ERASE any binding a previous splice of this callee left — the block
+    // arguments are the same mlir::Values at every call site — so a reader
+    // the proof missed fails its own Slot() loudly instead of silently
+    // reading another call's array.
+    if (ctx_->plan != nullptr &&
+        ctx_->plan->absorbed(op->getOperand(i).getDefiningOp())) {
+      slots_.erase(block.getArgument(i));
+      continue;
+    }
     ASSIGN_OR_RETURN(int s, Slot(op->getOperand(i)));
     Alias(block.getArgument(i), s);
   }
@@ -5806,6 +5858,13 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
         return Decline("a recognizer root with several results");
       RETURN_IF_ERROR(CheckValue(op->getResult(0)));
       return LowerMoe(op, *moe->second);
+    }
+    auto ragged = ctx_->plan->ragged_roots.find(op);
+    if (ragged != ctx_->plan->ragged_roots.end()) {
+      if (op->getNumResults() != 1)
+        return Decline("a recognizer root with several results");
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      return LowerRagged(op, *ragged->second);
     }
   }
 
@@ -6148,6 +6207,32 @@ absl::Status Lowering::LowerSdpa(mlir::Operation* op, const SdpaMatch& m) {
   ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.sdpa"));
   EmitF(opcode, std::move(ins), {Bind(op->getResult(0))}, std::move(attrs),
         {m.scale}, ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// metal_ragged.cc's emit: the whole masked-broadcast chain and the dense
+// [g, M, k] x [g, k, n] contraction become one gather_mm over the real rows
+// (runtime/emits.cc kRaggedDot).  ins [x, w, ends]; attrs
+// [g, m, M, k, n, out dtype].
+absl::Status Lowering::LowerRagged(mlir::Operation* op, const RaggedMatch& m) {
+  const mlir::Value wv = m.stacked ? m.w_stack : m.w;
+  for (mlir::Value v : {m.x, wv, m.ends}) RETURN_IF_ERROR(CheckValue(v));
+  ASSIGN_OR_RETURN(int x, Slot(m.x));
+  ASSIGN_OR_RETURN(int w, Slot(wv));
+  ASSIGN_OR_RETURN(int ends, Slot(m.ends));
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.ragged_dot"));
+  std::vector<int> ins{x, w, ends};
+  std::vector<int64_t> attrs{m.g,     m.m, m.M, m.k, m.n,
+                             static_cast<int64_t>(out_code),
+                             m.stacked ? 1 : 0, m.L};
+  if (m.stacked) {
+    RETURN_IF_ERROR(CheckValue(m.layer));
+    ASSIGN_OR_RETURN(int layer, Slot(m.layer));
+    ins.push_back(layer);
+  }
+  Emit(opcode, std::move(ins), {Bind(op->getResult(0))}, std::move(attrs),
+       std::nullopt, ResultBytes(op));
   return absl::OkStatus();
 }
 
@@ -6749,6 +6834,9 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
     // three recognizers are disjoint by construction: sdpa drops any
     // candidate overlapping a quantized matmul).
     AnalyzeSdpa(main, &plan);
+    // ...and the ragged-dot dispatches, LAST: they defer to every op the
+    // other three claimed (metal_ragged.cc reads their match lists).
+    AnalyzeRagged(main, &plan);
     plan.rebuild();
   } catch (const std::exception& e) {
     // Analysis must never break a program (qmm.py `analyze`).
@@ -6823,6 +6911,7 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
     if (!m->disabled && !m->absorbed) lowered->num_qmm++;
   lowered->num_moe = static_cast<int64_t>(plan.moe.size());
   lowered->num_sdpa = static_cast<int64_t>(plan.sdpa.size());
+  lowered->num_ragged = static_cast<int64_t>(plan.ragged.size());
   return lowered;
 }
 

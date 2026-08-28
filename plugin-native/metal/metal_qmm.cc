@@ -2452,6 +2452,7 @@ void RewritePlan::rebuild() {
   qmm_roots.clear();
   sdpa_roots.clear();
   moe_roots.clear();
+  ragged_roots.clear();
   for (const auto& m : qmm) {
     if (m->disabled) continue;
     // An ABSORBED match still owns its absorbed ops -- its weight is packed
@@ -2467,6 +2468,10 @@ void RewritePlan::rebuild() {
   for (const auto& m : moe) {
     if (m->disabled) continue;
     moe_roots[m->root] = m.get();
+    for (mlir::Operation* o : m->ops) skip.insert(o);
+  }
+  for (const auto& m : ragged) {
+    ragged_roots[m->root] = m.get();
     for (mlir::Operation* o : m->ops) skip.insert(o);
   }
 }

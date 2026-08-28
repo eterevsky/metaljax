@@ -27,9 +27,50 @@ bool Program::step_shape(const Entry& e,
 
   switch (e.op) {
     // --- shape (ops/shape.py) ---
-    case kReshape:
-      env[e.outs[0]] = mx::reshape(in(0), shape(at, 1, at[0]));
+    case kReshape: {
+      const mx::array& x = in(0);
+      mx::Shape want = shape(at, 1, at[0]);
+      // A reshape that only inserts and/or removes size-1 axes is a
+      // squeeze/expand_dims pair, and those are VIEWS where mx::reshape
+      // copies any non-row-contiguous operand.  The case that matters is
+      // jax's dynamic_index_in_dim — dynamic_slice + reshape — over a
+      // transposed stack (scan-over-layers weights): the slice is a strided
+      // view and the reshape re-materialized 100s of MB per layer per step
+      // (row 10's DeepSeek MoE weights, 3 x 369 MB per decode token per
+      // layer).  Zero-size arrays keep the plain reshape: their stride
+      // bookkeeping has no view form worth special-casing.
+      const mx::Shape& have = x.shape();
+      bool view_ok = x.size() > 0;
+      {
+        size_t i = 0;
+        for (auto d : have)
+          if (d != 1) {
+            while (i < want.size() && want[i] == 1) i++;
+            if (i < want.size() && want[i] == d) {
+              i++;
+            } else {
+              view_ok = false;
+              break;
+            }
+          }
+        if (view_ok)
+          for (; i < want.size(); i++) view_ok = view_ok && want[i] == 1;
+      }
+      if (view_ok && have != want) {
+        std::vector<int> drop;
+        for (size_t i = 0; i < have.size(); i++)
+          if (have[i] == 1) drop.push_back(static_cast<int>(i));
+        std::vector<int> add;
+        for (size_t i = 0; i < want.size(); i++)
+          if (want[i] == 1) add.push_back(static_cast<int>(i));
+        mx::array y = drop.empty() ? x : mx::squeeze(x, drop);
+        if (!add.empty()) y = mx::expand_dims(y, add);
+        env[e.outs[0]] = y;
+      } else {
+        env[e.outs[0]] = mx::reshape(x, want);
+      }
       break;
+    }
     case kTranspose:
       env[e.outs[0]] = mx::transpose(in(0), axes(at, 1, at[0]));
       break;

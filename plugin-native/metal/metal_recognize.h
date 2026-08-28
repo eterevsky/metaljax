@@ -254,6 +254,51 @@ struct MoeMatch {
 };
 
 // --------------------------------------------------------------------------
+// ragged dot (metal_ragged.cc): jax's `lax.ragged_dot` dense fallback
+// --------------------------------------------------------------------------
+
+// The graph shape jax emits for `lax.ragged_dot` on every backend without a
+// native lowering (jax _ragged_dot_general_impl, "ragged_to_dense"): the
+// [m, k] rows are broadcast to [g, m, k], masked by the half-open intervals
+// a cumsum of `group_sizes` defines, and contracted against the [g, k, n]
+// group weights over BOTH g and k.  That computes each row against its own
+// group's matrix while streaming — and, at maxtext's 512-row padding,
+// computing — all `g` of them.  The rewrite runs the row-vs-own-group form
+// literally: one `gather_mm` whose per-row group index is derived from the
+// same cumsum.  No runtime verification is needed; the equivalence is
+// structural (see metal_ragged.cc for the two documented deviations:
+// non-finite values in never-selected groups, and non-partition
+// `group_sizes` no bincount can produce).
+struct RaggedMatch {
+  mlir::Operation* root = nullptr;  // the dot_general
+  mlir::Value x;      // [m, k]: the real rows (the absorbed pad's input)
+  mlir::Value w;      // [g, k, n]: the group weights, as the dot read them
+  mlir::Value ends;   // [g]: cumsum(group_sizes), already in the graph
+  int64_t g = 0, m = 0, M = 0, k = 0, n = 0;   // M = padded rows at the root
+  int out_dtype = 0;
+  // The stacked-weights form (maxtext's scan over layers): `w` was a
+  // dynamic-index-in-dim out of a pass-through loop carry whose init is a
+  // [1,0,2,3] transpose of a [g, L, k, n] stack.  MLX's dynamic slice is a
+  // COPY (the offset is data), which re-materialized 100s of MB of weights
+  // per layer per token; the gather reads the ORIGINAL buffer instead, at
+  // matrix index `group * L + layer` — the transpose composed with the
+  // row-major flattening.  When set, `w` is unused and the helper call that
+  // computed it is absorbed; `w_stack` is the carried [L, g, k, n] view and
+  // `layer` the loop counter the slice took.
+  bool stacked = false;
+  mlir::Value w_stack;
+  mlir::Value layer;
+  int64_t L = 0;
+  // The helper call the stacked form absorbs.  AnalyzeRagged reverts the
+  // match to the sliced form if the use-count fixpoint could not absorb it
+  // (the slice would then run anyway, and the fused op must read its
+  // result rather than gather a second copy of the same weights).
+  mlir::Operation* helper_call = nullptr;
+  std::vector<mlir::Operation*> ops;  // the ops this match absorbs
+  std::string name;
+};
+
+// --------------------------------------------------------------------------
 // the plan
 // --------------------------------------------------------------------------
 
@@ -261,6 +306,7 @@ struct RewritePlan {
   std::vector<std::unique_ptr<QmmMatch>> qmm;
   std::vector<std::unique_ptr<SdpaMatch>> sdpa;
   std::vector<std::unique_ptr<MoeMatch>> moe;
+  std::vector<std::unique_ptr<RaggedMatch>> ragged;
 
   // Ops a recognizer absorbed: no entry, no slot, never executed.
   llvm::DenseSet<mlir::Operation*> skip;
@@ -268,6 +314,7 @@ struct RewritePlan {
   llvm::DenseMap<mlir::Operation*, QmmMatch*> qmm_roots;
   llvm::DenseMap<mlir::Operation*, SdpaMatch*> sdpa_roots;
   llvm::DenseMap<mlir::Operation*, MoeMatch*> moe_roots;
+  llvm::DenseMap<mlir::Operation*, RaggedMatch*> ragged_roots;
 
   // The packed arrays, in the order the tape's trailing inputs take them.
   std::vector<mx::array> packs;
@@ -278,7 +325,8 @@ struct RewritePlan {
   std::vector<std::uintptr_t> pack_arg_ids;
 
   bool empty() const {
-    return qmm_roots.empty() && sdpa_roots.empty() && moe_roots.empty();
+    return qmm_roots.empty() && sdpa_roots.empty() && moe_roots.empty() &&
+           ragged_roots.empty();
   }
   // Recompute `skip` and the root maps from the matches that are still live.
   void rebuild();
@@ -347,6 +395,12 @@ void AnalyzeSdpa(mlir::func::FuncOp fn, RewritePlan* plan);
 // was packed there is dispatched by `gather_qmm` instead of by the dense
 // `quantized_matmul`, and that match is marked `absorbed` rather than emitted.
 void AnalyzeMoe(mlir::func::FuncOp fn, RewritePlan* plan);
+
+// The ragged-dot dispatches (metal_ragged.cc).  Runs AFTER `AnalyzeMoe` and
+// claims only dots no other recognizer did.  Purely structural — nothing to
+// pack, nothing to verify at run time — so it runs at compile time like
+// `AnalyzeSdpa`.  METALJAX_RAGGED=0 disables it.
+void AnalyzeRagged(mlir::func::FuncOp fn, RewritePlan* plan);
 
 // The first-execute check of a match's router, on the buffers of this
 // execute: the scores must BE the top-k weights scattered at the matched

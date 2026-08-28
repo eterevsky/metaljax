@@ -477,6 +477,94 @@ bool Program::step_emit(const Entry& e,
       break;
     }
 
+    case kRaggedDot: {
+      // metal_ragged.cc: jax's `lax.ragged_dot` dense fallback, rewritten.
+      // The dense form runs every row against every group's [K, N] and masks
+      // the non-members to zero; this runs each row against ITS group only.
+      // attrs [g, m, M, k, n, out_dtype, stacked?, L]; ins [x [m, k],
+      // w ([g, k, n], or the carried [L, g, k, n] stack when `stacked`),
+      // ends [g] = cumsum(group_sizes), (layer index when `stacked`)].
+      // m is the REAL row count (the absorbed pad's input); M >= m is the
+      // row count the root declared, and the dense semantics for the M - m
+      // padded rows — masked to zero everywhere — is an exact zero row, so
+      // the result is zero-padded.
+      //
+      // Row i belongs to group e iff ends[e-1] <= i < ends[e]; the group
+      // index is #(ends <= i), which is nondecreasing in i whatever `ends`
+      // holds — so `sorted_indices` below is a structural fact, not an
+      // assumption about the data.  A row at or past ends[g-1] is in no
+      // group (the dense mask zeroes it everywhere), so its gather — clamped
+      // to the last group — is discarded by `valid`.
+      Cursor c(at);
+      int64_t g = c.next(), m = c.next(), M = c.next();
+      int64_t k = c.next(), n = c.next();
+      mx::Dtype out_dt = dtype_of(c.next());
+      const bool stacked = c.flag();
+      int64_t L = c.next();
+      mx::Shape out_shape{static_cast<mx::ShapeElem>(M),
+                          static_cast<mx::ShapeElem>(n)};
+      if (m == 0 || k == 0 || n == 0) {
+        env[e.outs[0]] = mx::zeros(out_shape, out_dt);
+        break;
+      }
+      const mx::array& x = in(0);
+      const mx::array& w = in(1);
+      mx::array ends =
+          mx::reshape(mx::astype(in(2), mx::int32),
+                      mx::Shape{1, static_cast<mx::ShapeElem>(g)});
+      mx::array row = mx::reshape(
+          mx::arange(static_cast<double>(m), mx::int32),
+          mx::Shape{static_cast<mx::ShapeElem>(m), 1});
+      mx::array eid =
+          mx::sum(mx::astype(mx::greater_equal(row, ends), mx::int32),
+                  std::vector<int>{1});
+      mx::array valid = mx::less(
+          eid, mx::array(static_cast<int32_t>(g), mx::int32));
+      mx::array eidc = mx::astype(
+          mx::minimum(eid, mx::array(static_cast<int32_t>(g - 1), mx::int32)),
+          mx::uint32);
+      mx::array rhs_idx = eidc;
+      mx::array wg = w;
+      if (stacked) {
+        // The analysis proved `w` is the [1, 0, 2, 3]-transposed view of a
+        // [g, L, k, n] buffer riding a pass-through carry: transposing it
+        // BACK and flattening [g, L] is a zero-copy view of the original,
+        // and matrix (e, l) sits at linear index e * L + l.  The dense
+        // chain's dynamic_slice clamped the layer index; so does this.
+        mx::array l = mx::minimum(
+            mx::maximum(mx::reshape(mx::astype(in(3), mx::int32), mx::Shape{}),
+                        mx::array(0, mx::int32)),
+            mx::array(static_cast<int32_t>(L - 1), mx::int32));
+        rhs_idx = mx::astype(
+            mx::add(mx::multiply(mx::astype(eidc, mx::int32),
+                                 mx::array(static_cast<int32_t>(L),
+                                           mx::int32)),
+                    l),
+            mx::uint32);
+        wg = mx::reshape(mx::transpose(w, {1, 0, 2, 3}),
+                         mx::Shape{static_cast<mx::ShapeElem>(g * L),
+                                   static_cast<mx::ShapeElem>(k),
+                                   static_cast<mx::ShapeElem>(n)});
+      }
+      mx::array lhs_idx = mx::arange(static_cast<double>(m), mx::uint32);
+      mx::array y = mx::gather_mm(
+          mx::reshape(x, mx::Shape{static_cast<mx::ShapeElem>(m), 1,
+                                   static_cast<mx::ShapeElem>(k)}),
+          wg, lhs_idx, rhs_idx, /*sorted_indices=*/true);
+      y = mx::reshape(y, mx::Shape{static_cast<mx::ShapeElem>(m),
+                                   static_cast<mx::ShapeElem>(n)});
+      y = mx::where(mx::reshape(valid,
+                                mx::Shape{static_cast<mx::ShapeElem>(m), 1}),
+                    y, mx::array(0.0f, y.dtype()));
+      if (M > m)
+        y = mx::pad(y, {0}, mx::Shape{0},
+                    mx::Shape{static_cast<mx::ShapeElem>(M - m)},
+                    mx::array(0.0f, y.dtype()));
+      if (y.dtype() != out_dt) y = mx::astype(y, out_dt);
+      env[e.outs[0]] = y;
+      break;
+    }
+
     default:
       return false;
   }

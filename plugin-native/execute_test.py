@@ -404,6 +404,66 @@ def _cases():
          [np.arange(-6, 6, dtype=np.int8).reshape(3, 4),
           np.arange(-10, 10, dtype=np.int8).reshape(4, 5)], *EXACT),
 
+        # lax.ragged_dot: jax's dense fallback is the ragged-dot recognizer's
+        # match (metal_ragged.cc -> one gather_mm); the CPU runs the dense
+        # chain literally, so this compares the rewrite against its spec.
+        ("ragged_dot f32",
+         lambda x, w, gs: jax.lax.ragged_dot(x, w, gs),
+         [_rand((10, 8), 60), _rand((4, 8, 6), 61),
+          np.array([3, 2, 0, 5], np.int32)], *DOT),
+        ("ragged_dot bf16",
+         lambda x, w, gs: jax.lax.ragged_dot(
+             x, w, gs, preferred_element_type=jnp.bfloat16),
+         [bf(_rand((10, 8), 62)), bf(_rand((4, 8, 6), 63)),
+          np.array([1, 4, 5, 0], np.int32)], *BF16DOT),
+        # The maxtext idiom: rows padded to the ragged tiling, group sizes
+        # covering only the real ones.  The pad is absorbed and the padded
+        # rows must come back as the exact zeros the dense mask computes.
+        ("ragged_dot padded rows",
+         lambda x, w, gs: jax.lax.ragged_dot(
+             jnp.pad(x, ((0, 6), (0, 0))), w, gs),
+         [_rand((10, 8), 64), _rand((4, 8, 6), 65),
+          np.array([2, 3, 4, 1], np.int32)], *DOT),
+        # Group sizes that cover only SOME rows: the uncovered tail is zero.
+        ("ragged_dot uncovered tail",
+         lambda x, w, gs: jax.lax.ragged_dot(x, w, gs),
+         [_rand((10, 8), 66), _rand((3, 8, 6), 67),
+          np.array([2, 0, 3], np.int32)], *DOT),
+        # bf16 inputs accumulating to f32: the recognizer must DECLINE (the
+        # gather would round the output to bf16) and the dense chain run.
+        ("ragged_dot mixed dtypes declines",
+         lambda x, w, gs: jax.lax.ragged_dot(
+             x, w, gs, preferred_element_type=jnp.float32),
+         [bf(_rand((6, 8), 68)), bf(_rand((4, 8, 6), 69)),
+          np.array([1, 2, 2, 1], np.int32)], *HALF),
+        # The ragged contraction WITHOUT the mask chain: not a match, and the
+        # canonicalized contracting-pair order must still contract correctly
+        # in both listed orders.
+        ("dot 2 contracting dims (k,g)",
+         lambda a, b: jax.lax.dot_general(a, b, (((2, 0), (1, 0)), ((), ()))),
+         [_rand((3, 4, 5), 70), _rand((3, 5, 6), 71)], *DOT),
+        ("dot 2 contracting dims (g,k)",
+         lambda a, b: jax.lax.dot_general(a, b, (((0, 2), (0, 1)), ((), ()))),
+         [_rand((3, 4, 5), 72), _rand((3, 5, 6), 73)], *DOT),
+        # The maxtext scan-over-layers form: ragged_dot inside lax.scan over
+        # a transposed weight stack.  The recognizer's STACKED extension
+        # absorbs the per-layer dynamic-slice copy and gathers matrix
+        # `group * L + layer` straight out of the original buffer.
+        ("ragged_dot scanned stack",
+         lambda x, Wt, gs: jax.lax.scan(
+             lambda h, w: (jax.lax.ragged_dot(
+                 h, w, gs, preferred_element_type=h.dtype), None),
+             x, jnp.transpose(Wt, (1, 0, 2, 3)))[0],
+         [_rand((10, 8), 75), _rand((4, 5, 8, 8), 76) * 0.1,
+          np.array([3, 2, 0, 5], np.int32)], *DOT),
+        # dynamic_index_in_dim of a transposed stack: the trailing reshape
+        # only drops the unit axis and must lower as a view-preserving
+        # squeeze (ops_shape.cc kReshape), not a copy -- and stay correct.
+        ("unit reshape of strided slice",
+         lambda a, i: jax.lax.dynamic_index_in_dim(
+             jnp.transpose(a, (1, 0, 2)), i, 0, keepdims=False) * 2.0,
+         [_rand((4, 5, 3), 74), np.array(2, np.int32)], *F32),
+
         # selection
         ("select / compare / clamp",
          lambda x: jnp.where(x > 0, jnp.clip(x, -1.0, 1.0), -x),

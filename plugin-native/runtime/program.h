@@ -123,6 +123,11 @@ enum Op : int {
   // reduce. The absorbed ops never reach the tape at all.
   kQmm, kSdpa, kSdpaMask,
   kMoeEIdx, kMoeTIdx, kMoeGather, kMoeConcat, kMoeView, kMoeDot, kMoeTail,
+  // The ragged-dot expert dispatch (metal_ragged.cc): jax's non-TPU
+  // `lax.ragged_dot` lowering — broadcast every row to all `g` groups, mask
+  // by the cumsum(group_sizes) intervals, contract over (group, k) — becomes
+  // one `gather_mm` over the rows' own groups.
+  kRaggedDot,
   // M5b: a counted loop msl_scan planned into one generated Metal kernel,
   // and a site where the handler computes on the HOST. Both were lowered by
   // src/metaljax/tape.py; the pseudo-names below are how it asked for them.

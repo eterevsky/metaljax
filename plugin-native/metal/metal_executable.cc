@@ -196,10 +196,11 @@ const std::shared_ptr<const LoweredProgram>& MetalLoadedExecutable::Tape(
   if (kDebug) {
     std::fprintf(stderr,
                  "[metaljax-native] %s: %lld fused quantized matmul(s), "
-                 "%lld gathered expert dispatch(es), %lld fused "
-                 "attention(s), %zu packed arrays\n",
+                 "%lld gathered expert dispatch(es), %lld ragged "
+                 "dispatch(es), %lld fused attention(s), %zu packed arrays\n",
                  name_.c_str(), static_cast<long long>(fused->num_qmm),
                  static_cast<long long>(fused->num_moe),
+                 static_cast<long long>(fused->num_ragged),
                  static_cast<long long>(fused->num_sdpa), fused->packs.size());
     std::fflush(stderr);
   }

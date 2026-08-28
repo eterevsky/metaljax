@@ -72,6 +72,7 @@ cc_library(
     srcs = [
         "metal_moe.cc",
         "metal_qmm.cc",
+        "metal_ragged.cc",
         "metal_sdpa.cc",
     ],
     hdrs = ["metal_recognize.h"],
