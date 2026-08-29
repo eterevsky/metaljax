@@ -36,7 +36,7 @@ metric per cell: LLM rows = warm decode ms/token; vision = forward ms;
 diffusion = ms/step; training = ms/step. ✗ = established impossible
 (with the measured reason).*
 
-| # | benchmark | jax CPU | metaljax (0.11.6 ³⁷) | mlx-lm | torch-MPS | llama.cpp |
+| # | benchmark | jax CPU | metaljax (current ³⁷) | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|
 | 1 | gemma4-31B bf16 | ✗ f32=123 GB | **235.2** ³⁷ | 137 | 148.7 | 111.2 ²⁰ |
 | 2 | gemma4-12B bf16 | 315 (f32) | **92.1** ³⁷ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
@@ -47,7 +47,7 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 7 | gpt-oss-20b | ✗ ⁴ | **21.3** ³⁷ (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | **29.4** ³³ ³⁷ (73 GB) | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | **211.0** ³⁷ (67 GB) | 131.8 | — | — |
-| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | **1948.2** ³³ ³⁷ ³⁸ (89 GB) | 10.5 | — | — |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | **113.9** ³⁸ (89 GB) | 10.5 | — | — |
 | 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.35** ³⁷ | — | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | **91.3** ³⁷ (93 GB) | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | **78.0** ³⁷ | — | — | — |
@@ -743,7 +743,8 @@ bf16 — the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     `gather_mm` over the real rows: decode **1948.2 → 113.9 ms/tok**
     (17.1×), prefill 2028 → 186 ms, decode text bit-identical, rows
     11/14 unregressed. The release column above keeps the 0.11.6-gated
-    1948.2 per release rule 1; 113.9 is the HEAD number. Remaining gap
+    1948.2 per release rule 1; this table shows the current (HEAD)
+    number. Remaining gap
     to mlx-lm's 10.5 is launch-bound decode (the ~16 ms maxtext-harness
     floor is row 11's entire cell), owned by the decode-loop fusion
     campaign. Diagnosis: notes/row10-ragged-dot-2026-08-28.md.
