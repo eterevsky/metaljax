@@ -104,7 +104,21 @@ bool Program::step_linalg(const Entry& e,
       } else {
         if (l3.dtype() != out_dt) l3 = mx::astype(l3, out_dt);
         if (r3.dtype() != out_dt) r3 = mx::astype(r3, out_dt);
-        o3 = mx::matmul(l3, r3);
+        if (k == 1 && !is_complex(out_dt)) {
+          // A K=1 contraction has no sum: the batched matmul is ONE product
+          // per output element, i.e. a broadcast multiply.  Bit-identical —
+          // the matmul path computes the exact product in its f32
+          // accumulator and rounds once on the way out, which for bf16/f16
+          // (8- and 11-bit mantissas: the product is exact in f32) and for
+          // f32 itself is the elementwise multiply's own RNE rounding.
+          // What it buys: jax spells `x * vec` einsums as batching-only
+          // dots (maxtext's norm scales and rope: 4 per layer, B=hidden,
+          // M=N=K=1), and each was a 1024-batch 1x1x1 GEMM launch; a
+          // multiply is one fusable elementwise node instead.
+          o3 = mx::multiply(l3, r3);  // [b,m,1] * [b,1,n] -> [b,m,n]
+        } else {
+          o3 = mx::matmul(l3, r3);
+        }
       }
       env[e.outs[0]] = mx::reshape(o3, out_shape);
       break;

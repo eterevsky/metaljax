@@ -7,6 +7,8 @@ Licensed under the Apache License, Version 2.0.
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -96,6 +98,25 @@ absl::StatusOr<size_t> MetalBuffer::CopyOut(void* dst, size_t dst_size,
 }
 
 xla::Future<> MetalBuffer::ToLiteral(xla::MutableLiteralBase* literal) {
+  // METALJAX_TIMING=1 (dev-only): a host read is the decode loop's sync
+  // point, so its cost belongs in the same per-token report the executes
+  // print (metal_executable.cc).
+  static const bool timing = [] {
+    const char* v = std::getenv("METALJAX_TIMING");
+    return v != nullptr && std::string(v) == "1";
+  }();
+  struct Report {
+    bool on;
+    int64_t t0;
+    size_t bytes;
+    ~Report() {
+      if (!on) return;
+      std::fprintf(stderr, "[metaljax-timing] to_host: bytes=%zu total=%lld us\n",
+                   bytes, (timing_now_ns() - t0) / 1000);
+      std::fflush(stderr);
+    }
+  } report{timing, timing ? timing_now_ns() : 0,
+           literal->shape().IsArray() ? static_cast<size_t>(literal->size_bytes()) : size_t{0}};
   if (!literal->shape().IsArray()) {
     return xla::Future<>(absl::UnimplementedError(
         "metaljax: only array-shaped literals are supported."));

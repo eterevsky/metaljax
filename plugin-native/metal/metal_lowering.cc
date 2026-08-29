@@ -1337,7 +1337,7 @@ int64_t ScatterCost(LowerContext& ctx, mlir::Operation* op) {
 // fused attention.  0 = not a root.
 int64_t RootCostUnit(const RewritePlan& plan, mlir::Operation* op) {
   if (plan.qmm_roots.count(op) || plan.moe_roots.count(op) ||
-      plan.ragged_roots.count(op))
+      plan.ragged_roots.count(op) || plan.stacked_roots.count(op))
     return 2;
   if (plan.sdpa_roots.count(op)) return 3;
   return 0;
@@ -1424,6 +1424,12 @@ int64_t RootExtraBytes(const RewritePlan& plan, mlir::Operation* op) {
     // and the weight reads allocate nothing.
     const RaggedMatch& m = *ra->second;
     return m.m * m.n * 4 + m.m * 16;
+  }
+  auto sd = plan.stacked_roots.find(op);
+  if (sd != plan.stacked_roots.end() && sd->second != nullptr) {
+    // At most one reshaped copy of the activation; the stack is read as a
+    // view and the helper's whole-layer slice copy is never made.
+    return ValueBytes(sd->second->x);
   }
   return 0;
 }
@@ -1644,6 +1650,69 @@ bool BytesOk(LowerContext& ctx, mlir::Block& block, int64_t mult,
                  static_cast<double>(nb) / static_cast<double>(1 << 20),
                  static_cast<long long>(mult),
                  static_cast<long long>(kCompileBytesMb));
+    // The audit: where the estimate lives, aggregated by op name — this
+    // block's own ops (a while charges trip x its body as one line), then
+    // one level into each while body, since a scan body's total is where a
+    // decode main's estimate usually hides.
+    std::function<void(mlir::Block&, const std::string&, int)> audit =
+        [&](mlir::Block& blk, const std::string& label, int depth) {
+          std::map<std::string, std::pair<int64_t, int64_t>> by_name;
+          std::vector<mlir::Operation*> whiles;
+          for (mlir::Operation& o : blk) {
+            if (ctx.plan != nullptr && ctx.plan->absorbed(&o)) continue;
+            int64_t b = OpBytes(&o);
+            if (ctx.plan != nullptr) b += RootExtraBytes(*ctx.plan, &o);
+            const llvm::StringRef n = o.getName().getStringRef();
+            if (n == "stablehlo.while") {
+              if (MslPlanFor(ctx, &o) == nullptr && o.getNumRegions() >= 2 &&
+                  !o.getRegion(1).empty()) {
+                std::optional<Counted> c = AnalyzeCounted(ctx, &o);
+                int64_t trip = 1024;
+                if (c.has_value() && c->kind == Counted::kStatic) {
+                  std::optional<int64_t> start = StaticStart(&o, c->k);
+                  if (start.has_value())
+                    trip = std::max<int64_t>(c->n - *start, 1);
+                }
+                b += trip * BlockBytes(ctx, o.getRegion(1).front());
+                whiles.push_back(&o);
+              }
+            } else if (n == "func.call" || n == "stablehlo.composite") {
+              auto sym = o.getAttrOfType<mlir::FlatSymbolRefAttr>(
+                  n == "func.call" ? "callee" : "decomposition");
+              if (sym) {
+                auto callee = ctx.module.lookupSymbol<mlir::func::FuncOp>(
+                    sym.getValue());
+                if (callee && !callee.getBody().empty())
+                  b += BlockBytes(ctx, callee.getBody().front());
+              }
+            }
+            auto& slot = by_name[n.str()];
+            slot.first += b;
+            slot.second += 1;
+          }
+          std::vector<std::pair<int64_t, std::string>> rows;
+          for (const auto& kv : by_name)
+            rows.emplace_back(kv.second.first,
+                              kv.first + " x" + std::to_string(kv.second.second));
+          std::sort(rows.rbegin(), rows.rend());
+          for (size_t i = 0; i < rows.size() && i < 10; i++) {
+            if (rows[i].first < (16 << 20)) break;
+            std::fprintf(stderr,
+                         "[metaljax-native]   bytes audit %s: %7lld MB  %s\n",
+                         label.c_str(),
+                         static_cast<long long>(rows[i].first >> 20),
+                         rows[i].second.c_str());
+          }
+          if (depth > 0) {
+            int wi = 0;
+            for (mlir::Operation* w : whiles)
+              audit(w->getRegion(1).front(),
+                    label + "/while" + std::to_string(wi++) + "-body",
+                    depth - 1);
+          }
+        };
+    audit(block, std::string(what), 1);
+    std::fflush(stderr);
   }
   return false;
 }
@@ -1960,6 +2029,7 @@ class Lowering {
   absl::Status LowerSdpa(mlir::Operation* op, const SdpaMatch& m);
   absl::Status LowerMoe(mlir::Operation* op, const MoeMatch& m);
   absl::Status LowerRagged(mlir::Operation* op, const RaggedMatch& m);
+  absl::Status LowerStackedDot(mlir::Operation* op, const StackedDotMatch& m);
   // One node of the pair-space plan, as one tape entry; `slots` holds the
   // slot each earlier node landed in.
   absl::StatusOr<int> LowerMoeNode(const MoeMatch& m, const MoeNode& node,
@@ -5866,6 +5936,13 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
       RETURN_IF_ERROR(CheckValue(op->getResult(0)));
       return LowerRagged(op, *ragged->second);
     }
+    auto stacked = ctx_->plan->stacked_roots.find(op);
+    if (stacked != ctx_->plan->stacked_roots.end()) {
+      if (op->getNumResults() != 1)
+        return Decline("a recognizer root with several results");
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      return LowerStackedDot(op, *stacked->second);
+    }
   }
 
   // Symbol-carrying calls are spliced in rather than lowered: both run the
@@ -6232,6 +6309,38 @@ absl::Status Lowering::LowerRagged(mlir::Operation* op, const RaggedMatch& m) {
     ins.push_back(layer);
   }
   Emit(opcode, std::move(ins), {Bind(op->getResult(0))}, std::move(attrs),
+       std::nullopt, ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// metal_stacked.cc's emit: the helper's dynamic slice and the dot become one
+// gather_mm over an [L, K, N] strided view of the ORIGINAL stack
+// (runtime/emits.cc kStackedDot).  ins [x, stack, layer]; attrs
+// [nperm, back_perm..., L, K, N, sl, sk, sn, M, out dtype, out rank,
+// out shape...].
+absl::Status Lowering::LowerStackedDot(mlir::Operation* op,
+                                       const StackedDotMatch& m) {
+  for (mlir::Value v : {m.x, m.w_carry, m.layer})
+    RETURN_IF_ERROR(CheckValue(v));
+  ASSIGN_OR_RETURN(int x, Slot(m.x));
+  ASSIGN_OR_RETURN(int w, Slot(m.w_carry));
+  ASSIGN_OR_RETURN(int layer, Slot(m.layer));
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.stacked_dot"));
+  std::vector<int64_t> attrs;
+  attrs.push_back(static_cast<int64_t>(m.back_perm.size()));
+  attrs.insert(attrs.end(), m.back_perm.begin(), m.back_perm.end());
+  attrs.push_back(m.L);
+  attrs.push_back(m.K);
+  attrs.push_back(m.N);
+  attrs.push_back(m.sl);
+  attrs.push_back(m.sk);
+  attrs.push_back(m.sn);
+  attrs.push_back(m.M);
+  attrs.push_back(static_cast<int64_t>(out_code));
+  attrs.push_back(static_cast<int64_t>(m.out_shape.size()));
+  attrs.insert(attrs.end(), m.out_shape.begin(), m.out_shape.end());
+  Emit(opcode, {x, w, layer}, {Bind(op->getResult(0))}, std::move(attrs),
        std::nullopt, ResultBytes(op));
   return absl::OkStatus();
 }
@@ -6834,9 +6943,11 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
     // three recognizers are disjoint by construction: sdpa drops any
     // candidate overlapping a quantized matmul).
     AnalyzeSdpa(main, &plan);
-    // ...and the ragged-dot dispatches, LAST: they defer to every op the
+    // ...and the ragged-dot dispatches: they defer to every op the
     // other three claimed (metal_ragged.cc reads their match lists).
     AnalyzeRagged(main, &plan);
+    // ...and the stacked-weight dots, LAST, deferring to all four.
+    AnalyzeStackedDot(main, &plan);
     plan.rebuild();
   } catch (const std::exception& e) {
     // Analysis must never break a program (qmm.py `analyze`).
@@ -6912,6 +7023,7 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
   lowered->num_moe = static_cast<int64_t>(plan.moe.size());
   lowered->num_sdpa = static_cast<int64_t>(plan.sdpa.size());
   lowered->num_ragged = static_cast<int64_t>(plan.ragged.size());
+  lowered->num_stacked = static_cast<int64_t>(plan.stacked.size());
   return lowered;
 }
 

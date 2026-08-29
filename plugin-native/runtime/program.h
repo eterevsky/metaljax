@@ -128,6 +128,12 @@ enum Op : int {
   // by the cumsum(group_sizes) intervals, contract over (group, k) — becomes
   // one `gather_mm` over the rows' own groups.
   kRaggedDot,
+  // The stacked-weight dot (metal_stacked.cc): a dot whose weight is
+  // `dynamic_index_in_dim(stack, layer)` over a loop-invariant layer stack —
+  // jax's scanned-layer form — becomes one `gather_mm` reading matrix
+  // `layer` straight out of the stack (a strided view; MLX's dynamic slice
+  // is a copy because the offset is data).
+  kStackedDot,
   // M5b: a counted loop msl_scan planned into one generated Metal kernel,
   // and a site where the handler computes on the HOST. Both were lowered by
   // src/metaljax/tape.py; the pseudo-names below are how it asked for them.
@@ -280,6 +286,13 @@ struct Stats {
   int64_t pages_released = 0;   // page-cache bytes invalidated after ingest
   int64_t pages_deactivated = 0;  // ...and bytes only deactivated (COW maps)
   int64_t page_sweeps = 0;      // sweeps of this process's own mappings
+  // METALJAX_TIMING=1 (dev-only diagnosis): time spent BLOCKED at the two
+  // sync-point families a tape walk reaches, so a per-execute report can
+  // split "building the graph" from "waiting for the device".  Counted
+  // unconditionally (two clock reads per flush, noise), printed only when
+  // the timing report is on.
+  int64_t flush_eval_ns = 0;    // inside eager-flush evals/submits
+  int64_t loop_eval_ns = 0;     // inside loop sync evals
 };
 
 extern Stats g_stats;
@@ -289,6 +302,9 @@ extern Stats g_stats;
 // --------------------------------------------------------------------------
 
 bool is_resource_limit(const std::exception& e);
+
+// Monotonic nanoseconds (steady_clock), for the METALJAX_TIMING counters.
+int64_t timing_now_ns();
 
 // Breaking reference cycles before a buffer-limit retry is an embedder's
 // business, not the tape's: what pins the buffers mx::clear_cache cannot free

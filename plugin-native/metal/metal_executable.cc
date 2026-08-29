@@ -69,6 +69,17 @@ const bool kDebug = [] {
   return v != nullptr && std::string(v) == "1";
 }();
 
+// METALJAX_TIMING=1 (dev-only diagnosis): per-execute phase report on
+// stderr -- where one PJRT execute's wall time went, split into argument
+// wrap, tape selection, the tape walk (itself split into graph building vs
+// blocking at sync points, via the g_stats wait counters), the final eval,
+// the contiguity fixups and the result wrap.  The decode-floor probe this
+// was built for is notes/row10 phase 2.
+const bool kTiming = [] {
+  const char* v = std::getenv("METALJAX_TIMING");
+  return v != nullptr && std::string(v) == "1";
+}();
+
 // METALJAX_VERIFY_COMPILE=1 compares the two paths; =dump also prints the
 // arguments and both answers of whatever diverged.
 const char* const kVerifyCompileEnv = std::getenv("METALJAX_VERIFY_COMPILE");
@@ -197,10 +208,12 @@ const std::shared_ptr<const LoweredProgram>& MetalLoadedExecutable::Tape(
     std::fprintf(stderr,
                  "[metaljax-native] %s: %lld fused quantized matmul(s), "
                  "%lld gathered expert dispatch(es), %lld ragged "
-                 "dispatch(es), %lld fused attention(s), %zu packed arrays\n",
+                 "dispatch(es), %lld stacked dot(s), %lld fused "
+                 "attention(s), %zu packed arrays\n",
                  name_.c_str(), static_cast<long long>(fused->num_qmm),
                  static_cast<long long>(fused->num_moe),
                  static_cast<long long>(fused->num_ragged),
+                 static_cast<long long>(fused->num_stacked),
                  static_cast<long long>(fused->num_sdpa), fused->packs.size());
     std::fflush(stderr);
   }
@@ -222,8 +235,10 @@ MetalLoadedExecutable::RunOnce(
         "metaljax-native: %s takes %d arguments, got %d", name_,
         lowered_->parameters.size(), argument_handles.size()));
   }
+  const int64_t t_entry = kTiming ? timing_now_ns() : 0;
   BindThread();
   std::unique_lock<std::recursive_mutex> submission = SubmissionLock();
+  const int64_t t_lock = kTiming ? timing_now_ns() : 0;
 
   // The governor's look at the machine before a program is entered (the
   // no-panic contract, runtime/memory.cc).  Sampled, so a decode loop paying
@@ -281,11 +296,15 @@ MetalLoadedExecutable::RunOnce(
     inputs.push_back(a);
   }
 
+  const int64_t t_args = kTiming ? timing_now_ns() : 0;
+
   // Which tape runs, and the packed weights it takes after the caller's own
   // arguments (P17).  The packs are INPUTS rather than constants: mx::compile
   // bakes a captured constant by value, and a repack would then never be seen.
   const std::shared_ptr<const LoweredProgram>& tape = Tape(inputs);
   for (const mx::array& pack : tape->packs) inputs.push_back(pack);
+  const int64_t t_tape = kTiming ? timing_now_ns() : 0;
+  int64_t t_run = 0, t_eval = 0, t_contig = 0;
 
   std::vector<mx::array> outs;
   const Stats before = g_stats;
@@ -293,6 +312,7 @@ MetalLoadedExecutable::RunOnce(
     const std::vector<mx::array> kept =
         kVerifyCompile ? inputs : std::vector<mx::array>{};
     outs = tape->program->run(std::move(inputs));
+    if (kTiming) t_run = timing_now_ns();
     // The half of the no-alias contract only a CALL can decide: an output the
     // lowering left uncopied because every argument it aliases is donated has
     // to be copied after all when this call takes the donation back
@@ -317,6 +337,7 @@ MetalLoadedExecutable::RunOnce(
     // the one thing to revisit first when the plugin is measured -- the Stage
     // 1 engine hands out lazy arrays and submits with async_eval instead.
     mx::eval(outs);
+    if (kTiming) t_eval = timing_now_ns();
     // ...and MATERIALIZED.  A tape's output can be an MLX VIEW whose buffer is
     // smaller than the array says it is -- the plain case is a broadcast, which
     // comes back as 110 elements over a buffer of ONE (`strides=[0,0]`,
@@ -346,6 +367,7 @@ MetalLoadedExecutable::RunOnce(
       }
     }
     if (refreshed) mx::eval(outs);
+    if (kTiming) t_contig = timing_now_ns();
     // METALJAX_VERIFY_COMPILE=1: run the tape a SECOND time op by op and
     // compare.  The compiled path is the only place this plugin can be right
     // in one mode and wrong in the other, and a divergence is silent by
@@ -440,6 +462,22 @@ MetalLoadedExecutable::RunOnce(
     if (static_cast<size_t>(i) < argument_handles.size() &&
         argument_handles[i] != nullptr)
       argument_handles[i]->Delete();
+  }
+  if (kTiming) {
+    const int64_t t_end = timing_now_ns();
+    std::fprintf(
+        stderr,
+        "[metaljax-timing] %s: lock=%lld args=%lld tape=%lld run=%lld "
+        "(flushwait=%lld loopwait=%lld) eval=%lld contig=%lld wrap=%lld "
+        "total=%lld us nargs=%zu\n",
+        name_.c_str(), (t_lock - t_entry) / 1000, (t_args - t_lock) / 1000,
+        (t_tape - t_args) / 1000, (t_run - t_tape) / 1000,
+        (g_stats.flush_eval_ns - before.flush_eval_ns) / 1000,
+        (g_stats.loop_eval_ns - before.loop_eval_ns) / 1000,
+        (t_eval - t_run) / 1000, (t_contig - t_eval) / 1000,
+        (t_end - t_contig) / 1000, (t_end - t_entry) / 1000,
+        argument_handles.size());
+    std::fflush(stderr);
   }
   return buffers;
 }

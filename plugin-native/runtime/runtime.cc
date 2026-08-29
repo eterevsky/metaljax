@@ -10,6 +10,7 @@
 
 #include "program.h"
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,12 @@ bool is_resource_limit(const std::exception& e) {
   return std::string(e.what()).find("Resource limit") != std::string::npos;
 }
 
+int64_t timing_now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 // Narration. Deliberately not routed through Python: these fire from paths
 // that have released the GIL, some of them while recovering from an
 // allocation failure.
@@ -53,6 +60,11 @@ void debug_print(const std::string& msg) {
 // interpreter.flush_eval: settle `arrays`, recovering once from Metal buffer
 // exhaustion. Programs are pure, so clearing and retrying is safe.
 void flush_eval(const std::vector<mx::array>& arrays, bool hard) {
+  const int64_t t0 = timing_now_ns();
+  struct Charge {
+    int64_t t0;
+    ~Charge() { g_stats.flush_eval_ns += timing_now_ns() - t0; }
+  } charge{t0};
   try {
     if (hard) {
       mx::eval(arrays);
@@ -289,6 +301,11 @@ int64_t flush_bound(int64_t cache_now, const FlushState& st) {
 // metal::malloc dies), and recovers once if the limit is hit anyway.
 // The blocking half: settle `arrays`, recovering once from exhaustion.
 void loop_eval(const std::vector<mx::array>& arrays) {
+  const int64_t t0 = timing_now_ns();
+  struct Charge {
+    int64_t t0;
+    ~Charge() { g_stats.loop_eval_ns += timing_now_ns() - t0; }
+  } charge{t0};
   bool retry = false;
   try {
     mx::eval(arrays);

@@ -565,6 +565,53 @@ bool Program::step_emit(const Entry& e,
       break;
     }
 
+    case kStackedDot: {
+      // metal_stacked.cc: `dot_general(x, dynamic_index_in_dim(stack,
+      // layer))` — jax's scanned-layer weight read — as one gather_mm over
+      // an [L, K, N] strided view of the ORIGINAL contiguous stack.  attrs
+      // [nperm, back_perm..., L, K, N, sl, sk, sn, M, out_dtype, out rank,
+      // out shape...]; ins [x, stack (possibly a carried transposed view),
+      // layer].  The analysis proved transpose(stack, back_perm) is the
+      // row-contiguous original, so `as_strided`'s flatten is a view, and
+      // MLX's gather kernels take the batch/ld strides from the array — no
+      // copy on any path.  The dense chain's dynamic_slice clamped the
+      // index; so does this.
+      Cursor c(at);
+      std::vector<int> back_perm = c.vec();
+      const int64_t L = c.next(), K = c.next(), N = c.next();
+      const int64_t sl = c.next(), sk = c.next(), sn = c.next();
+      const int64_t M = c.next();
+      mx::Dtype out_dt = dtype_of(c.next());
+      mx::Shape out_shape = c.shp();
+      const mx::array& x = in(0);
+      const mx::array& w = in(1);
+      mx::array wb = is_identity_perm(back_perm)
+                         ? w
+                         : mx::transpose(w, back_perm);
+      mx::array wv = mx::as_strided(
+          wb,
+          mx::Shape{static_cast<mx::ShapeElem>(L),
+                    static_cast<mx::ShapeElem>(K),
+                    static_cast<mx::ShapeElem>(N)},
+          mx::Strides{sl, sk, sn}, /*offset=*/0);
+      mx::array a2 = mx::reshape(
+          x, mx::Shape{1, static_cast<mx::ShapeElem>(M),
+                       static_cast<mx::ShapeElem>(K)});
+      mx::array idx = mx::astype(
+          mx::minimum(mx::maximum(mx::reshape(mx::astype(in(2), mx::int32),
+                                              mx::Shape{1}),
+                                  mx::array(0, mx::int32)),
+                      mx::array(static_cast<int32_t>(L - 1), mx::int32)),
+          mx::uint32);
+      mx::array lhs_idx = mx::zeros(mx::Shape{1}, mx::uint32);
+      mx::array y =
+          mx::gather_mm(a2, wv, lhs_idx, idx, /*sorted_indices=*/true);
+      y = mx::reshape(y, out_shape);
+      if (y.dtype() != out_dt) y = mx::astype(y, out_dt);
+      env[e.outs[0]] = y;
+      break;
+    }
+
     default:
       return false;
   }

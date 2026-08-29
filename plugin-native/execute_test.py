@@ -464,6 +464,58 @@ def _cases():
              jnp.transpose(a, (1, 0, 2)), i, 0, keepdims=False) * 2.0,
          [_rand((4, 5, 3), 74), np.array(2, np.int32)], *F32),
 
+        # The stacked-weight dot (metal_stacked.cc): jax's scanned-layer
+        # weight read -- dot(x, dynamic_index_in_dim(stack, i)) over a
+        # mid-axis layer stack -- becomes one gather_mm reading an [L, K, N]
+        # strided view of the original buffer.  The CPU runs the slice chain
+        # literally, so these compare the rewrite against its spec.
+        ("stacked dot scan (mid-axis stack)",
+         lambda x, W: jax.lax.scan(
+             lambda h, w: (h @ w, None), x,
+             jnp.transpose(W, (1, 0, 2)))[0],
+         [_rand((2, 128), 80), _rand((128, 4, 128), 81) * 0.1], *DOT),
+        ("stacked dot scan bf16",
+         lambda x, W: jax.lax.scan(
+             lambda h, w: (h @ w, None), x,
+             jnp.transpose(W, (1, 0, 2)))[0],
+         [bf(_rand((2, 128), 82)), bf(_rand((128, 4, 128), 83) * 0.1)],
+         *BF16DOT),
+        # The inline spelling (no scan, no helper call), with multi-axis
+        # free dims that must collapse in the strided view.
+        ("stacked dot inline multi-axis free",
+         lambda x, W, i: jnp.einsum(
+             "bk,kcd->bcd", x, jax.lax.dynamic_index_in_dim(
+                 jnp.transpose(W, (1, 0, 2, 3)), i, 0, keepdims=False)),
+         [_rand((3, 128), 84), _rand((128, 4, 2, 64), 85),
+          np.array(2, np.int32)], *DOT),
+        # ...and slicing the middle axis directly, no transpose at all.
+        ("stacked dot inline mid-axis slice",
+         lambda x, W, i: x @ jax.lax.dynamic_index_in_dim(
+             W, i, 1, keepdims=False),
+         [_rand((3, 130), 86), _rand((130, 4, 128), 87),
+          np.array(1, np.int32)], *DOT),
+        # An out-of-range layer index: dynamic_slice clamps, and so must the
+        # gather.
+        ("stacked dot clamped index",
+         lambda x, W, i: jnp.einsum(
+             "bk,kn->bn", x, jax.lax.dynamic_index_in_dim(
+                 jnp.transpose(W, (1, 0, 2)), i, 0, keepdims=False)),
+         [_rand((2, 128), 88), _rand((128, 4, 128), 89),
+          np.array(9, np.int32)], *DOT),
+        # Contracted axes that straddle the stack axis (maxtext's o-proj
+        # layout): the view cannot exist, the recognizer must DECLINE, and
+        # the slice chain runs.
+        ("stacked dot non-collapsible declines",
+         lambda x, W, i: jnp.einsum(
+             "bcd,cdk->bk", x, jax.lax.dynamic_index_in_dim(
+                 jnp.transpose(W, (1, 0, 2, 3)), i, 0, keepdims=False)),
+         # Small magnitudes: the DECLINE is the point, and the fallback's
+         # canonicalized pair order reduces K = 512 in a different order
+         # than the CPU, which at unit variance exceeds DOT's per-element
+         # atol on f32.
+         [_rand((3, 8, 64), 90) * 0.1, _rand((8, 4, 64, 64), 91) * 0.1,
+          np.array(3, np.int32)], *DOT),
+
         # selection
         ("select / compare / clamp",
          lambda x: jnp.where(x > 0, jnp.clip(x, -1.0, 1.0), -x),

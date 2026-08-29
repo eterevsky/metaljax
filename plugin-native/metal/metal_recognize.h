@@ -299,6 +299,40 @@ struct RaggedMatch {
 };
 
 // --------------------------------------------------------------------------
+// stacked-weight dot (metal_stacked.cc): jax's scanned-layer weight reads
+// --------------------------------------------------------------------------
+
+// `dot_general(x, w)` where `w = dynamic_index_in_dim(stack, layer)` — the
+// form every scanned-layer jax model (maxtext, flax scan) reads a layer's
+// weights in.  MLX's dynamic slice is a COPY (the offset is data), so a
+// 28-layer decode re-materialized every weight every token; the rewrite
+// reads matrix `layer` straight out of the stack with `gather_mm`, whose
+// kernels take the batch and leading strides from the array (no copy at
+// all).  The geometry is proven at analysis: the stack (behind an optional
+// loop-invariant transpose, carried or not) is contiguous, and the
+// contracted / free axes collapse to an [L, K, N] `as_strided` view with
+// the free stride 1 — anything else Bails to the ordinary slice chain.
+struct StackedDotMatch {
+  mlir::Operation* root = nullptr;  // the dot_general
+  mlir::Value x;        // the activation, as the dot read it
+  mlir::Value w_carry;  // the helper's stack operand (possibly a carried
+                        // transposed view; the emit transposes it back)
+  mlir::Value layer;    // the helper's index operand
+  mlir::Operation* helper_call = nullptr;
+  // Inverse of the transpose between `w_carry` and the contiguous stack
+  // (identity when the stack is carried untransposed).
+  std::vector<int64_t> back_perm;
+  // The [L, K, N] view of the CONTIGUOUS stack, in elements.
+  int64_t L = 0, K = 0, N = 0;
+  int64_t sl = 0, sk = 0, sn = 0;
+  int64_t M = 0;                    // product of the lhs free dims
+  int out_dtype = 0;
+  std::vector<int64_t> out_shape;   // the root's declared result shape
+  std::vector<mlir::Operation*> ops;  // the ops this match absorbs
+  std::string name;
+};
+
+// --------------------------------------------------------------------------
 // the plan
 // --------------------------------------------------------------------------
 
@@ -307,6 +341,7 @@ struct RewritePlan {
   std::vector<std::unique_ptr<SdpaMatch>> sdpa;
   std::vector<std::unique_ptr<MoeMatch>> moe;
   std::vector<std::unique_ptr<RaggedMatch>> ragged;
+  std::vector<std::unique_ptr<StackedDotMatch>> stacked;
 
   // Ops a recognizer absorbed: no entry, no slot, never executed.
   llvm::DenseSet<mlir::Operation*> skip;
@@ -315,6 +350,7 @@ struct RewritePlan {
   llvm::DenseMap<mlir::Operation*, SdpaMatch*> sdpa_roots;
   llvm::DenseMap<mlir::Operation*, MoeMatch*> moe_roots;
   llvm::DenseMap<mlir::Operation*, RaggedMatch*> ragged_roots;
+  llvm::DenseMap<mlir::Operation*, StackedDotMatch*> stacked_roots;
 
   // The packed arrays, in the order the tape's trailing inputs take them.
   std::vector<mx::array> packs;
@@ -326,7 +362,7 @@ struct RewritePlan {
 
   bool empty() const {
     return qmm_roots.empty() && sdpa_roots.empty() && moe_roots.empty() &&
-           ragged_roots.empty();
+           ragged_roots.empty() && stacked_roots.empty();
   }
   // Recompute `skip` and the root maps from the matches that are still live.
   void rebuild();
@@ -401,6 +437,11 @@ void AnalyzeMoe(mlir::func::FuncOp fn, RewritePlan* plan);
 // pack, nothing to verify at run time — so it runs at compile time like
 // `AnalyzeSdpa`.  METALJAX_RAGGED=0 disables it.
 void AnalyzeRagged(mlir::func::FuncOp fn, RewritePlan* plan);
+
+// The stacked-weight dots (metal_stacked.cc).  Runs LAST and claims only
+// dots no other recognizer did.  Purely structural, like AnalyzeRagged.
+// METALJAX_STACKED_DOT=0 disables it.
+void AnalyzeStackedDot(mlir::func::FuncOp fn, RewritePlan* plan);
 
 // The first-execute check of a match's router, on the buffers of this
 // execute: the scores must BE the top-k weights scattered at the matched

@@ -74,6 +74,7 @@ cc_library(
         "metal_qmm.cc",
         "metal_ragged.cc",
         "metal_sdpa.cc",
+        "metal_stacked.cc",
     ],
     hdrs = ["metal_recognize.h"],
     deps = [
