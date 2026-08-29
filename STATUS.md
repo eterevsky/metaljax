@@ -41,17 +41,17 @@ diffusion = ms/step; training = ms/step. ✗ = established impossible
 | 1 | gemma4-31B bf16 | ✗ f32=123 GB | **235.2** ³⁷ | 137 | 148.7 | 111.2 ²⁰ |
 | 2 | gemma4-12B bf16 | 315 (f32) | **92.1** ³⁷ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
 | 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **43.3** ³⁷ (53 GB) | **17.0** | — | — ²⁰ |
-| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **27.2** ³⁷ | 10.5 ¹⁵ | — | — |
+| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **25.8** ³⁸ | 10.5 ¹⁵ | — | — |
 | 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **57.6** ³⁷ | 30.4 | 38.1 | — ²⁰ |
-| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **54.3** ³⁷ | 29.4 | 35.5 | — ²⁰ |
+| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **54.3** ³⁷ | 29.4 | 35.5 | 29.2 ²⁰ |
 | 7 | gpt-oss-20b | ✗ ⁴ | **21.3** ³⁷ (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | **29.4** ³³ ³⁷ (73 GB) | **13.7** | — | — |
 | 9 | R1-Distill-32B | ✗ 131 GB | **211.0** ³⁷ (67 GB) | 131.8 | — | — |
-| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | **113.9** ³⁸ (89 GB) | 10.5 | — | — |
-| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **16.35** ³⁷ | — | — | — |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | **108.7** ³⁸ (83 GB) | 10.5 | — | 10.7 ²⁰ |
+| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **13.28** ³⁸ | 3.0 | — | — |
 | 12 | Mixtral 8×7B bf16 | ✗ | **91.3** ³⁷ (93 GB) | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | **78.0** ³⁷ | — | — | — |
-| 14 | maxtext qwix-int8 0.6B | 143.4 | **31.85** ³⁷ (9.2 GB) | — | — | — |
+| 14 | maxtext qwix-int8 0.6B | 143.4 | **31.08** ³⁸ (9.2 GB) | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | **381.7** ³⁵ ³⁷ (73 GB) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **88.31** ³⁷ | — | 29.8 (b32: 591) | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | **1234.7** @512², **4974.9** @1024² ³⁷ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
@@ -748,3 +748,15 @@ bf16 — the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     to mlx-lm's 10.5 is launch-bound decode (the ~16 ms maxtext-harness
     floor is row 11's entire cell), owned by the decode-loop fusion
     campaign. Diagnosis: notes/row10-ragged-dot-2026-08-28.md.
+    PHASE 2 (2026-08-29, ff569eb): stacked-weight dots read the layer
+    stack IN PLACE via gather_mm (zero-copy strided view) and K=1 dots
+    become broadcast multiplies (bit-identical) — rows 10/11/14 and the
+    gemma4-E2B control now 108.7 / 13.28 / 31.08 / 25.8. The floor is
+    PROVEN to be graph op count (~20k nodes/token; whole-main
+    compilation changes nothing), not protocol (<1 ms/token) — the <50
+    target is an MLA-attention/router fusion campaign. Row 11's mlx-lm
+    ground truth: 3.0 ms/tok bf16. Row 11's greedy stream moved at
+    token ~9 with the reduction-order change (the documented tie-flip
+    class; rows 10/14 streams unchanged). Row 10's protocol now pins
+    METALJAX_MEM_SYS_MB=107520 (documented envelope; default 96 GB sits
+    under the row's budget). notes/row10-decode-floor-2026-08-29.md.

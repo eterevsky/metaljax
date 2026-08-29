@@ -23,7 +23,7 @@ notes/data/. Append a column per release / major optimization.*
 | 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | **21.3** | |
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | **29.4** ᴳ | |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | **211.0** ᴳ | |
-| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | **1948.2** ᴳ | 113.9 ʰ |
+| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | **1948.2** ᴳ | 108.7 ʰ |
 | 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | 16.35 | **16.35** | |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | **91.3** ᴳ | |
 | 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | **78.0** | |
@@ -237,6 +237,6 @@ Notes:
   footnote 37; full report `~/.cache/metaljax-bench/logs/gate-0.11.6/`.
 
 - ʰ HEAD-column cell (the documented rightmost-tracks-HEAD convention):
-  row 10 = 113.9 ms/tok after the post-0.11.6 ragged_dot recognizer
-  (commit 6590c05, 17.1×, output bit-identical; STATUS.md fn 38). Ships
-  in the next release, where it becomes a frozen column cell.
+  rows 10/11/14/4 after the post-0.11.6 decode-floor work (ragged_dot
+  recognizer 6590c05 + stacked-dot/K=1 fixes ff569eb; STATUS.md fn 38).
+  Ship in the next release, where they become frozen column cells.
