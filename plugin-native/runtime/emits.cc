@@ -197,6 +197,76 @@ bool Program::step_emit(const Entry& e,
       break;
     }
 
+    case kRmsNorm: {
+      // metal_norm.cc: jax's spelled-out RMS norm as MLX's fused kernel.
+      // ins [x, w]; attrs [out_dtype]; fattrs [eps].  The kernel
+      // accumulates in f32 exactly as the literal chain does; the one
+      // difference (1-ULP class) is that the chain rounds `x * rsqrt` to
+      // bf16 before the weight multiply and the kernel rounds once.
+      mx::Dtype out_dt = dtype_of(at[0]);
+      mx::array out = mx::fast::rms_norm(
+          in(0), in(1), static_cast<float>(e.fattrs[0]));
+      if (out.dtype() != out_dt) out = mx::astype(out, out_dt);
+      env[e.outs[0]] = out;
+      break;
+    }
+
+    case kMlaSdpa: {
+      // metal_mla.cc: maxtext's multi-span MLA decode attention.  The
+      // per-span masked softmax partials joined by the flash renormalization
+      // ARE the softmax over the concatenated scores, so: concat the spans,
+      // build the additive mask from the segment ids (exactly the numbers
+      // the matched `_where` chain selects), and run ONE fused sdpa — whose
+      // vector kernel supports the MLA 192/128 head geometry.  The graph
+      // pre-scaled q, so scale = 1.
+      // ins [q(B,1,H,D), then per span k(B,T,H,D), v(B,T,H,Dv), seg(B,T)];
+      // attrs [B, H, D, Dv, nspans, T..., seg_val, dtype, out_dtype];
+      // fattrs [mask_true, mask_false].
+      Cursor c(at);
+      const auto B = static_cast<mx::ShapeElem>(c.next());
+      const auto H = static_cast<mx::ShapeElem>(c.next());
+      c.next();  // D: carried for the record, read off the arrays
+      const auto Dv = static_cast<mx::ShapeElem>(c.next());
+      const int64_t nspans = c.next();
+      std::vector<int64_t> T(static_cast<size_t>(nspans));
+      for (int64_t i = 0; i < nspans; i++) T[static_cast<size_t>(i)] = c.next();
+      const int64_t seg_val = c.next();
+      mx::Dtype dt = dtype_of(c.next());
+      mx::Dtype out_dt = dtype_of(c.next());
+      (void)Dv;
+
+      mx::array q = in(0);  // [B, 1, H, D] -> [B, H, 1, D]
+      q = mx::transpose(q, {0, 2, 1, 3});
+      if (q.dtype() != dt) q = mx::astype(q, dt);
+      std::vector<mx::array> ks, vs, masks;
+      for (int64_t i = 0; i < nspans; i++) {
+        mx::array k = in(static_cast<size_t>(1 + 3 * i));
+        mx::array v = in(static_cast<size_t>(2 + 3 * i));
+        mx::array seg = in(static_cast<size_t>(3 + 3 * i));
+        if (k.dtype() != dt) k = mx::astype(k, dt);
+        if (v.dtype() != dt) v = mx::astype(v, dt);
+        ks.push_back(k);
+        vs.push_back(v);
+        masks.push_back(mx::where(
+            mx::equal(seg, weak_int(seg_val, seg)),
+            mx::array(e.fattrs[0], dt), mx::array(e.fattrs[1], dt)));
+      }
+      // [B, T, H, D] concat on T, then to [B, H, T, D].
+      mx::array k = mx::transpose(mx::concatenate(ks, 1), {0, 2, 1, 3});
+      mx::array v = mx::transpose(mx::concatenate(vs, 1), {0, 2, 1, 3});
+      mx::array mask =
+          mx::reshape(mx::concatenate(masks, 1),
+                      mx::Shape{B, 1, 1, static_cast<mx::ShapeElem>(
+                                             k.shape(2))});
+      mx::array out = mx::fast::scaled_dot_product_attention(
+          q, k, v, /*scale=*/1.0f, /*mask_mode=*/"", mask);
+      out = mx::transpose(out, {0, 2, 1, 3});  // [B, H, 1, Dv] -> [B, 1, H, Dv]
+      if (out.dtype() != out_dt) out = mx::astype(out, out_dt);
+      (void)H;
+      env[e.outs[0]] = out;
+      break;
+    }
+
     // --- the MoE expert gather (metaljax.moe.emit) -------------------
     //
     // `emit` is a small interpreter over a plan of pair-space nodes, so

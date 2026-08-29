@@ -70,7 +70,9 @@ cc_library(
 cc_library(
     name = "metal_recognize",
     srcs = [
+        "metal_mla.cc",
         "metal_moe.cc",
+        "metal_norm.cc",
         "metal_qmm.cc",
         "metal_ragged.cc",
         "metal_sdpa.cc",

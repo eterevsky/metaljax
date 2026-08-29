@@ -516,6 +516,63 @@ def _cases():
          [_rand((3, 8, 64), 90) * 0.1, _rand((8, 4, 64, 64), 91) * 0.1,
           np.array(3, np.int32)], *DOT),
 
+        # P30: the tape post-passes (metal_lowering.cc CsePass /
+        # FoldConstants / DcePass).  The CPU backend runs the literal chains,
+        # so these compare the merged/folded tape against its spec.
+        ("cse: repeated subexpression",
+         lambda x: jnp.sin(x) * jnp.cos(x) + jnp.sin(x) - jnp.cos(x),
+         [_rand((4, 5), 92)], *F32),
+        ("cse: duplicate embedded constants",
+         lambda x: (x + np.linspace(0, 1, 12, dtype=f).reshape(3, 4))
+         * (np.linspace(0, 1, 12, dtype=f).reshape(3, 4) + 1.0),
+         [_rand((3, 4), 93)], *F32),
+        # The maxtext decode shape: a loop body that rebuilds an
+        # argument-independent table from iota and gathers one row by a
+        # dynamic index.  The fold pass evaluates the table once at lower
+        # time; the gather stays dynamic.
+        ("fold: invariant table in a scan body",
+         lambda h, idx: jax.lax.scan(
+             lambda c, i: (c + jnp.take(
+                 jnp.sin(jnp.arange(64.0, dtype=f).reshape(8, 8) * 0.1) ** 2,
+                 i, axis=0), None),
+             h, idx)[0],
+         [_rand((8,), 94), np.array([0, 3, 7, 2, 5], np.int32)], *F32),
+        # ...the rope spelling: a complex frequency table, one row applied
+        # per step (complex fold path: make_complex, complex exp, real/imag).
+        ("fold: complex rope table in a scan body",
+         lambda h, idx: jax.lax.scan(
+             lambda c, i: (c * jnp.real(jnp.take(
+                 jnp.exp(1j * (jnp.arange(64.0, dtype=f)[:, None]
+                               / (10000.0 ** (jnp.arange(8.0, dtype=f)
+                                              / 8.0))[None, :])),
+                 i, axis=0)) + 0.1, None),
+             h, idx)[0],
+         [_rand((8,), 95), np.array([1, 9, 33], np.int32)], *F32),
+        # A rank-0 f32 whose value does not round-trip through %.7g: the
+        # folded payload must take the one-element-buffer form so a compiled
+        # graph cannot bake it as a lossy literal.
+        ("fold: rank-0 f32 in a loop body",
+         lambda h, idx: jax.lax.scan(
+             lambda c, i: (c * (jnp.sin(jnp.float32(0.3)) + 1.5)
+                           + i.astype(f), None), h, idx)[0],
+         [_rand((6,), 96), np.arange(4, dtype=np.int32)], *F32),
+        # A body whose CARRY is purely constant: the payload crosses the loop
+        # and reaches @main's outputs, where the no-alias copy rule must see
+        # the constant-view taint behind it.
+        ("fold: constant carry crosses the loop",
+         lambda h, idx: jax.lax.scan(
+             lambda c, i: (jnp.cos(jnp.arange(6.0, dtype=f)) * 2.0, None),
+             h, idx)[0],
+         [_rand((6,), 97), np.arange(3, dtype=np.int32)], *F32),
+        # A multi-result const entry (top_k) with only one result read across
+        # the fold boundary.
+        ("fold: multi-result const top_k in a body",
+         lambda h, idx: jax.lax.scan(
+             lambda c, i: (c + jax.lax.top_k(
+                 jnp.sin(jnp.arange(16.0, dtype=f)), 4)[0][i % 4], None),
+             h, idx)[0],
+         [_rand((2,), 98), np.arange(3, dtype=np.int32)], *F32),
+
         # selection
         ("select / compare / clamp",
          lambda x: jnp.where(x > 0, jnp.clip(x, -1.0, 1.0), -x),
@@ -2882,7 +2939,259 @@ def _module_cases():
          [_rand((4,), 261)]),
         ("async collectives (start/done)", _ASYNC_COLLECTIVES,
          [_rand((4,), 262), _rand((4, 4), 263)]),
+        # P30: the fused-recognizer fingerprints, exactly as maxtext spells
+        # them (metal_norm.cc / metal_mla.cc); the CPU runs the literal
+        # chains.  f32, so the fused-vs-literal difference stays at the
+        # 1e-6 band this section compares at.
+        ("rms norm fingerprint", _RMS_NORM_FORM,
+         [_rand((2, 1, 8), 264), _rand((8,), 265)]),
+        ("mla two-span decode attention", _MLA_TWO_SPAN,
+         [_rand((1, 1, 2, 4), 266) * 0.5, _rand((1, 4, 2, 4), 267) * 0.5,
+          _rand((1, 4, 2, 4), 268) * 0.5,
+          np.array([[1, 0, 1, 1]], np.int32),
+          _rand((1, 2, 2, 4), 269) * 0.5, _rand((1, 2, 2, 4), 270) * 0.5,
+          np.array([[1, 1]], np.int32)]),
     ]
+
+
+# P30: the RMS-norm fingerprint exactly as maxtext/flax spell it (upcast
+# omitted: the f32 form), through metal_norm.cc's rewrite on metal and the
+# literal chain on CPU.
+_RMS_NORM_FORM = """
+module @rms_norm_form {
+  func.func public @main(%x: tensor<2x1x8xf32>, %w: tensor<8xf32>)
+      -> tensor<2x1x8xf32> {
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sq = stablehlo.multiply %x, %x : tensor<2x1x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<2x1x8xf32>, tensor<f32>) -> tensor<2x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<2x1xf32>) -> tensor<2x1x1xf32>
+    %b5 = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<2x1x1xf32>
+    %div = stablehlo.divide %b4, %b5 : tensor<2x1x1xf32>
+    %b7 = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<2x1x1xf32>
+    %pe = stablehlo.add %div, %b7 : tensor<2x1x1xf32>
+    %rs = stablehlo.rsqrt %pe : tensor<2x1x1xf32>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<2x1x1xf32>) -> tensor<2x1x8xf32>
+    %y = stablehlo.multiply %x, %b10 : tensor<2x1x8xf32>
+    %zv = stablehlo.broadcast_in_dim %zero, dims = []
+        : (tensor<f32>) -> tensor<8xf32>
+    %wp = stablehlo.add %w, %zv : tensor<8xf32>
+    %dot = stablehlo.dot_general %wp, %y,
+        batching_dims = [0] x [2], contracting_dims = [] x []
+        : (tensor<8xf32>, tensor<2x1x8xf32>) -> tensor<8x2x1xf32>
+    %out = stablehlo.transpose %dot, dims = [1, 2, 0]
+        : (tensor<8x2x1xf32>) -> tensor<2x1x8xf32>
+    return %out : tensor<2x1x8xf32>
+  }
+}
+"""
+
+# P30: maxtext's MLA multi-span decode attention, exactly as the captured
+# row-10 module spells it (f32, tiny dims), through metal_mla.cc's fused
+# rewrite on metal and the literal two-span combine on CPU.
+_MLA_TWO_SPAN = """
+module @mla_two_span {
+  func.func public @main(%q: tensor<1x1x2x4xf32>,
+      %kp: tensor<1x4x2x4xf32>, %vp: tensor<1x4x2x4xf32>,
+      %sp: tensor<1x4xi32>,
+      %ka: tensor<1x2x2x4xf32>, %va: tensor<1x2x2x4xf32>,
+      %sa: tensor<1x2xi32>) -> tensor<1x1x2x4xf32> {
+    %one = stablehlo.constant dense<1> : tensor<i32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %neg = stablehlo.constant dense<-2.38197633E+38> : tensor<f32>
+    %half = stablehlo.constant dense<-1.19098816E+38> : tensor<f32>
+    %ninf = stablehlo.constant dense<0xFF800000> : tensor<f32>
+    %q5 = stablehlo.reshape %q
+        : (tensor<1x1x2x4xf32>) -> tensor<1x1x2x1x4xf32>
+
+    %d1p = stablehlo.dot_general %kp, %q5,
+        batching_dims = [0, 2] x [0, 2], contracting_dims = [3] x [4]
+        : (tensor<1x4x2x4xf32>, tensor<1x1x2x1x4xf32>)
+        -> tensor<1x2x4x1x1xf32>
+    %scp = stablehlo.transpose %d1p, dims = [0, 1, 4, 3, 2]
+        : (tensor<1x2x4x1x1xf32>) -> tensor<1x2x1x1x4xf32>
+    %sbp = stablehlo.broadcast_in_dim %sp, dims = [0, 4]
+        : (tensor<1x4xi32>) -> tensor<1x1x1x1x4xi32>
+    %obp = stablehlo.broadcast_in_dim %one, dims = []
+        : (tensor<i32>) -> tensor<1x1x1x1x4xi32>
+    %eqp = stablehlo.compare EQ, %sbp, %obp, SIGNED
+        : (tensor<1x1x1x1x4xi32>, tensor<1x1x1x1x4xi32>)
+        -> tensor<1x1x1x1x4xi1>
+    %w16p = func.call @mla_w16p(%eqp, %zero, %neg)
+        : (tensor<1x1x1x1x4xi1>, tensor<f32>, tensor<f32>)
+        -> tensor<1x1x1x1x4xf32>
+    %thp = stablehlo.broadcast_in_dim %half, dims = []
+        : (tensor<f32>) -> tensor<1x1x1x1x4xf32>
+    %gep = stablehlo.compare GE, %w16p, %thp, FLOAT
+        : (tensor<1x1x1x1x4xf32>, tensor<1x1x1x1x4xf32>)
+        -> tensor<1x1x1x1x4xi1>
+    %mkp = func.call @mla_w17p(%gep, %scp, %neg)
+        : (tensor<1x1x1x1x4xi1>, tensor<1x2x1x1x4xf32>, tensor<f32>)
+        -> tensor<1x2x1x1x4xf32>
+    %m4p = stablehlo.reshape %mkp
+        : (tensor<1x2x1x1x4xf32>) -> tensor<1x2x1x4xf32>
+    %rmp = stablehlo.reduce(%m4p init: %ninf) applies stablehlo.maximum
+        across dimensions = [3]
+        : (tensor<1x2x1x4xf32>, tensor<f32>) -> tensor<1x2x1xf32>
+    %bmp = stablehlo.broadcast_in_dim %rmp, dims = [0, 1, 2]
+        : (tensor<1x2x1xf32>) -> tensor<1x2x1x1xf32>
+    %bm4p = stablehlo.broadcast_in_dim %bmp, dims = [0, 1, 2, 3]
+        : (tensor<1x2x1x1xf32>) -> tensor<1x2x1x4xf32>
+    %sup = stablehlo.subtract %m4p, %bm4p : tensor<1x2x1x4xf32>
+    %exp = stablehlo.exponential %sup : tensor<1x2x1x4xf32>
+    %rsp = stablehlo.reduce(%exp init: %zero) applies stablehlo.add
+        across dimensions = [3]
+        : (tensor<1x2x1x4xf32>, tensor<f32>) -> tensor<1x2x1xf32>
+    %bsp = stablehlo.broadcast_in_dim %rsp, dims = [0, 1, 2]
+        : (tensor<1x2x1xf32>) -> tensor<1x2x1x1xf32>
+    %mtp = stablehlo.transpose %bmp, dims = [0, 2, 1, 3]
+        : (tensor<1x2x1x1xf32>) -> tensor<1x1x2x1xf32>
+    %ltp = stablehlo.transpose %bsp, dims = [0, 2, 1, 3]
+        : (tensor<1x2x1x1xf32>) -> tensor<1x1x2x1xf32>
+    %e5p = stablehlo.reshape %exp
+        : (tensor<1x2x1x4xf32>) -> tensor<1x2x1x1x4xf32>
+    %d2p = stablehlo.dot_general %vp, %e5p,
+        batching_dims = [0, 2] x [0, 1], contracting_dims = [1] x [4]
+        : (tensor<1x4x2x4xf32>, tensor<1x2x1x1x4xf32>)
+        -> tensor<1x2x4x1x1xf32>
+    %otp = stablehlo.transpose %d2p, dims = [0, 4, 1, 3, 2]
+        : (tensor<1x2x4x1x1xf32>) -> tensor<1x1x2x1x4xf32>
+    %op = stablehlo.reshape %otp
+        : (tensor<1x1x2x1x4xf32>) -> tensor<1x1x2x4xf32>
+
+    %d1a = stablehlo.dot_general %ka, %q5,
+        batching_dims = [0, 2] x [0, 2], contracting_dims = [3] x [4]
+        : (tensor<1x2x2x4xf32>, tensor<1x1x2x1x4xf32>)
+        -> tensor<1x2x2x1x1xf32>
+    %sca = stablehlo.transpose %d1a, dims = [0, 1, 4, 3, 2]
+        : (tensor<1x2x2x1x1xf32>) -> tensor<1x2x1x1x2xf32>
+    %sba = stablehlo.broadcast_in_dim %sa, dims = [0, 4]
+        : (tensor<1x2xi32>) -> tensor<1x1x1x1x2xi32>
+    %oba = stablehlo.broadcast_in_dim %one, dims = []
+        : (tensor<i32>) -> tensor<1x1x1x1x2xi32>
+    %eqa = stablehlo.compare EQ, %sba, %oba, SIGNED
+        : (tensor<1x1x1x1x2xi32>, tensor<1x1x1x1x2xi32>)
+        -> tensor<1x1x1x1x2xi1>
+    %w16a = func.call @mla_w16a(%eqa, %zero, %neg)
+        : (tensor<1x1x1x1x2xi1>, tensor<f32>, tensor<f32>)
+        -> tensor<1x1x1x1x2xf32>
+    %tha = stablehlo.broadcast_in_dim %half, dims = []
+        : (tensor<f32>) -> tensor<1x1x1x1x2xf32>
+    %gea = stablehlo.compare GE, %w16a, %tha, FLOAT
+        : (tensor<1x1x1x1x2xf32>, tensor<1x1x1x1x2xf32>)
+        -> tensor<1x1x1x1x2xi1>
+    %mka = func.call @mla_w17a(%gea, %sca, %neg)
+        : (tensor<1x1x1x1x2xi1>, tensor<1x2x1x1x2xf32>, tensor<f32>)
+        -> tensor<1x2x1x1x2xf32>
+    %m4a = stablehlo.reshape %mka
+        : (tensor<1x2x1x1x2xf32>) -> tensor<1x2x1x2xf32>
+    %rma = stablehlo.reduce(%m4a init: %ninf) applies stablehlo.maximum
+        across dimensions = [3]
+        : (tensor<1x2x1x2xf32>, tensor<f32>) -> tensor<1x2x1xf32>
+    %bma = stablehlo.broadcast_in_dim %rma, dims = [0, 1, 2]
+        : (tensor<1x2x1xf32>) -> tensor<1x2x1x1xf32>
+    %bm4a = stablehlo.broadcast_in_dim %bma, dims = [0, 1, 2, 3]
+        : (tensor<1x2x1x1xf32>) -> tensor<1x2x1x2xf32>
+    %sua = stablehlo.subtract %m4a, %bm4a : tensor<1x2x1x2xf32>
+    %exa = stablehlo.exponential %sua : tensor<1x2x1x2xf32>
+    %rsa = stablehlo.reduce(%exa init: %zero) applies stablehlo.add
+        across dimensions = [3]
+        : (tensor<1x2x1x2xf32>, tensor<f32>) -> tensor<1x2x1xf32>
+    %bsa = stablehlo.broadcast_in_dim %rsa, dims = [0, 1, 2]
+        : (tensor<1x2x1xf32>) -> tensor<1x2x1x1xf32>
+    %mta = stablehlo.transpose %bma, dims = [0, 2, 1, 3]
+        : (tensor<1x2x1x1xf32>) -> tensor<1x1x2x1xf32>
+    %lta = stablehlo.transpose %bsa, dims = [0, 2, 1, 3]
+        : (tensor<1x2x1x1xf32>) -> tensor<1x1x2x1xf32>
+    %e5a = stablehlo.reshape %exa
+        : (tensor<1x2x1x2xf32>) -> tensor<1x2x1x1x2xf32>
+    %d2a = stablehlo.dot_general %va, %e5a,
+        batching_dims = [0, 2] x [0, 1], contracting_dims = [1] x [4]
+        : (tensor<1x2x2x4xf32>, tensor<1x2x1x1x2xf32>)
+        -> tensor<1x2x4x1x1xf32>
+    %ota = stablehlo.transpose %d2a, dims = [0, 4, 1, 3, 2]
+        : (tensor<1x2x4x1x1xf32>) -> tensor<1x1x2x1x4xf32>
+    %oa = stablehlo.reshape %ota
+        : (tensor<1x1x2x1x4xf32>) -> tensor<1x1x2x4xf32>
+
+    %m = stablehlo.maximum %mtp, %mta : tensor<1x1x2x1xf32>
+    %dp = stablehlo.subtract %mtp, %m : tensor<1x1x2x1xf32>
+    %e1p = stablehlo.exponential %dp : tensor<1x1x2x1xf32>
+    %tp = stablehlo.multiply %e1p, %ltp : tensor<1x1x2x1xf32>
+    %zt = stablehlo.broadcast_in_dim %zero, dims = []
+        : (tensor<f32>) -> tensor<1x1x2x1xf32>
+    %s1 = stablehlo.add %zt, %tp : tensor<1x1x2x1xf32>
+    %da = stablehlo.subtract %mta, %m : tensor<1x1x2x1xf32>
+    %e1a = stablehlo.exponential %da : tensor<1x1x2x1xf32>
+    %ta = stablehlo.multiply %e1a, %lta : tensor<1x1x2x1xf32>
+    %l = stablehlo.add %s1, %ta : tensor<1x1x2x1xf32>
+    %dp2 = stablehlo.subtract %mtp, %m : tensor<1x1x2x1xf32>
+    %e2p = stablehlo.exponential %dp2 : tensor<1x1x2x1xf32>
+    %wp = stablehlo.divide %e2p, %l : tensor<1x1x2x1xf32>
+    %wbp = stablehlo.broadcast_in_dim %wp, dims = [0, 1, 2, 3]
+        : (tensor<1x1x2x1xf32>) -> tensor<1x1x2x4xf32>
+    %wsp = stablehlo.multiply %wbp, %op : tensor<1x1x2x4xf32>
+    %zo = stablehlo.broadcast_in_dim %zero, dims = []
+        : (tensor<f32>) -> tensor<1x1x2x4xf32>
+    %acc = stablehlo.add %zo, %wsp : tensor<1x1x2x4xf32>
+    %da2 = stablehlo.subtract %mta, %m : tensor<1x1x2x1xf32>
+    %e2a = stablehlo.exponential %da2 : tensor<1x1x2x1xf32>
+    %wa = stablehlo.divide %e2a, %l : tensor<1x1x2x1xf32>
+    %wba = stablehlo.broadcast_in_dim %wa, dims = [0, 1, 2, 3]
+        : (tensor<1x1x2x1xf32>) -> tensor<1x1x2x4xf32>
+    %wsa = stablehlo.multiply %wba, %oa : tensor<1x1x2x4xf32>
+    %root = stablehlo.add %acc, %wsa : tensor<1x1x2x4xf32>
+    return %root : tensor<1x1x2x4xf32>
+  }
+  func.func private @mla_w16p(%p: tensor<1x1x1x1x4xi1>, %t: tensor<f32>,
+      %f: tensor<f32>) -> tensor<1x1x1x1x4xf32> {
+    %bt = stablehlo.broadcast_in_dim %t, dims = []
+        : (tensor<f32>) -> tensor<1x1x1x1x4xf32>
+    %bf = stablehlo.broadcast_in_dim %f, dims = []
+        : (tensor<f32>) -> tensor<1x1x1x1x4xf32>
+    %s = stablehlo.select %p, %bt, %bf
+        : tensor<1x1x1x1x4xi1>, tensor<1x1x1x1x4xf32>
+    return %s : tensor<1x1x1x1x4xf32>
+  }
+  func.func private @mla_w17p(%p: tensor<1x1x1x1x4xi1>,
+      %sc: tensor<1x2x1x1x4xf32>, %f: tensor<f32>) -> tensor<1x2x1x1x4xf32> {
+    %bp = stablehlo.broadcast_in_dim %p, dims = [0, 1, 2, 3, 4]
+        : (tensor<1x1x1x1x4xi1>) -> tensor<1x2x1x1x4xi1>
+    %bf = stablehlo.broadcast_in_dim %f, dims = []
+        : (tensor<f32>) -> tensor<1x2x1x1x4xf32>
+    %s = stablehlo.select %bp, %sc, %bf
+        : tensor<1x2x1x1x4xi1>, tensor<1x2x1x1x4xf32>
+    return %s : tensor<1x2x1x1x4xf32>
+  }
+  func.func private @mla_w16a(%p: tensor<1x1x1x1x2xi1>, %t: tensor<f32>,
+      %f: tensor<f32>) -> tensor<1x1x1x1x2xf32> {
+    %bt = stablehlo.broadcast_in_dim %t, dims = []
+        : (tensor<f32>) -> tensor<1x1x1x1x2xf32>
+    %bf = stablehlo.broadcast_in_dim %f, dims = []
+        : (tensor<f32>) -> tensor<1x1x1x1x2xf32>
+    %s = stablehlo.select %p, %bt, %bf
+        : tensor<1x1x1x1x2xi1>, tensor<1x1x1x1x2xf32>
+    return %s : tensor<1x1x1x1x2xf32>
+  }
+  func.func private @mla_w17a(%p: tensor<1x1x1x1x2xi1>,
+      %sc: tensor<1x2x1x1x2xf32>, %f: tensor<f32>) -> tensor<1x2x1x1x2xf32> {
+    %bp = stablehlo.broadcast_in_dim %p, dims = [0, 1, 2, 3, 4]
+        : (tensor<1x1x1x1x2xi1>) -> tensor<1x2x1x1x2xi1>
+    %bf = stablehlo.broadcast_in_dim %f, dims = []
+        : (tensor<f32>) -> tensor<1x2x1x1x2xf32>
+    %s = stablehlo.select %bp, %sc, %bf
+        : tensor<1x2x1x1x2xi1>, tensor<1x2x1x1x2xf32>
+    return %s : tensor<1x2x1x1x2xf32>
+  }
+}
+"""
 
 
 def _run_module(text, args):

@@ -333,6 +333,62 @@ struct StackedDotMatch {
 };
 
 // --------------------------------------------------------------------------
+// multi-span decode attention (metal_mla.cc): maxtext's MLA decode
+// --------------------------------------------------------------------------
+
+// maxtext's MLA decode attention computes each cache span (prefill,
+// autoregressive) as a separate masked softmax with running max/sum, then
+// joins them with the flash-attention renormalization:
+//   m = max(m_p, m_ar);  l = exp(m_p-m)*l_p + exp(m_ar-m)*l_ar
+//   out = (exp(m_p-m)/l)*o_p + (exp(m_ar-m)/l)*o_ar
+// which IS the softmax over the concatenated scores.  The rewrite emits
+// concat(K), concat(V), one additive mask from the segment ids, and ONE
+// `fast::scaled_dot_product_attention` — ~80 tape entries per layer become
+// one, and the two-dot chain becomes the fused decode kernel (the vendored
+// MLX supports the 192/128 MLA head geometry in its vector kernel).  The
+// probabilities move from the literal bf16 max-subtract/exp chain into the
+// kernel's f32 arithmetic: same class of reduction-order change as any fused
+// attention, tolerance-level vs CPU, greedy near-ties may flip.
+struct MlaSpan {
+  mlir::Value k;    // [B, T, H, D], as the scores dot read it
+  mlir::Value v;    // [B, T, H, Dv]
+  mlir::Value seg;  // [B, T] integer segment ids
+  int64_t T = 0;
+};
+
+struct MlaMatch {
+  mlir::Operation* root = nullptr;  // the final combine add, [B, 1, H, Dv]
+  mlir::Value q;                    // [B, 1, H, D], pre-scaled by the graph
+  std::vector<MlaSpan> spans;
+  int64_t B = 0, H = 0, D = 0, Dv = 0;
+  int64_t seg_val = 1;              // the id the mask compares EQ against
+  double mask_true = 0.0;           // the additive mask's two values
+  double mask_false = 0.0;          // (0 and the -2.38e38 sentinel)
+  int dtype = 0, out_dtype = 0;     // tape dtype codes
+  std::vector<mlir::Operation*> ops;  // the ops this match absorbs
+  std::string name;
+};
+
+// --------------------------------------------------------------------------
+// rms norm (metal_norm.cc): the spelled-out root-mean-square norm
+// --------------------------------------------------------------------------
+
+// jax spells one RMS norm as ~13 ops (upcast, square, sum/N, +eps, rsqrt,
+// scale, downcast, batching-dot weight apply, transpose); the rewrite is
+// MLX's fused `fast::rms_norm(x, w, eps)`, which accumulates in f32 exactly
+// as the chain does.  One 1-ULP-class difference: the chain rounds the
+// normalized value to bf16 BEFORE the weight multiply, the kernel rounds
+// once at the end.
+struct RmsNormMatch {
+  mlir::Operation* root = nullptr;  // the weight-apply transpose
+  mlir::Value x;                    // [.., N], the normed input
+  mlir::Value w;                    // [N], the learned scale ("+0" peeled)
+  double eps = 0.0;
+  std::vector<mlir::Operation*> ops;
+  std::string name;
+};
+
+// --------------------------------------------------------------------------
 // the plan
 // --------------------------------------------------------------------------
 
@@ -342,6 +398,8 @@ struct RewritePlan {
   std::vector<std::unique_ptr<MoeMatch>> moe;
   std::vector<std::unique_ptr<RaggedMatch>> ragged;
   std::vector<std::unique_ptr<StackedDotMatch>> stacked;
+  std::vector<std::unique_ptr<MlaMatch>> mla;
+  std::vector<std::unique_ptr<RmsNormMatch>> norm;
 
   // Ops a recognizer absorbed: no entry, no slot, never executed.
   llvm::DenseSet<mlir::Operation*> skip;
@@ -351,6 +409,8 @@ struct RewritePlan {
   llvm::DenseMap<mlir::Operation*, MoeMatch*> moe_roots;
   llvm::DenseMap<mlir::Operation*, RaggedMatch*> ragged_roots;
   llvm::DenseMap<mlir::Operation*, StackedDotMatch*> stacked_roots;
+  llvm::DenseMap<mlir::Operation*, MlaMatch*> mla_roots;
+  llvm::DenseMap<mlir::Operation*, RmsNormMatch*> norm_roots;
 
   // The packed arrays, in the order the tape's trailing inputs take them.
   std::vector<mx::array> packs;
@@ -362,7 +422,8 @@ struct RewritePlan {
 
   bool empty() const {
     return qmm_roots.empty() && sdpa_roots.empty() && moe_roots.empty() &&
-           ragged_roots.empty() && stacked_roots.empty();
+           ragged_roots.empty() && stacked_roots.empty() &&
+           mla_roots.empty() && norm_roots.empty();
   }
   // Recompute `skip` and the root maps from the matches that are still live.
   void rebuild();
@@ -438,10 +499,19 @@ void AnalyzeMoe(mlir::func::FuncOp fn, RewritePlan* plan);
 // `AnalyzeSdpa`.  METALJAX_RAGGED=0 disables it.
 void AnalyzeRagged(mlir::func::FuncOp fn, RewritePlan* plan);
 
-// The stacked-weight dots (metal_stacked.cc).  Runs LAST and claims only
-// dots no other recognizer did.  Purely structural, like AnalyzeRagged.
-// METALJAX_STACKED_DOT=0 disables it.
+// The stacked-weight dots (metal_stacked.cc).  Runs after AnalyzeRagged and
+// claims only dots no other recognizer did.  Purely structural, like
+// AnalyzeRagged.  METALJAX_STACKED_DOT=0 disables it.
 void AnalyzeStackedDot(mlir::func::FuncOp fn, RewritePlan* plan);
+
+// The multi-span decode attentions (metal_mla.cc).  Roots at the combine
+// ADD, which no dot-rooted recognizer claims.  Purely structural.
+// METALJAX_MLA=0 disables it.
+void AnalyzeMla(mlir::func::FuncOp fn, RewritePlan* plan);
+
+// The RMS norms (metal_norm.cc).  Runs LAST; roots at the weight-apply
+// transpose.  Purely structural.  METALJAX_NORM=0 disables it.
+void AnalyzeNorm(mlir::func::FuncOp fn, RewritePlan* plan);
 
 // The first-execute check of a match's router, on the buffers of this
 // execute: the scores must BE the top-k weights scattered at the matched

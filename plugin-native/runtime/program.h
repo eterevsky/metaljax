@@ -134,6 +134,15 @@ enum Op : int {
   // `layer` straight out of the stack (a strided view; MLX's dynamic slice
   // is a copy because the offset is data).
   kStackedDot,
+  // The multi-span decode attention (metal_mla.cc): maxtext's MLA decode —
+  // per-cache-span masked softmax partials joined by the flash-style
+  // renormalization — becomes concat + ONE fused
+  // `fast::scaled_dot_product_attention` over the joined spans (the joint
+  // softmax over concatenated scores is what the combine computes).
+  kMlaSdpa,
+  // The RMS norm (metal_norm.cc): jax's spelled-out root-mean-square norm
+  // becomes MLX's fused `fast::rms_norm(x, w, eps)`.
+  kRmsNorm,
   // M5b: a counted loop msl_scan planned into one generated Metal kernel,
   // and a site where the handler computes on the HOST. Both were lowered by
   // src/metaljax/tape.py; the pseudo-names below are how it asked for them.

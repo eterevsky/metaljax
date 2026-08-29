@@ -814,6 +814,94 @@ const int64_t kCompileBytesMb = EnvInt("METALJAX_COMPILE_BYTES_MB", 65536);
 const int64_t kCompileBytes =
     std::max<int64_t>(kCompileBytesMb, 0) * (int64_t{1} << 20);
 
+// P30 (the row-10 op-count campaign): the three tape post-passes.  CSE and
+// DCE run over every frame; constant folding only inside REGION frames --
+// a while body REPLAYS its tape every iteration, so an argument-independent
+// subgraph there (maxtext rebuilds its whole [163840, 32] rope table from
+// iota twice per layer) is paid 2 x 26 times per decoded token, while a
+// @main runs once and a 0-arg program (a checkpoint restore) is nothing BUT
+// argument-independent ops that must not be materialized at lower time.
+const bool kCsePass = EnvOn("METALJAX_CSE");
+const bool kFoldPass = EnvOn("METALJAX_FOLD");
+const int64_t kFoldMaxMb = EnvInt("METALJAX_FOLD_MAX_MB", 96);
+const int64_t kFoldTotalMb = EnvInt("METALJAX_FOLD_TOTAL_MB", 256);
+
+// An entry two structurally identical copies of which always hold the same
+// value -- what CSE may merge and DCE may drop when unread.  Control flow and
+// host calls have effects (a while reads its condition on the host); rng,
+// scatter and fft are excluded for caution, not correctness: float scatter-add
+// is order-nondeterministic on GPU (merging two would be LEGAL -- any one
+// execution's value serves both readers -- but keeping them apart preserves
+// the exact per-run behaviour the differential tests recorded), and fft has
+// the async-eval race history (CLAUDE.md item 20).
+bool PurePassOp(int op) {
+  switch (op) {
+    case kWhile:
+    case kIf:
+    case kCase:
+    case kMslScan:
+    case kHostCall:
+    case kToken:
+    case kRng:
+    case kScatter:
+    case kSelectAndScatter:
+    case kGenericReduce:
+    case kFft:
+      return false;
+    default:
+      return true;
+  }
+}
+
+// ...and the subset the constant-folding pass may EVALUATE at lower time.
+// The recognizer emits read packed weights and were rewritten for their
+// runtime behaviour, conv is heavy machinery a constant program never holds
+// in practice, and kConstant is the leaf the pass starts from rather than
+// something it folds.
+bool FoldableOp(int op) {
+  if (!PurePassOp(op)) return false;
+  switch (op) {
+    case kQmm:
+    case kSdpa:
+    case kSdpaMask:
+    case kMoeEIdx:
+    case kMoeTIdx:
+    case kMoeGather:
+    case kMoeConcat:
+    case kMoeView:
+    case kMoeDot:
+    case kMoeTail:
+    case kRaggedDot:
+    case kStackedDot:
+    case kApproxTopK:
+    case kConv:
+    case kConstant:
+      return false;
+    default:
+      return true;
+  }
+}
+
+// The tape-level image of `IsViewOp`: the ops whose MLX handler may hand back
+// a view of an operand.  What the folded-constant taint has to ride through so
+// the output-copy rule (XLA's no-alias contract) still sees a payload behind a
+// reshape.
+bool ViewOpcode(int op) {
+  switch (op) {
+    case kReshape:
+    case kTranspose:
+    case kConvert:
+    case kSlice:
+    case kBroadcastInDim:
+    case kConcatenate:
+    case kDynamicSlice:
+    case kBitcastConvert:
+      return true;
+    default:
+      return false;
+  }
+}
+
 std::string OpcodeName(int code) {
   for (const std::pair<std::string, int>& kv : opcodes())
     if (kv.second == code) return kv.first;
@@ -1340,6 +1428,10 @@ int64_t RootCostUnit(const RewritePlan& plan, mlir::Operation* op) {
       plan.ragged_roots.count(op) || plan.stacked_roots.count(op))
     return 2;
   if (plan.sdpa_roots.count(op)) return 3;
+  // The multi-span attention: one fused sdpa plus the span concats and the
+  // mask build.
+  if (plan.mla_roots.count(op)) return 6;
+  if (plan.norm_roots.count(op)) return 1;
   return 0;
 }
 
@@ -1430,6 +1522,16 @@ int64_t RootExtraBytes(const RewritePlan& plan, mlir::Operation* op) {
     // At most one reshaped copy of the activation; the stack is read as a
     // view and the helper's whole-layer slice copy is never made.
     return ValueBytes(sd->second->x);
+  }
+  auto ml = plan.mla_roots.find(op);
+  if (ml != plan.mla_roots.end() && ml->second != nullptr) {
+    // The concatenated K/V/mask copies (charged at 4 bytes/elem, loose in
+    // the safe direction); the scores the fused kernel absorbs are never
+    // written.
+    const MlaMatch& m = *ml->second;
+    int64_t rows = 0;
+    for (const MlaSpan& s : m.spans) rows += s.T;
+    return m.B * rows * (m.H * (m.D + m.Dv) + 2) * 4;
   }
   return 0;
 }
@@ -2007,6 +2109,19 @@ class Lowering {
                                    int npacks = 0);
   absl::StatusOr<Built> Finish(int nargs, const std::vector<int>& outputs);
 
+  // P30: the tape post-passes, run at the top of `Finish` before liveness.
+  // `CsePass` merges structurally identical pure entries (op, remapped ins,
+  // attrs) and rewrites every later reader; `FoldConstants` evaluates the
+  // argument-independent subgraphs of a REGION frame once, at lower time,
+  // and replaces them with payload constants (a while body replays its tape
+  // every iteration -- maxtext's decode body rebuilds two 41 MB rope tables
+  // from iota per layer, and this is what makes them cost one gather);
+  // `DcePass` drops pure entries nothing reads.  METALJAX_CSE=0 /
+  // METALJAX_FOLD=0 restore the literal tape exactly.
+  void CsePass(std::vector<int>& outputs);
+  void FoldConstants(std::vector<int>& outputs);
+  void DcePass(const std::vector<int>& outputs);
+
   // One region block as a sub-Program, lowered in a CHILD frame (tape.py's
   // `_region`).  `caps` are the capture slots in THIS frame, in the order
   // `free` names them; `taints` are the child's per-output taints, still in
@@ -2030,6 +2145,8 @@ class Lowering {
   absl::Status LowerMoe(mlir::Operation* op, const MoeMatch& m);
   absl::Status LowerRagged(mlir::Operation* op, const RaggedMatch& m);
   absl::Status LowerStackedDot(mlir::Operation* op, const StackedDotMatch& m);
+  absl::Status LowerMla(mlir::Operation* op, const MlaMatch& m);
+  absl::Status LowerRmsNorm(mlir::Operation* op, const RmsNormMatch& m);
   // One node of the pair-space plan, as one tape entry; `slots` holds the
   // slot each earlier node landed in.
   absl::StatusOr<int> LowerMoeNode(const MoeMatch& m, const MoeNode& node,
@@ -2292,6 +2409,37 @@ class Lowering {
     }
   };
   std::map<MaskKey, int> masks_;
+  // P30: one slot per distinct constant VALUE of this frame.  MLIR uniques a
+  // DenseElementsAttr by (value, type), so pointer equality here is value
+  // equality -- an inlined callee's constants (jax outlines `cumsum` and
+  // lowers it three times per layer) merge to one entry without ever reading
+  // the data.  Only consulted under METALJAX_CSE.
+  llvm::DenseMap<mlir::Attribute, int> const_slots_;
+  // ...and one slot per (splat constant, broadcast shape): a broadcast of a
+  // splat is itself a constant, and a splat's device form is a zero-stride
+  // view whatever its shape, so the pair lowers as ONE payload entry (the
+  // splat-broadcast fold in LowerOp's broadcast branch).
+  absl::flat_hash_map<std::string, int> splat_bcast_slots_;
+  // The payload behind every constant slot of this frame (refcounted views,
+  // not copies), for the splat-broadcast fold to build its view from.
+  absl::flat_hash_map<int, mx::array> const_payloads_;
+  // Payload arrays built as LAZY mx graphs (a splat's broadcast view), to be
+  // settled by ONE eval at the top of Finish.  Two reasons a payload must be
+  // a LEAF before it is stored on the tape: an unevaluated movement chain is
+  // traversed by mx::compile's fusion down to its one-element buffer, which
+  // `size() == 1 && !has_primitive()` then INLINES as a %.7g literal (the
+  // 1-ULP constant-baking bug, amplified ~400x by tan's pole in the
+  // ill-conditioned suite case); and a lazy node records the CREATING
+  // thread's stream, which `get_command_encoder` cannot resolve from another
+  // thread (metal_stream.cc binds a thread-unsafe stream per entering
+  // thread).  An evaluated view is a leaf: no primitive, no stream, and its
+  // logical size keeps it out of the scalar-inlining rule.
+  std::vector<mx::array> pending_payload_evals_;
+  // ...and whether this frame lowers a REGION block (LowerRegion sets it):
+  // the constant-folding pass only pays where a tape is REPLAYED, and a
+  // 0-arg @main (a checkpoint restore) must not be materialized at lower
+  // time.
+  bool region_ = false;
   std::vector<Pending> entries_;
   std::vector<std::string> calls_;   // callees currently being inlined
   // The two aliasing taints, consumed by the output-copy rule in `Run` and
@@ -3961,6 +4109,15 @@ absl::Status Lowering::LowerConstant(mlir::Operation* op) {
   if (!dense)
     return Decline("stablehlo.constant whose value is not a dense attribute");
 
+  // P30: one entry per distinct constant value (see `const_slots_`).
+  if (kCsePass) {
+    auto it = const_slots_.find(cst.getValue());
+    if (it != const_slots_.end()) {
+      Alias(op->getResult(0), it->second);
+      return absl::OkStatus();
+    }
+  }
+
   const mx::Dtype dt = *MxDtypeOf(type.getElementType());
   mx::Shape shape;
   int64_t numel = 1;
@@ -4059,6 +4216,11 @@ absl::Status Lowering::LowerConstant(mlir::Operation* op) {
     value = mx::broadcast_to(
         mx::reshape(OwnedArray(raw.data(), item, mx::Shape{1}, dt), unit),
         shape);
+    // Settled to a leaf before it is stored (see pending_payload_evals_): a
+    // lazy view records the lowering thread's stream, which another execute
+    // thread cannot resolve -- latent here since the splat path shipped,
+    // reachable whenever a numel>1 splat constant crosses threads.
+    pending_payload_evals_.push_back(value);
   } else {
     // Whatever is left holds at most one element (a splat of one, or a rank-0
     // value) or is a genuine dense blob, and in both cases the raw data is
@@ -4090,6 +4252,8 @@ absl::Status Lowering::LowerConstant(mlir::Operation* op) {
   const int op_code = OpcodeTable().at("stablehlo.constant");
   const int out = Bind(op->getResult(0));
   const_view_.insert(out);
+  if (kCsePass) const_slots_[cst.getValue()] = out;
+  const_payloads_.emplace(out, value);
   std::vector<int64_t> attrs;
   if (rank0_buffer) attrs.push_back(rank0_buffer);
   Emit(op_code, {}, {out}, std::move(attrs), std::move(value),
@@ -5180,6 +5344,7 @@ absl::StatusOr<Lowering::Region> Lowering::LowerRegion(mlir::Block& block) {
     out.caps.insert(out.caps.end(), pack_slots_.begin(), pack_slots_.end());
   }
   Lowering child(ctx_);
+  child.region_ = true;
   ASSIGN_OR_RETURN(Built built, child.LowerBlock(block, out.free, npacks));
   out.program = std::move(built.program);
   out.outputs = built.outputs;
@@ -5943,6 +6108,20 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
       RETURN_IF_ERROR(CheckValue(op->getResult(0)));
       return LowerStackedDot(op, *stacked->second);
     }
+    auto mla = ctx_->plan->mla_roots.find(op);
+    if (mla != ctx_->plan->mla_roots.end()) {
+      if (op->getNumResults() != 1)
+        return Decline("a recognizer root with several results");
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      return LowerMla(op, *mla->second);
+    }
+    auto norm = ctx_->plan->norm_roots.find(op);
+    if (norm != ctx_->plan->norm_roots.end()) {
+      if (op->getNumResults() != 1)
+        return Decline("a recognizer root with several results");
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      return LowerRmsNorm(op, *norm->second);
+    }
   }
 
   // Symbol-carrying calls are spliced in rather than lowered: both run the
@@ -6065,6 +6244,66 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
   } else if (name == "stablehlo.transpose") {
     ASSIGN_OR_RETURN(attrs, LowerTranspose(op));
   } else if (name == "stablehlo.broadcast_in_dim") {
+    // P30: a broadcast of a SPLAT constant is itself a constant, and a
+    // splat's device form is a zero-stride view whatever its shape -- so the
+    // pair lowers as ONE payload entry instead of a constant plus a
+    // per-replay broadcast op (jax's loop bodies are full of
+    // `broadcast(splat)` mask and scale feeders; the source constant dies in
+    // DcePass when nothing else reads it).  The dims mapping is irrelevant
+    // for a uniform value.
+    if (kCsePass && !Narrowed(op->getResult(0)) &&
+        !Narrowed(op->getOperand(0))) {
+      auto cst = mlir::dyn_cast_or_null<mlir::stablehlo::ConstantOp>(
+          op->getOperand(0).getDefiningOp());
+      auto rt =
+          mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+      auto dense =
+          cst ? mlir::dyn_cast<mlir::DenseElementsAttr>(cst.getValue())
+              : mlir::DenseElementsAttr();
+      // Rank-0 and size-1 results stay with LowerConstant's literal rule
+      // (the %.7g baking hazard: a size-1 leaf is inlined into fused-kernel
+      // source); a size-1 broadcast saves nothing anyway.
+      int64_t out_numel = 1;
+      if (rt && rt.hasStaticShape())
+        for (int64_t d : rt.getShape()) out_numel *= d;
+      if (dense && rt && rt.hasStaticShape() && !rt.getShape().empty() &&
+          out_numel > 1 && dense.getNumElements() >= 1 &&
+          (dense.isSplat() || dense.getNumElements() == 1)) {
+        auto in_slot = Slot(op->getOperand(0));
+        if (in_slot.ok()) {
+          auto pl = const_payloads_.find(*in_slot);
+          if (pl != const_payloads_.end()) {
+            std::string key = absl::StrCat(
+                reinterpret_cast<uintptr_t>(cst.getValue().getAsOpaquePointer()));
+            mx::Shape shape;
+            for (int64_t d : rt.getShape()) {
+              shape.push_back(static_cast<mx::ShapeElem>(d));
+              absl::StrAppend(&key, ",", d);
+            }
+            auto hit = splat_bcast_slots_.find(key);
+            if (hit != splat_bcast_slots_.end()) {
+              Alias(op->getResult(0), hit->second);
+              return absl::OkStatus();
+            }
+            const mx::array& src = pl->second;
+            mx::array one = mx::reshape(
+                mx::slice(mx::reshape(src, {static_cast<mx::ShapeElem>(
+                                               src.size())}),
+                          {0}, {1}),
+                mx::Shape(shape.size(), 1));
+            mx::array view = mx::broadcast_to(one, shape);
+            pending_payload_evals_.push_back(view);
+            const int out = Bind(op->getResult(0));
+            const_view_.insert(out);
+            const_payloads_.emplace(out, view);
+            splat_bcast_slots_.emplace(std::move(key), out);
+            Emit(OpcodeTable().at("stablehlo.constant"), {}, {out}, {},
+                 std::move(view), ResultBytes(op));
+            return absl::OkStatus();
+          }
+        }
+      }
+    }
     ASSIGN_OR_RETURN(attrs, LowerBroadcastInDim(op));
   } else if (name == "stablehlo.slice") {
     ASSIGN_OR_RETURN(attrs, LowerSlice(op));
@@ -6131,7 +6370,11 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
 int Lowering::AbsorbedSlot() {
   if (!absorbed_slot_.has_value()) {
     const int s = nslots_++;
-    Emit(kConstant, {}, {s}, {}, mx::zeros(mx::Shape{}, mx::uint8), 0);
+    mx::array zero = mx::zeros(mx::Shape{}, mx::uint8);
+    // Settled to a leaf like every stored payload (pending_payload_evals_):
+    // a lazy node carries the lowering thread's stream.
+    pending_payload_evals_.push_back(zero);
+    Emit(kConstant, {}, {s}, {}, std::move(zero), 0);
     const_view_.insert(s);
     absorbed_slot_ = s;
   }
@@ -6342,6 +6585,50 @@ absl::Status Lowering::LowerStackedDot(mlir::Operation* op,
   attrs.insert(attrs.end(), m.out_shape.begin(), m.out_shape.end());
   Emit(opcode, {x, w, layer}, {Bind(op->getResult(0))}, std::move(attrs),
        std::nullopt, ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// The multi-span decode attention (metal_mla.cc).  ins [q, then per span
+// k, v, seg]; attrs [B, H, D, Dv, nspans, T..., seg_val, dtype, out_dtype];
+// fattrs [mask_true, mask_false].
+absl::Status Lowering::LowerMla(mlir::Operation* op, const MlaMatch& m) {
+  RETURN_IF_ERROR(CheckValue(m.q));
+  ASSIGN_OR_RETURN(int q, Slot(m.q));
+  std::vector<int> ins{q};
+  for (const MlaSpan& s : m.spans) {
+    for (mlir::Value v : {s.k, s.v, s.seg}) RETURN_IF_ERROR(CheckValue(v));
+    ASSIGN_OR_RETURN(int k, Slot(s.k));
+    ASSIGN_OR_RETURN(int v, Slot(s.v));
+    ASSIGN_OR_RETURN(int seg, Slot(s.seg));
+    ins.push_back(k);
+    ins.push_back(v);
+    ins.push_back(seg);
+  }
+  ASSIGN_OR_RETURN(int dtype, DtypeCode(m.q));
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.mla_sdpa"));
+  std::vector<int64_t> attrs{m.B, m.H, m.D, m.Dv,
+                             static_cast<int64_t>(m.spans.size())};
+  for (const MlaSpan& s : m.spans) attrs.push_back(s.T);
+  attrs.push_back(m.seg_val);
+  attrs.push_back(static_cast<int64_t>(dtype));
+  attrs.push_back(static_cast<int64_t>(out_code));
+  EmitF(opcode, std::move(ins), {Bind(op->getResult(0))}, std::move(attrs),
+        {m.mask_true, m.mask_false}, ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// The RMS norm (metal_norm.cc).  ins [x, w]; attrs [out_dtype];
+// fattrs [eps].
+absl::Status Lowering::LowerRmsNorm(mlir::Operation* op,
+                                    const RmsNormMatch& m) {
+  for (mlir::Value v : {m.x, m.w}) RETURN_IF_ERROR(CheckValue(v));
+  ASSIGN_OR_RETURN(int x, Slot(m.x));
+  ASSIGN_OR_RETURN(int w, Slot(m.w));
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.rms_norm"));
+  EmitF(opcode, {x, w}, {Bind(op->getResult(0))},
+        {static_cast<int64_t>(out_code)}, {m.eps}, ResultBytes(op));
   return absl::OkStatus();
 }
 
@@ -6557,8 +6844,334 @@ absl::Status Lowering::LowerMoe(mlir::Operation* op, const MoeMatch& m) {
 }
 
 // tape.py `_build`: the entries, their drop lists, and the Program.
+// P30: merge structurally identical pure entries.  One forward pass with a
+// slot remap applied as it goes, so chains collapse transitively: once two
+// constants share a slot, the iotas over them key equal, then the multiplies,
+// and maxtext's second 163840x32 rope table -- an exact copy of the first,
+// jax re-emits it per rope application -- follows its leaves into the first
+// one entry at a time, gather included.
+void Lowering::CsePass(std::vector<int>& outputs) {
+  if (!kCsePass || entries_.empty()) return;
+  std::vector<int> remap(nslots_);
+  for (int i = 0; i < nslots_; i++) remap[i] = i;
+  absl::flat_hash_map<std::string, size_t> seen;
+  std::vector<Pending> kept;
+  kept.reserve(entries_.size());
+  int64_t merged = 0;
+  for (Pending& e : entries_) {
+    for (int& s : e.ins) s = remap[s];
+    // Payload entries are excluded because a payload has no cheap identity
+    // here -- `LowerConstant` already merged constants by their uniqued
+    // attribute, which is the identity that matters.
+    const bool eligible = !e.payload.has_value() && e.regions.empty() &&
+                          !e.host && !e.msl && PurePassOp(e.op);
+    if (!eligible) {
+      kept.push_back(std::move(e));
+      continue;
+    }
+    std::string key;
+    key.reserve(24 + e.ins.size() * 4 + e.attrs.size() * 6);
+    absl::StrAppend(&key, e.op, "|");
+    for (int s : e.ins) absl::StrAppend(&key, s, ",");
+    absl::StrAppend(&key, "|");
+    for (int64_t a : e.attrs) absl::StrAppend(&key, a, ",");
+    absl::StrAppend(&key, "|");
+    for (double f : e.fattrs) {
+      uint64_t bits;
+      std::memcpy(&bits, &f, sizeof(bits));
+      absl::StrAppend(&key, bits, ",");
+    }
+    absl::StrAppend(&key, "|", e.regrid);
+    auto it = seen.find(key);
+    if (it == seen.end()) {
+      seen.emplace(std::move(key), kept.size());
+      kept.push_back(std::move(e));
+      continue;
+    }
+    const Pending& first = kept[it->second];
+    if (first.outs.size() != e.outs.size()) {  // same key implies same arity;
+      kept.push_back(std::move(e));            // stay safe anyway
+      continue;
+    }
+    for (size_t i = 0; i < e.outs.size(); i++)
+      remap[e.outs[i]] = first.outs[i];
+    merged++;
+  }
+  entries_ = std::move(kept);
+  for (int& s : outputs) s = remap[s];
+  if (kDebug && merged > 0)
+    std::fprintf(stderr, "[metaljax-native] cse: merged %lld entries\n",
+                 static_cast<long long>(merged));
+}
+
+// P30: evaluate the argument-independent subgraphs of a region frame once and
+// replace them with payload constants.  The classification walks only the
+// BOUNDARY -- const slots read by dynamic entries or returned: an entry there
+// becomes a payload unless it is already a constant, is a broadcast (whose
+// materialization would trade a zero-stride view for real bytes; its input
+// folds instead), or is over the byte caps (then ITS const inputs are the new
+// boundary).  Interior entries are never materialized: they run once, in a
+// throwaway Program, to produce the boundary's values.  Any evaluation
+// failure keeps the literal tape -- a correct slow program, never a wrong
+// fast one.
+void Lowering::FoldConstants(std::vector<int>& outputs) {
+  if (!kFoldPass || !region_ || entries_.empty()) return;
+  const int64_t max_bytes = std::max<int64_t>(kFoldMaxMb, 0) << 20;
+  const int64_t total_cap = std::max<int64_t>(kFoldTotalMb, 0) << 20;
+  const size_t n = entries_.size();
+  std::vector<char> is_const(nslots_, 0);
+  std::vector<char> centry(n, 0);
+  std::vector<int> def(nslots_, -1);
+  for (size_t i = 0; i < n; i++) {
+    const Pending& e = entries_[i];
+    for (int o : e.outs) def[o] = static_cast<int>(i);
+    if (e.op == kConstant) {
+      centry[i] = 1;
+      for (int o : e.outs) is_const[o] = 1;
+      continue;
+    }
+    if (!FoldableOp(e.op) || !e.regions.empty() || e.host || e.msl) continue;
+    bool all = true;
+    for (int s : e.ins) all = all && is_const[s] != 0;
+    if (!all) continue;  // an iota has no ins and is vacuously const
+    centry[i] = 1;
+    for (int o : e.outs) is_const[o] = 1;
+  }
+  // 0 unseen/interior, 1 keep, 2 fold, 3 queued.
+  std::vector<char> cls(n, 0);
+  std::vector<int> work;
+  int64_t total = 0;
+  auto consider = [&](int s) {
+    if (s < 0 || s >= nslots_ || !is_const[s]) return;
+    const int d = def[s];
+    if (d < 0 || cls[d] != 0) return;
+    cls[d] = 3;
+    work.push_back(d);
+  };
+  for (size_t i = 0; i < n; i++) {
+    if (centry[i]) continue;
+    for (int s : entries_[i].ins) consider(s);
+  }
+  for (int s : outputs) consider(s);
+  bool any = false;
+  while (!work.empty()) {
+    const int d = work.back();
+    work.pop_back();
+    const Pending& e = entries_[d];
+    if (e.op == kConstant || e.op == kBroadcastInDim || e.bytes > max_bytes ||
+        total + e.bytes > total_cap) {
+      cls[d] = 1;
+      for (int s : e.ins) consider(s);
+    } else {
+      cls[d] = 2;
+      total += e.bytes;
+      any = true;
+    }
+  }
+  if (!any) return;
+  // The payload slots, in entry order: fold-entry outs a kept entry reads or
+  // the block returns.
+  std::vector<char> needed(nslots_, 0);
+  auto boundary_read = [&](int s) {
+    if (s >= 0 && s < nslots_ && is_const[s] && def[s] >= 0 &&
+        cls[def[s]] == 2)
+      needed[s] = 1;
+  };
+  for (size_t i = 0; i < n; i++) {
+    if (centry[i] && cls[i] != 1) continue;
+    for (int s : entries_[i].ins) boundary_read(s);
+  }
+  for (int s : outputs) boundary_read(s);
+  std::vector<int> proots;
+  for (size_t i = 0; i < n; i++) {
+    if (!centry[i] || cls[i] == 1) continue;
+    for (int o : entries_[i].outs)
+      if (needed[o]) proots.push_back(o);
+  }
+  if (proots.empty()) return;
+  // Evaluate: every const entry backward-reachable from the roots, as its own
+  // Program (with drop lists, so the table's forty 41 MB intermediates die at
+  // their last use), settled by one blocking eval.
+  std::vector<mx::array> vals;
+  try {
+    std::vector<char> reach(n, 0);
+    std::vector<int> stack;
+    for (int s : proots) {
+      if (def[s] >= 0 && !reach[def[s]]) {
+        reach[def[s]] = 1;
+        stack.push_back(def[s]);
+      }
+    }
+    while (!stack.empty()) {
+      const int d = stack.back();
+      stack.pop_back();
+      for (int s : entries_[d].ins) {
+        const int p = def[s];
+        if (p >= 0 && !reach[p]) {
+          reach[p] = 1;
+          stack.push_back(p);
+        }
+      }
+    }
+    std::vector<size_t> order;
+    for (size_t i = 0; i < n; i++)
+      if (reach[i]) order.push_back(i);
+    absl::flat_hash_map<int, size_t> last;
+    for (size_t j = 0; j < order.size(); j++)
+      for (int s : entries_[order[j]].ins) last[s] = j;
+    for (size_t j = 0; j < order.size(); j++)
+      for (int s : entries_[order[j]].outs) last.emplace(s, j);
+    for (int s : proots) last.erase(s);
+    std::vector<std::vector<int>> drops(order.size());
+    for (const auto& kv : last) drops[kv.second].push_back(kv.first);
+    Program tmp(nslots_, 0);
+    for (size_t j = 0; j < order.size(); j++) {
+      const Pending& e = entries_[order[j]];
+      tmp.add(e.op, e.ins, e.outs, e.attrs, e.payload, drops[j], {}, e.bytes,
+              e.fattrs, nullptr, {}, e.regrid);
+    }
+    tmp.set_outputs(proots, {});
+    vals = tmp.run({});
+    mx::eval(vals);
+  } catch (const std::exception& ex) {
+    if (kDebug)
+      std::fprintf(stderr,
+                   "[metaljax-native] fold: evaluation failed (%s); keeping "
+                   "the literal tape\n",
+                   ex.what());
+    return;
+  }
+  // The scalar-inlining guard: mx::compile inlines a size-1 leaf into fused
+  // kernel source as a %.7g literal, which loses a ULP of any f32 that does
+  // not round-trip through 7 digits.  Rank-0 f32 takes LowerConstant's
+  // one-element-buffer form below; a size-1 payload of HIGHER rank has no
+  // such form, so a non-round-tripping one aborts the fold (the literal
+  // tape is correct, and the case is rare).  Complex is skipped on the same
+  // caution.
+  for (const mx::array& v : vals) {
+    if (v.size() != 1) continue;
+    if (v.dtype() == mx::complex64) {
+      if (kDebug)
+        std::fprintf(stderr,
+                     "[metaljax-native] fold: size-1 complex payload; "
+                     "keeping the literal tape\n");
+      return;
+    }
+    if (v.ndim() >= 1 && v.dtype() == mx::float32 &&
+        !RoundTripsAsLiteral(mx::array(v).item<float>())) {
+      if (kDebug)
+        std::fprintf(stderr,
+                     "[metaljax-native] fold: a size-1 f32 payload does not "
+                     "round-trip; keeping the literal tape\n");
+      return;
+    }
+  }
+  absl::flat_hash_map<int, mx::array> payload;
+  for (size_t i = 0; i < proots.size() && i < vals.size(); i++)
+    payload.emplace(proots[i], vals[i]);
+  std::vector<Pending> out;
+  out.reserve(n);
+  int64_t dropped = 0, made = 0;
+  for (size_t i = 0; i < n; i++) {
+    Pending& e = entries_[i];
+    if (!centry[i] || cls[i] == 1) {
+      out.push_back(std::move(e));
+      continue;
+    }
+    dropped++;
+    for (int o : e.outs) {
+      auto it = payload.find(o);
+      if (it == payload.end()) continue;
+      mx::array v = it->second;
+      std::vector<int64_t> attrs;
+      if (v.ndim() == 0 && v.dtype() == mx::float32 &&
+          !RoundTripsAsLiteral(v.item<float>())) {
+        // The rank-0 literal rule, exactly as LowerConstant applies it.
+        // Settled immediately: the reshape node would otherwise carry this
+        // thread's stream onto the tape.
+        v = mx::reshape(v, mx::Shape{1});
+        mx::eval(v);
+        attrs.push_back(1);
+      }
+      const int64_t bytes = static_cast<int64_t>(v.nbytes());
+      out.push_back(Pending{kConstant,
+                            {},
+                            {o},
+                            std::move(attrs),
+                            {},
+                            std::optional<mx::array>(std::move(v)),
+                            bytes});
+      const_view_.insert(o);
+      made++;
+    }
+  }
+  entries_ = std::move(out);
+  // Re-propagate the constant-view taint through the surviving view chain:
+  // the output-copy rule (XLA's no-alias contract) reads it after Finish.
+  for (const Pending& e : entries_) {
+    if (e.outs.size() != 1 || !ViewOpcode(e.op)) continue;
+    for (int s : e.ins) {
+      if (const_view_.count(s)) {
+        const_view_.insert(e.outs[0]);
+        break;
+      }
+    }
+  }
+  if (kDebug)
+    std::fprintf(stderr,
+                 "[metaljax-native] fold: %lld const entries -> %lld payloads "
+                 "(%.1f MB)\n",
+                 static_cast<long long>(dropped), static_cast<long long>(made),
+                 static_cast<double>(total) / (1 << 20));
+}
+
+// P30: drop pure entries nothing reads -- what CSE and folding leave behind
+// (a merged table's splat feeders), and any dead code jax shipped.
+void Lowering::DcePass(const std::vector<int>& outputs) {
+  if ((!kCsePass && !kFoldPass) || entries_.empty()) return;
+  absl::flat_hash_set<int> live(outputs.begin(), outputs.end());
+  std::vector<char> keep(entries_.size(), 0);
+  int64_t dropped = 0;
+  for (size_t i = entries_.size(); i-- > 0;) {
+    const Pending& e = entries_[i];
+    bool used = e.host || e.msl || !e.regions.empty() || !PurePassOp(e.op);
+    if (!used)
+      for (int o : e.outs) used = used || live.count(o) > 0;
+    if (!used) {
+      dropped++;
+      continue;
+    }
+    keep[i] = 1;
+    for (int s : e.ins) live.insert(s);
+  }
+  if (dropped == 0) return;
+  std::vector<Pending> kept;
+  kept.reserve(entries_.size() - dropped);
+  for (size_t i = 0; i < entries_.size(); i++)
+    if (keep[i]) kept.push_back(std::move(entries_[i]));
+  entries_ = std::move(kept);
+  if (kDebug)
+    std::fprintf(stderr, "[metaljax-native] dce: dropped %lld dead entries\n",
+                 static_cast<long long>(dropped));
+}
+
 absl::StatusOr<Lowering::Built> Lowering::Finish(
     int nargs, const std::vector<int>& outputs) {
+  // Settle every lazy payload to a LEAF in one eval (see the field comment:
+  // the %.7g scalar-inlining rule and the thread-bound stream both demand
+  // it).  Ahead of the passes, whose temp programs read these payloads.
+  if (!pending_payload_evals_.empty()) {
+    mx::eval(pending_payload_evals_);
+    pending_payload_evals_.clear();
+  }
+
+  // P30: the tape post-passes, ahead of liveness (each rewrites entries_ and
+  // the output slots; drops are derived from what survives).
+  std::vector<int> outs = outputs;
+  CsePass(outs);
+  FoldConstants(outs);
+  DcePass(outs);
+
   // Per-op drop lists: the slots whose last use is that op (tape.py
   // `_liveness`).  Straight-line, so this is "highest index that reads it";
   // a result nothing reads is let go at the op that produced it, and an
@@ -6568,7 +7181,7 @@ absl::StatusOr<Lowering::Built> Lowering::Finish(
     for (int s : entries_[i].ins) last[s] = i;
   for (size_t i = 0; i < entries_.size(); i++)
     for (int s : entries_[i].outs) last.emplace(s, i);
-  for (int s : outputs) last.erase(s);
+  for (int s : outs) last.erase(s);
   std::vector<std::vector<int>> drops(entries_.size());
   for (const auto& kv : last) drops[kv.second].push_back(kv.first);
 
@@ -6588,9 +7201,9 @@ absl::StatusOr<Lowering::Built> Lowering::Finish(
   // A region Program never needs output copies: its results are a loop's
   // carries or a branch's values, which stay inside this engine.  Only a
   // whole program's outputs cross to a caller, and `Run` sets those.
-  built.program->set_outputs(outputs, {});
-  built.outputs = outputs;
-  built.dump.outputs = outputs;
+  built.program->set_outputs(outs, {});
+  built.outputs = outs;
+  built.dump.outputs = outs;
   built.dump.slots = nslots_;
   return built;
 }
@@ -6946,8 +7559,13 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
     // ...and the ragged-dot dispatches: they defer to every op the
     // other three claimed (metal_ragged.cc reads their match lists).
     AnalyzeRagged(main, &plan);
-    // ...and the stacked-weight dots, LAST, deferring to all four.
+    // ...and the stacked-weight dots, deferring to all four.
     AnalyzeStackedDot(main, &plan);
+    // ...and the multi-span decode attentions: rooted at the combine
+    // ADD, which no dot-rooted recognizer claims.
+    AnalyzeMla(main, &plan);
+    // ...and the RMS norms, LAST.
+    AnalyzeNorm(main, &plan);
     plan.rebuild();
   } catch (const std::exception& e) {
     // Analysis must never break a program (qmm.py `analyze`).
