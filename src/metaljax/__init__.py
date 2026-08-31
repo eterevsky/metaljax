@@ -14,5 +14,5 @@ plugin-native/metal/metal_client.cc, which carries the measurements behind
 the numbers.
 """
 
-__version__ = "0.11.6"
+__version__ = "0.11.7"
 __all__ = ["__version__"]
