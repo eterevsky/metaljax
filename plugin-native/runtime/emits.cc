@@ -199,13 +199,27 @@ bool Program::step_emit(const Entry& e,
 
     case kRmsNorm: {
       // metal_norm.cc: jax's spelled-out RMS norm as MLX's fused kernel.
-      // ins [x, w]; attrs [out_dtype]; fattrs [eps].  The kernel
-      // accumulates in f32 exactly as the literal chain does; the one
-      // difference (1-ULP class) is that the chain rounds `x * rsqrt` to
-      // bf16 before the weight multiply and the kernel rounds once.
+      // ins [x] or [x, w]; attrs [out_dtype, has_weight]; fattrs [eps,
+      // weight_offset].  The kernel accumulates in f32; each library's chain
+      // rounds somewhere else, which metal_norm.cc measures and bounds.
+      //
+      // `weight_offset` is the splat the match folded off the weight -- `w +
+      // 0` in maxtext, `1 + w` in gemma 2/3.  The chain formed it at FULL
+      // rank; forming it here is [N] wide and, the matcher having required
+      // the same dtype, the same arithmetic.
       mx::Dtype out_dt = dtype_of(at[0]);
-      mx::array out = mx::fast::rms_norm(
-          in(0), in(1), static_cast<float>(e.fattrs[0]));
+      const bool has_w = at.size() > 1 && at[1] != 0;
+      std::optional<mx::array> w;
+      if (has_w) {
+        mx::array wv = in(1);
+        const double off = e.fattrs.size() > 1 ? e.fattrs[1] : 0.0;
+        if (off != 0.0)
+          wv = mx::add(wv,
+                       mx::array(static_cast<float>(off), wv.dtype()));
+        w = wv;
+      }
+      mx::array out =
+          mx::fast::rms_norm(in(0), w, static_cast<float>(e.fattrs[0]));
       if (out.dtype() != out_dt) out = mx::astype(out, out_dt);
       env[e.outs[0]] = out;
       break;

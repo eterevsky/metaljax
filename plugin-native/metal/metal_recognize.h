@@ -374,16 +374,26 @@ struct MlaMatch {
 // --------------------------------------------------------------------------
 
 // jax spells one RMS norm as ~13 ops (upcast, square, sum/N, +eps, rsqrt,
-// scale, downcast, batching-dot weight apply, transpose); the rewrite is
-// MLX's fused `fast::rms_norm(x, w, eps)`, which accumulates in f32 exactly
-// as the chain does.  One 1-ULP-class difference: the chain rounds the
-// normalized value to bf16 BEFORE the weight multiply, the kernel rounds
-// once at the end.
+// scale, downcast, weight apply); the rewrite is MLX's fused
+// `fast::rms_norm(x, w, eps)`, which accumulates in f32.  Each library
+// spells the chain differently -- the square as a multiply or a `power`,
+// the upcast before or after it, the eps add in f32 or the model dtype, the
+// weight applied by a batching dot or a broadcast multiply, and sometimes no
+// weight at all -- so metal_norm.cc reads BACKWARDS from one of three roots.
+// The fused-vs-literal difference is 1 bf16 ULP for the keras families and 2
+// for gemma's (whose chain rounds the mean to bf16, making the kernel the
+// more accurate side); both measured, see metal_norm.cc.
 struct RmsNormMatch {
-  mlir::Operation* root = nullptr;  // the weight-apply transpose
+  // The transpose (maxtext's dot form), multiply (broadcast weight apply, or
+  // the bare normalize when there is no weight), or convert (keras' downcast)
+  // the fused op takes the place of.
+  mlir::Operation* root = nullptr;
   mlir::Value x;                    // [.., N], the normed input
-  mlir::Value w;                    // [N], the learned scale ("+0" peeled)
+  mlir::Value w;                    // [N] learned scale; null = no scale
   double eps = 0.0;
+  // A splat folded off the weight -- maxtext's `w + 0`, gemma 2/3's
+  // `1 + w`.  The emit forms `w + offset` once, [N] wide.
+  double offset = 0.0;
   std::vector<mlir::Operation*> ops;
   std::string name;
 };

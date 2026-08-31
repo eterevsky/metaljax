@@ -3207,6 +3207,377 @@ module @rms_norm_form {
 }
 """
 
+
+# ---------------------------------------------------------------------------
+# The dense band's RMS-norm spellings (metal_norm.cc)
+# ---------------------------------------------------------------------------
+#
+# P30 fingerprinted maxtext's norm (above) and matched none of the dense
+# rows.  Each module below is a REAL library's lowering, captured at toy dims
+# from the harness the model table actually runs and saved with its
+# provenance under ~/.cache/metaljax-bench/logs/dense-band-norm/:
+#
+#   gemma_lib  rows 1/2   gemma.gm.nn.gemma4._layers.RMSNorm
+#   keras_lm   rows 5/6/9/12 (and 3/4/7/8/20)
+#              keras_hub {Qwen3,Llama,Mixtral,Qwen}LayerNorm -- one spelling,
+#              all four families
+#   gemma 2/3  gemma.gm.nn._layers.RMSNorm, the `(1 + scale)` form.  No
+#              bench row runs it; it is here because the offset fold is
+#              general and this is the evidence it was built from.
+#
+# The text is the module the PLUGIN is handed, not the one jax prints: XLA's
+# parse legalizes chlo (gemma's `chlo.square` arrives as a multiply), CSEs,
+# and hoists the constants to the top.  What the matcher walks is this.
+#
+# `_p31_norm` runs them: each must FIRE with its own form tag, must agree
+# with the same binary under METALJAX_NORM=0, and must agree with jax-CPU.
+
+# gemma_lib, bf16 -- rows 1 and 2.  Squares in bf16 and upcasts the RESULT;
+# rounds the mean back to bf16, so the eps add and the rsqrt run there too;
+# applies the weight as a broadcast multiply.  The root is that multiply.
+_NORM_GEMMA_MUL_BF16 = """
+module @norm_gemma_mul_bf16 {
+  func.func public @main(%w: tensor<8xbf16>, %x: tensor<1x1x8xbf16>)
+      -> tensor<1x1x8xbf16> {
+    %eps = stablehlo.constant dense<9.983770e-07> : tensor<bf16>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sq = stablehlo.multiply %x, %x : tensor<1x1x8xbf16>
+    %up = stablehlo.convert %sq : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %red = stablehlo.reduce(%up init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x1xf32>
+    %dn = stablehlo.convert %div : (tensor<1x1x1xf32>) -> tensor<1x1x1xbf16>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<bf16>) -> tensor<1x1x1xbf16>
+    %pe = stablehlo.add %dn, %be : tensor<1x1x1xbf16>
+    %rs = stablehlo.rsqrt %pe : tensor<1x1x1xbf16>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x1x1xbf16>) -> tensor<1x1x8xbf16>
+    %y = stablehlo.multiply %x, %b10 : tensor<1x1x8xbf16>
+    %bw = stablehlo.broadcast_in_dim %w, dims = [2]
+        : (tensor<8xbf16>) -> tensor<1x1x8xbf16>
+    %out = stablehlo.multiply %y, %bw : tensor<1x1x8xbf16>
+    return %out : tensor<1x1x8xbf16>
+  }
+}
+"""
+
+# The same shape in f32: no converts anywhere, so the whole chain -- square,
+# mean, eps, rsqrt -- runs in one dtype.
+_NORM_GEMMA_MUL_F32 = """
+module @norm_gemma_mul_f32 {
+  func.func public @main(%w: tensor<8xf32>, %x: tensor<1x1x8xf32>)
+      -> tensor<1x1x8xf32> {
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sq = stablehlo.multiply %x, %x : tensor<1x1x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x1xf32>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %pe = stablehlo.add %div, %be : tensor<1x1x1xf32>
+    %rs = stablehlo.rsqrt %pe : tensor<1x1x1xf32>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x1x1xf32>) -> tensor<1x1x8xf32>
+    %y = stablehlo.multiply %x, %b10 : tensor<1x1x8xf32>
+    %bw = stablehlo.broadcast_in_dim %w, dims = [2]
+        : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %out = stablehlo.multiply %y, %bw : tensor<1x1x8xf32>
+    return %out : tensor<1x1x8xf32>
+  }
+}
+"""
+
+# gemma_lib `RMSNorm(with_scale=False)` -- the value/router/qk norms rows 1
+# and 2 run per layer per token.  There is no weight to bind at all, and
+# MLX's weight argument is optional; the root here IS the normalize multiply,
+# which is why it must not end up in its own absorbed list.
+_NORM_GEMMA_NOSCALE_BF16 = """
+module @norm_gemma_noscale_bf16 {
+  func.func public @main(%x: tensor<1x1x8xbf16>) -> tensor<1x1x8xbf16> {
+    %eps = stablehlo.constant dense<9.983770e-07> : tensor<bf16>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sq = stablehlo.multiply %x, %x : tensor<1x1x8xbf16>
+    %up = stablehlo.convert %sq : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %red = stablehlo.reduce(%up init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x1xf32>
+    %dn = stablehlo.convert %div : (tensor<1x1x1xf32>) -> tensor<1x1x1xbf16>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<bf16>) -> tensor<1x1x1xbf16>
+    %pe = stablehlo.add %dn, %be : tensor<1x1x1xbf16>
+    %rs = stablehlo.rsqrt %pe : tensor<1x1x1xbf16>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x1x1xbf16>) -> tensor<1x1x8xbf16>
+    %out = stablehlo.multiply %x, %b10 : tensor<1x1x8xbf16>
+    return %out : tensor<1x1x8xbf16>
+  }
+}
+"""
+
+# gemma 2/3: `normed * (1 + scale)`, the add at FULL rank and in the weight's
+# own dtype.  The match folds the 1 off and the emit re-forms it [N] wide,
+# which is the same arithmetic because the dtypes agree -- the matcher
+# declines the fold when they do not.
+_NORM_GEMMA_OFFSET_BF16 = """
+module @norm_gemma_offset_bf16 {
+  func.func public @main(%w: tensor<8xbf16>, %x: tensor<1x1x8xbf16>)
+      -> tensor<1x1x8xbf16> {
+    %one = stablehlo.constant dense<1.000000e+00> : tensor<bf16>
+    %eps = stablehlo.constant dense<9.983770e-07> : tensor<bf16>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sq = stablehlo.multiply %x, %x : tensor<1x1x8xbf16>
+    %up = stablehlo.convert %sq : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %red = stablehlo.reduce(%up init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x1xf32>
+    %dn = stablehlo.convert %div : (tensor<1x1x1xf32>) -> tensor<1x1x1xbf16>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<bf16>) -> tensor<1x1x1xbf16>
+    %pe = stablehlo.add %dn, %be : tensor<1x1x1xbf16>
+    %rs = stablehlo.rsqrt %pe : tensor<1x1x1xbf16>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x1x1xbf16>) -> tensor<1x1x8xbf16>
+    %y = stablehlo.multiply %x, %b10 : tensor<1x1x8xbf16>
+    %bw = stablehlo.broadcast_in_dim %w, dims = [2]
+        : (tensor<8xbf16>) -> tensor<1x1x8xbf16>
+    %b1 = stablehlo.broadcast_in_dim %one, dims = []
+        : (tensor<bf16>) -> tensor<1x1x8xbf16>
+    %ws = stablehlo.add %b1, %bw : tensor<1x1x8xbf16>
+    %out = stablehlo.multiply %y, %ws : tensor<1x1x8xbf16>
+    return %out : tensor<1x1x8xbf16>
+  }
+}
+"""
+
+# keras_hub -- rows 5, 6, 9 and 12 share this one spelling.  Upcasts x FIRST,
+# squares with `power(x, 2)` (the exponent itself a converted i32 splat),
+# keeps the whole chain and the weight multiply in f32, and rounds back down
+# at the very end: the root is that convert, and the weight enters as its
+# stored bf16 widened for the arithmetic.
+_NORM_KERAS_BF16 = """
+module @norm_keras_bf16 {
+  func.func public @main(%w: tensor<8xbf16>, %x: tensor<1x1x8xbf16>)
+      -> tensor<1x1x8xbf16> {
+    %two = stablehlo.constant dense<2> : tensor<i32>
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %xf = stablehlo.convert %x : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %twof = stablehlo.convert %two : (tensor<i32>) -> tensor<f32>
+    %btwo = stablehlo.broadcast_in_dim %twof, dims = []
+        : (tensor<f32>) -> tensor<1x1x8xf32>
+    %sq = stablehlo.power %xf, %btwo : tensor<1x1x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x1xf32>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %pe = stablehlo.add %div, %be : tensor<1x1x1xf32>
+    %rs = stablehlo.rsqrt %pe : tensor<1x1x1xf32>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x1x1xf32>) -> tensor<1x1x8xf32>
+    %y = stablehlo.multiply %xf, %b10 : tensor<1x1x8xf32>
+    %wf = stablehlo.convert %w : (tensor<8xbf16>) -> tensor<8xf32>
+    %bw = stablehlo.broadcast_in_dim %wf, dims = [2]
+        : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %sc = stablehlo.multiply %y, %bw : tensor<1x1x8xf32>
+    %out = stablehlo.convert %sc : (tensor<1x1x8xf32>) -> tensor<1x1x8xbf16>
+    return %out : tensor<1x1x8xbf16>
+  }
+}
+"""
+
+# The same layer with `head_dim` set -- Qwen3's per-head q/k norm, rank 4 and
+# normed over the head axis.  Its weight arrives through TWO broadcasts, so
+# the peel has to compose them and still land on the last axis.
+_NORM_KERAS_HEAD_BF16 = """
+module @norm_keras_head_bf16 {
+  func.func public @main(%w: tensor<4xbf16>, %x: tensor<1x1x2x4xbf16>)
+      -> tensor<1x1x2x4xbf16> {
+    %two = stablehlo.constant dense<2> : tensor<i32>
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<4.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %xf = stablehlo.convert %x
+        : (tensor<1x1x2x4xbf16>) -> tensor<1x1x2x4xf32>
+    %twof = stablehlo.convert %two : (tensor<i32>) -> tensor<f32>
+    %btwo = stablehlo.broadcast_in_dim %twof, dims = []
+        : (tensor<f32>) -> tensor<1x1x2x4xf32>
+    %sq = stablehlo.power %xf, %btwo : tensor<1x1x2x4xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [3]
+        : (tensor<1x1x2x4xf32>, tensor<f32>) -> tensor<1x1x2xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1, 2]
+        : (tensor<1x1x2xf32>) -> tensor<1x1x2x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x2x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x2x1xf32>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x1x2x1xf32>
+    %pe = stablehlo.add %div, %be : tensor<1x1x2x1xf32>
+    %rs = stablehlo.rsqrt %pe : tensor<1x1x2x1xf32>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2, 3]
+        : (tensor<1x1x2x1xf32>) -> tensor<1x1x2x4xf32>
+    %y = stablehlo.multiply %xf, %b10 : tensor<1x1x2x4xf32>
+    %wf = stablehlo.convert %w : (tensor<4xbf16>) -> tensor<4xf32>
+    %bw1 = stablehlo.broadcast_in_dim %wf, dims = [3]
+        : (tensor<4xf32>) -> tensor<1x1x1x4xf32>
+    %bw2 = stablehlo.broadcast_in_dim %bw1, dims = [0, 1, 2, 3]
+        : (tensor<1x1x1x4xf32>) -> tensor<1x1x2x4xf32>
+    %sc = stablehlo.multiply %y, %bw2 : tensor<1x1x2x4xf32>
+    %out = stablehlo.convert %sc
+        : (tensor<1x1x2x4xf32>) -> tensor<1x1x2x4xbf16>
+    return %out : tensor<1x1x2x4xbf16>
+  }
+}
+"""
+
+
+# TWO keras norms in one module, sharing the hoisted `broadcast(eps)`,
+# `broadcast(N)` and `broadcast(2)` between them -- which is what a real
+# 48-layer model looks like after XLA's parse hoists and CSEs the constants,
+# every norm at the model width reaching the same three ops.
+#
+# Absorbing those would collide the second norm out of the plan and leave the
+# first with an intermediate escaping into it, so BOTH would decline: one
+# fused norm per model instead of the fifty the rewrite is for.  Nothing
+# about the answers would change, which is why this is a test and not a
+# tolerance.  metal_norm.cc's `IsConstSubtree` keeps them shareable, and DCE
+# drops the ones the rewrite made dead.
+_NORM_TWO_STACKED = """
+module @norm_two_stacked {
+  func.func public @main(%w: tensor<8xbf16>, %v: tensor<8xbf16>,
+      %x: tensor<1x1x8xbf16>) -> tensor<1x1x8xbf16> {
+    %two = stablehlo.constant dense<2> : tensor<i32>
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %twof = stablehlo.convert %two : (tensor<i32>) -> tensor<f32>
+    %btwo = stablehlo.broadcast_in_dim %twof, dims = []
+        : (tensor<f32>) -> tensor<1x1x8xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+
+    %xf = stablehlo.convert %x : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %sq = stablehlo.power %xf, %btwo : tensor<1x1x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x1xf32>
+    %pe = stablehlo.add %div, %be : tensor<1x1x1xf32>
+    %rs = stablehlo.rsqrt %pe : tensor<1x1x1xf32>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x1x1xf32>) -> tensor<1x1x8xf32>
+    %y = stablehlo.multiply %xf, %b10 : tensor<1x1x8xf32>
+    %wf = stablehlo.convert %w : (tensor<8xbf16>) -> tensor<8xf32>
+    %bw = stablehlo.broadcast_in_dim %wf, dims = [2]
+        : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %sc = stablehlo.multiply %y, %bw : tensor<1x1x8xf32>
+    %o1 = stablehlo.convert %sc : (tensor<1x1x8xf32>) -> tensor<1x1x8xbf16>
+
+    %xf2 = stablehlo.convert %o1 : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %sq2 = stablehlo.power %xf2, %btwo : tensor<1x1x8xf32>
+    %red2 = stablehlo.reduce(%sq2 init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b42 = stablehlo.broadcast_in_dim %red2, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %div2 = stablehlo.divide %b42, %bn : tensor<1x1x1xf32>
+    %pe2 = stablehlo.add %div2, %be : tensor<1x1x1xf32>
+    %rs2 = stablehlo.rsqrt %pe2 : tensor<1x1x1xf32>
+    %b102 = stablehlo.broadcast_in_dim %rs2, dims = [0, 1, 2]
+        : (tensor<1x1x1xf32>) -> tensor<1x1x8xf32>
+    %y2 = stablehlo.multiply %xf2, %b102 : tensor<1x1x8xf32>
+    %vf = stablehlo.convert %v : (tensor<8xbf16>) -> tensor<8xf32>
+    %bv = stablehlo.broadcast_in_dim %vf, dims = [2]
+        : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %sc2 = stablehlo.multiply %y2, %bv : tensor<1x1x8xf32>
+    %o2 = stablehlo.convert %sc2 : (tensor<1x1x8xf32>) -> tensor<1x1x8xbf16>
+    return %o2 : tensor<1x1x8xbf16>
+  }
+}
+"""
+
+
+def _norm_forms():
+    """(label, module, form tag metal_norm.cc must narrate, dtype, matches).
+
+    `matches` is how many norms the module must fuse -- one each, except the
+    stacked pair, which is here because BOTH of them have to.
+    """
+    return [
+        ("maxtext dot", _RMS_NORM_FORM, "R3.dot", "f32", 1),
+        ("gemma multiply bf16", _NORM_GEMMA_MUL_BF16, "R3.mul", "bf16", 1),
+        ("gemma multiply f32", _NORM_GEMMA_MUL_F32, "R3.mul", "f32", 1),
+        ("gemma weightless bf16", _NORM_GEMMA_NOSCALE_BF16, "R3.noscale",
+         "bf16", 1),
+        ("gemma 1+w offset bf16", _NORM_GEMMA_OFFSET_BF16, "R3.mul+off",
+         "bf16", 1),
+        ("keras power/downcast bf16", _NORM_KERAS_BF16, "R3.cvt", "bf16", 1),
+        ("keras head-dim bf16", _NORM_KERAS_HEAD_BF16, "R4.cvt", "bf16", 1),
+        ("two norms, shared constants", _NORM_TWO_STACKED, "R3.cvt", "bf16",
+         2),
+    ]
+
+
+def _norm_inputs(text):
+    """Deterministic inputs for one norm module, read off @main's signature.
+
+    The [N] operand is the learned scale, so it is drawn around 1 the way a
+    trained norm's is -- a weight centred on 0 would hide a dropped weight.
+    """
+    import re as _re
+    import ml_dtypes
+    sig = _re.search(r"func\.func public @main\((.*?)\)\s*->", text,
+                     _re.S).group(1)
+    rng = np.random.default_rng(3011)
+    args = []
+    for a in _re.findall(r"tensor<([^>]*)>", sig):
+        *dims, dt = a.split("x")
+        shape = tuple(int(d) for d in dims)
+        v = rng.standard_normal(shape)
+        if len(shape) == 1:
+            v = 1.0 + 0.05 * v
+        args.append(v.astype({"f32": np.float32,
+                              "bf16": ml_dtypes.bfloat16}[dt]))
+    return args
+
+
 # P30: maxtext's MLA multi-span decode attention, exactly as the captured
 # row-10 module spells it (f32, tiny dims), through metal_mla.cc's fused
 # rewrite on metal and the literal two-span combine on CPU.
@@ -5630,6 +6001,120 @@ def _p21_msl(subprocess, pathlib, re):
             ("bf16 msl plans build", bf16_takes_a_kernel)]
 
 
+def _p31_norm(subprocess, pathlib, re):
+    """The RMS-norm recognizer's coverage of the model table's spellings.
+
+    P30 built `metal_norm.cc` on maxtext's norm and, measured on the captured
+    lowerings, matched NONE of the dense band: gemma squares in bf16 and
+    takes its rsqrt there, keras squares with `power` and applies the weight
+    in f32 under a downcast, and both apply the weight as a broadcast
+    multiply rather than maxtext's batching dot.  No correctness test could
+    see that -- every answer stayed right, just built out of ~13 ops instead
+    of one -- so what is pinned here is that each spelling FIRES, and with
+    the form the matcher claims to have recognized it by.
+
+    The answers are pinned twice over: against the SAME binary with
+    METALJAX_NORM=0 (which runs the literal chain, so the two arms differ by
+    the fusion and nothing else) and against jax-CPU in its own process.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+
+    def arm(env_extra, platform="metal"):
+        import json
+        child = dict(os.environ)
+        if platform == "cpu":
+            child.pop("METALJAX_PLUGIN_PATH", None)
+            child["JAX_PLATFORMS"] = "cpu"
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--norm-forms"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if not line.startswith("NORM "):
+                continue
+            label, payload = line[5:].split("\t", 1)
+            answers[label] = np.array(json.loads(payload))
+        tags = re.findall(r"norm: matched an rms norm \(([^,]*),", proc.stderr)
+        return answers, tags
+
+    def worst(a, b):
+        """Max error against the tensor's own scale."""
+        scale = max(float(np.max(np.abs(b))), 1e-30)
+        return float(np.max(np.abs(a - b))) / scale
+
+    # bf16 keeps 8 mantissa bits, so one ULP is 2^-8..2^-7 relative; the bar
+    # is two of the wide ones.  Measured worst across these seven: 7.5e-3
+    # (gemma, whose chain rounds the MEAN to bf16 and rsqrts it there -- the
+    # fused kernel is the more accurate side of that difference).  f32 sits
+    # at 1.5e-7, MLX's `precise::rsqrt` against XLA's.
+    BAR = {"bf16": 2 * 2.0**-7, "f32": 1e-6}
+
+    def every_spelling_fires():
+        _fused, tags = arm({})
+        forms = _norm_forms()
+        want = [tag for _l, _t, tag, _d, _n in forms]
+        missing = [t for t in want if not any(t in got for got in tags)]
+        if missing:
+            return False, f"no match tagged {missing} (saw {sorted(set(tags))})"
+        # The count matters as much as the tags: the stacked pair shares its
+        # hoisted constants, and a rewrite that claimed them would fuse ONE
+        # of the two with every tag still present.
+        n = sum(k for _l, _t, _g, _d, k in forms)
+        if len(tags) != n:
+            return False, (f"{len(tags)} matches over {len(forms)} modules, "
+                           f"wanted {n}")
+        return True, (f"{len(forms)} modules, {n} norms fused: "
+                      f"{', '.join(sorted(set(tags)))}")
+
+    def the_kill_switch_kills():
+        _answers, tags = arm({"METALJAX_NORM": "0"})
+        return (not tags), (f"{len(tags)} matches with METALJAX_NORM=0"
+                            if tags else "no match with METALJAX_NORM=0")
+
+    def fused_agrees_with_the_literal_chain():
+        fused, _ = arm({})
+        literal, tags = arm({"METALJAX_NORM": "0"})
+        if tags:
+            return False, "the METALJAX_NORM=0 arm still fused"
+        bad = []
+        for label, _text, _tag, dt, _n in _norm_forms():
+            e = worst(fused[label], literal[label])
+            if e > BAR[dt]:
+                bad.append(f"{label} {e:.2e} > {BAR[dt]:.0e}")
+        if bad:
+            return False, "; ".join(bad)
+        e = max(worst(fused[l], literal[l])
+                for l, _t, _g, _d, _n in _norm_forms())
+        return True, (f"{len(_norm_forms())} modules agree with the chain, "
+                      f"worst {e:.1e}")
+
+    def fused_agrees_with_cpu():
+        fused, _ = arm({})
+        cpu, tags = arm({}, platform="cpu")
+        if tags:
+            return False, "the CPU arm loaded the plugin"
+        bad = []
+        for label, _text, _tag, dt, _n in _norm_forms():
+            e = worst(fused[label], cpu[label])
+            if e > BAR[dt]:
+                bad.append(f"{label} {e:.2e} > {BAR[dt]:.0e}")
+        if bad:
+            return False, "; ".join(bad)
+        e = max(worst(fused[l], cpu[l]) for l, _t, _g, _d, _n in _norm_forms())
+        return True, (f"{len(_norm_forms())} modules agree with jax-CPU, "
+                      f"worst {e:.1e}")
+
+    return [("norm covers the table's spellings", every_spelling_fires),
+            ("METALJAX_NORM=0 fuses nothing", the_kill_switch_kills),
+            ("norm fused == the literal chain",
+             fused_agrees_with_the_literal_chain),
+            ("norm fused == jax-CPU", fused_agrees_with_cpu)]
+
+
 def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
     """Re-run every case through the SAME dylib under `env_extra` and compare.
 
@@ -5782,6 +6267,20 @@ def main():
         xs = _rand((128, 32, 64), 932) * f32(0.1)
         ws = [_rand((64, 64), 933 + i) * f32(0.1) for i in range(3)]
         jax.jit(_msl_gru)(h0, xs, *ws)
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--norm-forms":
+        # Every RMS-norm spelling the model table runs, through whichever
+        # backend the caller put in the environment.  The answers go to
+        # stdout so the parent can compare arms; the plugin's own narration
+        # goes to stderr, which is where the parent reads what FIRED.
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        import json as _json
+        for label, text, _tag, _dt, _n in _norm_forms():
+            out = _run_module(text, _norm_inputs(text))[0]
+            print(f"NORM {label}\t"
+                  f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
         return 0
     if len(sys.argv) > 2 and sys.argv[1] == "--eager-arm":
         os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
@@ -5955,6 +6454,7 @@ def main():
 
     for label, check in (_p19_packing(subprocess, tempfile, pathlib)
                          + _p21_msl(subprocess, pathlib, __import__("re"))
+                         + _p31_norm(subprocess, pathlib, __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,

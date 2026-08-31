@@ -7349,17 +7349,24 @@ absl::Status Lowering::LowerMla(mlir::Operation* op, const MlaMatch& m) {
   return absl::OkStatus();
 }
 
-// The RMS norm (metal_norm.cc).  ins [x, w]; attrs [out_dtype];
-// fattrs [eps].
+// The RMS norm (metal_norm.cc).  ins [x] or [x, w]; attrs [out_dtype,
+// has_weight]; fattrs [eps, weight_offset].  MLX's weight argument is
+// optional, and a norm with `with_scale=False` has none to bind.
 absl::Status Lowering::LowerRmsNorm(mlir::Operation* op,
                                     const RmsNormMatch& m) {
-  for (mlir::Value v : {m.x, m.w}) RETURN_IF_ERROR(CheckValue(v));
+  RETURN_IF_ERROR(CheckValue(m.x));
   ASSIGN_OR_RETURN(int x, Slot(m.x));
-  ASSIGN_OR_RETURN(int w, Slot(m.w));
+  std::vector<int> ins{x};
+  if (m.w) {
+    RETURN_IF_ERROR(CheckValue(m.w));
+    ASSIGN_OR_RETURN(int w, Slot(m.w));
+    ins.push_back(w);
+  }
   ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
   ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.rms_norm"));
-  EmitF(opcode, {x, w}, {Bind(op->getResult(0))},
-        {static_cast<int64_t>(out_code)}, {m.eps}, ResultBytes(op));
+  EmitF(opcode, std::move(ins), {Bind(op->getResult(0))},
+        {static_cast<int64_t>(out_code), m.w ? 1 : 0}, {m.eps, m.offset},
+        ResultBytes(op));
   return absl::OkStatus();
 }
 
