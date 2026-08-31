@@ -429,9 +429,42 @@ bool Program::step_index(const Entry& e,
         axis = axes[pos];
         idxs[pos] = mx::where(*oob, mx::array(extent, mx::int32), idxs[pos]);
       }
+      // The single-window SET (`metal_lowering.cc`'s strategies 3 and 4, the
+      // decode cache append): the whole index batch is ONE coordinate, so the
+      // op writes one contiguous window and `mx::slice_update` is the write --
+      // one pass over the operand against the dummy pad's three. The starts are
+      // the plan's, already clamped, stacked into the vector MLX's dynamic
+      // slice takes.
+      std::optional<mx::array> start;
+      std::optional<mx::array> guard;
+      if (strategy == 3 || strategy == 4) {
+        std::vector<mx::array> parts;
+        parts.reserve(idxs.size());
+        for (const mx::array& a : idxs)
+          parts.push_back(mx::reshape(a, mx::Shape{}));
+        start = mx::stack(parts);
+        if (strategy == 4) {
+          // XLA DROPS an update whose start is out of bounds. The lowering
+          // could not prove that impossible here, so the drop is spelled at
+          // window size: the indices are clamped, and writing back what is
+          // already at the clamped start leaves the operand exactly as it was.
+          if (!oob)
+            throw std::runtime_error("tape: scatter window guard without a "
+                                     "mask");
+          guard = mx::reshape(*oob, mx::Shape(sshape.size(), 1));
+        }
+      }
       // One write, over an operand and updates of a dtype MLX can scatter.
       auto write = [&](const mx::array& base, mx::array u) -> mx::array {
         if (mask) u = mx::where(*mask, *e.payload, u);
+        if (start) {
+          mx::array win = mx::reshape(u, sshape);
+          if (guard)
+            win = mx::where(
+                *guard,
+                mx::reshape(mx::gather(base, idxs, axes, sshape), sshape), win);
+          return mx::slice_update(base, win, *start, axes);
+        }
         if (strategy != 2) return scatter_by(method, base, idxs, u, axes);
         mx::Shape padshape = base.shape();
         padshape[static_cast<size_t>(axis)] = pad;

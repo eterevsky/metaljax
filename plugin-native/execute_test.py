@@ -269,6 +269,87 @@ def run_wedge_probe(path):
     np.savez(path, **{f"a{i}": a for i, a in enumerate(flat)})
 
 
+# --------------------------------------------------------------------------
+# the cache-append scatter (METALJAX_SCATTER_APPEND)
+# --------------------------------------------------------------------------
+#
+# A SET whose index batch holds exactly ONE coordinate writes exactly one
+# contiguous window, and the lowering emits it as `mx::slice_update` instead of
+# the dummy pad's concatenate/scatter/slice.  Two arms, and both are here: the
+# index is either provably in bounds (nothing else needed) or it is not, and
+# then the drop is a window-sized read-back.  A SET moves bits, so every case
+# below is compared EXACTLY -- a fast path that changed a value would not be a
+# tolerance question.
+
+
+def _kv_append(cache, upd, end_index):
+    """The decode KV-cache append, as gemma's sampler spells it.
+
+    `cache.at[b, end_index % T].set(u)`: jnp's Python-semantics modulo, then
+    jnp's negative-index normalization, then a two-component index vector --
+    which is the exact `stablehlo.scatter` the row-2 decode program contains
+    (3 per layer per token), and the shape the analysis has to bound to prove
+    the drop can never fire.
+    """
+    import jax.numpy as jnp
+
+    b = jnp.arange(cache.shape[0])[:, None]
+    slot = (end_index % cache.shape[1])[:, None]
+    return cache.at[b, slot].set(upd)
+
+
+def _kv_append_vmap(cache, upd, end_index):
+    """The same append written as a vmapped `dynamic_update_slice`.
+
+    jax's batching rule turns that into a scatter under
+    `GatherScatterMode.CLIP` -- an explicit `clamp(0, i, hi)` over the index
+    vector, which is the other spelling the bound analysis has to read.
+    """
+    import jax
+
+    T = cache.shape[1]
+    return jax.vmap(lambda c, u, e: jax.lax.dynamic_update_slice(
+        c, u, (e % T, 0, 0)))(cache, upd, end_index)
+
+
+def _window_set(x, i, u):
+    """One window SET at a traced index nothing bounds: the GUARDED arm.
+
+    jnp normalizes a negative index (`i + n`) but does not clamp, so an index
+    past either end stays out of range and XLA DROPS the update.  That is what
+    the read-back guard has to reproduce exactly.
+    """
+    return x.at[i].set(u)
+
+
+def _window_set_skewed(x, n, u):
+    """`select(f < -5, f + 8, f)` over `f = rem(n, 8)`: the normalization's
+    SHAPE without its rule, written as a RAW `lax.scatter` so nothing
+    normalizes the index afterwards.
+
+    The bound analysis reads the select's predicate.  A predicate that merely
+    IMPLIES `f < 0` leaves the else-arm free to be negative -- at n = -3 the
+    else-arm is taken and the index is -3 -- so claiming this in bounds would
+    turn XLA's DROP into a write at the CLAMPED slot 0, which is a wrong
+    answer rather than a slow one.  Measured: an `is_zero` relaxed to
+    `hi <= 0` writes `[-1, -1, -1, -1]` into row 0 here.
+
+    Two spelling details, both load-bearing: jnp's `.at[]` would normalize -3
+    to 5 and hide the drop (hence the raw `lax.scatter`), and `jnp.where`
+    lowers through jax's `@_where` helper, which puts the select's arms behind
+    block arguments where the rule never fires (hence `lax.select`).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    f = jax.lax.rem(n, jnp.int32(8))
+    j = jax.lax.select(f < jnp.int32(-5), f + jnp.int32(8), f)
+    dnums = jax.lax.ScatterDimensionNumbers(
+        update_window_dims=(1,), inserted_window_dims=(0,),
+        scatter_dims_to_operand_dims=(0,))
+    return jax.lax.scatter(x, j.reshape(1, 1), u.reshape(1, -1), dnums)
+
+
 def _cases():
     import jax
     import jax.numpy as jnp
@@ -1044,6 +1125,82 @@ def _cases():
         ("scatter with empty updates", lambda x, i, u: x.at[i].add(u),
          [np.arange(4, dtype=f), np.zeros((0,), np.int32),
           np.zeros((0,), f)], *EXACT),
+
+        # the cache-append fast path (METALJAX_SCATTER_APPEND).  Run the whole
+        # suite at 0, 1 and 2 to cover the three lowerings of these rows: the
+        # dummy pad, the provably-in-bounds `slice_update`, and the guarded
+        # one.  EXACT throughout -- a SET copies bits.
+        ("kv cache append (bf16, first slot)", _kv_append,
+         [bf(_rand((1, 16, 4, 8), 71)), bf(_rand((1, 1, 4, 8), 72)),
+          np.array([0], np.int32)], *EXACT),
+        ("kv cache append (bf16, last slot)", _kv_append,
+         [bf(_rand((1, 16, 4, 8), 71)), bf(_rand((1, 1, 4, 8), 72)),
+          np.array([15], np.int32)], *EXACT),
+        # end_index past the cache: the modulo wraps it, which is the whole
+        # reason the append is in bounds at all.
+        ("kv cache append (bf16, wrapped)", _kv_append,
+         [bf(_rand((1, 16, 4, 8), 71)), bf(_rand((1, 1, 4, 8), 72)),
+          np.array([16 * 5 + 3], np.int32)], *EXACT),
+        ("kv cache append (f32)", _kv_append,
+         [_rand((1, 16, 4, 8), 73), _rand((1, 1, 4, 8), 74),
+          np.array([7], np.int32)], *EXACT),
+        # Batch 3: THREE update windows, so the fast path declines and the
+        # dummy pad runs -- the row that says the batch-size guard holds.
+        ("kv cache append (batch 3, declines)", _kv_append,
+         [_rand((3, 16, 4, 8), 75), _rand((3, 1, 4, 8), 76),
+          np.array([2, 15, 33], np.int32)], *EXACT),
+        ("kv cache append (vmapped dynamic_update_slice)", _kv_append_vmap,
+         [bf(_rand((1, 16, 4, 8), 77)), bf(_rand((1, 1, 4, 8), 78)),
+          np.array([9], np.int32)], *EXACT),
+        # The guarded arm: nothing in the graph bounds these indices.
+        ("window set at a traced index", _window_set,
+         [np.arange(32, dtype=f).reshape(8, 4), np.int32(3),
+          np.full(4, -1.0, f)], *EXACT),
+        ("window set at a normalized negative index", _window_set,
+         [np.arange(32, dtype=f).reshape(8, 4), np.int32(-3),
+          np.full(4, -1.0, f)], *EXACT),
+        ("window set past the end (must DROP)", _window_set,
+         [np.arange(32, dtype=f).reshape(8, 4), np.int32(11),
+          np.full(4, -1.0, f)], *EXACT),
+        ("window set far below zero (must DROP)", _window_set,
+         [np.arange(32, dtype=f).reshape(8, 4), np.int32(-100),
+          np.full(4, -1.0, f)], *EXACT),
+        ("window set bf16 past the end (must DROP)", _window_set,
+         [bf(_rand((8, 4), 79)), np.int32(9), bf(np.full(4, -1.0, f))],
+         *EXACT),
+        # A window that does not span the un-indexed axes: the update starts
+        # at 0 on those, which is XLA's rule and MLX's alike.
+        ("window set of a partial row", lambda x, i, u: x.at[i, 1:3].set(u),
+         [np.arange(32, dtype=f).reshape(8, 4), np.int32(5),
+          np.full(2, -1.0, f)], *EXACT),
+        ("window set of a partial row (out of bounds)",
+         lambda x, i, u: x.at[i, 1:3].set(u),
+         [np.arange(32, dtype=f).reshape(8, 4), np.int32(12),
+          np.full(2, -1.0, f)], *EXACT),
+        # A single-window SET of a COMPLEX operand: the handler writes the two
+        # parts, so the fast path has to survive being called twice.
+        ("window set complex64", _window_set,
+         [_crand((8, 4), 80), np.int32(6),
+          np.full(4, -1.0 - 2.0j, np.complex64)], *EXACT),
+        ("window set complex64 (out of bounds)", _window_set,
+         [_crand((8, 4), 80), np.int32(19),
+          np.full(4, -1.0 - 2.0j, np.complex64)], *EXACT),
+        # int32, where a one-ULP story could not hide anything.
+        ("window set int32", _window_set,
+         [np.arange(32, dtype=np.int32).reshape(8, 4), np.int32(2),
+          np.full(4, -7, np.int32)], *EXACT),
+        # The normalization's shape under a predicate that only IMPLIES
+        # negativity: must not be claimed in bounds.  n = -3 takes the
+        # ELSE arm and lands at -3, which XLA drops; n = -7 takes the then
+        # arm and lands at 1, which it writes.
+        ("raw scatter under a skewed normalization (drops)",
+         _window_set_skewed,
+         [np.arange(32, dtype=f).reshape(8, 4), np.int32(-3),
+          np.full(4, -1.0, f)], *EXACT),
+        ("raw scatter under a skewed normalization (writes)",
+         _window_set_skewed,
+         [np.arange(32, dtype=f).reshape(8, 4), np.int32(-7),
+          np.full(4, -1.0, f)], *EXACT),
 
         # the small-op tail (P4)
         ("shift left", lambda x: x << 3, [np.arange(8, dtype=np.uint32)],

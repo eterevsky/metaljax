@@ -830,6 +830,21 @@ const bool kFoldPass = EnvOn("METALJAX_FOLD");
 const int64_t kFoldMaxMb = EnvInt("METALJAX_FOLD_MAX_MB", 96);
 const int64_t kFoldTotalMb = EnvInt("METALJAX_FOLD_TOTAL_MB", 256);
 
+// METALJAX_SCATTER_APPEND: the single-window SET fast path (`LowerScatter`,
+// the drop-strategy block).  A SET whose index batch holds exactly ONE
+// coordinate writes exactly one contiguous window, which `mx::slice_update`
+// does in one pass; the dummy pad the SET rule otherwise takes needs three
+// (concatenate the operand with a window of zeros, scatter into the extended
+// copy, slice the pad back off).
+//
+//   0  off -- every scatter takes the strategy it took before this knob
+//   1  only when the start index is PROVABLY in bounds, so XLA's OOB drop
+//      cannot fire and the write needs no drop machinery at all
+//   2  (default) also when it is not, guarded by a window-sized read-back:
+//      the indices are clamped already, so writing the current contents back
+//      IS the drop, and it costs one window rather than three passes
+const int64_t kScatterAppend = EnvInt("METALJAX_SCATTER_APPEND", 2);
+
 // An entry two structurally identical copies of which always hold the same
 // value -- what CSE may merge and DCE may drop when unread.  Control flow and
 // host calls have effects (a while reads its condition on the host); rng,
@@ -3598,6 +3613,495 @@ void AppendIndexAttrs(const IndexPlan& plan, std::vector<int64_t>* out) {
   }
 }
 
+// --------------------------------------------------------------------------
+// is a scatter's start index provably in bounds?  (the cache-append fast path)
+// --------------------------------------------------------------------------
+//
+// XLA DROPS an update whose start is out of bounds, and expressing a drop with
+// primitives that cannot skip a write is what makes a SET expensive here (the
+// dummy pad: three passes over the operand).  It is also, in the programs that
+// pay the most for it, dead weight: a decode loop writes its KV cache at
+// `end_index % cache_size`, which cannot be out of range.  So: a small
+// interval analysis over the index expression, which either PROVES the drop
+// can never fire -- and then the write is one `mx::slice_update` -- or gives
+// up and lets the caller take the guarded arm.
+//
+// Only the shapes jax actually emits for an index are handled, and the
+// analysis is sound at every one of them (a rule that cannot bound its
+// operands returns "unknown", never a guess):
+//
+//   * `clamp(0, i, hi)` -- jax's `GatherScatterMode.CLIP`, which is what the
+//     batching rule for `dynamic_update_slice` emits (slicing.py
+//     `_clamp_scatter_indices`), so every vmapped cache write lands here;
+//   * `select(i < 0, i + D, i)` over `i = remainder(n, D)` -- jnp's
+//     Python-semantics modulo followed by negative-index normalization, which
+//     is what an un-vmapped `.at[i % D]` write lands on.  The `select` rule is
+//     the only one that needs the predicate: a plain interval union of the two
+//     arms would give [-D+1, 2D-1] and prove nothing.
+//   * constants, iota, and the arithmetic between them.
+
+struct IntRange {
+  int64_t lo = 0;
+  int64_t hi = 0;
+  bool known = false;
+};
+
+// Wide enough for any index arithmetic, narrow enough that sums cannot
+// overflow int64 -- a range that leaves the band is simply unknown.
+constexpr int64_t kRangeBound = int64_t{1} << 50;
+
+IntRange UnknownRange() { return IntRange{}; }
+
+IntRange MakeRange(int64_t lo, int64_t hi) {
+  if (lo > hi || lo < -kRangeBound || hi > kRangeBound) return UnknownRange();
+  return IntRange{lo, hi, true};
+}
+
+std::optional<mlir::IntegerType> IntElem(mlir::Value v) {
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+  if (!t) return std::nullopt;
+  auto it = mlir::dyn_cast<mlir::IntegerType>(t.getElementType());
+  if (!it) return std::nullopt;
+  return it;
+}
+
+std::vector<int64_t> StaticShape(mlir::Value v) {
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+  if (!t || !t.hasStaticShape()) return {};
+  return std::vector<int64_t>(t.getShape().begin(), t.getShape().end());
+}
+
+// The min and max of a constant, over the whole array or over the sub-slice at
+// `idx` along `axis` (`axis < 0` = the whole array).  A splat answers without
+// walking anything; anything larger than a jax index table is refused rather
+// than iterated.
+IntRange ConstantRange(mlir::stablehlo::ConstantOp cst, int64_t axis,
+                       int64_t idx) {
+  auto dense = mlir::dyn_cast<mlir::DenseIntElementsAttr>(cst.getValue());
+  if (!dense) return UnknownRange();
+  auto it = mlir::dyn_cast<mlir::IntegerType>(dense.getElementType());
+  // APInt's 64-bit accessors ASSERT on anything wider, and no index type is.
+  if (!it || it.getWidth() > 64) return UnknownRange();
+  const bool uns = it.isUnsigned();
+  auto value_of = [&](const llvm::APInt& a) -> int64_t {
+    return uns ? static_cast<int64_t>(a.getZExtValue()) : a.getSExtValue();
+  };
+  if (dense.isSplat()) {
+    const int64_t v = value_of(dense.getSplatValue<llvm::APInt>());
+    return MakeRange(v, v);
+  }
+  const std::vector<int64_t> shape = StaticShape(cst.getResult());
+  int64_t numel = 1;
+  for (int64_t d : shape) numel *= d;
+  if (numel <= 0 || numel > 65536) return UnknownRange();
+  // The stride of `axis` and the extent of everything under it, which is all
+  // it takes to say whether a linear position sits at coordinate `idx`.
+  int64_t stride = 1, extent = 1;
+  if (axis >= 0) {
+    if (axis >= static_cast<int64_t>(shape.size())) return UnknownRange();
+    for (size_t i = static_cast<size_t>(axis) + 1; i < shape.size(); i++)
+      stride *= shape[i];
+    extent = shape[static_cast<size_t>(axis)];
+    if (idx < 0 || idx >= extent) return UnknownRange();
+  }
+  int64_t lo = std::numeric_limits<int64_t>::max();
+  int64_t hi = std::numeric_limits<int64_t>::min();
+  int64_t pos = 0;
+  bool any = false;
+  for (const llvm::APInt& a : dense.getValues<llvm::APInt>()) {
+    if (axis < 0 || (pos / stride) % extent == idx) {
+      const int64_t v = value_of(a);
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+      any = true;
+    }
+    pos++;
+  }
+  if (!any) return UnknownRange();
+  return MakeRange(lo, hi);
+}
+
+// A `func.call` frame: the lowering splices a callee into the caller's frame,
+// so an index expression may run through jax's private helpers (`@remainder`,
+// `@_where`) and the analysis follows them the same way -- a result is its
+// callee's returned value, an argument is the call's operand.
+using CallStack = std::vector<mlir::func::CallOp>;
+
+mlir::func::FuncOp CalleeOf(mlir::func::CallOp call, mlir::ModuleOp module) {
+  if (!module) return nullptr;
+  return module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+}
+
+// The module the walk resolves calls against, and one budget for the whole
+// question: the two rules below recurse into each other and re-walk shared
+// subtrees, so the node count -- not the depth -- is what has to be bounded.
+struct RangeCtx {
+  mlir::ModuleOp module;
+  int budget = 4000;
+};
+
+IntRange RangeOfIndex(mlir::Value v, int64_t axis, int64_t idx, RangeCtx* ctx,
+                      CallStack calls, int depth);
+
+// Strip the reshapes that do not change a value's contents.
+mlir::Value PeelIndexView(mlir::Value v) {
+  for (int i = 0; i < 8; i++) {
+    mlir::Operation* o = v.getDefiningOp();
+    if (o == nullptr ||
+        (!mlir::isa<mlir::stablehlo::BroadcastInDimOp>(o) &&
+         !mlir::isa<mlir::stablehlo::ReshapeOp>(o)))
+      break;
+    v = o->getOperand(0);
+  }
+  return v;
+}
+
+// The `select` rule below needs `p` to be EXACTLY "x < 0", not merely to
+// imply it: it reads the then-arm under `x < 0` and the else-arm under
+// `x >= 0`, so a predicate that only implied negativity (`x < -5`, say) would
+// leave the else-arm free to be negative and the conclusion would be wrong.
+// Two questions, then, and both are answered structurally:
+//
+//   kEquals   `p` is true exactly where x < 0
+//   kWeaker   `p` is true wherever x < 0 (it may be true elsewhere too)
+//
+// `and(a, b)` is the second one's reason for existing: jnp's Python-modulo
+// predicate is `(r < 0) != (d < 0) and r != 0`, where the first conjunct IS
+// `r < 0` (the divisor is positive, and its sign term is decided by the
+// DIVISOR'S RANGE rather than by a folded constant -- jax's divide-by-zero
+// guard leaves `d` computed) and the second is merely implied by it.
+enum class NegSense { kEquals, kWeaker };
+
+bool NegPredicate(mlir::Value p, mlir::Value x, NegSense sense, RangeCtx* ctx,
+                  CallStack calls, int depth) {
+  if (depth > 12 || ctx->budget <= 0) return false;
+  ctx->budget--;
+  mlir::Operation* d = p.getDefiningOp();
+  if (d == nullptr) return false;
+  if (mlir::isa<mlir::stablehlo::BroadcastInDimOp>(d) ||
+      mlir::isa<mlir::stablehlo::ReshapeOp>(d))
+    return NegPredicate(d->getOperand(0), x, sense, ctx, calls, depth + 1);
+  if (auto conj = mlir::dyn_cast<mlir::stablehlo::AndOp>(d)) {
+    auto et = IntElem(conj.getResult());
+    if (!et || et->getWidth() != 1) return false;
+    mlir::Value a = conj.getOperand(0), b = conj.getOperand(1);
+    if (sense == NegSense::kWeaker)
+      return NegPredicate(a, x, NegSense::kWeaker, ctx, calls, depth + 1) &&
+             NegPredicate(b, x, NegSense::kWeaker, ctx, calls, depth + 1);
+    // `a and b` is `x < 0` when one conjunct is and the other cannot narrow
+    // it -- i.e. is already true wherever x < 0.
+    for (int k = 0; k < 2; k++) {
+      mlir::Value e = k == 0 ? a : b, o = k == 0 ? b : a;
+      if (NegPredicate(e, x, NegSense::kEquals, ctx, calls, depth + 1) &&
+          NegPredicate(o, x, NegSense::kWeaker, ctx, calls, depth + 1))
+        return true;
+    }
+    return false;
+  }
+  auto cmp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(d);
+  if (!cmp) return false;
+  const mlir::stablehlo::ComparisonDirection dir = cmp.getComparisonDirection();
+  mlir::Value lhs = cmp.getOperand(0), rhs = cmp.getOperand(1);
+  auto ei = IntElem(lhs);
+  if (ei && ei->getWidth() == 1) {
+    // `q != false` and `q == true` are `q`; their negations say nothing.
+    for (int k = 0; k < 2; k++) {
+      mlir::Value b = k == 0 ? lhs : rhs, c = k == 0 ? rhs : lhs;
+      const IntRange rc = RangeOfIndex(c, -1, 0, ctx, calls, depth + 1);
+      if (!rc.known || rc.lo != rc.hi) continue;
+      const bool cv = rc.lo != 0;
+      if ((dir == mlir::stablehlo::ComparisonDirection::NE && !cv) ||
+          (dir == mlir::stablehlo::ComparisonDirection::EQ && cv))
+        return NegPredicate(b, x, sense, ctx, calls, depth + 1);
+    }
+    return false;
+  }
+  // The comparison itself, against a bound that must be EXACTLY zero: an
+  // inequality against anything else would answer a different question.
+  const mlir::Value xp = PeelIndexView(x);
+  auto is_zero = [&](mlir::Value v) {
+    const IntRange r = RangeOfIndex(v, -1, 0, ctx, calls, depth + 1);
+    return r.known && r.lo == 0 && r.hi == 0;
+  };
+  const bool x_left = PeelIndexView(lhs) == xp && is_zero(rhs);
+  const bool x_right = PeelIndexView(rhs) == xp && is_zero(lhs);
+  using CD = mlir::stablehlo::ComparisonDirection;
+  if (x_left && dir == CD::LT) return true;              // x < 0
+  if (x_right && dir == CD::GT) return true;             // 0 > x
+  if (sense == NegSense::kEquals) return false;
+  // Implied by x < 0, and possibly true elsewhere.
+  if (x_left && (dir == CD::LE || dir == CD::NE)) return true;
+  if (x_right && (dir == CD::GE || dir == CD::NE)) return true;
+  // A term the ranges already decide to be TRUE narrows nothing.
+  const IntRange rp = RangeOfIndex(p, -1, 0, ctx, calls, depth + 1);
+  return rp.known && rp.lo == 1 && rp.hi == 1;
+}
+
+// The range of `v`, or of its sub-slice at coordinate `idx` along `axis`
+// (`axis < 0` = the whole value).  Falling back to the whole value is always
+// sound: a component's values are a subset of the array's.
+IntRange RangeOfIndex(mlir::Value v, int64_t axis, int64_t idx, RangeCtx* ctx,
+                      CallStack calls, int depth) {
+  if (depth > 48 || ctx->budget <= 0) return UnknownRange();
+  ctx->budget--;
+  if (!IntElem(v).has_value()) return UnknownRange();
+  const std::vector<int64_t> shape = StaticShape(v);
+  if (axis >= 0 && (axis >= static_cast<int64_t>(shape.size()) ||
+                    idx < 0 || idx >= shape[static_cast<size_t>(axis)]))
+    return UnknownRange();
+
+  auto whole = [&](mlir::Value x) {
+    return RangeOfIndex(x, -1, 0, ctx, calls, depth + 1);
+  };
+  auto same = [&](mlir::Value x) {
+    return RangeOfIndex(x, axis, idx, ctx, calls, depth + 1);
+  };
+
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+    // A callee's argument is the call's operand, in the frame that called it.
+    if (calls.empty()) return UnknownRange();
+    mlir::func::CallOp call = calls.back();
+    mlir::func::FuncOp fn = CalleeOf(call, ctx->module);
+    if (!fn || fn.getBody().getBlocks().size() != 1 ||
+        arg.getOwner() != &fn.getBody().front() ||
+        arg.getArgNumber() >= call->getNumOperands())
+      return UnknownRange();
+    CallStack up = calls;
+    up.pop_back();
+    return RangeOfIndex(call->getOperand(arg.getArgNumber()), axis, idx, ctx,
+                        std::move(up), depth + 1);
+  }
+  mlir::Operation* d = v.getDefiningOp();
+  if (d == nullptr) return UnknownRange();
+
+  if (auto call = mlir::dyn_cast<mlir::func::CallOp>(d)) {
+    mlir::func::FuncOp fn = CalleeOf(call, ctx->module);
+    if (!fn || fn.getBody().getBlocks().size() != 1 || calls.size() > 8)
+      return UnknownRange();
+    mlir::Operation* term = fn.getBody().front().getTerminator();
+    if (term == nullptr || !mlir::isa<mlir::func::ReturnOp>(term))
+      return UnknownRange();
+    const unsigned k = mlir::cast<mlir::OpResult>(v).getResultNumber();
+    if (k >= term->getNumOperands()) return UnknownRange();
+    CallStack down = calls;
+    down.push_back(call);
+    return RangeOfIndex(term->getOperand(k), axis, idx, ctx,
+                        std::move(down), depth + 1);
+  }
+
+  if (auto cst = mlir::dyn_cast<mlir::stablehlo::ConstantOp>(d))
+    return ConstantRange(cst, axis, idx);
+
+  if (auto io = mlir::dyn_cast<mlir::stablehlo::IotaOp>(d)) {
+    const int64_t dim = io.getIotaDimension();
+    if (dim < 0 || dim >= static_cast<int64_t>(shape.size()))
+      return UnknownRange();
+    if (axis == dim) return MakeRange(idx, idx);
+    return MakeRange(0, shape[static_cast<size_t>(dim)] - 1);
+  }
+
+  if (auto bc = mlir::dyn_cast<mlir::stablehlo::BroadcastInDimOp>(d)) {
+    if (axis < 0) return whole(bc.getOperand());
+    // Which source axis (if any) feeds `axis`, and whether it is replicated.
+    llvm::ArrayRef<int64_t> dims = bc.getBroadcastDimensions();
+    const std::vector<int64_t> src = StaticShape(bc.getOperand());
+    for (size_t k = 0; k < dims.size(); k++) {
+      if (dims[k] != axis) continue;
+      if (k >= src.size()) return UnknownRange();
+      if (src[k] == shape[static_cast<size_t>(axis)])
+        return RangeOfIndex(bc.getOperand(), static_cast<int64_t>(k), idx,
+                            ctx, calls, depth + 1);
+      return whole(bc.getOperand());   // extent 1, replicated over `axis`
+    }
+    return whole(bc.getOperand());     // `axis` is new: replicated too
+  }
+
+  if (mlir::isa<mlir::stablehlo::ReshapeOp>(d) ||
+      mlir::isa<mlir::stablehlo::TransposeOp>(d))
+    return whole(d->getOperand(0));
+
+  if (auto cv = mlir::dyn_cast<mlir::stablehlo::ConvertOp>(d)) {
+    // Value-preserving only: same signedness, no narrowing.
+    std::optional<mlir::IntegerType> from = IntElem(cv.getOperand());
+    std::optional<mlir::IntegerType> to = IntElem(cv.getResult());
+    if (!from || !to || from->isUnsigned() != to->isUnsigned() ||
+        to->getWidth() < from->getWidth())
+      return UnknownRange();
+    return same(cv.getOperand());
+  }
+
+  if (auto cat = mlir::dyn_cast<mlir::stablehlo::ConcatenateOp>(d)) {
+    if (axis < 0 || cat.getDimension() != static_cast<uint64_t>(axis)) {
+      IntRange out = UnknownRange();
+      for (mlir::Value o : cat.getOperands()) {
+        IntRange r = same(o);
+        if (!r.known) return UnknownRange();
+        out = out.known ? MakeRange(std::min(out.lo, r.lo),
+                                    std::max(out.hi, r.hi))
+                        : r;
+      }
+      return out;
+    }
+    int64_t off = 0;
+    for (mlir::Value o : cat.getOperands()) {
+      const std::vector<int64_t> os = StaticShape(o);
+      if (axis >= static_cast<int64_t>(os.size())) return UnknownRange();
+      const int64_t n = os[static_cast<size_t>(axis)];
+      if (idx < off + n)
+        return RangeOfIndex(o, axis, idx - off, ctx, calls, depth + 1);
+      off += n;
+    }
+    return UnknownRange();
+  }
+
+  // The elementwise arithmetic, componentwise: StableHLO's elementwise ops
+  // take equally-shaped operands, so the same coordinate reads through.
+  auto binary = [&](mlir::Value a, mlir::Value b, IntRange* ra, IntRange* rb) {
+    *ra = same(a);
+    *rb = same(b);
+    return ra->known && rb->known;
+  };
+  IntRange ra, rb;
+  if (mlir::isa<mlir::stablehlo::AddOp>(d)) {
+    if (!binary(d->getOperand(0), d->getOperand(1), &ra, &rb))
+      return UnknownRange();
+    return MakeRange(ra.lo + rb.lo, ra.hi + rb.hi);
+  }
+  if (mlir::isa<mlir::stablehlo::SubtractOp>(d)) {
+    if (!binary(d->getOperand(0), d->getOperand(1), &ra, &rb))
+      return UnknownRange();
+    return MakeRange(ra.lo - rb.hi, ra.hi - rb.lo);
+  }
+  if (mlir::isa<mlir::stablehlo::MaxOp>(d)) {
+    if (!binary(d->getOperand(0), d->getOperand(1), &ra, &rb))
+      return UnknownRange();
+    return MakeRange(std::max(ra.lo, rb.lo), std::max(ra.hi, rb.hi));
+  }
+  if (mlir::isa<mlir::stablehlo::MinOp>(d)) {
+    if (!binary(d->getOperand(0), d->getOperand(1), &ra, &rb))
+      return UnknownRange();
+    return MakeRange(std::min(ra.lo, rb.lo), std::min(ra.hi, rb.hi));
+  }
+  if (mlir::isa<mlir::stablehlo::ClampOp>(d)) {
+    // `min(max(x, lo), hi)`: at most `hi`, and at least the smaller of the two
+    // bounds -- which holds whether or not `lo <= hi`, so the rule needs no
+    // ordering assumption and no bound on `x` at all.
+    IntRange rlo = same(d->getOperand(0)), rhi = same(d->getOperand(2));
+    if (!rlo.known || !rhi.known) return UnknownRange();
+    return MakeRange(std::min(rlo.lo, rhi.lo), rhi.hi);
+  }
+  if (auto cmp = mlir::dyn_cast<mlir::stablehlo::CompareOp>(d)) {
+    // A boolean is an i1 in [0, 1], and a comparison the operand ranges settle
+    // is that constant -- which is what decides jax's Python-modulo predicate,
+    // whose "is the divisor negative" term never folds (the divisor went
+    // through the divide-by-zero guard).
+    const IntRange a = same(cmp.getOperand(0)), b = same(cmp.getOperand(1));
+    const IntRange any = MakeRange(0, 1);
+    if (!a.known || !b.known) return any;
+    // Signed and unsigned agree on non-negative ranges; anything else is only
+    // read when the op says SIGNED.
+    auto ct = cmp.getCompareType();
+    const bool ok =
+        (a.lo >= 0 && b.lo >= 0) ||
+        (ct.has_value() && *ct == mlir::stablehlo::ComparisonType::SIGNED);
+    if (!ok) return any;
+    bool always_true = false, always_false = false;
+    switch (cmp.getComparisonDirection()) {
+      case mlir::stablehlo::ComparisonDirection::LT:
+        always_true = a.hi < b.lo;  always_false = a.lo >= b.hi;  break;
+      case mlir::stablehlo::ComparisonDirection::LE:
+        always_true = a.hi <= b.lo; always_false = a.lo > b.hi;   break;
+      case mlir::stablehlo::ComparisonDirection::GT:
+        always_true = a.lo > b.hi;  always_false = a.hi <= b.lo;  break;
+      case mlir::stablehlo::ComparisonDirection::GE:
+        always_true = a.lo >= b.hi; always_false = a.hi < b.lo;   break;
+      case mlir::stablehlo::ComparisonDirection::EQ:
+        always_true = a.lo == a.hi && b.lo == b.hi && a.lo == b.lo;
+        always_false = a.hi < b.lo || b.hi < a.lo;
+        break;
+      case mlir::stablehlo::ComparisonDirection::NE:
+        always_false = a.lo == a.hi && b.lo == b.hi && a.lo == b.lo;
+        always_true = a.hi < b.lo || b.hi < a.lo;
+        break;
+    }
+    if (always_true) return MakeRange(1, 1);
+    if (always_false) return MakeRange(0, 0);
+    return any;
+  }
+  if (auto rem = mlir::dyn_cast<mlir::stablehlo::RemOp>(d)) {
+    // StableHLO's remainder takes the sign of the DIVIDEND and is smaller in
+    // MAGNITUDE than the divisor, so any divisor range that excludes zero
+    // bounds it whatever the dividend is -- which is what jax's own
+    // divide-by-zero guard (`_where(d == 0, 1, d)`) leaves behind: a range,
+    // not a constant.  A non-negative dividend tightens it to [0, |D| - 1].
+    IntRange rd = same(rem.getOperand(1));
+    if (!rd.known || (rd.lo <= 0 && rd.hi >= 0)) return UnknownRange();
+    const int64_t mag =
+        std::max(std::abs(rd.lo), std::abs(rd.hi)) - 1;
+    IntRange rn = same(rem.getOperand(0));
+    if (rn.known && rn.lo >= 0) return MakeRange(0, mag);
+    return MakeRange(-mag, mag);
+  }
+  if (auto sel = mlir::dyn_cast<mlir::stablehlo::SelectOp>(d)) {
+    mlir::Value p = sel.getOperand(0), t = sel.getOperand(1),
+                f = sel.getOperand(2);
+    // jax's negative-index normalization, `select(i < 0, i + D, i)`: where
+    // i < 0 the taken arm is i + D and where i >= 0 it is i, so the result is
+    // in [0, D-1] as soon as i is in [-D, D-1].  This is the ONE place the
+    // predicate is read (a plain union of the arms gives [-D+1, 2D-1] and
+    // proves nothing), and it is read for EXACTLY "i < 0": under a merely
+    // sufficient predicate the else-arm could still be negative.
+    IntRange rf = same(f);
+    if (rf.known) {
+      if (auto add = mlir::dyn_cast_or_null<mlir::stablehlo::AddOp>(
+              t.getDefiningOp())) {
+        for (int k = 0; k < 2; k++) {
+          if (add->getOperand(k) != f) continue;
+          mlir::Value off = add->getOperand(1 - k);
+          IntRange rD = same(off);
+          if (!rD.known || rD.lo <= 0) continue;
+          if (!NegPredicate(p, f, NegSense::kEquals, ctx, calls, 0)) continue;
+          if (rD.lo == rD.hi && rf.lo >= -rD.lo && rf.hi <= rD.lo - 1)
+            return MakeRange(0, rD.lo - 1);
+          // jnp's `mod`: the same select over `remainder(n, D)` -- and with
+          // the SAME D, which is the whole of the proof.  |r| <= D - 1 makes
+          // the taken arm land in [1, D-1] and the other in [0, D-1], for
+          // whatever positive value D turns out to hold.  Reading D as an
+          // interval (as the guarded divisor forces) would lose exactly this
+          // correlation, so it is matched structurally instead.
+          auto fr = mlir::dyn_cast_or_null<mlir::stablehlo::RemOp>(
+              PeelIndexView(f).getDefiningOp());
+          if (fr && PeelIndexView(fr.getOperand(1)) == PeelIndexView(off))
+            return MakeRange(0, rD.hi - 1);
+        }
+      }
+    }
+    IntRange rt = same(t);
+    if (!rt.known || !rf.known) return UnknownRange();
+    return MakeRange(std::min(rt.lo, rf.lo), std::max(rt.hi, rf.hi));
+  }
+  return UnknownRange();
+}
+
+// Whether XLA's out-of-bounds DROP can fire on this scatter at all: every
+// MAPPED start component must be inside its window's legal range.  The
+// batching iota and the synthesized constant zero are in bounds by
+// construction and are not asked.
+bool ScatterIndicesInBounds(mlir::Value indices, const IndexPlan& plan,
+                            mlir::ModuleOp module) {
+  RangeCtx ctx{module, 4000};
+  for (const IndexEntry& e : plan.entries) {
+    if (e.kind != 0) continue;
+    // With `index_vector_dim == rank` the whole array is component 0; other-
+    // wise the components sit along `ivd`.
+    const IntRange r =
+        plan.split ? RangeOfIndex(indices, plan.ivd, e.a, &ctx, {}, 0)
+                   : RangeOfIndex(indices, -1, 0, &ctx, {}, 0);
+    if (!r.known || r.lo < 0 || r.hi > e.b) return false;
+  }
+  return true;
+}
+
 // tape.py `_lower_gather`, as ONE mx::gather.  StableHLO's gather IS MLX's,
 // modulo three static rearrangements: the coordinate vector is split into one
 // index array per mapped operand dim (all of the index batch shape, which
@@ -4208,6 +4712,39 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
       const int64_t axis = plan.entries[pos].axis;
       extra = {static_cast<int64_t>(pos), sshape[static_cast<size_t>(axis)],
                op_shape[static_cast<size_t>(axis)]};
+
+      // A SET whose index batch holds exactly ONE coordinate writes exactly
+      // one contiguous window -- which `mx::slice_update` does in a single
+      // pass, where the dummy pad above needs three (a concatenate that
+      // DOUBLES the operand, a scatter over the extended copy, a slice to cut
+      // the pad back off).  That is the whole cost of a decode KV-cache
+      // append, 3 x per layer per token.  Two arms, both exact:
+      //
+      //   3  the start is provably in bounds, so the drop cannot fire and
+      //      the write needs nothing else;
+      //   4  it is not, and the drop is spelled as a window-sized read-back
+      //      (the handler's indices are CLAMPED, so writing the current
+      //      contents back at the clamped start leaves the operand untouched
+      //      -- exactly what dropping the update means).
+      //
+      // Restricted to a genuine SET: the rewritten complex multiply (6) and
+      // the vectorized apply (7) read the operand through the same clamped
+      // indices, and mixing that read with this one is not worth the proof.
+      if (kScatterAppend > 0 && combiner == Combiner::kSet &&
+          method_code == 0 && Product(plan.batch_shape) == 1 &&
+          Product(sshape) > 0 && op_numel > 0) {
+        const bool proven =
+            ScatterIndicesInBounds(op->getOperand(1), plan, ctx_->module);
+        if (proven || kScatterAppend > 1) {
+          strategy = proven ? 3 : 4;
+          extra.clear();   // neither arm has a pad to describe
+          if (kDebug)
+            std::fprintf(stderr,
+                         "[metaljax-native] scatter append: one-window SET, "
+                         "%s\n",
+                         proven ? "in bounds" : "guarded");
+        }
+      }
     } else {
       strategy = 1;
       auto t =

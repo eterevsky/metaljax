@@ -496,7 +496,8 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //                        [updates shape],
 //                        strategy 1: [mask shape] (the neutral value is in
 //                                    `payload`)
-//                        strategy 2: pad position, pad width, extent]
+//                        strategy 2: pad position, pad width, extent
+//                        strategies 3 and 4: nothing]
 //                       method: 0 set 1 add 2 mul 3 max 4 min 5 sub
 //                               6 complex multiply, as gather-multiply-set
 //                               7 an APPLY body under `unique_indices`,
@@ -505,7 +506,12 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //                               8 the same body with NO promise: one update
 //                                 at a time, in row-major update order
 //                       strategy: the OOB-drop rule — 0 none, 1 neutral
-//                       value, 2 dummy pad. Second, ahead of everything
+//                       value, 2 dummy pad, 3 and 4 the single-window SET
+//                       (`mx::slice_update`, whose one pass replaces the pad's
+//                       three): 3 when the start is provably in bounds so the
+//                       drop cannot fire, 4 when it is not and the drop is a
+//                       window-sized read-back (METALJAX_SCATTER_APPEND).
+//                       Second, ahead of everything
 //                       variable-length, so it can be read at a glance.
 //                       methods 7 and 8 append [ncaps] right after [updates
 //                       shape]
