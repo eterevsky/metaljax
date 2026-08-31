@@ -1,0 +1,90 @@
+metal: give the transposed GEMV an occupancy floor
+
+`gemv_axbpy` picks the transposed-matrix kernel's tile from two thresholds:
+
+    if (in_vector_len >= 8192 && out_vector_len >= 2048) { sm = 4; sn = 8; }
+    else                                                 { sm = 8; sn = 4; }
+    bn = out_vector_len >= 2048 ? 16 : out_vector_len >= 512 ? 4 : 2;
+    n_out_per_tgp = bn * sn * tn;
+    n_tgp         = ceil(out_vector_len / n_out_per_tgp);   // == the grid
+
+One threadgroup covers `bn * sn * tn` outputs and loops over the whole
+contracted axis, so every widening of the tile DIVIDES the number of
+threadgroups the dispatch launches.  The widest choice (sn = 8 with bn = 16)
+covers 512 outputs -- and a 5376-wide projection is then eleven threadgroups
+for an 84 MB read.  Most of the GPU is idle and the dispatch runs at a
+fraction of memory bandwidth.
+
+Measured on an M5 Max, bfloat16, M = 1, best of 30, `x @ w` with w row-major
+[K, N]:
+
+    K = 8192, N = 5376   11 threadgroups   0.709 ms
+    K = 8191, N = 5376   21 threadgroups   0.336 ms
+
+One element less on the contracted axis, one branch different, 2.1x.  The
+same cliff shows up as a storage-orientation effect, because `[N, K]` read
+through `.T` takes the OTHER kernel entirely:
+
+    contraction              row-major [K,N]   [N,K] read .T
+    K=8192  -> N=5376              0.709            0.346
+    K=21504 -> N=5376              0.990            0.585
+    K=5376  -> N=8192  (below)     0.332            0.305
+    K=5376  -> N=43008 (below)     1.025            0.982
+
+Only the two dispatches in the `>= 8192` branch are affected, which is what
+made this look like a layout problem rather than a tiling one.
+
+The fix narrows the simdgroup back (sn 8 -> 4, sm 4 -> 8; the product stays
+32) while the grid would be under 32 threadgroups.  sn = 4 is the shape every
+`in_vector_len < 8192` dispatch already uses, so this only ever restores a
+well-trodden kernel; nothing new is compiled and no other shape moves.
+
+After, through a PJRT plugin on the same machine (3 runs each, medians, the
+`as-is` = row-major arm):
+
+    contraction              before   after   [N,K].T reference
+    31B attn_vec K=8192      0.605    0.476   0.340
+    31B down    K=21504      1.012    0.674   0.598
+    31B q_proj  K=5376       0.595    0.576   0.578   (untouched, as designed)
+    31B gating  K=5376       1.058    1.047   0.985   (untouched)
+    12B attn_vec K=4096      0.235    0.238   0.187   (untouched)
+    12B down    K=15360      1.013    0.524   0.365
+
+Whole-model, gemma-4-12B-it bf16 decode, 128 greedy tokens, one process per
+cell, against a control built from the same tree with this hunk reverted:
+74.7 -> 63.9 ms/token, token stream byte-identical.
+
+Signed-off-by: (prepared locally; not pushed)
+---
+diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
+--- a/mlx/backend/metal/matmul.cpp
++++ b/mlx/backend/metal/matmul.cpp
+@@ -1107,6 +1107,28 @@ void gemv_axbpy(
+
+     // Specialized kernel for very small outputs
+     tn = out_vector_len < tn ? 1 : tn;
++
++    // Occupancy floor.  One threadgroup covers bn * sn * tn outputs, so the
++    // grid is out_vector_len divided by that: every widening of the tile
++    // divides the number of threadgroups the dispatch launches.  The widest
++    // choice here (sn = 8 with bn = 16) covers 512 outputs, which on a
++    // 5376-wide projection is ELEVEN threadgroups for an 84 MB read -- most
++    // of the GPU idle, and the dispatch running at a fraction of memory
++    // bandwidth.  Narrow the simdgroup back until the grid can fill the
++    // machine; sn = 4 is the shape every in_vector_len < 8192 dispatch
++    // already uses, so this only ever restores a well-trodden kernel.
++    //
++    // Measured on an M5 Max, bfloat16, M = 1, best of 30: at K = 8192,
++    // N = 5376 the wide tile gives 11 threadgroups and 0.709 ms; one element
++    // less (K = 8191) takes the narrow branch, gives 21, and costs 0.336 ms.
++    // A 2.1x cliff either side of a threshold that is about K alone.
++    constexpr int min_threadgroups = 32;
++    while (sn > 4 &&
++           (out_vector_len + bn * sn * tn - 1) / (bn * sn * tn) <
++               min_threadgroups) {
++      sn /= 2;
++      sm *= 2;
++    }
+
+     n_out_per_tgp = bn * sn * tn;
+     kname << "gemv_t_" << type_to_name(out);

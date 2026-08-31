@@ -473,9 +473,14 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //   kArgReduce          [is_max, dim]           two results: (value, index)
 //   kShift*             [static?, amount]       see shift_guard
 //   kDotGeneral         [lrank, lperm..., rrank, rperm..., B, M, K, N,
-//                        out_dtype, out_rank, out_shape..., kind, chunk]
+//                        out_dtype, out_rank, out_shape..., kind, chunk,
+//                        batch side, batch groups, batch tail]
 //                       kind: 0 float matmul, 1 exact-f32 K-chunks,
 //                             2 int64 outer product, 3 the same in bool
+//                       batch side selects the MIDDLE-contracted arm, which
+//                       reads that operand where it lies instead of copying
+//                       it into the plain merge: 0 off, 1 the rhs (viewed
+//                       [B, G, K, Ntail]), 2 the lhs ([B, G, Mtail, K])
 //   kBitcastConvert     [dtype, kind]           kind: 0 same width,
 //                                               1 narrowing, 2 widening
 //   kDynamicSlice       [rank, clamp bounds..., sizes...]

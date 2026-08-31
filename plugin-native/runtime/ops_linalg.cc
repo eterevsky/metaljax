@@ -47,21 +47,60 @@ bool Program::step_linalg(const Entry& e,
       p += static_cast<size_t>(out_rank);
       int64_t kind = at[p++];
       int64_t chunk = at[p++];
+      int64_t bside = at[p++];
+      int64_t bgroups = at[p++];
+      int64_t btail = at[p++];
 
       mx::array l = mx::transpose(in(0), lperm);
       mx::array r = mx::transpose(in(1), rperm);
-      mx::array l3 = mx::reshape(
-          l, mx::Shape{static_cast<int>(b), static_cast<int>(m),
-                       static_cast<int>(k)});
-      mx::array r3 = mx::reshape(
-          r, mx::Shape{static_cast<int>(b), static_cast<int>(k),
-                       static_cast<int>(n)});
       if (b * m * n == 0) {
         // mx.matmul with an empty M/N output yields an array whose host
         // conversion segfaults (null data pointer, MLX 0.32).
         env[e.outs[0]] = mx::zeros(out_shape, out_dt);
         break;
       }
+      if (bside != 0) {
+        // The MIDDLE-contracted operand, contracted WHERE IT LIES.  The
+        // lowering has already checked that the plain arm would copy it,
+        // that this arm would not, and that its own permutation
+        // (`lperm`/`rperm` on that side) is the identity -- so every
+        // reshape below is a view, and the transposes above are no-ops.
+        // mx::matmul broadcasts the batch dims, so the other operand only
+        // needs a unit axis to ride.
+        const int gi = static_cast<int>(bgroups), ti = static_cast<int>(btail);
+        const int bi = static_cast<int>(b), ki = static_cast<int>(k);
+        mx::array a = l, c = r;
+        if (bside == 1) {
+          // The weight is the RHS: [B, G, K, Ntail] against [B, 1, M, K].
+          a = mx::reshape(l, mx::Shape{bi, 1, static_cast<int>(m), ki});
+          c = mx::reshape(r, mx::Shape{bi, gi, ki, ti});
+        } else {
+          // The weight is the LHS: [B, G, Mtail, K] (last two axes swapped,
+          // which `check_transpose` reads off `stx == 1` with no copy)
+          // against [B, 1, K, N].
+          a = mx::transpose(mx::reshape(l, mx::Shape{bi, gi, ki, ti}),
+                            std::vector<int>{0, 1, 3, 2});
+          c = mx::reshape(r, mx::Shape{bi, 1, ki, static_cast<int>(n)});
+        }
+        if (a.dtype() != out_dt) a = mx::astype(a, out_dt);
+        if (c.dtype() != out_dt) c = mx::astype(c, out_dt);
+        mx::array o4 = mx::matmul(a, c);
+        // The lhs arm lands on [B, G, Mtail, N], which IS the result layout
+        // (batch ++ lhs free ++ rhs free).  The rhs arm lands on
+        // [B, G, M, Ntail] and the layout wants [B, M, G, Ntail] -- the same
+        // bytes in the same order when M == 1, so the permute is skipped
+        // there rather than left to MLX's unit-axis contiguity rule.
+        if (bside == 1 && m != 1)
+          o4 = mx::transpose(o4, std::vector<int>{0, 2, 1, 3});
+        env[e.outs[0]] = mx::reshape(o4, out_shape);
+        break;
+      }
+      mx::array l3 = mx::reshape(
+          l, mx::Shape{static_cast<int>(b), static_cast<int>(m),
+                       static_cast<int>(k)});
+      mx::array r3 = mx::reshape(
+          r, mx::Shape{static_cast<int>(b), static_cast<int>(k),
+                       static_cast<int>(n)});
       mx::array o3 = l3;
       if (kind == 1) {
         // _int_dot_via_f32: f32 holds every integer up to 2**24 exactly,

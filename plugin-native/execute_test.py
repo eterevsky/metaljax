@@ -404,6 +404,63 @@ def _cases():
          [np.arange(-6, 6, dtype=np.int8).reshape(3, 4),
           np.arange(-10, 10, dtype=np.int8).reshape(4, 5)], *EXACT),
 
+        # The MIDDLE-contracted operand (metal_lowering.cc's batched arm).
+        # When an operand's contracted axes have free axes on BOTH sides, the
+        # plain [B, K, N] merge is not a view and MLX copies the whole thing;
+        # the batched arm reads it where it lies instead.  Both slots, because
+        # jax puts the weight in whichever one the einsum's output names
+        # first: `BTD,NDH` gives dot(x, w), `BSD,CKDH` gives dot(w, x).
+        ("middle-contracted rhs (q einsum)",
+         lambda x, w: jnp.einsum("BTD,NDH->BTNH", x, w),
+         [_rand((1, 1, 24), 80), _rand((5, 24, 7), 81)], *DOT),
+        ("middle-contracted lhs (kv einsum)",
+         lambda x, w: jnp.einsum("BSD,CKDH->CBSKH", x, w),
+         [_rand((1, 1, 24), 82), _rand((2, 3, 24, 7), 83)], *DOT),
+        # M > 1: the rhs arm owes an output permute here, the lhs arm does not.
+        ("middle-contracted rhs, M > 1",
+         lambda x, w: jnp.einsum("BTD,NDH->BTNH", x, w),
+         [_rand((2, 6, 24), 84), _rand((5, 24, 7), 85)], *DOT),
+        ("middle-contracted lhs, M > 1",
+         lambda x, w: jnp.einsum("BSD,CKDH->CBSKH", x, w),
+         [_rand((3, 4, 24), 86), _rand((2, 3, 24, 7), 87)], *DOT),
+        ("middle-contracted bf16",
+         lambda x, w: jnp.einsum("BTD,NDH->BTNH", x, w),
+         [bf(_rand((1, 1, 24), 88)), bf(_rand((5, 24, 7), 89))], *BF16DOT),
+        ("middle-contracted lhs bf16",
+         lambda x, w: jnp.einsum("BSD,CKDH->CBSKH", x, w),
+         [bf(_rand((1, 1, 24), 90)), bf(_rand((2, 3, 24, 7), 91))], *BF16DOT),
+        # A real batching dim in front of the middle-contracted axes.
+        ("middle-contracted with batch dim",
+         lambda x, w: jnp.einsum("GBD,GNDH->GBNH", x, w),
+         [_rand((3, 1, 24), 92), _rand((3, 5, 24, 7), 93)], *DOT),
+        # Two contracted axes, adjacent and in the middle: still one merge.
+        ("middle-contracted, 2 contracting dims",
+         lambda x, w: jnp.einsum("BTDE,NDEH->BTNH", x, w),
+         [_rand((1, 1, 4, 6), 94), _rand((5, 4, 6, 7), 95)], *DOT),
+        # ...and NON-adjacent, which the arm must decline (the weight cannot
+        # be viewed as [G, K, Ntail] and the plain copy stands).
+        ("split contracting dims decline",
+         lambda x, w: jnp.einsum("BTDE,NDMEH->BTNMH", x, w),
+         [_rand((1, 1, 4, 6), 96), _rand((5, 4, 3, 6, 7), 97)], *DOT),
+        # The shapes that must keep the plain arm: contracted axes LEADING
+        # (attn_vec) and LAST (gating) are views already, and a unit leading
+        # free axis has nothing to batch over.
+        ("leading-contracted stays plain",
+         lambda x, w: jnp.einsum("BTNH,NHD->BTD", x, w),
+         [_rand((1, 1, 5, 7), 98), _rand((5, 7, 24), 99)], *DOT),
+        ("last-contracted stays plain",
+         lambda x, w: jnp.einsum("BTF,NHF->BTNH", x, w),
+         [_rand((1, 1, 24), 100), _rand((2, 9, 24), 101)], *DOT),
+        ("middle-contracted, one group",
+         lambda x, w: jnp.einsum("BTD,NDH->BTNH", x, w),
+         [_rand((1, 1, 24), 102), _rand((1, 24, 7), 103)], *DOT),
+        # Integer dots take the exact-f32-chunk arm, never the batched one.
+        ("middle-contracted int32",
+         lambda x, w: jnp.einsum("BTD,NDH->BTNH", x, w),
+         [np.arange(-12, 12, dtype=np.int32).reshape(1, 1, 24),
+          (np.arange(5 * 24 * 7, dtype=np.int32).reshape(5, 24, 7) % 9) - 4],
+         *EXACT),
+
         # lax.ragged_dot: jax's dense fallback is the ragged-dot recognizer's
         # match (metal_ragged.cc -> one gather_mm); the CPU runs the dense
         # chain literally, so this compares the rewrite against its spec.

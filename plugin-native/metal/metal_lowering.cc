@@ -821,6 +821,10 @@ const int64_t kCompileBytes =
 // iota twice per layer) is paid 2 x 26 times per decoded token, while a
 // @main runs once and a 0-arg program (a checkpoint restore) is nothing BUT
 // argument-independent ops that must not be materialized at lower time.
+// 0.11.7 dense band, item 1: contract a MIDDLE-contracted weight as a batched
+// matmul over its leading free axes rather than copying it into the plain
+// arm's [B, K, N] merge.  See LowerDotGeneral for the three conditions.
+const bool kDotBatched = EnvOn("METALJAX_DOT_BATCHED");
 const bool kCsePass = EnvOn("METALJAX_CSE");
 const bool kFoldPass = EnvOn("METALJAX_FOLD");
 const int64_t kFoldMaxMb = EnvInt("METALJAX_FOLD_MAX_MB", 96);
@@ -2804,6 +2808,70 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerPad(mlir::Operation* op) {
   return attrs;
 }
 
+// Would `reshape(transpose(x, perm), target)` hand back a VIEW, for a
+// row-contiguous `x` of shape `src`?  When it would not, MLX materializes a
+// full copy of the operand -- `reshape_gpu` (mlx/backend/metal/copy.cpp) asks
+// `prepare_reshape` (mlx/backend/common/common.cpp) and falls through to
+// `copy_gpu_inplace` on a `true`.  This mirrors that decision: collapse the
+// input's contiguous runs, then try to factor the target's dims out of them.
+//
+// It is used to price the dot's own lowering, so a divergence from MLX can
+// only cost or save an optimization -- never a result.
+bool ReshapeIsView(const std::vector<int64_t>& src,
+                   const std::vector<int64_t>& perm,
+                   const std::vector<int64_t>& target) {
+  const size_t r = src.size();
+  if (perm.size() != r) return false;
+  std::vector<int64_t> stride(r, 1);
+  for (size_t i = r; i-- > 1;) stride[i - 1] = stride[i] * src[i];
+  std::vector<int64_t> pshape(r), pstride(r);
+  for (size_t i = 0; i < r; i++) {
+    pshape[i] = src[perm[i]];
+    pstride[i] = stride[perm[i]];
+  }
+
+  int64_t numel = 1;
+  for (int64_t d : src) numel *= d;
+  if (numel == 0) return true;  // prepare_reshape's empty early-out
+
+  // `collapse_contiguous_dims`: drop unit axes, merge a run when the outer
+  // stride is exactly the inner stride times the inner extent.  MLX keeps
+  // unit axes IN the contiguity test (a unit axis whose stride differs from
+  // its neighbour's breaks the run there); dropping them is the permissive
+  // side, and permissive here only ever declines an optimization.
+  std::vector<int64_t> cshape, cstride;
+  for (size_t i = 0; i < r; i++) {
+    if (pshape[i] == 1) continue;
+    if (!cshape.empty() && pstride[i] * pshape[i] == cstride.back()) {
+      cshape.back() *= pshape[i];
+      cstride.back() = pstride[i];
+    } else {
+      cshape.push_back(pshape[i]);
+      cstride.push_back(pstride[i]);
+    }
+  }
+  if (cshape.empty()) return true;  // a scalar after collapsing
+  // Row-contiguous input is prepare_reshape's other early-out: one run left
+  // whose stride is 1.
+  if (cshape.size() == 1 && cstride[0] == 1) return true;
+
+  // The factoring loop, verbatim in effect: peel each target extent off the
+  // front of the current run; a run that does not divide forces the copy.
+  size_t j = 0;
+  for (size_t i = 0; i < target.size(); i++) {
+    const int64_t want = target[i];
+    if (j < cshape.size() && cshape[j] % want == 0) {
+      cshape[j] /= want;
+      if (cshape[j] == 1) j++;
+    } else if (want == 1) {
+      continue;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
 absl::StatusOr<std::vector<int64_t>> Lowering::LowerDotGeneral(
     mlir::Operation* op) {
   auto dot = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op);
@@ -2909,6 +2977,129 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDotGeneral(
     return Decline("dot_general result dtype");
   }
 
+  // ------------------------------------------------------------------
+  // The MIDDLE-contracted weight: contract as a BATCHED matmul instead.
+  // ------------------------------------------------------------------
+  //
+  // The plain arm merges each operand down to [B, M, K] / [B, K, N] after a
+  // transpose.  That merge is a free view when the contracted axes are the
+  // operand's leading ones (the transpose is the identity) or its trailing
+  // ones (the free axes stay adjacent), and it is NOT when they sit in the
+  // MIDDLE: merging the free axes ACROSS the contracted stride is not
+  // expressible, so MLX materializes the whole operand -- every call, in
+  // every layer (`reshape_gpu` -> `prepare_reshape` -> `copy_gpu_inplace`).
+  // gemma spells both of its attention projections that way, which cost
+  // row 1 a measured 42.4 ms per decoded token (the 0.11.7 dense-band
+  // diagnosis, layout probe x4, plus this pass's lhs probe x2).
+  //
+  // The alternative reads the weight WHERE IT LIES: take its leading free
+  // axes as extra batch dims and contract each slice against the other
+  // operand, broadcast over those batches.  No new kernel, no rewritten
+  // weight, no extra byte resident.
+  //
+  // Both slots need it, because jax puts the weight in whichever slot the
+  // einsum's OUTPUT spec names first:
+  //
+  //   `BTD,NDH->BTNH`   (q)  -> dot(x, w)  weight is the RHS
+  //   `BSD,CKDH->CBSKH` (kv) -> dot(w, x)  weight is the LHS
+  //
+  // and the plain arm copies the middle-contracted one either way.
+  //
+  //   RHS side: view the weight as [B, G, K, Ntail], give the lhs a unit
+  //     batch axis, matmul -> [B, G, M, Ntail].  The result layout wants
+  //     [B, M, G, Ntail], so this arm owes ONE permute of the (usually
+  //     tiny) output -- and none at all when M == 1, where the two read the
+  //     same bytes in the same order.
+  //   LHS side: view the weight as [B, G, K, Mtail] and swap its last two
+  //     axes (a view: `check_transpose` takes `stx == 1` without a copy),
+  //     matmul -> [B, G, Mtail, N], which IS the result layout
+  //     (batch ++ lhs free ++ rhs free).  This arm never owes a permute.
+  //
+  // Conditions, all read off the shapes and strides:
+  //
+  //   (a) the operand's axes already read [batch][lead free][contract]
+  //       [tail free] -- i.e. that permutation is the IDENTITY, so the
+  //       batched operand is the weight itself, viewed;
+  //   (b) there are free axes on BOTH sides of the contracted block, and
+  //       more than one leading group (otherwise the plain arm's merge is a
+  //       view already and there is nothing to batch over);
+  //   (c) the plain arm really would copy -- asked of the merge, not
+  //       assumed from the shape; and
+  //   (d) it is cheaper: the plain arm copies the whole operand, this one
+  //       copies at most the output, so compare those two element counts.
+  //
+  // When both operands qualify (nothing in the band does), the bigger one
+  // wins: it is the one whose copy is worth removing.
+  int64_t batch_side = 0, batch_groups = 0, batch_tail = 0;
+  if (kDotBatched && kind == 0) {
+    // `slot` returns {groups, tail, identity-permutation} for one operand, or
+    // groups == 0 when the batched form does not apply to it.
+    auto slot = [&](const std::vector<int64_t>& shape,
+                    const std::vector<int64_t>& sb,
+                    const std::vector<int64_t>& sc,
+                    const std::vector<int64_t>& sfree,
+                    const std::vector<int64_t>& plain_perm,
+                    const std::vector<int64_t>& plain_merge,
+                    int64_t permute_cost,
+                    std::vector<int64_t>* perm_out) -> std::pair<int64_t, int64_t> {
+      if (sc.empty()) return {0, 0};
+      int64_t lo = sc[0];
+      for (int64_t d : sc) lo = std::min(lo, d);
+      std::vector<int64_t> lead, tail;
+      for (int64_t d : sfree) (d < lo ? lead : tail).push_back(d);
+      if (lead.empty() || tail.empty()) return {0, 0};
+      std::vector<int64_t> pb = sb;
+      pb.insert(pb.end(), lead.begin(), lead.end());
+      pb.insert(pb.end(), sc.begin(), sc.end());
+      pb.insert(pb.end(), tail.begin(), tail.end());
+      if (pb.size() != shape.size()) return {0, 0};
+      for (size_t i = 0; i < pb.size(); i++)
+        if (pb[i] != static_cast<int64_t>(i)) return {0, 0};
+      const int64_t g = Product(pick(shape, lead));
+      if (g <= 1) return {0, 0};
+      if (permute_cost >= Product(shape)) return {0, 0};
+      if (ReshapeIsView(shape, plain_perm, plain_merge)) return {0, 0};
+      *perm_out = std::move(pb);
+      return {g, Product(pick(shape, tail))};
+    };
+
+    // The rhs arm owes an output permute unless there is a single lhs-free
+    // element; the lhs arm never owes one.
+    std::vector<int64_t> rperm_b, lperm_b;
+    const auto r_hit =
+        slot(rhs, rb, rc, rfree, rperm,
+             {Product(batch), Product(k), Product(n)},
+             Product(m) == 1 ? 0
+                             : Product(batch) * Product(m) * Product(n),
+             &rperm_b);
+    const auto l_hit =
+        slot(lhs, lb, lc, lfree, lperm,
+             {Product(batch), Product(m), Product(k)}, 0, &lperm_b);
+    const bool take_rhs =
+        r_hit.first > 1 && (l_hit.first <= 1 || Product(rhs) >= Product(lhs));
+    if (take_rhs) {
+      batch_side = 1;
+      batch_groups = r_hit.first;
+      batch_tail = r_hit.second;
+      rperm = std::move(rperm_b);  // the identity; the runtime is uniform
+    } else if (l_hit.first > 1) {
+      batch_side = 2;
+      batch_groups = l_hit.first;
+      batch_tail = l_hit.second;
+      lperm = std::move(lperm_b);
+    }
+    if (batch_side != 0 && kDebug)
+      std::fprintf(stderr,
+                   "[metaljax-native] dot: %s batched over %lld leading "
+                   "group(s) (K=%lld, tail=%lld) instead of copying a "
+                   "%lld-element operand\n",
+                   batch_side == 1 ? "rhs" : "lhs",
+                   static_cast<long long>(batch_groups),
+                   static_cast<long long>(Product(k)),
+                   static_cast<long long>(batch_tail),
+                   static_cast<long long>(Product(batch_side == 1 ? rhs : lhs)));
+  }
+
   std::vector<int64_t> attrs{static_cast<int64_t>(lperm.size())};
   attrs.insert(attrs.end(), lperm.begin(), lperm.end());
   attrs.push_back(static_cast<int64_t>(rperm.size()));
@@ -2922,6 +3113,9 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDotGeneral(
   attrs.insert(attrs.end(), out_shape.begin(), out_shape.end());
   attrs.push_back(kind);
   attrs.push_back(chunk);
+  attrs.push_back(batch_side);
+  attrs.push_back(batch_groups);
+  attrs.push_back(batch_tail);
   return attrs;
 }
 
