@@ -21,7 +21,7 @@ parentheses is peak footprint where measured.
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | **28.5** (73 GB) | **13.7** | — | 15.3 ¹⁰ |
 | 9 | R1-Distill-32B | ✗ 131 GB | **190.8** (67 GB) | 131.8 | — | 114.9 ¹⁰ |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ² | **24.8** ¹¹ (92 GB) | 10.5 | — | 10.7 ¹⁰ |
-| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **12.33** | 3.0 | — | 3.4 ¹⁰ |
+| 11 | Qwen3-0.6B (keras-hub decode) | 29.4 | **9.0** ¹³ | 3.0 | — | 3.4 ¹⁰ |
 | 12 | Mixtral 8×7B bf16 | ✗ | **85.6** (90 GB) | **52.8** (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ⁸ | **77.0** | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **29.88** | — | — | — |
@@ -31,12 +31,14 @@ parentheses is peak footprint where measured.
 | 18 | LoRA E2B train (ms/step) | 2048 | **362.1** | — | 135.6 ³ | — |
 | 19 | maxtext train 0.6B (ms/step) | 1402 | **444.6** | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | **56.2** (101 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
+| 21 | Qwen3.8-27B bf16 (dense hybrid) | ✗ ¹⁴ | **154.9** (56 GB) | **106.4** ¹⁵ | — | 98.2 ¹⁰ |
 
 **mlx-lm gap band (same Metal library underneath — the optimization
 target):** 31B **0.95×** (126.1 vs 133.1); 12B ~parity (57.3 vs a dated
 58.3 ⁷); Qwen3-8B 1.4× (42.0 vs 30.4); Llama 1.4× (42.2 vs 29.4);
 gpt-oss 2.3× (19.8 vs 8.8 — native MXFP4 both sides); MoE 2.0× (33.4
-vs 17.0); 3-bit 2.0× (56.2 vs 28.0). llama.cpp leads mlx-lm a further
+vs 17.0); 3-bit 2.0× (56.2 vs 28.0); Qwen3.8-27B 1.46× (154.9 vs
+106.4). llama.cpp leads mlx-lm a further
 ~1.25× on bf16 — the kernel frontier. metaljax prefill trails ~5×;
 load ~20–30×.
 
@@ -81,14 +83,36 @@ load ~20–30×.
     LIKE-FOR-LIKE RULE (Oleg, 2026-08-28): cross-framework cells appear
     only at the SAME precision as the metaljax cell — custom kernels
     are fair game, different quantization is not. Kept cells: bf16
-    (rows 1/2/3/5/6/8/9/10/11, dtype-verified), native MXFP4 (row 7,
-    both sides), 3-bit (row 20, both sides). Mixtral (row 12) is
-    proven quant-only across all 9 publishing providers, so its
-    llama.cpp cell is legitimately empty.
+    (rows 1/2/3/5/6/8/9/10/11/21, dtype-verified), native MXFP4
+    (row 7, both sides), 3-bit (row 20, both sides). Mixtral (row 12)
+    is proven quant-only across all 9 publishing providers, so its
+    llama.cpp cell is legitimately empty. Row 21 is the one bf16 row
+    where llama.cpp leads mlx-lm by only 1.08× (98.2 vs 106.4).
 11. Row 10 protocol: runs with `METALJAX_MEM_SYS_MB=107520` (its
     documented envelope; the shipped default sits under this row's
     restore transient).
-12. Greedy token agreement vs jax-CPU: rows 5/6 are exact 64/64;
+12. Greedy token agreement vs jax-CPU: rows 5/6 are exact 64/64, and
+    row 11 is exact over 64 GENERATED tokens (checked past the
+    51-token prompt — stronger than the harness's first-64-ids check);
     rows 1/2/3 each flip one 1-bf16-ULP logit tie (accepted; logit
     evidence in notes/release-gates-0.11.7.md); row 4 diverges at
-    token 51 (certified-benign, MODEL_TOKEN_KNOWN).
+    token 51 (certified-benign, MODEL_TOKEN_KNOWN). Row 21 has no CPU
+    counterpart — its metal stream is recorded only (4 runs
+    token-identical).
+13. Row 11 harness: keras-hub `Qwen3CausalLM` on `hf://Qwen/Qwen3-0.6B`
+    (bench id `qwen3-06b-keras`), replacing the maxtext decode harness
+    under the best-available-implementation rule (Oleg, 2026-09-01) —
+    keras-hub jits the whole sampler loop, maxtext drives a Python loop
+    per token. Same model, same bf16 precision, greedy streams
+    identical metal-vs-CPU. Pre-switch cells are NOT comparable (see
+    models.md ᵐ); the maxtext arm stays measured beside rows 14/19
+    (same-day control 12.22 ms/tok). Cell band 8.5–9.0 tracking
+    machine state; 9.0 is the unguarded gate-protocol median.
+14. Row 21 CPU: 55.6 GB of bf16 weights plus the checkpoint's own page
+    cache reaches ~116 GB of 128; two guarded attempts (the second with
+    the load throttled to 0.4 GB/s) were killed during the load at RSS
+    101.4 / 100.3 GB with the free list at 0.1 / 0.8 GB.
+15. Row 21 mlx-lm: mlx-lm 0.31.3 released, `mlx_lm.models.qwen3_5`
+    dense path on the same bf16 checkpoint; it emits EOS at 93 of 128
+    tokens, so its per-token average sits at a shallower KV depth than
+    the metaljax cell's.

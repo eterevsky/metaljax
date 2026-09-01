@@ -134,7 +134,21 @@
         "metaljax",
         "cpu"
       ],
-      "status": "needs-adapter"
+      "status": "needs-adapter",
+      "note": "row 11's ORIGINAL harness, retained: rows 14/19 are maxtext-only and need a same-harness decode baseline beside them. NOT the row-11 headline any more — qwen3-06b-keras is (best-available-implementation rule, Oleg 2026-09-01). Cells from the two harnesses are not comparable."
+    },
+    {
+      "id": "qwen3-06b-keras",
+      "path": "keras_lm",
+      "model": "hf://Qwen/Qwen3-0.6B",
+      "size_gb": 1.5,
+      "backends": [
+        "metaljax",
+        "cpu",
+        "mlx"
+      ],
+      "arch": "Qwen3CausalLM",
+      "note": "row 11 HEADLINE harness from 0.11.8 (best-available-implementation rule). keras-hub jits the entire sampler loop into one executable per max_length (zero per-token Python dispatch); MaxEngine drives a Python loop over a jit'd step, which at 0.6B is a large fraction of the number."
     },
     {
       "id": "mixtral-8x7b",
@@ -240,6 +254,19 @@
       "arch": "Qwen3MoeCausalLM",
       "native_quant": "mlx3bit",
       "note": "mlx-community affine 3-bit (group 64), loaded PACKED via scripts/model_bench/qwen3_moe_mlx3bit.py and fused to mx.quantized_matmul/gather_qmm at bits=3. The engine aliases the already-MLX-packed codes and maps, so the 96 GiB of weights is held once. 4-bit is 132 GB and does NOT fit. METALJAX_BENCH_NATIVE_QUANT=0 disables the packed path (and does not fit)."
+    },
+    {
+      "id": "qwen38-27b-bf16",
+      "path": "keras_lm",
+      "model": "hf://Qwen/Qwen3.8-27B",
+      "size_gb": 55.6,
+      "backends": [
+        "metaljax",
+        "mlx"
+      ],
+      "cpu": false,
+      "arch": "Qwen3_5CausalLM",
+      "note": "Qwen's August-2026 flagship open-weight DENSE model, apache-2.0. Hybrid attention: 64 layers = 48 Gated-DeltaNet linear-attention + 16 full-attention, full_attention_interval 4, attn_output_gate, partial/mRoPE, MTP head, vision tower unused in text-only decode. Same qwen3_5 family as row 8, whose MoE cell already drives the GDN path. Guard envelope 85 GB footprint / 95 GB RSS against 55.6 GB of bf16 weights. CPU measured infeasible 2026-09-01: 55.6 GB of bf16 weights plus the checkpoint's page cache reaches ~116 GB of 128, and two guarded attempts (the second throttled to 0.4 GB/s) were killed during the load at RSS 101.4 / 100.3 GB with the free list at 0.1 / 0.8 GB."
     }
   ]
 }
