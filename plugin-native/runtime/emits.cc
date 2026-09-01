@@ -226,14 +226,20 @@ bool Program::step_emit(const Entry& e,
     }
 
     case kMlaSdpa: {
-      // metal_mla.cc: maxtext's multi-span MLA decode attention.  The
+      // metal_mla.cc: maxtext's multi-span MLA/GQA decode attention.  The
       // per-span masked softmax partials joined by the flash renormalization
       // ARE the softmax over the concatenated scores, so: concat the spans,
       // build the additive mask from the segment ids (exactly the numbers
       // the matched `_where` chain selects), and run ONE fused sdpa — whose
       // vector kernel supports the MLA 192/128 head geometry.  The graph
       // pre-scaled q, so scale = 1.
-      // ins [q(B,1,H,D), then per span k(B,T,H,D), v(B,T,H,Dv), seg(B,T)];
+      // Grouped query attention needs nothing here: k and v simply carry
+      // Hkv < H heads, and MLX's sdpa reads both counts off the arrays and
+      // repeats the KV heads itself, in the same head order the matched
+      // reshape merged (query head h -> kv head h / (H/Hkv)).  The mask is
+      // per-key, so [B,1,1,T] broadcasts over heads either way.
+      // ins [q(B,1,H,D), then per span k(B,T,Hkv,D), v(B,T,Hkv,Dv),
+      // seg(B,T)];
       // attrs [B, H, D, Dv, nspans, T..., seg_val, dtype, out_dtype];
       // fattrs [mask_true, mask_false].
       Cursor c(at);
@@ -265,7 +271,7 @@ bool Program::step_emit(const Entry& e,
             mx::equal(seg, weak_int(seg_val, seg)),
             mx::array(e.fattrs[0], dt), mx::array(e.fattrs[1], dt)));
       }
-      // [B, T, H, D] concat on T, then to [B, H, T, D].
+      // [B, T, Hkv, D] concat on T, then to [B, Hkv, T, D].
       mx::array k = mx::transpose(mx::concatenate(ks, 1), {0, 2, 1, 3});
       mx::array v = mx::transpose(mx::concatenate(vs, 1), {0, 2, 1, 3});
       mx::array mask =

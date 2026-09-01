@@ -7321,7 +7321,9 @@ absl::Status Lowering::LowerStackedDot(mlir::Operation* op,
 
 // The multi-span decode attention (metal_mla.cc).  ins [q, then per span
 // k, v, seg]; attrs [B, H, D, Dv, nspans, T..., seg_val, dtype, out_dtype];
-// fattrs [mask_true, mask_false].
+// fattrs [mask_true, mask_false].  `H` is the QUERY head count; a grouped
+// match's KV head count is not emitted because the emit reads it off k
+// (`MlaMatch::Hkv` exists for the shape checks and the narration).
 absl::Status Lowering::LowerMla(mlir::Operation* op, const MlaMatch& m) {
   RETURN_IF_ERROR(CheckValue(m.q));
   ASSIGN_OR_RETURN(int q, Slot(m.q));

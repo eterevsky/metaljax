@@ -3165,6 +3165,15 @@ def _module_cases():
           np.array([[1, 0, 1, 1]], np.int32),
           _rand((1, 2, 2, 4), 269) * 0.5, _rand((1, 2, 2, 4), 270) * 0.5,
           np.array([[1, 1]], np.int32)]),
+        # The same chain in maxtext's GROUPED-query spelling (row 11: 16
+        # query heads over 8 KV heads), which declined until the matcher
+        # read the grouping off the masked-scores reshape.
+        ("gqa two-span decode attention", _MLA_GQA_TWO_SPAN_F32,
+         [_rand((1, 1, 4, 4), 271) * 0.5, _rand((1, 4, 2, 4), 272) * 0.5,
+          _rand((1, 4, 2, 4), 273) * 0.5,
+          np.array([[1, 0, 1, 1]], np.int32),
+          _rand((1, 2, 2, 4), 274) * 0.5, _rand((1, 2, 2, 4), 275) * 0.5,
+          np.array([[1, 1]], np.int32)]),
     ]
 
 
@@ -3777,6 +3786,230 @@ module @mla_two_span {
   }
 }
 """
+
+
+def _mla_gqa_two_span(dt, acc, d=4):
+    """maxtext's GROUPED-QUERY decode attention, as row 11 spells it.
+
+    Same two-span flash combine as `_MLA_TWO_SPAN`, with the one difference
+    that made `AnalyzeMla` decline on Qwen3-0.6B: H query heads over Hkv < H
+    KV heads.  q is reshaped [B,1,H,D] -> [B,1,Hkv,G,D] before the scores
+    dot, the scores come back [B,Hkv,T,1,G] and transpose to [B,Hkv,G,1,T],
+    and a reshape merges dims 1,2 into [B,H,1,T] for the softmax; the values
+    dot and the output reshape mirror it.  Shrunk to B=1, Hkv=2, G=2 (so
+    H=4), D=Dv=4, spans of 4 and 2; the model narrates
+    `B1H16Hkv8D128Dv128T64+72` -- 8 KV heads, 2 groups, D=128, a 64-long
+    prefill span and an autoregressive span the size of the decode budget.
+
+    `acc` is the dtype the probability SUM accumulates in.  bf16 attention
+    upcasts for it and converts the result back (the captured spelling,
+    which the matcher must peel); passing acc == dt leaves identity
+    converts, which is the f32 arm.
+
+    `d` is the head dim, and it decides which MLX kernel the emit reaches:
+    the fused sdpa VECTOR kernel wants D in {64, 96, 128, 256} (or 192/128),
+    so d=4 keeps the module small and lands on MLX's unfused fallback --
+    which tests the recognizer and the emit's plumbing -- while d=64 is the
+    path row 11 actually takes, GQA head repeat inside the kernel included.
+    """
+    ninf = {"f32": "0xFF800000", "bf16": "0xFF80"}[dt]
+    # Two spans, identical but for their key length; the callee names have
+    # to differ because their shapes do.
+    def span(tag, T, k, v, seg):
+        return f"""
+    %q5{tag} = stablehlo.reshape %q
+        : (tensor<1x1x4x{d}x{dt}>) -> tensor<1x1x2x2x{d}x{dt}>
+    %d1{tag} = stablehlo.dot_general {k}, %q5{tag},
+        batching_dims = [0, 2] x [0, 2], contracting_dims = [3] x [4]
+        : (tensor<1x{T}x2x{d}x{dt}>, tensor<1x1x2x2x{d}x{dt}>)
+        -> tensor<1x2x{T}x1x2x{dt}>
+    %sc{tag} = stablehlo.transpose %d1{tag}, dims = [0, 1, 4, 3, 2]
+        : (tensor<1x2x{T}x1x2x{dt}>) -> tensor<1x2x2x1x{T}x{dt}>
+    %sb{tag} = stablehlo.broadcast_in_dim {seg}, dims = [0, 4]
+        : (tensor<1x{T}xi32>) -> tensor<1x1x1x1x{T}xi32>
+    %ob{tag} = stablehlo.broadcast_in_dim %one, dims = []
+        : (tensor<i32>) -> tensor<1x1x1x1x{T}xi32>
+    %eq{tag} = stablehlo.compare EQ, %sb{tag}, %ob{tag}, SIGNED
+        : (tensor<1x1x1x1x{T}xi32>, tensor<1x1x1x1x{T}xi32>)
+        -> tensor<1x1x1x1x{T}xi1>
+    %w16{tag} = func.call @gqa_w16{tag}(%eq{tag}, %zero, %neg)
+        : (tensor<1x1x1x1x{T}xi1>, tensor<f32>, tensor<f32>)
+        -> tensor<1x1x1x1x{T}xf32>
+    %th{tag} = stablehlo.broadcast_in_dim %half, dims = []
+        : (tensor<f32>) -> tensor<1x1x1x1x{T}xf32>
+    %ge{tag} = stablehlo.compare GE, %w16{tag}, %th{tag}, FLOAT
+        : (tensor<1x1x1x1x{T}xf32>, tensor<1x1x1x1x{T}xf32>)
+        -> tensor<1x1x1x1x{T}xi1>
+    %mk{tag} = func.call @gqa_w17{tag}(%ge{tag}, %sc{tag}, %neg)
+        : (tensor<1x1x1x1x{T}xi1>, tensor<1x2x2x1x{T}x{dt}>, tensor<f32>)
+        -> tensor<1x2x2x1x{T}x{dt}>
+    %m4{tag} = stablehlo.reshape %mk{tag}
+        : (tensor<1x2x2x1x{T}x{dt}>) -> tensor<1x4x1x{T}x{dt}>
+    %rm{tag} = stablehlo.reduce(%m4{tag} init: %ninf)
+        applies stablehlo.maximum across dimensions = [3]
+        : (tensor<1x4x1x{T}x{dt}>, tensor<{dt}>) -> tensor<1x4x1x{dt}>
+    %bm{tag} = stablehlo.broadcast_in_dim %rm{tag}, dims = [0, 1, 2]
+        : (tensor<1x4x1x{dt}>) -> tensor<1x4x1x1x{dt}>
+    %bm4{tag} = stablehlo.broadcast_in_dim %bm{tag}, dims = [0, 1, 2, 3]
+        : (tensor<1x4x1x1x{dt}>) -> tensor<1x4x1x{T}x{dt}>
+    %su{tag} = stablehlo.subtract %m4{tag}, %bm4{tag}
+        : tensor<1x4x1x{T}x{dt}>
+    %ex{tag} = stablehlo.exponential %su{tag} : tensor<1x4x1x{T}x{dt}>
+    %ea{tag} = stablehlo.convert %ex{tag}
+        : (tensor<1x4x1x{T}x{dt}>) -> tensor<1x4x1x{T}x{acc}>
+    %rs{tag} = stablehlo.reduce(%ea{tag} init: %zacc)
+        applies stablehlo.add across dimensions = [3]
+        : (tensor<1x4x1x{T}x{acc}>, tensor<{acc}>) -> tensor<1x4x1x{acc}>
+    %bs{tag} = stablehlo.broadcast_in_dim %rs{tag}, dims = [0, 1, 2]
+        : (tensor<1x4x1x{acc}>) -> tensor<1x4x1x1x{acc}>
+    %bd{tag} = stablehlo.convert %bs{tag}
+        : (tensor<1x4x1x1x{acc}>) -> tensor<1x4x1x1x{dt}>
+    %mt{tag} = stablehlo.transpose %bm{tag}, dims = [0, 2, 1, 3]
+        : (tensor<1x4x1x1x{dt}>) -> tensor<1x1x4x1x{dt}>
+    %lt{tag} = stablehlo.transpose %bd{tag}, dims = [0, 2, 1, 3]
+        : (tensor<1x4x1x1x{dt}>) -> tensor<1x1x4x1x{dt}>
+    %e5{tag} = stablehlo.reshape %ex{tag}
+        : (tensor<1x4x1x{T}x{dt}>) -> tensor<1x2x2x1x{T}x{dt}>
+    %d2{tag} = stablehlo.dot_general {v}, %e5{tag},
+        batching_dims = [0, 2] x [0, 1], contracting_dims = [1] x [4]
+        : (tensor<1x{T}x2x{d}x{dt}>, tensor<1x2x2x1x{T}x{dt}>)
+        -> tensor<1x2x{d}x2x1x{dt}>
+    %ot{tag} = stablehlo.transpose %d2{tag}, dims = [0, 4, 1, 3, 2]
+        : (tensor<1x2x{d}x2x1x{dt}>) -> tensor<1x1x2x2x{d}x{dt}>
+    %o{tag} = stablehlo.reshape %ot{tag}
+        : (tensor<1x1x2x2x{d}x{dt}>) -> tensor<1x1x4x{d}x{dt}>
+"""
+
+    def where_callees(tag, T):
+        return f"""
+  func.func private @gqa_w16{tag}(%p: tensor<1x1x1x1x{T}xi1>,
+      %t: tensor<f32>, %f: tensor<f32>) -> tensor<1x1x1x1x{T}xf32> {{
+    %bt = stablehlo.broadcast_in_dim %t, dims = []
+        : (tensor<f32>) -> tensor<1x1x1x1x{T}xf32>
+    %bf = stablehlo.broadcast_in_dim %f, dims = []
+        : (tensor<f32>) -> tensor<1x1x1x1x{T}xf32>
+    %s = stablehlo.select %p, %bt, %bf
+        : tensor<1x1x1x1x{T}xi1>, tensor<1x1x1x1x{T}xf32>
+    return %s : tensor<1x1x1x1x{T}xf32>
+  }}
+  func.func private @gqa_w17{tag}(%p: tensor<1x1x1x1x{T}xi1>,
+      %sc: tensor<1x2x2x1x{T}x{dt}>, %f: tensor<f32>)
+      -> tensor<1x2x2x1x{T}x{dt}> {{
+    %fc = stablehlo.convert %f : (tensor<f32>) -> tensor<{dt}>
+    %bp = stablehlo.broadcast_in_dim %p, dims = [0, 1, 2, 3, 4]
+        : (tensor<1x1x1x1x{T}xi1>) -> tensor<1x2x2x1x{T}xi1>
+    %bf = stablehlo.broadcast_in_dim %fc, dims = []
+        : (tensor<{dt}>) -> tensor<1x2x2x1x{T}x{dt}>
+    %s = stablehlo.select %bp, %sc, %bf
+        : tensor<1x2x2x1x{T}xi1>, tensor<1x2x2x1x{T}x{dt}>
+    return %s : tensor<1x2x2x1x{T}x{dt}>
+  }}
+"""
+
+    return f"""
+module @mla_gqa_two_span {{
+  func.func public @main(%q: tensor<1x1x4x{d}x{dt}>,
+      %kp: tensor<1x4x2x{d}x{dt}>, %vp: tensor<1x4x2x{d}x{dt}>,
+      %sp: tensor<1x4xi32>,
+      %ka: tensor<1x2x2x{d}x{dt}>, %va: tensor<1x2x2x{d}x{dt}>,
+      %sa: tensor<1x2xi32>) -> tensor<1x1x4x{d}x{dt}> {{
+    %one = stablehlo.constant dense<1> : tensor<i32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %zacc = stablehlo.constant dense<0.000000e+00> : tensor<{acc}>
+    %zdt = stablehlo.constant dense<0.000000e+00> : tensor<{dt}>
+    %neg = stablehlo.constant dense<-2.38197633E+38> : tensor<f32>
+    %half = stablehlo.constant dense<-1.19098816E+38> : tensor<f32>
+    %ninf = stablehlo.constant dense<{ninf}> : tensor<{dt}>
+{span("p", 4, "%kp", "%vp", "%sp")}
+{span("a", 2, "%ka", "%va", "%sa")}
+    %m = stablehlo.maximum %mtp, %mta : tensor<1x1x4x1x{dt}>
+    %dp = stablehlo.subtract %mtp, %m : tensor<1x1x4x1x{dt}>
+    %e1p = stablehlo.exponential %dp : tensor<1x1x4x1x{dt}>
+    %tp = stablehlo.multiply %e1p, %ltp : tensor<1x1x4x1x{dt}>
+    %zt = stablehlo.broadcast_in_dim %zdt, dims = []
+        : (tensor<{dt}>) -> tensor<1x1x4x1x{dt}>
+    %s1 = stablehlo.add %zt, %tp : tensor<1x1x4x1x{dt}>
+    %da = stablehlo.subtract %mta, %m : tensor<1x1x4x1x{dt}>
+    %e1a = stablehlo.exponential %da : tensor<1x1x4x1x{dt}>
+    %ta = stablehlo.multiply %e1a, %lta : tensor<1x1x4x1x{dt}>
+    %l = stablehlo.add %s1, %ta : tensor<1x1x4x1x{dt}>
+    %dp2 = stablehlo.subtract %mtp, %m : tensor<1x1x4x1x{dt}>
+    %e2p = stablehlo.exponential %dp2 : tensor<1x1x4x1x{dt}>
+    %wp = stablehlo.divide %e2p, %l : tensor<1x1x4x1x{dt}>
+    %wbp = stablehlo.broadcast_in_dim %wp, dims = [0, 1, 2, 3]
+        : (tensor<1x1x4x1x{dt}>) -> tensor<1x1x4x{d}x{dt}>
+    %wsp = stablehlo.multiply %wbp, %op : tensor<1x1x4x{d}x{dt}>
+    %zo = stablehlo.broadcast_in_dim %zdt, dims = []
+        : (tensor<{dt}>) -> tensor<1x1x4x{d}x{dt}>
+    %acc = stablehlo.add %zo, %wsp : tensor<1x1x4x{d}x{dt}>
+    %da2 = stablehlo.subtract %mta, %m : tensor<1x1x4x1x{dt}>
+    %e2a = stablehlo.exponential %da2 : tensor<1x1x4x1x{dt}>
+    %wa = stablehlo.divide %e2a, %l : tensor<1x1x4x1x{dt}>
+    %wba = stablehlo.broadcast_in_dim %wa, dims = [0, 1, 2, 3]
+        : (tensor<1x1x4x1x{dt}>) -> tensor<1x1x4x{d}x{dt}>
+    %wsa = stablehlo.multiply %wba, %oa : tensor<1x1x4x{d}x{dt}>
+    %root = stablehlo.add %acc, %wsa : tensor<1x1x4x{d}x{dt}>
+    return %root : tensor<1x1x4x{d}x{dt}>
+  }}
+{where_callees("p", 4)}{where_callees("a", 2)}}}
+"""
+
+
+_MLA_GQA_TWO_SPAN_F32 = _mla_gqa_two_span("f32", "f32")
+_MLA_GQA_TWO_SPAN_BF16 = _mla_gqa_two_span("bf16", "f32")
+# D = 64: MLX's fused sdpa VECTOR kernel takes this one, so the GQA head
+# repeat happens inside the kernel rather than in its fallback -- the path
+# row 11 runs (D = 128 there).
+_MLA_GQA_TWO_SPAN_BF16_D64 = _mla_gqa_two_span("bf16", "f32", d=64)
+
+
+def _mla_forms():
+    """(label, module, geometry tag metal_mla.cc must narrate, dtype).
+
+    Row 10 built the recognizer on MLA -- one query head per KV head -- and
+    row 11 (Qwen3-0.6B, 16 query heads over 8 KV heads) declined on the head
+    geometry alone.  What is pinned here is that BOTH geometries fire, with
+    the Hkv the matcher claims to have read, and that the GQA arm's answer
+    is the literal chain's.
+    """
+    return [
+        ("mla f32 (Hkv == H)", _MLA_TWO_SPAN, "H2Hkv2D4", "f32"),
+        ("gqa f32 (H=4, Hkv=2)", _MLA_GQA_TWO_SPAN_F32, "H4Hkv2D4", "f32"),
+        ("gqa bf16 (row-11 spelling)", _MLA_GQA_TWO_SPAN_BF16, "H4Hkv2D4",
+         "bf16"),
+        ("gqa bf16 D=64 (fused kernel)", _MLA_GQA_TWO_SPAN_BF16_D64,
+         "H4Hkv2D64", "bf16"),
+    ]
+
+
+def _mla_inputs(text):
+    """Deterministic inputs for one attention module, read off @main.
+
+    The i32 operands are segment ids, and the mask keeps position i when
+    `seg[i] == 1`.  A span whose every position is masked makes the literal
+    chain's running max -inf and its renormalization NaN -- true of the
+    reference too, so it would test nothing -- hence the pattern below,
+    which always keeps position 0.
+    """
+    import re as _re
+    import ml_dtypes
+    sig = _re.search(r"func\.func public @main\((.*?)\)\s*->", text,
+                     _re.S).group(1)
+    rng = np.random.default_rng(1109)
+    args = []
+    for a in _re.findall(r"tensor<([^>]*)>", sig):
+        *dims, dt = a.split("x")
+        shape = tuple(int(d) for d in dims)
+        if dt == "i32":
+            keep = np.ones(shape, np.int32)
+            keep.reshape(-1)[1::3] = 0
+            keep.reshape(-1)[0] = 1
+            args.append(keep)
+            continue
+        v = (rng.standard_normal(shape) * 0.5).astype(np.float32)
+        args.append(v.astype({"f32": np.float32,
+                              "bf16": ml_dtypes.bfloat16}[dt]))
+    return args
 
 
 def _run_module(text, args):
@@ -6115,6 +6348,120 @@ def _p31_norm(subprocess, pathlib, re):
             ("norm fused == jax-CPU", fused_agrees_with_cpu)]
 
 
+def _p32_mla(subprocess, pathlib, re):
+    """The multi-span decode attention's coverage of BOTH head geometries.
+
+    The recognizer shipped in P30 against maxtext's MLA decode, where every
+    query head has its own KV head.  On row 11 (Qwen3-0.6B: 16 query heads
+    over 8 KV heads) it declined -- `the keys have the wrong shape`, because
+    the keys carry Hkv heads and the matcher compared them against H -- and
+    the whole attention ran literally: 81 of the layer body's 216 tape
+    entries, 37 %, replayed 28 times per decoded token.  No correctness
+    test could see that -- the answers were right, just built out of 82 ops
+    instead of one -- which is why what follows pins the MATCH, not only
+    the answer.
+
+    So what is pinned is that each geometry FIRES, tagged with the Hkv the
+    matcher read; that the kill switches still kill (BOTH of them --
+    METALJAX_MLA and the shared METALJAX_SDPA); and that the fused answer is
+    the literal chain's and jax-CPU's, at each dtype's own bar.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+
+    def arm(env_extra, platform="metal"):
+        import json
+        child = dict(os.environ)
+        if platform == "cpu":
+            child.pop("METALJAX_PLUGIN_PATH", None)
+            child["JAX_PLATFORMS"] = "cpu"
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--mla-forms"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if not line.startswith("MLA "):
+                continue
+            label, payload = line[4:].split("\t", 1)
+            answers[label] = np.array(json.loads(payload))
+        tags = re.findall(
+            r"mla: matched a multi-span attention \(([^,]*),", proc.stderr)
+        return answers, tags
+
+    def worst(a, b):
+        scale = max(float(np.max(np.abs(b))), 1e-30)
+        return float(np.max(np.abs(a - b))) / scale
+
+    # The fused kernel does the whole softmax in f32; the literal chain
+    # subtracts, exps and renormalizes in the model dtype.  bf16 keeps 8
+    # mantissa bits, so the bar is a couple of ULP of the wide values --
+    # the same band `_p31_norm` uses, and the same "documented fused
+    # attention class" the recognizer's header claims.
+    BAR = {"bf16": 2 * 2.0**-7, "f32": 1e-6}
+
+    def both_geometries_fire():
+        _fused, tags = arm({})
+        want = [tag for _l, _t, tag, _d in _mla_forms()]
+        missing = [t for t in want if not any(t in got for got in tags)]
+        if missing:
+            return False, f"no match tagged {missing} (saw {sorted(set(tags))})"
+        if len(tags) != len(_mla_forms()):
+            return False, (f"{len(tags)} matches over {len(_mla_forms())} "
+                           "modules, wanted one each")
+        return True, f"{len(tags)} fused: {', '.join(tags)}"
+
+    def the_kill_switches_kill():
+        """Two switches, and BOTH have to work: METALJAX_MLA is this
+        recognizer's own, METALJAX_SDPA is the shared attention one that
+        `AnalyzeMla` also honours."""
+        for knob in ("METALJAX_MLA", "METALJAX_SDPA"):
+            _answers, tags = arm({knob: "0"})
+            if tags:
+                return False, f"{len(tags)} matches with {knob}=0"
+        return True, "no match under METALJAX_MLA=0 or METALJAX_SDPA=0"
+
+    def fused_agrees_with_the_literal_chain():
+        fused, _ = arm({})
+        literal, tags = arm({"METALJAX_MLA": "0"})
+        if tags:
+            return False, "the METALJAX_MLA=0 arm still fused"
+        bad = []
+        for label, _text, _tag, dt in _mla_forms():
+            e = worst(fused[label], literal[label])
+            if e > BAR[dt]:
+                bad.append(f"{label} {e:.2e} > {BAR[dt]:.0e}")
+        if bad:
+            return False, "; ".join(bad)
+        e = max(worst(fused[l], literal[l]) for l, _t, _g, _d in _mla_forms())
+        return True, (f"{len(_mla_forms())} modules agree with the chain, "
+                      f"worst {e:.1e}")
+
+    def fused_agrees_with_cpu():
+        fused, _ = arm({})
+        cpu, tags = arm({}, platform="cpu")
+        if tags:
+            return False, "the CPU arm loaded the plugin"
+        bad = []
+        for label, _text, _tag, dt in _mla_forms():
+            e = worst(fused[label], cpu[label])
+            if e > BAR[dt]:
+                bad.append(f"{label} {e:.2e} > {BAR[dt]:.0e}")
+        if bad:
+            return False, "; ".join(bad)
+        e = max(worst(fused[l], cpu[l]) for l, _t, _g, _d in _mla_forms())
+        return True, (f"{len(_mla_forms())} modules agree with jax-CPU, "
+                      f"worst {e:.1e}")
+
+    return [("mla covers MLA and GQA", both_geometries_fire),
+            ("mla kill switches fuse nothing", the_kill_switches_kill),
+            ("mla fused == the literal chain",
+             fused_agrees_with_the_literal_chain),
+            ("mla fused == jax-CPU", fused_agrees_with_cpu)]
+
+
 def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
     """Re-run every case through the SAME dylib under `env_extra` and compare.
 
@@ -6280,6 +6627,19 @@ def main():
         for label, text, _tag, _dt, _n in _norm_forms():
             out = _run_module(text, _norm_inputs(text))[0]
             print(f"NORM {label}\t"
+                  f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--mla-forms":
+        # Both decode-attention head geometries, through whichever backend
+        # the caller put in the environment.  Answers to stdout, the
+        # plugin's narration to stderr -- the parent reads what FIRED there.
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        import json as _json
+        for label, text, _tag, _dt in _mla_forms():
+            out = _run_module(text, _mla_inputs(text))[0]
+            print(f"MLA {label}\t"
                   f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
         return 0
     if len(sys.argv) > 2 and sys.argv[1] == "--eager-arm":
@@ -6455,6 +6815,7 @@ def main():
     for label, check in (_p19_packing(subprocess, tempfile, pathlib)
                          + _p21_msl(subprocess, pathlib, __import__("re"))
                          + _p31_norm(subprocess, pathlib, __import__("re"))
+                         + _p32_mla(subprocess, pathlib, __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,

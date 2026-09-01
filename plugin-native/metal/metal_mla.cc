@@ -1,12 +1,13 @@
 /* metaljax: fully-native PJRT plugin for Apple-silicon GPUs (Stage 2).
 
-The multi-span decode-attention recognizer: maxtext's MLA decode, rewritten
-into one fused `scaled_dot_product_attention` over the concatenated spans.
+The multi-span decode-attention recognizer: maxtext's decode attention —
+MLA (one query head per KV head) and GQA (several) alike — rewritten into
+one fused `scaled_dot_product_attention` over the concatenated spans.
 
-maxtext's MLA attention (DeepSeek-family models) keeps its KV cache in two
-spans — the prefill span and the autoregressive span — and computes decode
-attention per span as a masked softmax with a running max and sum, joining
-the partials with the flash-attention renormalization:
+maxtext's attention keeps its KV cache in two spans — the prefill span and
+the autoregressive span — and computes decode attention per span as a
+masked softmax with a running max and sum, joining the partials with the
+flash-attention renormalization:
 
     m = max(m_p, m_ar)
     l = exp(m_p - m) * l_p + exp(m_ar - m) * l_ar
@@ -17,7 +18,20 @@ graph spells it as ~80 ops per layer (two scores dots, two mask trees
 through outlined `_where` callees, two max/sum softmax chains, the combine
 algebra) and jax re-emits the whole thing for every scanned layer — on
 DeepSeek-V2-Lite decode this chain is the single largest slice of the
-~700-node layer body (notes/row10-decode-floor-2026-08-29.md).
+~700-node layer body (notes/row10-decode-floor-2026-08-29.md), and on
+Qwen3-0.6B decode it is ~84 of the 216 body entries, 39 %
+(`~/.cache/metaljax-bench/logs/row11-diag/diagnosis.md` §3b).
+
+GROUPED QUERY ATTENTION.  With H query heads over Hkv < H KV heads the same
+chain carries one extra axis: q is reshaped [B,1,H,D] -> [B,1,Hkv,G,D]
+(G = H/Hkv) before the scores dot, so the scores arrive as [B,Hkv,T,1,G],
+transpose to [B,Hkv,G,1,T], and a reshape merges dims 1 and 2 back into
+[B,H,1,T] for the softmax.  Row-major merge means query head h is kv head
+h/G, group h%G — which is exactly MLX's own GQA convention
+(`unflatten(q, 1, {n_kv_heads, n_repeats})` in fast.cpp), so the q we bind
+is the q the fused kernel wants, unpermuted.  MLA is this with G = 1, and
+the matcher reads Hkv and G off the masked-scores reshape rather than
+assuming either.
 
 The rewrite binds the OUTSIDE values — q, each span's keys/values as the
 dots read them, each span's segment-id vector — and emits one kMlaSdpa
@@ -32,6 +46,15 @@ class of reduction-order change as any fused attention — tolerance-level
 against the CPU, greedy near-ties may flip (both cells reported wherever a
 stream changes).  Masked positions get `score + (-2.38e38)` instead of
 exactly `-2.38e38`; both are the softmax zero.
+
+Zero-initialised accumulators.  jax seeds both the joint sum and the output
+combine with a splat zero — `add(broadcast(0), w*o)` — so `FlattenAdd` /
+`IsZeroTensor` strip a provably-zero term instead of demanding the bare
+product.  `x + (-0.0)` is `x` for every IEEE x, and `x + (+0.0)` is `x`
+except at x = -0.0, where it yields +0.0; that one case cannot matter here
+because the folded value never escapes the match — the whole chain is
+replaced by the fused kernel, whose own sign of zero is already inside the
+documented sdpa class above.
 
 A half-matched pattern lowers as ORDINARY ops: every rejection below is a
 `Bail`, and the consequence is the correct slow program — never a wrong
@@ -539,11 +562,13 @@ class Matcher {
       Bail("the query shape disagrees");
     m->q = q_;
     m->D = D_;
+    m->Hkv = Hkv_;
     m->seg_val = seg_val_;
     m->mask_true = mask_true_;
     m->mask_false = mask_false_;
-    m->name = absl::StrCat("B", m->B, "H", m->H, "D", m->D, "Dv", m->Dv,
-                           "T", m->spans[0].T, "+", m->spans[1].T);
+    m->name = absl::StrCat("B", m->B, "H", m->H, "Hkv", m->Hkv, "D", m->D,
+                           "Dv", m->Dv, "T", m->spans[0].T, "+",
+                           m->spans[1].T);
     return m;
   }
 
@@ -568,9 +593,26 @@ class Matcher {
       Bail("the masked scores have the wrong shape");
     const int64_t T = mshape[3];
 
-    // masked4 = reshape(where_tensor(...)), [B,H,1,1,T] -> [B,H,1,T].
+    // masked4 = reshape(where_tensor(...)):
+    //   MLA  [B,H,1,1,T]   -> [B,H,1,T]      (Hkv = H, G = 1)
+    //   GQA  [B,Hkv,G,1,T] -> [B,H,1,T]      (H = Hkv * G)
+    // Read the grouping off this reshape rather than assuming it: the merge
+    // is row-major, so query head h is kv head h/G group h%G, and every
+    // shape below is checked against the Hkv/G it yields.
     mlir::Value where_t = MatchReshape(masked4, {B, H, 1, T}, &ops,
                                        "the masked scores");
+    const std::vector<int64_t> wshape = ShapeOf(where_t);
+    if (wshape.size() != 5 || wshape[0] != B || wshape[1] < 1 ||
+        wshape[2] < 1 || wshape[1] * wshape[2] != H || wshape[3] != 1 ||
+        wshape[4] != T)
+      Bail("the masked scores do not split the heads into kv groups");
+    const int64_t Hkv = wshape[1], G = wshape[2];
+    if (Hkv_ == 0) {
+      Hkv_ = Hkv;
+      G_ = G;
+    }
+    if (Hkv != Hkv_ || G != G_)
+      Bail("the spans disagree on the head grouping");
     mlir::Operation* wt_call = DefOf(where_t, "the mask select");
     WhereTensor wt = MatchWhereTensor(wt_call, module_);
     ops.push_back(wt_call);
@@ -649,17 +691,17 @@ class Matcher {
         !eq_dims(dn1.getRhsContractingDimensions(), {4}))
       Bail("the scores dot has the wrong dims");
     mlir::Value k = dot1.getLhs();
-    std::vector<int64_t> kshape = ShapeOf(k);  // [B, T, H, D]
+    std::vector<int64_t> kshape = ShapeOf(k);  // [B, T, Hkv, D]
     if (kshape.size() != 4 || kshape[0] != B || kshape[1] != T ||
-        kshape[2] != H)
+        kshape[2] != Hkv)
       Bail("the keys have the wrong shape");
     const int64_t D = kshape[3];
     if (D_ == 0) D_ = D;
     if (D != D_) Bail("the spans disagree on the head dim");
-    mlir::Value q5 = dot1.getRhs();  // [B, 1, H, 1, D]
-    if (ShapeOf(q5) != std::vector<int64_t>{B, 1, H, 1, D})
+    mlir::Value q5 = dot1.getRhs();  // [B, 1, Hkv, G, D]
+    if (ShapeOf(q5) != std::vector<int64_t>{B, 1, Hkv, G, D})
       Bail("the query operand has the wrong shape");
-    mlir::Value q4 = MatchReshape(q5, {B, 1, H, 1, D}, &ops, "the query");
+    mlir::Value q4 = MatchReshape(q5, {B, 1, Hkv, G, D}, &ops, "the query");
     if (ShapeOf(q4) != std::vector<int64_t>{B, 1, H, D})
       Bail("the query reshape has the wrong source");
     if (!q_) q_ = q4;
@@ -692,8 +734,11 @@ class Matcher {
       Bail("the probabilities subtract a different max");
     ops.insert(ops.end(), lops.begin(), lops.end());
 
-    // o_i = reshape(transpose([0,4,1,3,2], dot2(v, reshape(exp_i)))).
+    // o_i = reshape(transpose([0,4,1,3,2], dot2(v, reshape(exp_i)))), the
+    // mirror of the masked-scores reshape: [B,1,Hkv,G,Dv] -> [B,1,H,Dv].
     mlir::Value tr2 = MatchReshape(o_i, {B, 1, H, Dv}, &ops, "the span out");
+    if (ShapeOf(tr2) != std::vector<int64_t>{B, 1, Hkv, G, Dv})
+      Bail("the span out does not merge the kv groups back");
     mlir::Value dot2_v = MatchTranspose(tr2, {0, 4, 1, 3, 2}, &ops,
                                         "the span out transpose");
     auto dot2 = mlir::dyn_cast_or_null<mlir::stablehlo::DotGeneralOp>(
@@ -707,10 +752,10 @@ class Matcher {
         !eq_dims(dn2.getRhsContractingDimensions(), {4}))
       Bail("the values dot has the wrong dims");
     mlir::Value v = dot2.getLhs();
-    if (ShapeOf(v) != std::vector<int64_t>{B, T, H, Dv})
+    if (ShapeOf(v) != std::vector<int64_t>{B, T, Hkv, Dv})
       Bail("the values have the wrong shape");
     mlir::Value exp5 = dot2.getRhs();
-    mlir::Value exp_back = MatchReshape(exp5, {B, H, 1, 1, T}, &ops,
+    mlir::Value exp_back = MatchReshape(exp5, {B, Hkv, G, 1, T}, &ops,
                                         "the probabilities operand");
     if (exp_back != exp_op.getResult())
       Bail("the values dot reads different probabilities");
@@ -745,6 +790,8 @@ class Matcher {
   mlir::ModuleOp module_;
   mlir::Value q_;
   int64_t D_ = 0;
+  int64_t Hkv_ = 0;  // the KV head count and the query group size, read off
+  int64_t G_ = 0;    // the first span's masked-scores reshape (MLA: Hkv, 1)
   int64_t seg_val_ = 0;
   double mask_true_ = 0.0, mask_false_ = 0.0;
 };

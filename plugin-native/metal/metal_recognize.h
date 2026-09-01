@@ -333,10 +333,10 @@ struct StackedDotMatch {
 };
 
 // --------------------------------------------------------------------------
-// multi-span decode attention (metal_mla.cc): maxtext's MLA decode
+// multi-span decode attention (metal_mla.cc): maxtext's MLA/GQA decode
 // --------------------------------------------------------------------------
 
-// maxtext's MLA decode attention computes each cache span (prefill,
+// maxtext's decode attention computes each cache span (prefill,
 // autoregressive) as a separate masked softmax with running max/sum, then
 // joins them with the flash-attention renormalization:
 //   m = max(m_p, m_ar);  l = exp(m_p-m)*l_p + exp(m_ar-m)*l_ar
@@ -345,13 +345,15 @@ struct StackedDotMatch {
 // concat(K), concat(V), one additive mask from the segment ids, and ONE
 // `fast::scaled_dot_product_attention` — ~80 tape entries per layer become
 // one, and the two-dot chain becomes the fused decode kernel (the vendored
-// MLX supports the 192/128 MLA head geometry in its vector kernel).  The
-// probabilities move from the literal bf16 max-subtract/exp chain into the
-// kernel's f32 arithmetic: same class of reduction-order change as any fused
-// attention, tolerance-level vs CPU, greedy near-ties may flip.
+// MLX supports the 192/128 MLA head geometry in its vector kernel, and
+// grouped query attention -- H query heads over Hkv KV heads -- in that
+// same one).  The probabilities move from the literal bf16
+// max-subtract/exp chain into the kernel's f32 arithmetic: same class of
+// reduction-order change as any fused attention, tolerance-level vs CPU,
+// greedy near-ties may flip.
 struct MlaSpan {
-  mlir::Value k;    // [B, T, H, D], as the scores dot read it
-  mlir::Value v;    // [B, T, H, Dv]
+  mlir::Value k;    // [B, T, Hkv, D], as the scores dot read it
+  mlir::Value v;    // [B, T, Hkv, Dv]
   mlir::Value seg;  // [B, T] integer segment ids
   int64_t T = 0;
 };
@@ -361,6 +363,12 @@ struct MlaMatch {
   mlir::Value q;                    // [B, 1, H, D], pre-scaled by the graph
   std::vector<MlaSpan> spans;
   int64_t B = 0, H = 0, D = 0, Dv = 0;
+  // Grouped query attention: H query heads over Hkv KV heads, H % Hkv == 0
+  // (MLA is Hkv == H).  The emit needs no separate handle on it -- MLX's
+  // sdpa reads both counts off the arrays and repeats the KV heads itself
+  // -- but the matcher checks every shape against it, and the narration
+  // names it.
+  int64_t Hkv = 0;
   int64_t seg_val = 1;              // the id the mask compares EQ against
   double mask_true = 0.0;           // the additive mask's two values
   double mask_false = 0.0;          // (0 and the -2.38e38 sentinel)
