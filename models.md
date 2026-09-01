@@ -218,23 +218,22 @@ Notes:
   drop (`slicing.cpp:62`), fixed in our vendored patched MLX inside the
   native wheel; 10/10 deterministic first tokens and a coherent decode on
   the release binary, and the 401.4 ms/tok cell is the row's first honest
-  timing. Mechanism + attestation: STATUS.md footnotes 35/36,
-  `notes/mlx-patch-diagnosis.md`.
+  timing. Mechanism + attestation: `notes/mlx-patch-diagnosis.md`.
 
 - **0.11.5** (2026-08-18 consolidated re-gate): every cell measured in one
   campaign on the release binary `frozen-vendor-d651add3` (native plugin +
   vendored patched `libmlx_metaljax`, tree `29bb8eb`), one guarded process
   per cell, historical budgets, token agreement PASS. Named items (row 1
   variance disposition, rows 3/8 suite-context brackets, row 10 spread,
-  row 18 drift, row 15 first timing) in STATUS.md footnote 36; full report
+  row 18 drift, row 15 first timing) in notes/release-gates-0.11.5.md; full report
   `~/.cache/metaljax-bench/logs/regate-0.11.5/models/`.
 - **0.11.6** (2026-08-27 release gate): every cell from the release binary
   `frozen-0.11.6-dde2d668` (tree `83ff94f`), one guarded process per cell.
   ALL 20 rows now produce numbers — rows 12 and 20 for the first time
   (run at documented raised memory envelopes; shipped defaults unchanged).
   Zero regressions standing; token agreement under the greedy contract
-  (Qwen3-8B and Llama-8B now EXACT vs CPU). Named items in STATUS.md
-  footnote 37; full report `~/.cache/metaljax-bench/logs/gate-0.11.6/`.
+  (Qwen3-8B and Llama-8B now EXACT vs CPU). Named items in
+  notes/release-gates-0.11.6.md; full report `~/.cache/metaljax-bench/logs/gate-0.11.6/`.
 
 - **0.11.7** (2026-08-31/09-01, the dense-band release): every cell from
   the release binary `frozen-0117-combined-c0ed1a10` (tree `e9c0728`; the
@@ -252,8 +251,8 @@ Notes:
   texmo 106/106 + topconfs within ~1% of the 0.11.6 gate. Token
   streams: rows 1/2/3 carry accepted 1-bf16-ULP tie-flips (logit
   evidence archived), row 20 identical, rows 5/6 CPU-exact 64/64.
-  Named items in STATUS.md footnote 39; full report
+  Named items in notes/release-gates-0.11.7.md; full report
   `~/.cache/metaljax-bench/logs/gate-0.11.7/`.
 - ʰ HEAD-column cells (rows 4/10/11/14, post-0.11.6 decode-floor work,
-  STATUS.md fn 38) became frozen 0.11.7 cells; the HEAD column is empty
+  notes/row10-*.md) became frozen 0.11.7 cells; the HEAD column is empty
   again by the rightmost-tracks-HEAD convention.
