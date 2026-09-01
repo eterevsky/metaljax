@@ -383,10 +383,10 @@ device-active for metaljax, weight footprint for CPU.
 
 | model | dtype / backend | decode ms/tok | tok/s | warmup | memory |
 |---|---|---:|---:|---:|---:|
-| gemma-4-31B-it | bf16 **metaljax** | **235.2** | 4.25 | 6.2 s | 66 GB |
+| gemma-4-31B-it | bf16 **metaljax** | **126.1** | 7.93 | | 63 GB |
 | gemma-4-31B-it | f32 metaljax | —¹ | | | 123 GB |
 | gemma-4-31B-it | f32 jax CPU | —¹ | | | 123 GB |
-| gemma-4-12B-it | bf16 **metaljax** | **92.1** | 10.9 | 6.3 s | 25 GB |
+| gemma-4-12B-it | bf16 **metaljax** | **57.3** | 17.5 | | 26 GB |
 | gemma-4-12B-it | f32 metaljax² | 254 | 3.93 | 6 s | 50 GB |
 | gemma-4-12B-it | f32 jax CPU² | 938 | 1.07 | 11 s | 48 GB |
 
@@ -396,15 +396,18 @@ the ground (the CPU attempt took the whole OS with it). bf16 is the
 only way to run the 31B locally; bf16 on the CPU backend is omitted
 because XLA:CPU upcasts bf16 matmuls to f32 internally.
 ² measured at 0.11.0 (the Stage-1 engine); kept for the dtype/backend
-comparison. The bf16 rows are the 0.11.6 release-gate cells (native
-engine, greedy decode, tokens exact vs CPU on the 12B-class rows) —
-the full 20-model release table lives in `STATUS.md` and
-`models.md`.
+comparison. The bf16 rows are the 0.11.7 release-gate cells (native
+engine, greedy decode; the 31B now runs at 0.95× mlx-lm's decode rate
+on the same machine) — the full 20-model release table lives in
+`STATUS.md` and `models.md`.
 
 The Stage 1 (Python) engine these tables originally showcased carried
 ~120 ms/token of dtype-independent host dispatch; the native engine
 that replaced it in 0.11.5 removed that overhead (31B: 374 → 235.2,
-12B: 189 → 92.1).
+12B: 189 → 92.1), and 0.11.7's dense-band pass — batched
+middle-contracted dots, a GEMV occupancy fix in the vendored MLX,
+fused cache appends and norms — nearly halved both again (126.1 /
+57.3).
 
 ## Known limitations
 

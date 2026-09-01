@@ -12,28 +12,28 @@ Cells: metaljax warm decode ms/token (or the row's noted metric);
 version's commit. Full per-run tables live in STATUS.md; raw JSONL in
 notes/data/. Append a column per release / major optimization.*
 
-| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 | 0.11.6 | HEAD |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | **235.2** | |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | **92.1** | |
-| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | **43.3** | |
-| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | **27.2** | 24.7 ʰ |
-| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | **57.6** | |
-| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | **54.3** | |
-| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | **21.3** | |
-| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | **29.4** ᴳ | |
-| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | **211.0** ᴳ | |
-| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | **1948.2** ᴳ | 25.4 ʰ |
-| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | 16.35 | **16.35** | 12.03 ʰ |
-| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | **91.3** ᴳ | |
-| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | **78.0** | |
-| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | **31.85** | 29.84 ʰ |
-| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | **381.7** ᵛ | |
-| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | **88.31** | |
-| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | **1234.7 / 4974.9** | |
-| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | **369.2** | |
-| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | **463.4** | |
-| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ | **66.3** ᴳ | |
+| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 | 0.11.6 | 0.11.7 | HEAD |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | **126.1** | |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | **57.3** | |
+| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | **33.4** | |
+| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | **24.0** | |
+| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | |
+| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | **42.2** | |
+| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | |
+| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | |
+| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | |
+| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **24.8** ᴳ | |
+| 11 | Qwen3-0.6B maxtext decode | ✗ | 16.0 | 15.8 | 16.63 | 16.35 | 16.35 | **12.33** | |
+| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | |
+| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | |
+| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | |
+| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | **388.4** ᵛ | |
+| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | **86.68** | |
+| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | **1249.3 / 4961.6** | |
+| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | |
+| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | |
+| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | **56.2** ᴳ | |
 
 Notes:
 
@@ -236,7 +236,24 @@ Notes:
   (Qwen3-8B and Llama-8B now EXACT vs CPU). Named items in STATUS.md
   footnote 37; full report `~/.cache/metaljax-bench/logs/gate-0.11.6/`.
 
-- ʰ HEAD-column cell (the documented rightmost-tracks-HEAD convention):
-  rows 10/11/14/4 after the post-0.11.6 decode-floor work (ragged_dot
-  recognizer 6590c05 + stacked-dot/K=1 fixes ff569eb; STATUS.md fn 38).
-  Ship in the next release, where they become frozen column cells.
+- **0.11.7** (2026-08-31/09-01, the dense-band release): every cell from
+  the release binary `frozen-0117-combined-c0ed1a10` (tree `e9c0728`; the
+  only change after the binary was frozen is the version string, and the
+  tree reproduces the binary byte for byte). What landed: batched
+  middle-contracted dots + the MLX gemv occupancy floor (rows 1/2/5/6 —
+  the dense-band campaign, row 1 now 0.95× mlx-lm), the cache-append
+  scatter→slice_update, and the rms_norm recognizer's gemma/keras
+  coverage; the row-10 decode-floor work (ragged_dot 6590c05,
+  stacked-dot/K=1 ff569eb, P30 op-count 37b0cee) ships here too, hence
+  1948.2 → 24.8. Vendored MLX carries fork `fix/gemv-occupancy`
+  (vendor/0.32.0 @ d4967fa9). 17 of 20 rows improved, 3 flat within
+  noise (15/17 dispositioned standalone — suite-context), zero
+  regressions; jax pinned suite failure-set id-identical to 0.11.6;
+  texmo 106/106 + topconfs within ~1% of the 0.11.6 gate. Token
+  streams: rows 1/2/3 carry accepted 1-bf16-ULP tie-flips (logit
+  evidence archived), row 20 identical, rows 5/6 CPU-exact 64/64.
+  Named items in STATUS.md footnote 39; full report
+  `~/.cache/metaljax-bench/logs/gate-0.11.7/`.
+- ʰ HEAD-column cells (rows 4/10/11/14, post-0.11.6 decode-floor work,
+  STATUS.md fn 38) became frozen 0.11.7 cells; the HEAD column is empty
+  again by the rightmost-tracks-HEAD convention.

@@ -36,39 +36,43 @@ metric per cell: LLM rows = warm decode ms/token; vision = forward ms;
 diffusion = ms/step; training = ms/step. ✗ = established impossible
 (with the measured reason).*
 
-| # | benchmark | jax CPU | metaljax (current ³⁷) | mlx-lm | torch-MPS | llama.cpp |
+| # | benchmark | jax CPU | metaljax (current ³⁹) | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|
-| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **235.2** ³⁷ | 137 | 148.7 | 111.2 ²⁰ |
-| 2 | gemma4-12B bf16 | 315 (f32) | **92.1** ³⁷ | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
-| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **43.3** ³⁷ (53 GB) | **17.0** | — | 16.9 ²⁰ |
-| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ¹³ | **24.7** ³⁸ | 10.5 ¹⁵ | — | — |
-| 5 | Qwen3-8B bf16 | 209 (bf16→f32) ¹³ | **57.6** ³⁷ | 30.4 | 38.1 | 29.6 ²⁰ |
-| 6 | Llama-3.1-8B bf16 | 200 (bf16→f32) ¹³ | **54.3** ³⁷ | 29.4 | 35.5 | 29.2 ²⁰ |
-| 7 | gpt-oss-20b | ✗ ⁴ | **21.3** ³⁷ (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
-| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | **29.4** ³³ ³⁷ (73 GB) | **13.7** | — | 15.3 ²⁰ |
-| 9 | R1-Distill-32B | ✗ 131 GB | **211.0** ³⁷ (67 GB) | 131.8 | — | 114.9 ²⁰ |
-| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | **25.4** ³⁸ (91 GB) | 10.5 | — | 10.7 ²⁰ |
-| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **12.03** ³⁸ | 3.0 | — | 3.4 ²⁰ |
-| 12 | Mixtral 8×7B bf16 | ✗ | **91.3** ³⁷ (93 GB) | **52.8** (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | **78.0** ³⁷ | — | — | — |
-| 14 | maxtext qwix-int8 0.6B | 143.4 | **29.84** ³⁸ (9.2 GB) | — | — | — |
-| 15 | *qwix-int8 Qwen3-8B* | 2118 | **381.7** ³⁵ ³⁷ (73 GB) | — | — | — |
-| 16 | SigLIP 2 (fwd b1 ms) | 533 | **88.31** ³⁷ | — | 29.8 (b32: 591) | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | **1234.7** @512², **4974.9** @1024² ³⁷ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
-| 18 | LoRA E2B train (ms/step) | 2048 | **369.2** ³⁷ | — | 135.6 ¹⁰ | — |
-| 19 | maxtext train 0.6B (ms/step) | 1402 | **463.4** ³⁷ | — | — | — |
-| 20 | *aspirational* 235B-A22B 3-bit | ✗ | **66.3** ³⁷ (100 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
+| 1 | gemma4-31B bf16 | ✗ f32=123 GB | **126.1** ³⁹ (63 GB) | 133.1 ³⁹ | 148.7 | 111.2 ²⁰ |
+| 2 | gemma4-12B bf16 | 315.2 (f32) ³⁹ | **57.3** ³⁹ (26 GB) | 58.3 ¹⁵ | 67.6 | 44.2 ²⁰ |
+| 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ¹⁴ | **33.4** ³⁹ | **17.0** | — | 16.9 ²⁰ |
+| 4 | gemma4-E2B bf16 | 67.5 (bf16→f32) ¹³ ³⁹ | **24.0** ³⁹ | 10.5 ¹⁵ | — | — |
+| 5 | Qwen3-8B bf16 | 207.0 (bf16→f32) ¹³ ³⁹ | **42.0** ³⁹ (17 GB) | 30.4 | 38.1 | 29.6 ²⁰ |
+| 6 | Llama-3.1-8B bf16 | 203.6 (bf16→f32) ¹³ ³⁹ | **42.2** ³⁹ | 29.4 | 35.5 | 29.2 ²⁰ |
+| 7 | gpt-oss-20b | ✗ ⁴ | **19.8** ³⁹ | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ²⁰ |
+| 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | **28.5** ³³ ³⁹ (73 GB) | **13.7** | — | 15.3 ²⁰ |
+| 9 | R1-Distill-32B | ✗ 131 GB | **190.8** ³⁹ (67 GB) | 131.8 | — | 114.9 ²⁰ |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ⁶ | **24.8** ³⁹ (92 GB) | 10.5 | — | 10.7 ²⁰ |
+| 11 | Qwen3-0.6B (maxtext decode) | 89.7 | **12.33** ³⁹ | 3.0 | — | 3.4 ²⁰ |
+| 12 | Mixtral 8×7B bf16 | ✗ | **85.6** ³⁹ (90 GB) | **52.8** (93.4 GB) | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ¹⁸ | **77.0** ³⁹ | — | — | — |
+| 14 | maxtext qwix-int8 0.6B | 143.4 | **29.88** ³⁹ | — | — | — |
+| 15 | *qwix-int8 Qwen3-8B* | 2118 | **388.4** ³⁵ ³⁹ (73 GB) | — | — | — |
+| 16 | SigLIP 2 (fwd b1 ms) | 533 | **86.68** ³⁹ | — | 29.8 (b32: 591) | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ¹² | **1249.3** @512², **4961.6** @1024² ³⁹ | ✗ ¹⁹ | 654 @512², 2998 @1024² ¹⁹ | — |
+| 18 | LoRA E2B train (ms/step) | 2048 | **362.1** ³⁹ | — | 135.6 ¹⁰ | — |
+| 19 | maxtext train 0.6B (ms/step) | 1402 | **444.6** ³⁹ | — | — | — |
+| 20 | *aspirational* 235B-A22B 3-bit | ✗ | **56.2** ³⁹ (101 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
 
 **Splat-fix before/after (HISTORICAL, 2026-08-02, Stage-1 engine):** Qwen3-8B 268→60.3 ms/tok
 (143.6→16.4 GB); Llama-8B 228→58.6 (127→16.1 GB); gpt-oss 2090→220.4
 (224→41.8 GB). All three now beat jax-CPU 3.4–3.7×.
 
 **mlx-lm gap band (same Metal library underneath — the optimization
-target):** bf16 dense decode 1.6–1.9× (Qwen3-8B 57.6 vs 30.4; Llama
-54.3 vs 29.4; 12B 92.1 vs 58.3; 31B 235.2 vs 137); gpt-oss 2.4×
-(21.3 vs 8.8 — native MXFP4 both sides); MoE 2.5× (43.3 vs 17.0);
-3-bit 2.4× (66.3 vs 28.0). llama.cpp leads mlx-lm a further ~1.25× on
-bf16 — the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
+target):** the 0.11.7 dense-band campaign closed the flagship: 31B is
+**0.95×** mlx-lm (126.1 vs a same-week 133.1) and 12B reads under the
+dated mlx-lm cell (57.3 vs 58.3 of 2026-08-03; mlx-lm 0.31.3 refuses
+the cached checkpoint, so that arm could not be re-measured — fn 39).
+Remaining band: Qwen3-8B 1.4× (42.0 vs 30.4), Llama 1.4× (42.2 vs
+29.4), gpt-oss 2.3× (19.8 vs 8.8 — native MXFP4 both sides), MoE 2.0×
+(33.4 vs 17.0), 3-bit 2.0× (56.2 vs 28.0). llama.cpp leads mlx-lm a
+further ~1.25× on bf16 — the kernel frontier. metaljax prefill trails
+~5×; load ~20–30×.
 
 ## Footnotes
 
@@ -780,3 +784,54 @@ bf16 — the kernel frontier. metaljax prefill trails ~6×; load ~20–30×.
     class; rows 10/14 streams unchanged). Row 10's protocol now pins
     METALJAX_MEM_SYS_MB=107520 (documented envelope; default 96 GB sits
     under the row's budget). notes/row10-decode-floor-2026-08-29.md.
+39. **The 0.11.7 release column** (2026-08-31/09-01 gate; full artifacts
+    ~/.cache/metaljax-bench/logs/gate-0.11.7/, per-fix records in
+    .../dense-band-{diag,norm,dot,kv,combined,logits}/findings.md).
+    Every cell from the release binary frozen-0117-combined-c0ed1a10
+    (tree e9c0728; the binary reproduces from the tree byte for byte,
+    3×), one guarded process per row, machine lock, settle prechecks.
+    What landed: the dense-band campaign — (a) middle-contracted
+    dot_general as batched matmul, both operand slots
+    (METALJAX_DOT_BATCHED); (b) the MLX gemv occupancy floor, fixed in
+    OUR FORK (fix/gemv-occupancy → vendor/0.32.0 @ d4967fa9, vendored;
+    a 2.1× tiling cliff at K>=8192, notes/patches/
+    mlx-gemv-occupancy.diff); (c) the cache-append scatter as ONE
+    mx::slice_update (interval-analysis bounds proof + guarded arm,
+    METALJAX_SCATTER_APPEND, bit-exact); (d) the rms_norm recognizer
+    extended to the gemma/keras spellings incl. weightless norms
+    (METALJAX_NORM; 0→11 of 11 dense-band spellings fused) — plus the
+    post-0.11.6 row-10 decode-floor work (fn 38) shipping here.
+    Gate: jax pinned suite 28,073/129 — failure set id-for-id identical
+    to 0.11.6; texmo_gate 106/106; topconfs fp32/bf16 within ~1% of the
+    0.11.6 gate; 17 of 20 rows improved, 3 flat (15/17a/17b, each
+    dispositioned standalone — suite-context class), ZERO regressions;
+    row 20 first-attempt clean at its documented envelope, stream
+    identical. Zero guard fires, zero refusals, zero panics all night.
+    NAMED ITEMS: (i) rows 1/2/3 carry ACCEPTED tie-flips (Oleg,
+    2026-08-31, on logit evidence): each a 1-bf16-ULP adjacent-code
+    near-tie (row 2 idx 16 p=0.515/0.484, row 1 idx 45 a three-way
+    0.36/0.31/0.25), attributed to the norm recognizer by same-binary
+    METALJAX_NORM=0 A/B; row 2 thereby loses its 0.11.6 CPU-exact
+    64/64 status (takes the other side of a tie CPU resolves the old
+    way) — candidate for MODEL_TOKEN_KNOWN; rows 5/6 stay CPU-exact
+    64/64. (ii) tc010-w17, one topconfs config of 223: a real +8.4%
+    fp32 / +7.3% bf16 micro-regression (0.046 ms), reproducible, NOT
+    attributable to the three campaign knobs (all off doesn't recover
+    it) — prime suspect the MLX restage; disclosed per release rule 2 and
+    signed off by Oleg (2026-09-01). (iii) Historical frozen dylibs now resolve
+    the RESTAGED vendored MLX via absolute rpath — pre-0.11.7 binaries
+    can no longer be re-run as baselines; comparisons are to recorded
+    numbers. (iv) Row 19's 4-step loss is no longer bit-identical
+    (86.888 vs 87.043; step-1 loss CLOSER to CPU than 0.11.6's) —
+    trajectory amplification of the ULP class, not a correctness
+    signal. (v) Row 2's mlx-lm comparator arm is blocked (mlx-lm
+    0.31.3 refuses the cached gemma4_unified checkpoint); its 58.3
+    cell is dated 2026-08-03; row 1's mlx-lm 133.1 is the same-week
+    diagnosis re-measure. (vi) The MLX slice_update donation patch was
+    measured a wash (donate branch taken 95% of calls, 0.0 ms, 0.0 GB)
+    and DROPPED; archived in logs/dense-band-kv/. (vii) Row-1 prefill
+    still gates at cost=20839 compile=0 (BlockCost prices the MLIR
+    block; recognizers collapse the tape) — deferred, latency-only.
+    (viii) A pre-existing multi-thread Stream(gpu,N) execute flake
+    surfaced 4× under concurrent GPU processes (clean 20/20 serially,
+    both binaries) — ticketed, environmental.
