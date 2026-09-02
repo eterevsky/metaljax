@@ -118,11 +118,39 @@ std::string ElemExpr(const Sym* s, const std::vector<std::string>& acc,
 
 // ------------------------------------------------------------ register widths
 
+// Vector mode reads a value's TRAILING dim as its register width: the
+// convention every value shaped (lane..., reg) follows.  A value that is ONE
+// SCALAR PER LANE follows another one -- its dims (unit dims aside) are
+// exactly the trailing dims of the lane space, so the dim the convention
+// would call its register axis is the last LANE axis.  jax leaves such values
+// with no register dim at all (a reduce over the feature axis yields (B,) or
+// (B1, B2), a vmapped scalar carry is (B,), a per-step scalar input is (B,)),
+// so the shape tells the two apart: (B, F) is a register vector even when
+// B == F, having one dim more than the lane space; (B,) under lane (B,), or
+// (B1, B2) under lane (B1, B2), is one scalar per lane.
+//
+// Reading such a value as `lane[-1]` registers was silent wrongness: every
+// lane loaded (or wrote) the whole trailing row and broadcast its own scalar
+// across it -- stacked outputs since v0.2.0 (2125c96 declined the 1-D lane
+// case), scalar-per-lane carries and per-step reads in EVERY lane rank until
+// 2026-09-02.  The lane-space computation (`StackedLaneDims`) is what makes
+// the rule sound: a lane dim that no value really varies over (the stack
+// axis of a residual stack counted as one) is exactly what would make a
+// genuine (B, F) register vector look lane-shaped.
+bool MslPlanned::LaneScalar(const MslShape& shape) const {
+  return MslLaneSuffix(lane_shape_, shape);
+}
+
+int64_t MslPlanned::RegWidth(const MslShape& shape) const {
+  if (shape.empty() || LaneScalar(shape)) return 1;
+  return shape.back();
+}
+
 int64_t MslPlanned::R(const Sym* s) const {
   if (s->kind == SymKind::kConst || s->kind == SymKind::kCounter) return 1;
   if (s->kind == SymKind::kDot) return s->dsize;
   if (s->kind == SymKind::kPad) return s->shape.back();
-  return s->shape.empty() ? 1 : s->shape.back();
+  return RegWidth(s->shape);
 }
 
 int64_t MslPlanned::CoopR(const Sym* s) const {
@@ -153,6 +181,22 @@ std::string MslPlanned::VecOff(const MslShape& shape, const MslShape* strides,
                                int64_t base) const {
   const MslShape& lane = lane_shape_;
   const MslShape sts = strides != nullptr ? *strides : MslRowmajor(shape);
+  if (LaneScalar(shape)) {
+    // One scalar per lane: the non-unit dims ARE the trailing lane dims, in
+    // order, and there is no register term.
+    size_t nnz = 0;
+    for (int64_t d : shape) nnz += d != 1;
+    std::vector<std::string> terms;
+    if (base != 0) terms.push_back(absl::StrCat(base, "u"));
+    size_t j = lane.size() - nnz;
+    for (size_t i = 0; i < shape.size(); i++) {
+      if (shape[i] == 1) continue;
+      const size_t li = j++;
+      if (sts[i] == 0) continue;
+      terms.push_back(absl::StrCat("c", li, " * ", sts[i], "u"));
+    }
+    return terms.empty() ? "0u" : absl::StrJoin(terms, " + ");
+  }
   const int64_t reg = shape.empty() ? 1 : shape.back();
   const int64_t reg_stride = shape.empty() ? 0 : sts.back();
   MslShape lane_dims, lane_sts;
@@ -257,8 +301,8 @@ void MslPlanned::CheckStateView(const Sym* s, int64_t pos, bool coop) const {
       reg_st = CoopRShape(shape);
       reg_use = CoopRShape(vshape);
     } else {
-      reg_st = shape.empty() ? 1 : shape.back();
-      reg_use = vshape.empty() ? 1 : vshape.back();
+      reg_st = RegWidth(shape);
+      reg_use = RegWidth(vshape);
     }
     if (!vstrides.empty() && vstrides.back() == 0)
       reg_use = 1;   // broadcast along the trailing axis
@@ -439,7 +483,17 @@ std::string MslPlanned::EmitVector() {
       const int64_t r = R(leaf);
       out.push_back(Declare(name, leaf->dtype, r));
       if (BufferShape(leaf).empty()) {
-        out.push_back(r == 1 ? absl::StrCat(name, " = inp", sid, ";") : "");
+        // A rank-0 input arrives by value.  A broadcast use of it -- a
+        // hoisted scalar reduce added to a register vector -- still wants
+        // every register filled: the load here used to be EMPTY for r > 1,
+        // leaving `name[r]` uninitialized (NaN gradients on the 2125c96
+        // cell the moment its loop stopped declining, 2026-09-03).
+        if (r == 1) {
+          out.push_back(absl::StrCat(name, " = inp", sid, ";"));
+        } else {
+          out.push_back(absl::StrCat("for (int r = 0; r < ", r, "; r++) ",
+                                     name, "[r] = inp", sid, ";"));
+        }
       } else {
         Load(&out, name, leaf->dtype, r, Src(sid),
              VecOff(leaf->shape, &leaf->strides, leaf->offset));
@@ -450,7 +504,7 @@ std::string MslPlanned::EmitVector() {
   for (size_t j = 0; j < states_.size(); j++) {
     const int64_t pos = states_[j].first;
     const MslShape& shape = arg_shapes[pos];
-    const int64_t r = shape.empty() ? 1 : shape.back();
+    const int64_t r = RegWidth(shape);
     out.push_back(Declare(absl::StrCat("st", j), arg_dtypes[pos], r));
     if (shape.empty()) {
       out.push_back(absl::StrCat("st", j, " = init", j, ";"));
@@ -574,9 +628,7 @@ std::string MslPlanned::EmitVector() {
           auto st = state_args_.find(pos);
           if (st != state_args_.end()) {
             CheckStateView(s, pos, false);
-            const MslShape& shape = arg_shapes[pos];
-            v = {absl::StrCat("st", st->second),
-                 shape.empty() ? 1 : shape.back()};
+            v = {absl::StrCat("st", st->second), RegWidth(arg_shapes[pos])};
           } else {
             const WholeEntry& w = Whole(s);
             v = {w.name, R(w.leaf)};
@@ -630,7 +682,9 @@ std::string MslPlanned::EmitVector() {
       }
       case SymKind::kIota: {
         const std::string name = absl::StrCat("v", tmp_++);
-        if (s->axis == static_cast<int64_t>(s->shape.size()) - 1 &&
+        const bool lane_scalar = LaneScalar(s->shape);
+        if (!lane_scalar &&
+            s->axis == static_cast<int64_t>(s->shape.size()) - 1 &&
             s->shape.back() > 1) {
           const int64_t r = s->shape.back();
           body_.push_back(absl::StrCat("  ", T(s->dtype), " ", name, "[", r,
@@ -643,6 +697,19 @@ std::string MslPlanned::EmitVector() {
           std::string expr;
           if (s->shape[s->axis] == 1) {
             expr = absl::StrCat("(", T(s->dtype), ")", s->start);
+          } else if (lane_scalar) {
+            // The iota axis is a lane axis: its coordinate is the axis' rank
+            // among the non-unit dims, right-aligned to the lane space.
+            int64_t nnz = 0, before = 0;
+            for (size_t i = 0; i < s->shape.size(); i++) {
+              if (s->shape[i] == 1) continue;
+              nnz++;
+              if (static_cast<int64_t>(i) < s->axis) before++;
+            }
+            const int64_t li =
+                static_cast<int64_t>(lane_shape_.size()) - nnz + before;
+            expr = absl::StrCat("(", T(s->dtype), ")(c", li, " + ", s->start,
+                                ")");
           } else {
             const int64_t pad = static_cast<int64_t>(lane_shape_.size()) -
                                 (static_cast<int64_t>(s->shape.size()) - 1);
@@ -769,7 +836,7 @@ std::string MslPlanned::EmitVector() {
     int64_t tgt_R = 1;
     if (have_strides) {
       off2 = VecOff(v2->shape, &wr_strides, 0);
-      tgt_R = v2->shape.empty() ? 1 : v2->shape.back();
+      tgt_R = RegWidth(v2->shape);
     } else if (e.second == 1 && !per_shape.empty() &&
                MslNumel(per_shape) == MslNumel(lane_shape_)) {
       // Width-1 value: every target dim is a lane dim; a fake unit register
@@ -780,7 +847,7 @@ std::string MslPlanned::EmitVector() {
       tgt_R = 1;
     } else {
       off2 = VecOff(v2->shape.empty() ? per_shape : v2->shape, nullptr, 0);
-      tgt_R = v2->shape.empty() ? 1 : v2->shape.back();
+      tgt_R = RegWidth(v2->shape);
     }
     const std::string src =
         stored(MslRegSrc(e.first, e.second, tgt_R, "stacked write"));
@@ -819,8 +886,7 @@ std::string MslPlanned::EmitVector() {
   std::vector<NewState> news;
   for (const auto& kv : states_) {
     const EVal e = emit(kv.second);
-    const MslShape& shape = arg_shapes[kv.first];
-    news.push_back({e.first, e.second, shape.empty() ? 1 : shape.back()});
+    news.push_back({e.first, e.second, RegWidth(arg_shapes[kv.first])});
   }
   out.insert(out.end(), body_.begin(), body_.end());
   out.insert(out.end(), writes_.begin(), writes_.end());
@@ -829,8 +895,7 @@ std::string MslPlanned::EmitVector() {
   const std::vector<int64_t> moved = MslAliasedStateMoves(names);
   for (int64_t k : moved) {
     const int64_t kpos = states_[k].first;
-    const MslShape& kshape = arg_shapes[kpos];
-    const int64_t kr = kshape.empty() ? 1 : kshape.back();
+    const int64_t kr = RegWidth(arg_shapes[kpos]);
     out.push_back(absl::StrCat("  ",
                                Declare(absl::StrCat("sv", k), arg_dtypes[kpos],
                                        kr)));
@@ -860,7 +925,7 @@ std::string MslPlanned::EmitVector() {
   out.push_back("}");
   for (size_t j = 0; j < states_.size(); j++) {
     const MslShape& shape = arg_shapes[states_[j].first];
-    const int64_t sr = shape.empty() ? 1 : shape.back();
+    const int64_t sr = RegWidth(shape);
     if (shape.empty()) {
       out.push_back(absl::StrCat("fin", j, "[0u] = st", j, ";"));
     } else if (sr > 1) {
@@ -920,7 +985,13 @@ std::string MslPlanned::EmitCoop() {
       const int64_t r = CoopR(leaf);
       out.push_back(Declare(name, leaf->dtype, r));
       if (BufferShape(leaf).empty()) {
-        out.push_back(absl::StrCat(name, " = inp", sid, ";"));
+        // By-value rank-0 input; fill every register (see EmitVector).
+        if (r == 1) {
+          out.push_back(absl::StrCat(name, " = inp", sid, ";"));
+        } else {
+          out.push_back(absl::StrCat("for (int r = 0; r < ", r, "; r++) ",
+                                     name, "[r] = inp", sid, ";"));
+        }
       } else {
         Load(&out, name, leaf->dtype, r, Src(sid),
              CoopOff(leaf->shape, &leaf->strides, leaf->offset));

@@ -599,3 +599,100 @@ def test_incremented_int_carry_not_in_cond():
         (a, j), ys = jax.lax.scan(step, (a0, j), xs)
         return a, j, ys
     check(f, _CA, np.int32(5), _CXS, **_EXACT)
+
+
+# ---- one scalar per lane (2026-09-02) ---------------------------------------
+#
+# A value shaped like the trailing dims of the lane space has no register
+# dim: a reduce over the feature axis yields (B,) or (B1, B2), a vmapped
+# scalar carry is (B,), a per-step scalar input is (B,).  Vector-mode kernels
+# read a value's trailing dim as its register width, so every such value was
+# loaded, carried or written as `lane[-1]` registers -- each lane broadcast
+# its own scalar over a whole row of the buffer -- wrong for carries and
+# per-step reads in every lane rank, and for stacked outputs in 2-D lane
+# spaces (2125c96 declined only the 1-D stacked case).  Exact arithmetic as
+# above: doublings of small integers, no tolerance, and every lane holds
+# different values so a row broadcast cannot pass.
+
+def _lane_ints(shape, seed):
+    n = int(np.prod(shape))
+    return ((np.arange(n, dtype=np.float32) * 7 + 3 * seed) % 5 - 2).reshape(
+        shape)
+
+
+def _scan_scalar_carry(c0, s0, xs):
+    def cell(carry, a):
+        c, s = carry
+        c2 = c * 2.0 + a
+        return (c2, s + jnp.sum(c2)), c2
+    return jax.lax.scan(cell, (c0, s0), xs)
+
+
+def _scan_scalar_input(c0, s0, xs, zs):
+    def cell(carry, x):
+        a, z = x
+        c, s = carry
+        c2 = c * 2.0 + a
+        return (c2, s + jnp.sum(c2) * z), c2
+    return jax.lax.scan(cell, (c0, s0), (xs, zs))
+
+
+def _scan_scalar_output(c0, xs, zs):
+    def cell(c, x):
+        a, z = x
+        c2 = c * 2.0 + a
+        return c2, jnp.sum(c2) * z
+    return jax.lax.scan(cell, c0, (xs, zs))
+
+
+def test_vmapped_scalar_carry_from_reduce():
+    """A scalar carry beside a vector carry, updated from a register reduce:
+    (B,) under lane (B,), including B == F where the shapes coincide."""
+    f = jax.vmap(_scan_scalar_carry)
+    for fdim in (8, 4):
+        check(f, _lane_ints((4, fdim), 1), _lane_ints((4,), 2),
+              _lane_ints((4, 6, fdim), 3), **_EXACT)
+
+
+def test_doubly_vmapped_scalar_carry():
+    """The same carry under a 2-D lane space, square and not."""
+    f = jax.vmap(jax.vmap(_scan_scalar_carry))
+    for b1, b2, fdim in ((4, 4, 8), (4, 4, 4), (3, 4, 8)):
+        check(f, _lane_ints((b1, b2, fdim), 4), _lane_ints((b1, b2), 5),
+              _lane_ints((b1, b2, 6, fdim), 6), **_EXACT)
+
+
+def test_vmapped_scalar_input_used_bare():
+    """A per-step scalar input combined with a reduce (no broadcast in the
+    body to give it a register dim): (B,) read per step."""
+    f = jax.vmap(_scan_scalar_input)
+    for fdim in (8, 4):
+        check(f, _lane_ints((4, fdim), 7), _lane_ints((4,), 8),
+              _lane_ints((4, 6, fdim), 9), _lane_ints((4, 6), 10), **_EXACT)
+
+
+def test_doubly_vmapped_scalar_input_used_bare():
+    f = jax.vmap(jax.vmap(_scan_scalar_input))
+    for b1, b2, fdim in ((4, 4, 8), (4, 4, 4), (3, 4, 8)):
+        check(f, _lane_ints((b1, b2, fdim), 11), _lane_ints((b1, b2), 12),
+              _lane_ints((b1, b2, 6, fdim), 13), _lane_ints((b1, b2, 6), 14),
+              **_EXACT)
+
+
+def test_vmapped_scalar_stacked_expression():
+    """A stacked per-lane scalar that is an EXPRESSION over a reduce (a bare
+    reduce was always written right; the elementwise op on top took the lane
+    dim as its width).  1-D lane: 2125c96 declined this shape, it now takes
+    a kernel."""
+    f = jax.vmap(_scan_scalar_output)
+    for fdim in (8, 4):
+        check(f, _lane_ints((4, fdim), 15), _lane_ints((4, 6, fdim), 16),
+              _lane_ints((4, 6), 17), **_EXACT)
+
+
+def test_doubly_vmapped_scalar_stacked_output():
+    """The 2-D case 2125c96 left unguarded: per-step shape == lane shape."""
+    f = jax.vmap(jax.vmap(_scan_scalar_output))
+    for b1, b2, fdim in ((4, 4, 8), (4, 4, 4), (3, 4, 8)):
+        check(f, _lane_ints((b1, b2, fdim), 18), _lane_ints((b1, b2, 6, fdim), 19),
+              _lane_ints((b1, b2, 6), 20), **_EXACT)

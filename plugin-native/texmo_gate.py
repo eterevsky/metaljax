@@ -342,6 +342,10 @@ def main():
     print(f"{'':<6} {'config':<18} {'spec':<46} detail")
     for name, spec, precision, batch, length in configs:
         t0 = time.perf_counter()
+        if os.environ.get("METALJAX_DEBUG"):
+            # Tag the plugin's narration (C stdio on fd 2, unbuffered) per
+            # configuration, so a plan census can be attributed to its row.
+            os.write(2, f"### config {name} {spec}\n".encode())
         work = root / name
         child = dict(os.environ)
         child["JAX_PLATFORMS"] = "cpu"

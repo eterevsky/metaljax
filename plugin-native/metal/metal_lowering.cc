@@ -24,6 +24,7 @@ Licensed under the Apache License, Version 2.0.
 #include "absl/status/statusor.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "host_callback.h"
 #include "host_lapack.h"
@@ -1296,12 +1297,13 @@ std::shared_ptr<MslPlanned> MslPlanFor(LowerContext& ctx,
       std::fprintf(stderr,
                    "[metaljax] msl_scan: compiled plan trip=%lld mode=%s "
                    "lanes=%lld counters=%zu passthrough=%zu states=%zu "
-                   "stacked=%zu packed=%lld\n",
+                   "stacked=%zu packed=%lld lane=%s\n",
                    static_cast<long long>(plan->trip), plan->mode.c_str(),
                    static_cast<long long>(plan->N), plan->counters.size(),
                    plan->passthrough.size(), plan->state_pos.size(),
                    plan->stacked_pos.size(),
-                   static_cast<long long>(plan->num_packed));
+                   static_cast<long long>(plan->num_packed),
+                   absl::StrJoin(plan->lane_shape(), ",").c_str());
       // The generated MSL, on request: a build error's line numbers point
       // into MLX's prepended preamble, so the source is what an
       // investigation actually needs (the bf16 float->bfloat conversion

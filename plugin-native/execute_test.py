@@ -321,6 +321,117 @@ def _msl_strided_int_carry(a0, j, xs):
     return a, j, ys
 
 
+def _lane_ints(shape, seed):
+    """Exact-in-f32 operands for the one-scalar-per-lane cases: small
+    integers, every lane different, so a row broadcast cannot pass."""
+    n = int(np.prod(shape))
+    return ((np.arange(n, dtype=np.float32) * 7 + 3 * seed) % 5 - 2).reshape(
+        shape)
+
+
+# One scalar per lane (2026-09-02).  A value shaped like the trailing dims of
+# the lane space has no register dim -- a reduce over the feature axis
+# yields (B,) or (B1, B2), a vmapped scalar carry is (B,), a per-step scalar
+# input is (B,) -- and vector-mode kernels read a value's trailing dim as its
+# register width, so each lane broadcast its own scalar over a whole row of
+# the buffer: wrong for carries and per-step reads in every lane rank, and
+# for stacked outputs in 2-D lane spaces (2125c96 declined the 1-D stacked
+# case only).  Doublings of small integers, compared EXACTLY; the "one
+# scalar per lane takes a kernel" contract asserts these loops plan.
+
+def _msl_lane_scalar_carry(c0, s0, xs):
+    import jax
+    import jax.numpy as jnp
+
+    def scan(c0, s0, xs):
+        def cell(carry, a):
+            c, s = carry
+            c2 = c * 2.0 + a
+            return (c2, s + jnp.sum(c2)), c2
+        (c, s), ys = jax.lax.scan(cell, (c0, s0), xs)
+        return c, s, ys
+    return jax.vmap(scan)(c0, s0, xs)
+
+
+def _msl_lane_scalar_carry_2d(c0, s0, xs):
+    import jax
+    import jax.numpy as jnp
+
+    def scan(c0, s0, xs):
+        def cell(carry, a):
+            c, s = carry
+            c2 = c * 2.0 + a
+            return (c2, s + jnp.sum(c2)), c2
+        (c, s), ys = jax.lax.scan(cell, (c0, s0), xs)
+        return c, s, ys
+    return jax.vmap(jax.vmap(scan))(c0, s0, xs)
+
+
+def _msl_lane_scalar_input(c0, s0, xs, zs):
+    import jax
+    import jax.numpy as jnp
+
+    def scan(c0, s0, xs, zs):
+        def cell(carry, x):
+            a, z = x
+            c, s = carry
+            c2 = c * 2.0 + a
+            return (c2, s + jnp.sum(c2) * z), c2
+        (c, s), ys = jax.lax.scan(cell, (c0, s0), (xs, zs))
+        return c, s, ys
+    return jax.vmap(scan)(c0, s0, xs, zs)
+
+
+def _msl_lane_scalar_input_2d(c0, s0, xs, zs):
+    import jax
+    import jax.numpy as jnp
+
+    def scan(c0, s0, xs, zs):
+        def cell(carry, x):
+            a, z = x
+            c, s = carry
+            c2 = c * 2.0 + a
+            return (c2, s + jnp.sum(c2) * z), c2
+        (c, s), ys = jax.lax.scan(cell, (c0, s0), (xs, zs))
+        return c, s, ys
+    return jax.vmap(jax.vmap(scan))(c0, s0, xs, zs)
+
+
+def _msl_lane_scalar_output_2d(c0, xs, zs):
+    import jax
+    import jax.numpy as jnp
+
+    def scan(c0, xs, zs):
+        def cell(c, x):
+            a, z = x
+            c2 = c * 2.0 + a
+            return c2, jnp.sum(c2) * z
+        return jax.lax.scan(cell, c0, (xs, zs))
+    return jax.vmap(jax.vmap(scan))(c0, xs, zs)
+
+
+def _msl_scalar_out_grad_2125c96(xs):
+    """2125c96's cell -- a vmapped scan whose per-step output is one scalar
+    per lane -- under value_and_grad.  The forward loop declined under the
+    old guard; now that it plans, its AD forward pass is the loop that
+    reached the rank-0 by-value input hole (a hoisted `sum(d)` broadcast to
+    a register vector was declared and never loaded: NaN gradients,
+    2026-09-03).  Transcendentals, so DOT tolerance."""
+    import jax
+    import jax.numpy as jnp
+    d = np.array([0.3, -0.7], np.float32)
+    c0 = (np.arange(4, dtype=np.float32) % 3) * 0.5 - 0.5
+
+    def cell(c, a):
+        b = jnp.cos(jnp.sum(jnp.sin(a)) + jnp.sum(jnp.cos(c)) + jnp.sum(d))
+        return jnp.sin(c * b), b
+
+    def loss(a):
+        return jax.vmap(lambda v: jax.lax.scan(cell, jnp.asarray(c0), v)[1]
+                        .sum())(a).sum()
+    return jax.value_and_grad(loss)(xs)
+
+
 def _carry_args():
     """Exact-in-f32 operands for the carry cases: small integers, 8 steps.
 
@@ -1103,6 +1214,30 @@ def _cases():
           _carry_args()[2]], *EXACT),
         ("msl incremented int32 carry (+3)", _msl_strided_int_carry,
          [_carry_args()[0], np.int32(5), _carry_args()[2]], *EXACT),
+
+        # One scalar per lane (2026-09-02); see the helpers.  Lane spaces in
+        # this order: 4 / 3,4 / 4 / 4,4 / 3,4 -- the contract reads them back.
+        ("msl lane scalar state, 1-D lane", _msl_lane_scalar_carry,
+         [_lane_ints((4, 8), 1), _lane_ints((4,), 2),
+          _lane_ints((4, 6, 8), 3)], *EXACT),
+        ("msl lane scalar state, 2-D lane (3,4)", _msl_lane_scalar_carry_2d,
+         [_lane_ints((3, 4, 8), 4), _lane_ints((3, 4), 5),
+          _lane_ints((3, 4, 6, 8), 6)], *EXACT),
+        ("msl lane scalar input read bare, 1-D lane (F == B)",
+         _msl_lane_scalar_input,
+         [_lane_ints((4, 4), 7), _lane_ints((4,), 8),
+          _lane_ints((4, 6, 4), 9), _lane_ints((4, 6), 10)], *EXACT),
+        ("msl lane scalar input read bare, 2-D lane (4,4) (F == B)",
+         _msl_lane_scalar_input_2d,
+         [_lane_ints((4, 4, 4), 11), _lane_ints((4, 4), 12),
+          _lane_ints((4, 4, 6, 4), 13), _lane_ints((4, 4, 6), 14)], *EXACT),
+        ("msl lane scalar stacked expression, 2-D lane (3,4)",
+         _msl_lane_scalar_output_2d,
+         [_lane_ints((3, 4, 8), 15), _lane_ints((3, 4, 6, 8), 16),
+          _lane_ints((3, 4, 6), 17)], *EXACT),
+        ("msl per-lane scalar stacked output, grad (2125c96 cell)",
+         _msl_scalar_out_grad_2125c96,
+         [_rand((7, 5, 3), 18) * f(0.5)], *DOT),
 
         # msl in bf16 (the topconfs16k cliff, 2026-08-22): the dtype table
         # maps bf16 to MLX's bfloat16_t, so all three modes must plan and
@@ -6659,6 +6794,42 @@ def _p21_msl(subprocess, pathlib, re):
         return True, ("5 loops planned, 1 counter each, "
                       f"{sum(int(p) for _, p in plans)} pass-throughs")
 
+    def one_scalar_per_lane_takes_a_kernel():
+        """The one-scalar-per-lane cases (2026-09-02), pinned at the plan.
+
+        Their EXACT comparison against the CPU is satisfied by a decline too,
+        and declining was 2125c96's answer for the 1-D stacked shape.  What
+        is checked here is that each of the five loops PLANS, in vector mode,
+        on the lane space its shapes imply -- `lane=` in the narration -- so
+        the value shaped like that space was read as one scalar per lane and
+        not as `lane[-1]` registers.
+        """
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        proc = subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).resolve()),
+             "--msl-lane-scalars"], env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout).splitlines()[-1][:80]
+        plans = re.findall(
+            r"msl_scan: compiled plan .*?mode=(\w+) .*?lane=([\d,]+)",
+            proc.stderr)
+        want = ["4", "3,4", "4", "4,4", "3,4"]
+        if len(plans) != len(want):
+            declines = re.findall(r"msl_scan: not eligible \((.*?)\)",
+                                  proc.stderr)
+            return False, (f"{len(plans)} of {len(want)} lane-scalar loops "
+                           "planned"
+                           + (f" (declines: {declines[:3]})" if declines
+                              else ""))
+        modes = [m for m, _ in plans]
+        if any(m != "vector" for m in modes):
+            return False, f"modes {modes}, all must be vector"
+        lanes = [l for _, l in plans]
+        if lanes != want:
+            return False, f"lane spaces {lanes}, expected {want}"
+        return True, f"5 loops planned in vector mode on lanes {lanes}"
+
     return [("msl covers its three modes", modes_are_covered),
             ("METALJAX_MSL=0 builds no kernel", the_kill_switch_kills),
             ("msl coop flip at F=4", the_f4_flip_fires),
@@ -6667,7 +6838,9 @@ def _p21_msl(subprocess, pathlib, re):
              a_planned_loop_is_charged_as_one_kernel),
             ("bf16 msl plans build", bf16_takes_a_kernel),
             ("only the induction variable is an msl counter",
-             only_the_induction_variable_is_a_counter)]
+             only_the_induction_variable_is_a_counter),
+            ("one scalar per lane takes a kernel",
+             one_scalar_per_lane_takes_a_kernel)]
 
 
 def _p31_norm(subprocess, pathlib, re):
@@ -7019,6 +7192,17 @@ def main():
         import jax
         for name, fn, args, _rtol, _atol in _cases():
             if name.startswith("msl ") and "carry" in name:
+                jax.jit(fn)(*args)
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--msl-lane-scalars":
+        # The five one-scalar-per-lane cases, alone, so the parent can read
+        # one `lane=` census per loop out of the narration (they must PLAN;
+        # a decline satisfies the EXACT comparison too).
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        for name, fn, args, _rtol, _atol in _cases():
+            if name.startswith("msl lane scalar"):
                 jax.jit(fn)(*args)
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--msl-wide-coop":

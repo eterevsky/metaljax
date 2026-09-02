@@ -269,6 +269,50 @@ MslShape Bshape(const MslShape& a, const MslShape& b) {
 
 std::string Join(const MslShape& s) { return absl::StrJoin(s, ","); }
 
+// The lane dims a stacked per-step value contributes to the lane space
+// (vector and coop modes), by the value's STRUCTURE.  The value is the
+// (1, per-step...) block a dynamic_update_slice writes -- its lane dims sit
+// between the step dim and the register dim -- unless the unit-dim squeeze
+// already dropped the step dim, in which case they are everything but the
+// register dim.  A SymStack is a small tensor assembled from static-index
+// update slices (a nested loop unrolled symbolically leaves one part per
+// iteration): its stack axis is a PART index, written as a constant offset
+// per part, not a lane coordinate, so its lane dims are its parts' and the
+// stack axis contributes nothing.
+//
+// Counting the stack axis put lrnn's forward loop -- state (B, F), residual
+// stacks (reps, B, F) -- on a (reps, B) lane space: reps-fold redundant
+// threads whose leading coordinate no expression read.  It was also what
+// kept `MslPlanned::LaneScalar` from being sound in 2-D lane spaces: on that
+// space the (B, F) state with B == F == reps looked exactly like one scalar
+// per lane, which is why 2125c96 guarded 1-D lane spaces only.
+//
+// Both contributions are matched against the lane space built so far: a
+// value whose dims are already a suffix of it is one scalar per lane
+// (`MslLaneSuffix`, the emitter's `LaneScalar`), has no register dim, and
+// contributes nothing new -- reading its trailing lane dim as a register
+// would leave its other lane dims to collide with the space (a (3, 4)
+// per-lane scalar under lane (3, 4) contributed (3,), which is not (4,)).
+MslShape StackedLaneDims(const MslShape& lane, const Sym* v) {
+  if (v->kind == SymKind::kStack) {
+    MslShape out(lane);
+    for (const auto& kv : v->parts)
+      out = Bshape(out, StackedLaneDims(out, kv.second));
+    return out;
+  }
+  const MslShape& vs = v->shape;
+  if (vs.size() < 2 || MslLaneSuffix(lane, vs)) return {};
+  const bool step_dim = vs[0] == 1;
+  return MslShape(vs.begin() + (step_dim ? 1 : 0), vs.end() - 1);
+}
+
+// A (lane..., reg) value's lane dims -- or none, when the value is one
+// scalar per lane already accounted for.
+MslShape ValueLaneDims(const MslShape& lane, const MslShape& shape) {
+  if (shape.empty() || MslLaneSuffix(lane, shape)) return {};
+  return MslShape(shape.begin(), shape.end() - 1);
+}
+
 bool IsZeroConst(const Sym* s) {
   return s != nullptr && s->kind == SymKind::kConst && s->dval == 0.0;
 }
@@ -1068,8 +1112,10 @@ std::vector<Sym*> MslAnalyzer::EvalOp(mlir::Operation* o, Env& env) {
       Env env2 = env;
       for (unsigned j = 0; j < body.getNumArguments(); j++)
         env2[body.getArgument(j)] = vals[j];
-      env2[body.getArgument(static_cast<unsigned>(k))] =
-          MakeIntConst(arena_, *start + it, "i32");
+      // The inner counter's own dtype (i64 under jax_enable_x64), read off
+      // the block argument rather than assumed.
+      env2[body.getArgument(static_cast<unsigned>(k))] = MakeIntConst(
+          arena_, *start + it, Dt(body.getArgument(static_cast<unsigned>(k))));
       vals = EvalBlock(body, env2);
     }
     return vals;
@@ -2103,6 +2149,17 @@ Sym* MslAnalyzer::DynamicUpdate(mlir::Operation* o,
   Sym* idx = starts[0];
   if (idx->kind == SymKind::kConst)
     idx = MakeCounter(arena_, 0, idx->ival, -1);
+  // The index must be affine in the induction variable: the emitters write
+  // step t at `(a*(t+start)+b) * inner` with no clamp and no check that the
+  // trip count covers the buffer's leading dim.  That coverage is guaranteed
+  // only by jax's own lowerings, not by anything here: a scan's stacked
+  // output is written at the loop counter itself; jax's
+  // `dynamic_update_slice` lowering wraps its index in XLA's clamp, which is
+  // not affine and declines below; `.at[i].set` lowers to `stablehlo.scatter`,
+  // which msl_scan never sees.  An unclamped affine index that ran past the
+  // buffer would read or write out-of-bounds device memory -- should a future
+  // lowering emit one, this is where a bounds check belongs (2026-09-02
+  // finding: probed through all three spellings, all decline first).
   if (idx->kind != SymKind::kCounter) MslDecline("dus non-affine index");
   Sym* out = MakeLeaf(arena_, LeafKind::kUpdated, shape, x->dtype, x->source);
   out->idx = idx;
@@ -2422,6 +2479,15 @@ std::vector<int64_t> MslAliasedStateMoves(
   return std::vector<int64_t>(out.begin(), out.end());
 }
 
+bool MslLaneSuffix(const MslShape& lane, const MslShape& shape) {
+  if (shape.empty()) return false;
+  MslShape nz;
+  for (int64_t d : shape)
+    if (d != 1) nz.push_back(d);
+  if (nz.empty() || nz.size() > lane.size()) return false;
+  return std::equal(nz.begin(), nz.end(), lane.end() - nz.size());
+}
+
 // msl_scan.py `_reg_src`: the read expression for a value held in `R`
 // registers when the write loop runs over a target of `tgt_R`.
 std::string MslRegSrc(const std::string& name, int64_t R, int64_t tgt_R,
@@ -2727,10 +2793,7 @@ MslPlanned::MslPlanned(const MslEnv& env, mlir::Block& body,
       const MslShape& sh = arg_shapes[pos];
       if (sh.empty()) MslDecline("coop: rank-0 stacked output");
       if (sh.back() % F != 0) MslDecline("coop: width not multiple of F");
-      const MslShape& vs = std::get<2>(t)->shape;
-      lane = Bshape(lane, vs.size() >= 2
-                              ? MslShape(vs.begin() + 1, vs.end() - 1)
-                              : MslShape{});
+      lane = Bshape(lane, StackedLaneDims(lane, std::get<2>(t)));
     }
     for (const auto& h : hidden_) {
       const MslShape& sh = h.first->shape;
@@ -2739,22 +2802,21 @@ MslPlanned::MslPlanned(const MslEnv& env, mlir::Block& body,
     }
     lane.push_back(F);
   } else if (mode == "vector") {
-    for (const auto& kv : states_) {
-      const MslShape& sh = kv.second->shape;
-      lane = Bshape(lane, sh.empty() ? MslShape{}
-                                     : MslShape(sh.begin(), sh.end() - 1));
-    }
-    for (const auto& t : stacked_) {
-      const MslShape& vs = std::get<2>(t)->shape;
-      lane = Bshape(lane, vs.size() >= 2
-                              ? MslShape(vs.begin() + 1, vs.end() - 1)
-                              : MslShape{});
-    }
-    for (const auto& h : hidden_) {
-      const MslShape& sh = h.first->shape;
-      lane = Bshape(lane, sh.empty() ? MslShape{}
-                                     : MslShape(sh.begin(), sh.end() - 1));
-    }
+    // The full-rank (lane..., reg) carries first: they fix the space that a
+    // lower-rank value -- one scalar per lane, no register dim -- is then
+    // matched against instead of contributing its trailing lane dim as a
+    // register.  Bshape commutes, so the order changes nothing else.
+    std::vector<const Sym*> vals;
+    for (const auto& kv : states_) vals.push_back(kv.second);
+    std::stable_sort(vals.begin(), vals.end(),
+                     [](const Sym* a, const Sym* b) {
+                       return a->shape.size() > b->shape.size();
+                     });
+    for (const Sym* v : vals) lane = Bshape(lane, ValueLaneDims(lane, v->shape));
+    for (const auto& t : stacked_)
+      lane = Bshape(lane, StackedLaneDims(lane, std::get<2>(t)));
+    for (const auto& h : hidden_)
+      lane = Bshape(lane, ValueLaneDims(lane, h.first->shape));
   } else {
     for (const auto& kv : states_) lane = Bshape(lane, kv.second->shape);
     for (const auto& t : stacked_) {
@@ -2766,21 +2828,12 @@ MslPlanned::MslPlanned(const MslEnv& env, mlir::Block& body,
   lane_shape_ = lane;
   N = Numel(lane);
   if (N == 0) MslDecline("empty lane space");
-  if (mode == "vector" && lane.size() == 1 && lane.back() > 1) {
-    // A per-step value shaped exactly like the lane space is ONE SCALAR PER
-    // LANE.  The emitter reads a value's trailing dim as its register width,
-    // so such a value would look like `lane[-1]` registers and every lane
-    // would broadcast-write all lanes' output slots (silently wrong results,
-    // v0.2.0..v0.4.4).  The DESTINATION layout is what disambiguates.
-    for (const auto& t : stacked_) {
-      const MslShape& sh = arg_shapes[std::get<0>(t)];
-      const MslShape per(sh.begin() + (sh.empty() ? 0 : 1), sh.end());
-      if (per == lane && R(std::get<2>(t)) > 1)
-        MslDecline(absl::StrCat(
-            "stacked output is one scalar per lane (per-step shape ",
-            Join(lane), ")"));
-    }
-  }
+  // A value shaped like the trailing dims of this lane space is ONE SCALAR
+  // PER LANE (`LaneScalar`, metal_msl_emit.cc), and the vector emitter loads,
+  // carries and writes it as such.  2125c96's guard, which declined a stacked
+  // output of that shape in 1-D lane spaces, is subsumed: such a loop now
+  // takes a kernel, and so do the carries and per-step reads of that shape
+  // the guard never covered.
 
   // ---- device inputs
   for (const auto& kv : state_pos_to_id) state_args_[kv.first] = kv.second;

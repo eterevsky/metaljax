@@ -281,6 +281,8 @@ class MslPlanned {
   int64_t num_packed = 0;
 
   size_t num_hidden() const { return hidden_shapes.size(); }
+  // The lane space (diagnostics: the METALJAX_DEBUG narration).
+  const MslShape& lane_shape() const { return lane_shape_; }
 
   // ---- construction (msl_scan.py `Plan.__init__`)
   //
@@ -305,8 +307,12 @@ class MslPlanned {
   std::string EmitVector();
   std::string EmitCoop();
 
-  // Register width of a value, per mode.
+  // Register width of a value, per mode.  Vector mode: a value shaped like
+  // the trailing dims of the lane space is one scalar per lane (`LaneScalar`,
+  // metal_msl_emit.cc), width 1; otherwise the trailing dim.
   int64_t R(const Sym* s) const;
+  bool LaneScalar(const MslShape& shape) const;
+  int64_t RegWidth(const MslShape& shape) const;
   int64_t CoopR(const Sym* s) const;
   int64_t CoopRShape(const MslShape& shape) const;
   std::string VecOff(const MslShape& shape, const MslShape* strides = nullptr,
@@ -407,6 +413,10 @@ std::string MslLaneOffset(const MslShape& shape, const MslShape& lane);
 std::vector<int64_t> MslAliasedStateMoves(const std::vector<std::string>& srcs);
 std::string MslRegSrc(const std::string& name, int64_t R, int64_t tgt_R,
                       const std::string& what);
+// Whether `shape`, unit dims aside, is a suffix of `lane`: the shape of ONE
+// SCALAR PER LANE in vector mode (its dims are lane dims; it has no register
+// dim).  Shared by the lane-space computation and the emitter's `LaneScalar`.
+bool MslLaneSuffix(const MslShape& lane, const MslShape& shape);
 int64_t MslNumel(const MslShape& s);
 MslShape MslRowmajor(const MslShape& shape);
 int64_t MslRegLimit();
