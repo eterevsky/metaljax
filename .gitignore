@@ -19,3 +19,6 @@ native/build/
 plugin-native/bazel-*
 plugin-native/.bazelrc.user
 test-pypi.txt
+
+# Untracked model/benchmark caches (moved here from ~/.cache; symlinked back)
+/cache/
