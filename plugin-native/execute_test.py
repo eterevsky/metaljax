@@ -215,6 +215,126 @@ def _msl_nested(h0, xs, w):
     return jax.lax.scan(outer, h0, xs)
 
 
+# --------------------------------------------------------------------------
+# msl_scan carries that are NOT the loop counter (2026-09-02)
+# --------------------------------------------------------------------------
+#
+# THE BUG (silent wrongness, present since msl_scan existed and carried
+# through the Stage 2 port): `MslAnalyzer::Analyze` seeded a SymCounter for
+# `i == counter_pos || (int scalar)`.  A SymCounter denotes "the induction
+# variable", and the emitters bake it in as `a*(t+start)+b` -- a value read
+# out of the ITERATION INDEX, never out of the carry.  That is true of the
+# carry `_analyze_counted` proved is the counter, and of nothing else: any
+# other i32/i64 scalar carry silently became the loop index, and never even
+# became a kernel input.  An invariant `int32` position held across a 28-step
+# scan produced sin(0), sin(1), ... instead of sin(7).
+#
+# The fix identifies the counter by DATAFLOW alone (the carry the cond
+# compares and the body returns as `arg + 1`), so these five shapes pin the
+# classification from both sides: an invariant integer carry must read back
+# as ITSELF, and a carry that merely LOOKS like a counter must not be given
+# the counter's arithmetic.
+#
+# Every body here is exact in f32 on purpose -- doublings and small integers,
+# nothing above 2**16 -- so the comparison is EXACT and no tolerance can hide
+# an off-by-a-few-iterations read.  Each returns the final integer carries
+# too, not just the float state: the old code got the final value RIGHT
+# (post-kernel `carry + delta*trip`) and only the in-body reads wrong, so a
+# case that checked the carry alone would have passed on the bug.
+
+
+def _msl_invariant_int(a0, q, xs):
+    """An invariant int32 SCALAR carry beside the counter -- the row-11 rope
+    shape, minimised.  `q` is returned unchanged forever, so the kernel must
+    load it as an input and read 7 (or whatever it is) on every iteration."""
+    import jax
+    import jax.numpy as jnp
+
+    def step(c, x):
+        a, q = c
+        return (a * 2.0 + q.astype(jnp.float32) + x, q), a
+    (a, q), ys = jax.lax.scan(step, (a0, q), xs)
+    return a, q, ys
+
+
+def _msl_invariant_int_first(q, a0, b0, xs):
+    """The same invariant carry, moved to the FIRST scan carry -- while-carry
+    index 1, immediately after the counter, which is where a classification
+    that went by POSITION rather than by dataflow would hide.  Two float
+    states around it so the position really differs from the case above."""
+    import jax
+    import jax.numpy as jnp
+
+    def step(c, x):
+        q, a, b = c
+        fq = q.astype(jnp.float32)
+        return (q, a * 2.0 + fq + x, b - fq), (a, b)
+    (q, a, b), ys = jax.lax.scan(step, (q, a0, b0), xs)
+    return q, a, b, ys[0], ys[1]
+
+
+def _msl_invariant_float(a0, s, xs):
+    """An invariant FLOAT scalar carry.  This one was always right -- only
+    integer scalars were seeded as counters -- and it is here so that the
+    guard is "the counter is the carry the cond compares", not "the counter
+    is the integer one"."""
+    import jax
+
+    def step(c, x):
+        a, s = c
+        return (a * 2.0 + s + x, s), a
+    (a, s), ys = jax.lax.scan(step, (a0, s), xs)
+    return a, s, ys
+
+
+def _msl_counter_lookalike(a0, j, b0, xs):
+    """Two carries that look exactly like counters; only one feeds the cond.
+
+    `j` starts at 100 and the body returns `j + 1`: structurally identical to
+    the induction variable, distinguishable ONLY by the cond's compare (and
+    by its start).  The old code called it a counter and read `t + start` for
+    it -- 0, 1, 2, ... instead of 100, 101, 102 -- while still handing back
+    the right final `j`.  Middle position, to move it again."""
+    import jax
+    import jax.numpy as jnp
+
+    def step(c, x):
+        a, j, b = c
+        fj = j.astype(jnp.float32)
+        return (a * 2.0 + fj + x, j + 1, b - fj), (a, b)
+    (a, j, b), ys = jax.lax.scan(step, (a0, j, b0), xs)
+    return a, j, b, ys[0], ys[1]
+
+
+def _msl_strided_int_carry(a0, j, xs):
+    """An integer carry that IS incremented but does not feed the cond, and
+    by 3 rather than 1.  The old code read `t + start` for it; the fix makes
+    it an ordinary kernel state, so the kernel keeps `j` in a register and
+    steps it itself."""
+    import jax
+    import jax.numpy as jnp
+
+    def step(c, x):
+        a, j = c
+        return (a * 2.0 + j.astype(jnp.float32) + x, j + 3), a
+    (a, j), ys = jax.lax.scan(step, (a0, j), xs)
+    return a, j, ys
+
+
+def _carry_args():
+    """Exact-in-f32 operands for the carry cases: small integers, 8 steps.
+
+    Built rather than drawn, because the whole point is an EXACT comparison:
+    `a` doubles each step, so the largest value any of these reaches is
+    about 2**8 * 4 + 255 * 103 -- far below the 2**24 where f32 stops
+    counting by ones.
+    """
+    a0 = (np.arange(32, dtype=np.float32).reshape(4, 8) % 5) - 2
+    b0 = (np.arange(32, dtype=np.float32).reshape(4, 8) % 3) - 1
+    xs = (np.arange(8 * 32, dtype=np.float32).reshape(8, 4, 8) % 7) - 3
+    return a0, b0, xs
+
+
 def _msl_chunked(h0, xs, us, wz, wh):
     """The 0.11.6 WEDGE SHAPE: a generated kernel traced into a CHUNKED
     replay.
@@ -961,6 +1081,28 @@ def _cases():
         ("msl nested unrolled loop", _msl_nested,
          [_rand((4, 8), 85), _rand((10, 4, 8), 86),
           _rand((8, 8), 87) * f(0.2)], *DOT),
+
+        # Carries that are NOT the loop counter (2026-09-02).  See the
+        # helpers: every i32/i64 SCALAR carry used to be seeded as the
+        # induction variable, so an invariant integer carry read back inside
+        # the kernel as 0, 1, 2, ...  All five are EXACT by construction, and
+        # the "only the induction variable is an msl counter" contract below
+        # asserts that the msl path really claims them -- without it these
+        # would pass by falling back to the interpreted loop.
+        ("msl invariant int32 carry", _msl_invariant_int,
+         [_carry_args()[0], np.int32(7), _carry_args()[2]], *EXACT),
+        ("msl invariant int32 carry, first position",
+         _msl_invariant_int_first,
+         [np.int32(-3), _carry_args()[0], _carry_args()[1],
+          _carry_args()[2]], *EXACT),
+        ("msl invariant float carry", _msl_invariant_float,
+         [_carry_args()[0], np.float32(2.5), _carry_args()[2]], *EXACT),
+        ("msl counter-lookalike carry (+1, not in the cond)",
+         _msl_counter_lookalike,
+         [_carry_args()[0], np.int32(100), _carry_args()[1],
+          _carry_args()[2]], *EXACT),
+        ("msl incremented int32 carry (+3)", _msl_strided_int_carry,
+         [_carry_args()[0], np.int32(5), _carry_args()[2]], *EXACT),
 
         # msl in bf16 (the topconfs16k cliff, 2026-08-22): the dtype table
         # maps bf16 to MLX's bfloat16_t, so all three modes must plan and
@@ -6474,13 +6616,58 @@ def _p21_msl(subprocess, pathlib, re):
         return True, (f"F=4 flips to coop (vector under COOP_MIN_F=8), "
                       f"answers agree to {rel:.1e}")
 
+    def only_the_induction_variable_is_a_counter():
+        """The 2026-09-02 non-counter-carry bug, pinned at the CLASSIFICATION
+        rather than at the answer.
+
+        `MslAnalyzer::Analyze` used to seed a SymCounter for the counter
+        `_analyze_counted` found AND for every i32/i64 scalar carry.  A
+        SymCounter is read out of the iteration index, so those carries came
+        back as 0, 1, 2, ... -- and were not kernel inputs at all.  The five
+        carry cases compare EXACTLY against the CPU, but a decline would make
+        them pass by falling back, so what is checked here is the census the
+        plugin narrates: each of those loops must plan, and each plan must
+        hold EXACTLY ONE counter, the induction variable.
+
+        Under the bug the counts were 2, 2, 1, 2 and 2 (the float-carry case
+        was always right, which is why it is in the list).
+        """
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        proc = subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).resolve()),
+             "--msl-carries"], env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout).splitlines()[-1][:80]
+        plans = re.findall(
+            r"msl_scan: compiled plan .*?counters=(\d+) passthrough=(\d+)",
+            proc.stderr)
+        if len(plans) != 5:
+            declines = re.findall(r"msl_scan: not eligible \((.*?)\)",
+                                  proc.stderr)
+            return False, (f"{len(plans)} of 5 carry loops planned"
+                           + (f" (declines: {declines[:3]})" if declines
+                              else ""))
+        extra = [c for c, _ in plans if c != "1"]
+        if extra:
+            return False, (f"a plan classified {extra[0]} carries as "
+                           "counters; only the induction variable is one")
+        # The two invariant cases must ALSO hand their carry back untouched
+        # rather than recompute it, which is the pass-through rule.
+        if sum(int(p) for _, p in plans) < 2:
+            return False, "no plan carries a pass-through"
+        return True, ("5 loops planned, 1 counter each, "
+                      f"{sum(int(p) for _, p in plans)} pass-throughs")
+
     return [("msl covers its three modes", modes_are_covered),
             ("METALJAX_MSL=0 builds no kernel", the_kill_switch_kills),
             ("msl coop flip at F=4", the_f4_flip_fires),
             ("msl coop width cap (F>=1024)", the_width_cap_holds),
             ("msl loop charged as one kernel",
              a_planned_loop_is_charged_as_one_kernel),
-            ("bf16 msl plans build", bf16_takes_a_kernel)]
+            ("bf16 msl plans build", bf16_takes_a_kernel),
+            ("only the induction variable is an msl counter",
+             only_the_induction_variable_is_a_counter)]
 
 
 def _p31_norm(subprocess, pathlib, re):
@@ -6820,6 +7007,18 @@ def main():
         import jax
         for name, fn, args, _rtol, _atol in _cases():
             if name.startswith("msl bf16"):
+                jax.jit(fn)(*args)
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--msl-carries":
+        # The five carry-classification cases, alone, so the parent can read
+        # one `counters=` census per loop out of the narration.  They must
+        # PLAN: an EXACT comparison against the CPU is satisfied by a decline
+        # too, and a decline is exactly what a careless fix would produce.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        for name, fn, args, _rtol, _atol in _cases():
+            if name.startswith("msl ") and "carry" in name:
                 jax.jit(fn)(*args)
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--msl-wide-coop":

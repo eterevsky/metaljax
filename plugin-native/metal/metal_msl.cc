@@ -842,10 +842,21 @@ std::vector<Sym*> MslAnalyzer::Analyze() {
     auto t = mlir::dyn_cast<mlir::RankedTensorType>(arg.getType());
     if (!t) MslDecline("a carry that is not a ranked tensor");
     const MslShape shape = ShapeOf(arg);
-    std::optional<std::string> el = TapeElementName(t.getElementType());
-    const bool int_scalar =
-        shape.empty() && el.has_value() && (*el == "i32" || *el == "i64");
-    if (i == counter_pos_ || int_scalar) {
+    // ONLY the induction variable becomes a SymCounter.  `counter_pos_` is
+    // the carry `_analyze_counted` PROVED is the counter by dataflow: the
+    // cond compares it (`arg_k < N`) and the body returns `arg_k + 1`, so at
+    // iteration t it holds `start + t` -- which is exactly the value a
+    // SymCounter denotes and the emitters bake in as `a*(t+start)+b`.
+    //
+    // Every other carry holds a value the kernel can only learn at run time,
+    // whatever its dtype or rank.  Seeding every i32/i64 SCALAR carry as a
+    // counter too (as msl_scan.py did, and this port faithfully copied)
+    // claimed "this carry equals the loop index" for carries with no such
+    // relationship, and nothing downstream rechecked the claim: a scalar
+    // `int32` carry the body returns UNCHANGED read back inside the kernel
+    // as 0, 1, 2, ... instead of its own value, and never became a kernel
+    // input at all.  A silent wrong answer, not a decline.
+    if (i == counter_pos_) {
       env[arg] = MakeCounter(arena_, 1, 0, i);
       counter_seeded.insert(i);
     } else {
@@ -2461,6 +2472,13 @@ MslPlanned::MslPlanned(const MslEnv& env, mlir::Block& body,
         s->source.kind == SrcKind::kCarry && s->source.carry == pos) {
       passthrough.push_back(static_cast<int>(pos));
     } else if (s->kind == SymKind::kCounter) {
+      // A SymCounter can only be seeded at `counter_pos`, so `base == pos`
+      // says this position IS the induction variable and its update is the
+      // `+1` the cond's contract needs.  A DIFFERENT position that happens to
+      // evaluate to an affine function of the loop index (`p' = 2*i`) has
+      // `base != pos` and declines: the value is right, but the post-kernel
+      // rule for a counter is `carry + delta*trip`, which such a carry does
+      // not satisfy.
       if (s->base != pos || s->a != 1) MslDecline("non-increment counter");
       counters.emplace_back(static_cast<int>(pos), s->b);
     } else if (s->kind == SymKind::kLeaf && s->leaf == LeafKind::kUpdated) {
@@ -2472,8 +2490,11 @@ MslPlanned::MslPlanned(const MslEnv& env, mlir::Block& body,
         MslDecline(absl::StrCat("acc in stacked write: ", Dump(val)));
       stacked_.emplace_back(pos, idx, val);
     } else {
+      // The induction variable itself, updated by something other than the
+      // `+1` the counted-loop analysis matched.  Unreachable via
+      // `_analyze_counted`, kept as the cheap assertion that it is.
       if (an.counter_seeded.count(pos))
-        MslDecline(absl::StrCat("i32 scalar carry ", pos,
+        MslDecline(absl::StrCat("loop counter carry ", pos,
                                 " with non-affine update: ", KindName(s)));
       std::vector<Sym*> accs;
       if (MatchAccum(s, pos, &accs)) {

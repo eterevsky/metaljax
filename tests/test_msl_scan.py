@@ -168,7 +168,11 @@ def test_sliced_fused_dot_gates():
 
 def test_i64_scalar_carry():
     # texmo runs under jax_enable_x64: position/suffix indices are i64
-    # scalars carried through the scan (msl counters must accept them).
+    # scalars carried through the scan, and `k` is stacked out as well as
+    # carried.  Until 2026-09-02 seeding every integer scalar carry as a
+    # counter DECLINED this loop ("broadcast of SymCounter ->1 dims="), so
+    # the test passed on the interpreted path; it takes a kernel now, with
+    # `k` an ordinary state.
     jax.config.update("jax_enable_x64", True)
     try:
         def f(xs):
@@ -502,3 +506,96 @@ def test_nested_scan_over_captured_sequence():
     check(f, h0, xs, us, wz, wh)
     check(jax.value_and_grad(lambda *a: f(*a).sum(), argnums=(0, 3, 4)),
           h0, xs, us, wz, wh, rtol=1e-4, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# carries that are NOT the loop counter (2026-09-02)
+# ---------------------------------------------------------------------------
+#
+# `MslAnalyzer::Analyze` seeded a SymCounter -- the symbol that MEANS "the
+# induction variable", emitted as `a*(t+start)+b` -- for the counter the
+# counted-loop analysis found AND for every i32/i64 scalar carry besides.  So
+# an invariant `int32` carry read back inside the generated kernel as
+# 0, 1, 2, ... instead of its own value, and never became a kernel input at
+# all: a constant position held across a 28-step scan produced sin(0),
+# sin(1), ... instead of sin(7).  Found on the row-11 rope work; wrong since
+# msl_scan existed, and carried through the Stage 2 port.
+#
+# The counter is now identified by DATAFLOW only (the carry the cond compares
+# and the body returns as `arg + 1`).  These pin both directions: an integer
+# carry that is not the counter must read as itself, and one that merely
+# LOOKS like a counter must not be given the counter's arithmetic.
+#
+# Exact arithmetic on purpose -- doublings of small integers, nothing near
+# 2**24 -- so `check` compares with no tolerance to hide an off-by-a-few
+# reads.  The final integer carry is returned as well as the state: the old
+# code computed the final value correctly (post-kernel `carry + delta*trip`)
+# and only the in-body reads wrong, so a test that looked at the carry alone
+# would have passed on the bug.
+
+_CA = (np.arange(32, dtype=np.float32).reshape(4, 8) % 5) - 2
+_CB = (np.arange(32, dtype=np.float32).reshape(4, 8) % 3) - 1
+_CXS = (np.arange(8 * 32, dtype=np.float32).reshape(8, 4, 8) % 7) - 3
+_EXACT = dict(rtol=0.0, atol=0.0)
+
+
+def test_invariant_int_carry():
+    """The reproducer's shape: an int32 scalar carry returned unchanged."""
+    def f(a0, q, xs):
+        def step(c, x):
+            a, q = c
+            return (a * 2.0 + q.astype(jnp.float32) + x, q), a
+        (a, q), ys = jax.lax.scan(step, (a0, q), xs)
+        return a, q, ys
+    check(f, _CA, np.int32(7), _CXS, **_EXACT)
+
+
+def test_invariant_int_carry_first_position():
+    """The same carry moved to while-index 1, right after the counter, where
+    a classification that went by POSITION would hide."""
+    def f(q, a0, b0, xs):
+        def step(c, x):
+            q, a, b = c
+            fq = q.astype(jnp.float32)
+            return (q, a * 2.0 + fq + x, b - fq), (a, b)
+        (q, a, b), ys = jax.lax.scan(step, (q, a0, b0), xs)
+        return q, a, b, ys[0], ys[1]
+    check(f, np.int32(-3), _CA, _CB, _CXS, **_EXACT)
+
+
+def test_invariant_float_carry():
+    """Always correct -- only integer scalars were seeded -- and here so the
+    rule reads "the counter is the carry the cond compares", not "the counter
+    is the integer one"."""
+    def f(a0, s, xs):
+        def step(c, x):
+            a, s = c
+            return (a * 2.0 + s + x, s), a
+        (a, s), ys = jax.lax.scan(step, (a0, s), xs)
+        return a, s, ys
+    check(f, _CA, np.float32(2.5), _CXS, **_EXACT)
+
+
+def test_counter_lookalike_carry():
+    """Two carries that look like counters; only one feeds the cond.  `j`
+    starts at 100 and the body returns `j + 1`, so it is structurally the
+    induction variable and distinguishable only by the compare."""
+    def f(a0, j, b0, xs):
+        def step(c, x):
+            a, j, b = c
+            fj = j.astype(jnp.float32)
+            return (a * 2.0 + fj + x, j + 1, b - fj), (a, b)
+        (a, j, b), ys = jax.lax.scan(step, (a0, j, b0), xs)
+        return a, j, b, ys[0], ys[1]
+    check(f, _CA, np.int32(100), _CB, _CXS, **_EXACT)
+
+
+def test_incremented_int_carry_not_in_cond():
+    """Incremented, but by 3 and not compared: an ordinary kernel state."""
+    def f(a0, j, xs):
+        def step(c, x):
+            a, j = c
+            return (a * 2.0 + j.astype(jnp.float32) + x, j + 3), a
+        (a, j), ys = jax.lax.scan(step, (a0, j), xs)
+        return a, j, ys
+    check(f, _CA, np.int32(5), _CXS, **_EXACT)

@@ -1287,11 +1287,19 @@ std::shared_ptr<MslPlanned> MslPlanFor(LowerContext& ctx,
       std::fprintf(stderr, "[metaljax] msl_scan: not eligible (%s)\n",
                    why.c_str());
     } else {
+      // The carry census (`counters=` / `passthrough=`) is part of the line
+      // because the classification is exactly what the 2026-09-02
+      // non-counter-carry bug got wrong, and it is invisible in the answer
+      // until a wrong one comes out: `counters` must be 1 -- the induction
+      // variable and nothing else -- for every loop `_analyze_counted`
+      // claimed.
       std::fprintf(stderr,
                    "[metaljax] msl_scan: compiled plan trip=%lld mode=%s "
-                   "lanes=%lld states=%zu stacked=%zu packed=%lld\n",
+                   "lanes=%lld counters=%zu passthrough=%zu states=%zu "
+                   "stacked=%zu packed=%lld\n",
                    static_cast<long long>(plan->trip), plan->mode.c_str(),
-                   static_cast<long long>(plan->N), plan->state_pos.size(),
+                   static_cast<long long>(plan->N), plan->counters.size(),
+                   plan->passthrough.size(), plan->state_pos.size(),
                    plan->stacked_pos.size(),
                    static_cast<long long>(plan->num_packed));
       // The generated MSL, on request: a build error's line numbers point
