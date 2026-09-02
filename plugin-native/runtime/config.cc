@@ -159,6 +159,7 @@ const NamedOp kOpNames[] = {
     {"metaljax.stacked_dot", kStackedDot},
     {"metaljax.mla_sdpa", kMlaSdpa},
     {"metaljax.rms_norm", kRmsNorm},
+    {"metaljax.layer_norm", kLayerNorm},
     // M5b pseudo-names.
     {"metaljax.msl_scan", kMslScan},
     {"metaljax.host_call", kHostCall},

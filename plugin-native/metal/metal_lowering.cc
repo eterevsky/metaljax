@@ -7364,11 +7364,17 @@ absl::Status Lowering::LowerRmsNorm(mlir::Operation* op,
     ASSIGN_OR_RETURN(int w, Slot(m.w));
     ins.push_back(w);
   }
+  if (m.b) {
+    RETURN_IF_ERROR(CheckValue(m.b));
+    ASSIGN_OR_RETURN(int b, Slot(m.b));
+    ins.push_back(b);
+  }
   ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
-  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.rms_norm"));
+  ASSIGN_OR_RETURN(int opcode, Opcode(m.layer ? "metaljax.layer_norm"
+                                              : "metaljax.rms_norm"));
   EmitF(opcode, std::move(ins), {Bind(op->getResult(0))},
-        {static_cast<int64_t>(out_code), m.w ? 1 : 0}, {m.eps, m.offset},
-        ResultBytes(op));
+        {static_cast<int64_t>(out_code), m.w ? 1 : 0, m.b ? 1 : 0},
+        {m.eps, m.offset}, ResultBytes(op));
   return absl::OkStatus();
 }
 

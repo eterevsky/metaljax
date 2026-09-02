@@ -143,6 +143,10 @@ enum Op : int {
   // The RMS norm (metal_norm.cc): jax's spelled-out root-mean-square norm
   // becomes MLX's fused `fast::rms_norm(x, w, eps)`.
   kRmsNorm,
+  // The layer norm (metal_norm.cc): flax/NNX's spelled-out LayerNorm --
+  // the mean subtracted, the variance as a clamped moment difference --
+  // becomes MLX's fused `fast::layer_norm(x, w, b, eps)`.
+  kLayerNorm,
   // M5b: a counted loop msl_scan planned into one generated Metal kernel,
   // and a site where the handler computes on the HOST. Both were lowered by
   // src/metaljax/tape.py; the pseudo-names below are how it asked for them.

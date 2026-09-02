@@ -225,6 +225,35 @@ bool Program::step_emit(const Entry& e,
       break;
     }
 
+    case kLayerNorm: {
+      // metal_norm.cc: flax/NNX's spelled-out LayerNorm as MLX's fused
+      // kernel.  ins [x] then w then b, each present only if its flag is;
+      // attrs [out_dtype, has_weight, has_bias]; fattrs [eps,
+      // weight_offset].  The kernel takes a SECOND pass over the row and
+      // accumulates `sum((x - mean)^2)`, where the chain subtracts two
+      // nearly-equal moments -- so the fused side is the more accurate one,
+      // by a margin that grows with mean/stddev.  execute_test.py's
+      // fixtures measure it.
+      mx::Dtype out_dt = dtype_of(at[0]);
+      const bool has_w = at.size() > 1 && at[1] != 0;
+      const bool has_b = at.size() > 2 && at[2] != 0;
+      int next = 1;
+      std::optional<mx::array> w, b;
+      if (has_w) {
+        mx::array wv = in(next++);
+        const double off = e.fattrs.size() > 1 ? e.fattrs[1] : 0.0;
+        if (off != 0.0)
+          wv = mx::add(wv, mx::array(static_cast<float>(off), wv.dtype()));
+        w = wv;
+      }
+      if (has_b) b = in(next++);
+      mx::array out = mx::fast::layer_norm(in(0), w, b,
+                                           static_cast<float>(e.fattrs[0]));
+      if (out.dtype() != out_dt) out = mx::astype(out, out_dt);
+      env[e.outs[0]] = out;
+      break;
+    }
+
     case kMlaSdpa: {
       // metal_mla.cc: maxtext's multi-span MLA/GQA decode attention.  The
       // per-span masked softmax partials joined by the flash renormalization

@@ -398,6 +398,11 @@ struct RmsNormMatch {
   mlir::Operation* root = nullptr;
   mlir::Value x;                    // [.., N], the normed input
   mlir::Value w;                    // [N] learned scale; null = no scale
+  // A genuine LayerNorm -- flax's, the mean actually subtracted -- and its
+  // optional [N] bias.  `fast::layer_norm` instead of `fast::rms_norm`; the
+  // bias is null (and meaningless) when `layer` is false.
+  mlir::Value b;
+  bool layer = false;
   double eps = 0.0;
   // A splat folded off the weight -- maxtext's `w + 0`, gemma 2/3's
   // `1 + w`.  The emit forms `w + offset` once, [N] wide.

@@ -3542,6 +3542,248 @@ module @norm_two_stacked {
 }
 """
 
+# ---------------------------------------------------------------------------
+# flax NNX (`notes/bonsai-coverage-2026-09-01.md`)
+#
+# flax emits ONE normalization -- LayerNorm -- and spells RMSNorm as that
+# with the mean pinned to a literal 0.0.  The coverage probe measured 251
+# norms missed in one process against 49 matched (226 in bonsai's Qwen3-0.6B,
+# 25 in ViT-base, all of ViT's being genuine LayerNorms), so this is what
+# every nnx-based model in the table normalizes with.
+#
+# The five modules below are what the PLUGIN is handed for
+# `nnx.RMSNorm(8, epsilon=1e-6)` and `nnx.LayerNorm(8, epsilon=1e-6)` --
+# captured with METALJAX_DUMP_MODULE=1, saved with the script that produced
+# them under ~/.cache/metaljax-bench/logs/flax-norm/.  Four spelling details
+# are visible here and in none of the modules above: the zero-mean subtract,
+# the scale-first `rsqrt * w` product, the mean divided at the REDUCED rank
+# and lifted by a reshape, and the weight reshaped `[N] -> [1,1,N]` before
+# its broadcast.
+
+# flax `nnx.RMSNorm`, f32.  The root is the outer multiply.
+_NORM_FLAX_RMS_F32 = """
+module @norm_flax_rms_f32 {
+  func.func public @main(%w: tensor<8xf32>, %x: tensor<1x4x8xf32>)
+      -> tensor<1x4x8xf32> {
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sq = stablehlo.multiply %x, %x : tensor<1x4x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x4x8xf32>, tensor<f32>) -> tensor<1x4xf32>
+    %nb = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %mean = stablehlo.divide %red, %nb : tensor<1x4xf32>
+    %z2 = stablehlo.broadcast_in_dim %zero, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %z3 = stablehlo.reshape %z2 : (tensor<1x4xf32>) -> tensor<1x4x1xf32>
+    %mk = stablehlo.reshape %mean : (tensor<1x4xf32>) -> tensor<1x4x1xf32>
+    %zb = stablehlo.broadcast_in_dim %z3, dims = [0, 1, 2]
+        : (tensor<1x4x1xf32>) -> tensor<1x4x8xf32>
+    %cx = stablehlo.subtract %x, %zb : tensor<1x4x8xf32>
+    %eb = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x4x1xf32>
+    %ve = stablehlo.add %mk, %eb : tensor<1x4x1xf32>
+    %rs = stablehlo.rsqrt %ve : tensor<1x4x1xf32>
+    %wr = stablehlo.reshape %w : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %rb = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x4x1xf32>) -> tensor<1x4x8xf32>
+    %wb = stablehlo.broadcast_in_dim %wr, dims = [0, 1, 2]
+        : (tensor<1x1x8xf32>) -> tensor<1x4x8xf32>
+    %scale = stablehlo.multiply %rb, %wb : tensor<1x4x8xf32>
+    %o = stablehlo.multiply %cx, %scale : tensor<1x4x8xf32>
+    return %o : tensor<1x4x8xf32>
+  }
+}
+"""
+
+# The same in bf16.  Two things only this one has: the root is the downcast
+# convert (the whole norm runs in f32), and the square is taken over a
+# DIFFERENT `convert %x` than the one the zero-mean subtract reads -- XLA did
+# not CSE the two, so the matcher has to compare the values under the
+# upcasts rather than by SSA identity.
+_NORM_FLAX_RMS_BF16 = """
+module @norm_flax_rms_bf16 {
+  func.func public @main(%w: tensor<8xbf16>, %x: tensor<1x4x8xbf16>)
+      -> tensor<1x4x8xbf16> {
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %xf = stablehlo.convert %x : (tensor<1x4x8xbf16>) -> tensor<1x4x8xf32>
+    %sq = stablehlo.multiply %xf, %xf : tensor<1x4x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x4x8xf32>, tensor<f32>) -> tensor<1x4xf32>
+    %nb = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %mean = stablehlo.divide %red, %nb : tensor<1x4xf32>
+    %z2 = stablehlo.broadcast_in_dim %zero, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %z3 = stablehlo.reshape %z2 : (tensor<1x4xf32>) -> tensor<1x4x1xf32>
+    %mk = stablehlo.reshape %mean : (tensor<1x4xf32>) -> tensor<1x4x1xf32>
+    %xf2 = stablehlo.convert %x : (tensor<1x4x8xbf16>) -> tensor<1x4x8xf32>
+    %zb = stablehlo.broadcast_in_dim %z3, dims = [0, 1, 2]
+        : (tensor<1x4x1xf32>) -> tensor<1x4x8xf32>
+    %cx = stablehlo.subtract %xf2, %zb : tensor<1x4x8xf32>
+    %eb = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x4x1xf32>
+    %ve = stablehlo.add %mk, %eb : tensor<1x4x1xf32>
+    %rs = stablehlo.rsqrt %ve : tensor<1x4x1xf32>
+    %wr = stablehlo.reshape %w : (tensor<8xbf16>) -> tensor<1x1x8xbf16>
+    %wf = stablehlo.convert %wr : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %rb = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x4x1xf32>) -> tensor<1x4x8xf32>
+    %wb = stablehlo.broadcast_in_dim %wf, dims = [0, 1, 2]
+        : (tensor<1x1x8xf32>) -> tensor<1x4x8xf32>
+    %scale = stablehlo.multiply %rb, %wb : tensor<1x4x8xf32>
+    %sc = stablehlo.multiply %cx, %scale : tensor<1x4x8xf32>
+    %o = stablehlo.convert %sc : (tensor<1x4x8xf32>) -> tensor<1x4x8xbf16>
+    return %o : tensor<1x4x8xbf16>
+  }
+}
+"""
+
+# `nnx.RMSNorm(use_scale=False)`: no weight, so the root IS the normalize
+# multiply -- the same weightless form gemma's value/router norms take, but
+# reached through the zero-mean subtract.
+_NORM_FLAX_RMS_NOSCALE_F32 = """
+module @norm_flax_rms_noscale_f32 {
+  func.func public @main(%x: tensor<1x4x8xf32>) -> tensor<1x4x8xf32> {
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sq = stablehlo.multiply %x, %x : tensor<1x4x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x4x8xf32>, tensor<f32>) -> tensor<1x4xf32>
+    %nb = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %mean = stablehlo.divide %red, %nb : tensor<1x4xf32>
+    %z2 = stablehlo.broadcast_in_dim %zero, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %z3 = stablehlo.reshape %z2 : (tensor<1x4xf32>) -> tensor<1x4x1xf32>
+    %mk = stablehlo.reshape %mean : (tensor<1x4xf32>) -> tensor<1x4x1xf32>
+    %zb = stablehlo.broadcast_in_dim %z3, dims = [0, 1, 2]
+        : (tensor<1x4x1xf32>) -> tensor<1x4x8xf32>
+    %cx = stablehlo.subtract %x, %zb : tensor<1x4x8xf32>
+    %eb = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x4x1xf32>
+    %ve = stablehlo.add %mk, %eb : tensor<1x4x1xf32>
+    %rs = stablehlo.rsqrt %ve : tensor<1x4x1xf32>
+    %rb = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x4x1xf32>) -> tensor<1x4x8xf32>
+    %o = stablehlo.multiply %cx, %rb : tensor<1x4x8xf32>
+    return %o : tensor<1x4x8xf32>
+  }
+}
+"""
+
+# `nnx.LayerNorm`, the real thing: the mean subtracted, the variance as
+# `max(0, E[x^2] - E[x]^2)`, and an [N] bias added at the root.  Every ViT in
+# the model table normalizes with this.  It rewrites into
+# `fast::layer_norm`, whose kernel takes a second pass and accumulates
+# `sum((x - mean)^2)` -- the more accurate side of the difference.
+_NORM_FLAX_LN_F32 = """
+module @norm_flax_ln_f32 {
+  func.func public @main(%b: tensor<8xf32>, %w: tensor<8xf32>,
+      %x: tensor<1x4x8xf32>) -> tensor<1x4x8xf32> {
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sq = stablehlo.multiply %x, %x : tensor<1x4x8xf32>
+    %rsum = stablehlo.reduce(%x init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x4x8xf32>, tensor<f32>) -> tensor<1x4xf32>
+    %nb = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %mu = stablehlo.divide %rsum, %nb : tensor<1x4xf32>
+    %rsq = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x4x8xf32>, tensor<f32>) -> tensor<1x4xf32>
+    %nb2 = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %m2 = stablehlo.divide %rsq, %nb2 : tensor<1x4xf32>
+    %mm = stablehlo.multiply %mu, %mu : tensor<1x4xf32>
+    %vr = stablehlo.subtract %m2, %mm : tensor<1x4xf32>
+    %zb0 = stablehlo.broadcast_in_dim %zero, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %var = stablehlo.maximum %zb0, %vr : tensor<1x4xf32>
+    %muk = stablehlo.reshape %mu : (tensor<1x4xf32>) -> tensor<1x4x1xf32>
+    %vk = stablehlo.reshape %var : (tensor<1x4xf32>) -> tensor<1x4x1xf32>
+    %mub = stablehlo.broadcast_in_dim %muk, dims = [0, 1, 2]
+        : (tensor<1x4x1xf32>) -> tensor<1x4x8xf32>
+    %cx = stablehlo.subtract %x, %mub : tensor<1x4x8xf32>
+    %eb = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x4x1xf32>
+    %ve = stablehlo.add %vk, %eb : tensor<1x4x1xf32>
+    %rs = stablehlo.rsqrt %ve : tensor<1x4x1xf32>
+    %wr = stablehlo.reshape %w : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %rb = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x4x1xf32>) -> tensor<1x4x8xf32>
+    %wb = stablehlo.broadcast_in_dim %wr, dims = [0, 1, 2]
+        : (tensor<1x1x8xf32>) -> tensor<1x4x8xf32>
+    %scale = stablehlo.multiply %rb, %wb : tensor<1x4x8xf32>
+    %sc = stablehlo.multiply %cx, %scale : tensor<1x4x8xf32>
+    %br = stablehlo.reshape %b : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %bb = stablehlo.broadcast_in_dim %br, dims = [0, 1, 2]
+        : (tensor<1x1x8xf32>) -> tensor<1x4x8xf32>
+    %o = stablehlo.add %sc, %bb : tensor<1x4x8xf32>
+    return %o : tensor<1x4x8xf32>
+  }
+}
+"""
+
+# `nnx.LayerNorm(use_bias=False)`: the same without the trailing add, so the
+# root is the scale multiply.  Both roots match in the module above -- the
+# bias one absorbs the other -- and this is the evidence the smaller form
+# stands on its own.
+_NORM_FLAX_LN_NOBIAS_F32 = """
+module @norm_flax_ln_nobias_f32 {
+  func.func public @main(%w: tensor<8xf32>, %x: tensor<1x4x8xf32>)
+      -> tensor<1x4x8xf32> {
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %sq = stablehlo.multiply %x, %x : tensor<1x4x8xf32>
+    %rsum = stablehlo.reduce(%x init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x4x8xf32>, tensor<f32>) -> tensor<1x4xf32>
+    %nb = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %mu = stablehlo.divide %rsum, %nb : tensor<1x4xf32>
+    %rsq = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x4x8xf32>, tensor<f32>) -> tensor<1x4xf32>
+    %nb2 = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %m2 = stablehlo.divide %rsq, %nb2 : tensor<1x4xf32>
+    %mm = stablehlo.multiply %mu, %mu : tensor<1x4xf32>
+    %vr = stablehlo.subtract %m2, %mm : tensor<1x4xf32>
+    %zb0 = stablehlo.broadcast_in_dim %zero, dims = []
+        : (tensor<f32>) -> tensor<1x4xf32>
+    %var = stablehlo.maximum %zb0, %vr : tensor<1x4xf32>
+    %muk = stablehlo.reshape %mu : (tensor<1x4xf32>) -> tensor<1x4x1xf32>
+    %vk = stablehlo.reshape %var : (tensor<1x4xf32>) -> tensor<1x4x1xf32>
+    %mub = stablehlo.broadcast_in_dim %muk, dims = [0, 1, 2]
+        : (tensor<1x4x1xf32>) -> tensor<1x4x8xf32>
+    %cx = stablehlo.subtract %x, %mub : tensor<1x4x8xf32>
+    %eb = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x4x1xf32>
+    %ve = stablehlo.add %vk, %eb : tensor<1x4x1xf32>
+    %rs = stablehlo.rsqrt %ve : tensor<1x4x1xf32>
+    %wr = stablehlo.reshape %w : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %rb = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x4x1xf32>) -> tensor<1x4x8xf32>
+    %wb = stablehlo.broadcast_in_dim %wr, dims = [0, 1, 2]
+        : (tensor<1x1x8xf32>) -> tensor<1x4x8xf32>
+    %scale = stablehlo.multiply %rb, %wb : tensor<1x4x8xf32>
+    %o = stablehlo.multiply %cx, %scale : tensor<1x4x8xf32>
+    return %o : tensor<1x4x8xf32>
+  }
+}
+"""
+
 
 def _norm_forms():
     """(label, module, form tag metal_norm.cc must narrate, dtype, matches).
@@ -3561,6 +3803,13 @@ def _norm_forms():
         ("keras head-dim bf16", _NORM_KERAS_HEAD_BF16, "R4.cvt", "bf16", 1),
         ("two norms, shared constants", _NORM_TWO_STACKED, "R3.cvt", "bf16",
          2),
+        ("flax rms f32", _NORM_FLAX_RMS_F32, "R3.scale", "f32", 1),
+        ("flax rms bf16", _NORM_FLAX_RMS_BF16, "R3.cvt.scale", "bf16", 1),
+        ("flax rms weightless f32", _NORM_FLAX_RMS_NOSCALE_F32, "R3.noscale",
+         "f32", 1),
+        ("flax layernorm f32", _NORM_FLAX_LN_F32, "R3.scale.ln+b", "f32", 1),
+        ("flax layernorm no bias f32", _NORM_FLAX_LN_NOBIAS_F32,
+         "R3.scale.ln", "f32", 1),
     ]
 
 
@@ -6271,7 +6520,8 @@ def _p31_norm(subprocess, pathlib, re):
                 continue
             label, payload = line[5:].split("\t", 1)
             answers[label] = np.array(json.loads(payload))
-        tags = re.findall(r"norm: matched an rms norm \(([^,]*),", proc.stderr)
+        tags = re.findall(r"norm: matched an? (?:rms|layer) norm \(([^,]*),",
+                          proc.stderr)
         return answers, tags
 
     def worst(a, b):
