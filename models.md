@@ -34,7 +34,7 @@ notes/data/. Append a column per release / major optimization.*
 | 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | |
 | 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | |
 | 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | **56.2** ᴳ | |
-| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | — | 148.7 ʰ |
+| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | — | 148.4 ʰ |
 
 Notes:
 
@@ -259,8 +259,8 @@ Notes:
   binary, band 8.5–9.0); row 14 = 27.64 after the GQA attention
   recognizer (43d4ad6); row 7 = 16.45 after the keras attention
   recognizer (f1fbe30); row 8 = 25.8 on the merged main binary with the
-  fused GDN step + keras norm coverage; row 21 = 148.7 after the fused GDN
-  step (GDN-only binary; combined re-measure pending). The previous ʰ
+  fused GDN step + keras norm coverage; row 21 = 148.4 on the merged main binary (fused GDN step + keras norm
+  coverage; 148.4 / 155.3 / 147.4, median). The previous ʰ
   cells (rows 4/10/11/14) became frozen 0.11.7 cells.
 - ᵐ **Row 11 changed benchmark implementation after 0.11.7** (the
   best-available-implementation rule): every cell through the 0.11.7
