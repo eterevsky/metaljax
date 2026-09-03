@@ -12,32 +12,45 @@ Cells: metaljax warm decode ms/token (or the row's noted metric);
 version's commit. Full per-run tables live in STATUS.md; raw JSONL in
 notes/data/. Append a column per release / major optimization.*
 
-| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 | 0.11.6 | 0.11.7 | HEAD |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | **126.1** | 123.9 ʰ |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | **57.3** | 56.4 ʰ |
-| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | **33.4** | 31.4 ʰ |
-| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | **24.0** | |
-| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | 40.8 ʰ |
-| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | **42.2** | |
-| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 16.45 ʰ |
-| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 24.8 ʰ |
-| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | |
-| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **24.8** ᴳ | 24.27 ʰ |
-| 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 8.3 ʰ |
-| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | |
-| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | |
-| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | 27.2 ʰ |
-| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | **388.4** ᵛ | |
-| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | **86.68** | |
-| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | **1249.3 / 4961.6** | |
-| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | |
-| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | |
-| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | **56.2** ᴳ | |
-| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | — | 148.4 ʰ |
+| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 | 0.11.6 | 0.11.7 | HEAD | goal |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | **126.1** | 123.9 ʰ | 111.2 ˡ |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | **57.3** | 56.4 ʰ | 44.2 ˡ |
+| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | **33.4** | 31.4 ʰ | 16.9 ˡ |
+| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | **24.0** | | 10.5 ˣ |
+| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | 40.8 ʰ | 29.6 ˡ |
+| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | **42.2** | | 29.2 ˡ |
+| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 16.45 ʰ | 6.7 ˡ |
+| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 24.8 ʰ | 13.7 ˣ |
+| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | | 114.9 ˡ |
+| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **24.8** ᴳ | 24.27 ʰ | 10.5 ˣ |
+| 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 8.3 ʰ | 3.0 ˣ |
+| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | | 52.8 ˣ |
+| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | | 67.8 ᶜ |
+| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | 27.2 ʰ | 143.4 ᶜ |
+| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | **388.4** ᵛ | | 2118 ᶜ |
+| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | **86.68** | | 29.8 ᵗ |
+| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | **1249.3 / 4961.6** | | 654 / 2998 ᵗ |
+| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | | 135.6 ᵗ |
+| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | | 1402 ᶜ |
+| 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | **56.2** ᴳ | | 28.0 ˣ |
+| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | **154.9** | 148.4 ʰ | 98.2 ˡ |
 
 Notes:
 
+- **goal** = the best non-metaljax cell for the row in STATUS.md's table,
+  at the same precision (STATUS.md's like-for-like rule, fn 10): ˣ mlx-lm,
+  ˡ llama.cpp, ᵗ torch-MPS, ᶜ jax-CPU (used only where no other framework
+  runs the row). Copied from STATUS.md on 2026-09-03; STATUS.md stays the
+  source of truth and carries the caveats behind these cells: row 4's goal
+  is the dated 2026-08-03 mlx-lm git-main cell (fn 7); row 13's goal is
+  jax-CPU only because XLA:CPU unpacks the int4 weights in-graph while
+  metaljax keeps them packed, 2.7 vs 10.2 GB (fn 8); row 18 is torch with
+  the SDPA math fallback (fn 3); row 17's comparators are fn 9; and the
+  llama.cpp cells carry a 4 % two-pass band (fn 10), wider than their lead
+  over mlx-lm on rows 3 and 6, so ˡ vs ˣ there is a coin toss.
+  It sits last, beside HEAD, so the current status of a row is the last two
+  cells.
 - **0.11.1** (2026-08-02): pre-buffer-fix era, mixed command-buffer
   caps; raw data lost to the panic reboots — values from STATUS
   history. Row 16 measured under machine contention.
@@ -126,9 +139,10 @@ Notes:
   for row 1, and twice in a row for row 11. Row 1 takes no sdpa emit at
   all, so its divergence is the plain lowering's arithmetic order, not
   the fused path.
-- Comparison stacks (2026-08-03, versions in
-  scripts/model_bench/versions.lock.md — re-measure alongside major
-  metaljax changes): mlx-lm 12B 58.3 / 31B 137 / MoE 17.0 / gpt-oss
+- Comparison stacks — a DATED 2026-08-03 snapshot (versions in
+  scripts/model_bench/versions.lock.md); the current comparators are the
+  goal column and STATUS.md (e.g. mlx-lm 31B re-measured 133.1 on
+  2026-08-31, V2-Lite 10.5): mlx-lm 12B 58.3 / 31B 137 / MoE 17.0 / gpt-oss
   8.8 / V2-Lite 10.6 / Mixtral 52.8 / R1-32B 131.8; torch-MPS 12B
   67.6 / 31B 148.7 / SigLIP 29.8 / LoRA 135.6 / SD3.5 654 @512²,
   2998 @1024²; llama.cpp 12B-bf16 44.2 / 31B-bf16 111.2 (the
