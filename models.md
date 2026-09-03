@@ -20,8 +20,8 @@ notes/data/. Append a column per release / major optimization.*
 | 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | **24.0** | |
 | 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | |
 | 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | **42.2** | |
-| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | |
-| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | |
+| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 16.45 ʰ |
+| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 25.8 ʰ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | |
 | 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **24.8** ᴳ | |
 | 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 9.0 ʰ |
@@ -34,7 +34,7 @@ notes/data/. Append a column per release / major optimization.*
 | 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | |
 | 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | |
 | 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | **56.2** ᴳ | |
-| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | — | 154.9 ʰ |
+| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | — | 148.7 ʰ |
 
 Notes:
 
@@ -257,9 +257,11 @@ Notes:
 - ʰ HEAD-column cells (the rightmost-tracks-HEAD convention): row 11 =
   9.0 on the keras-hub harness (see ᵐ; measured on the 0.11.7 release
   binary, band 8.5–9.0); row 14 = 27.64 after the GQA attention
-  recognizer (43d4ad6); row 21 = 154.9 on the 0.11.7 release binary
-  (first cell for the new row). The previous ʰ cells (rows 4/10/11/14)
-  became frozen 0.11.7 cells.
+  recognizer (43d4ad6); row 7 = 16.45 after the keras attention
+  recognizer (f1fbe30); row 8 = 25.8 on the merged main binary with the
+  fused GDN step + keras norm coverage; row 21 = 148.7 after the fused GDN
+  step (GDN-only binary; combined re-measure pending). The previous ʰ
+  cells (rows 4/10/11/14) became frozen 0.11.7 cells.
 - ᵐ **Row 11 changed benchmark implementation after 0.11.7** (the
   best-available-implementation rule): every cell through the 0.11.7
   column is the maxtext decode harness and is NOT comparable to the
