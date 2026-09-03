@@ -49,6 +49,20 @@ RMSNorm as that with the mean pinned to a literal zero.
     the mean with a `reshape`.  A `reshape` also sits under the weight's
     broadcast (`[N] -> [1, .., N]`), and under the zero itself.
 
+keras-hub's own model layers (the MoE band -- rows 3, 7, 8, 10; captured in
+`~/.cache/metaljax-bench/logs/norm-coverage/`) add two more, and BOTH of them
+declined every norm in their models before this pass:
+
+  * gemma4 (`gemma4_layers.py`: `RMSNormalization`, `Gemma4VNorm`,
+    `Gemma4FrozenNorm`) writes the reciprocal square root as
+    `ops.power(var + eps, -0.5)`.  jax lowers that literally, so there is no
+    `stablehlo.rsqrt` ANYWHERE in the module -- row 3 recognized zero norms
+    and said nothing, because "no rsqrt side" is a quiet reject;
+  * qwen3.5 (`qwen3_5_layers.py: Qwen3_5LayerNorm`) forms its `(1 + w)` scale
+    in f32 over a bf16 parameter, so the value the weight chain reaches is an
+    [N] f32 add sitting over a bf16 activation.  Row 8 declined 717 of these
+    per generate shape against 60 matches.
+
 So the matcher reads BACKWARDS from a root and treats `convert` as a
 transparent dtype hop, rather than pinning one op sequence.  Four roots are
 tried: a transpose (the maxtext dot form), a multiply (the broadcast weight
@@ -85,8 +99,49 @@ dtype.  Measured against each literal chain at the real feature widths
     MEAN to bf16 and takes its rsqrt there, so the fused kernel is the more
     accurate side; the difference is the chain's own precision loss.
 
+  * keras-hub `(1+w)` (qwen3.5, row 8) -- **0 ULP, bit-identical to the
+    chain at every width measured** (128/256/2560/4096/5120, 64 rows,
+    `logs/norm-coverage/`).  The chain is f32 throughout and rounds once at
+    the end; promotion makes the fused op do exactly that.
+  * gemma4 `power(-0.5)` weightless (`Gemma4VNorm`, row 3) -- **0 ULP**.
+    `pow(v, -0.5)` and `rsqrt(v)` are two approximations of the same value;
+    on `v = mean(x^2) + eps`, which is positive and finite (or +inf), they
+    agree to ~1 f32 ULP of the SCALE, far under one bf16 ULP of the result,
+    and they agree at the poles too (`v = 0` gives +inf, `v = inf` gives 0,
+    `v < 0` cannot arise).
+  * gemma4 `power(-0.5)` WITH a bf16 scale -- max 1 bf16 ULP, ~75 %
+    bit-identical: the same rounding-point difference as keras above, not
+    the power spelling (its weightless sibling is exact).
+
 Both are the documented fused-kernel class, and 2 ULP on rows 1/2 is a
 token-stream tie-flip risk that belongs in the gate report.
+
+MIXED DTYPES.  MLX does not require x, w and b to agree: `fast.cpp` types the
+result `result_type(x, w[, b])`, casts EVERY operand to that, and runs the
+kernel there; the emit then rounds to whatever dtype the chain's root
+produced.  So the fused op computes in the promoted dtype `T` and rounds once
+into the root's dtype `R`, and a mixed-dtype norm is this op exactly when
+that leaves no precision behind:
+
+    accept iff  T == R  (what this matcher required before, in any dtype)
+            or  T == f32 and R is one of f16 / bf16 / f32.
+
+`T` is never narrower than x or w -- among the three real float dtypes any
+distinct pair promotes to f32 (f16 and bf16 have no common narrower type) --
+so `T == f32` means the whole fused computation runs at least as precisely as
+the chain did, and the single rounding into `R` is the chain's own final
+convert.  The rejected case is the one that matters: `T` narrower than `R`
+(bf16 x AND bf16 w feeding an f32 result) would compute in bf16 what the
+chain computed in f32, ~256 ULP of R.  That declines.
+
+Promotion is not free -- MLX materialises `astype(x, T)` -- but it is one
+elementwise kernel that the enclosing `mx::compile` graph fuses, against the
+11-13 tape entries the rewrite removes.  Note the asymmetry it leaves: a
+chain that reaches its weight through `convert(w_bf16 -> f32)` keeps being
+matched at `T = bf16` (`PeelWeight` walks widening converts, so the fused op
+reads the stored parameter), which is the older 1-ULP class; only a weight
+whose [N] value really is f32 -- keras' `1 + w`, or an f32 norm variable --
+promotes.  Both are inside the documented class and the cheaper one wins.
 
 A half-matched pattern lowers as ORDINARY ops (`Bail`), and a match whose
 intermediates escape is declined whole -- the fused op computes everything
@@ -153,6 +208,15 @@ mlir::Type ElemOf(mlir::Value v) {
   auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
   if (!t) Bail("a value that is not a ranked tensor");
   return t.getElementType();
+}
+
+// One of the three float dtypes MLX actually has.  Everything else that
+// answers to `FloatType` here is an emulated sub-byte format the runtime
+// stores in one of these -- outside the promotion rule, and only ever
+// accepted when x, w, b and the result already agree.
+bool IsRealFloat(mlir::Type t) {
+  return mlir::isa<mlir::Float16Type>(t) || mlir::isa<mlir::BFloat16Type>(t) ||
+         mlir::isa<mlir::Float32Type>(t);
 }
 
 mlir::Operation* DefOf(mlir::Value v, const char* what) {
@@ -322,6 +386,35 @@ bool IsFeatureBroadcast(mlir::Value v, int64_t N) {
   return false;
 }
 
+// `rsqrt(v)`, however the library spelled it -- the value under it, or null.
+// keras-hub's gemma4 layers write `ops.power(var + eps, -0.5)` where every
+// other library writes `rsqrt`, and jax lowers that literally: row 3's
+// modules carry no `stablehlo.rsqrt` at all.  The two are the same function
+// of the value this reaches (`mean(x^2) + eps`, which is positive, or +inf);
+// they differ only in how each is approximated, and the header's numeric
+// note bounds that at ~1 f32 ULP of the scale.
+//
+// PREDICATE-SAFE: never bails, because `IsNormalizeMul` probes with it.  The
+// exponent's own broadcasts and converts go into `ops` alongside the op, the
+// way every other splat this matcher walks does.
+mlir::Value RsqrtOperand(mlir::Operation* def,
+                         std::vector<mlir::Operation*>* ops) {
+  if (mlir::isa_and_nonnull<mlir::stablehlo::RsqrtOp>(def)) {
+    if (ops != nullptr) ops->push_back(def);
+    return def->getOperand(0);
+  }
+  auto pw = mlir::dyn_cast_or_null<mlir::stablehlo::PowOp>(def);
+  if (!pw) return {};
+  std::vector<mlir::Operation*> eops;
+  std::optional<double> e = SplatThroughCasts(pw.getRhs(), &eops);
+  if (!e.has_value() || *e != -0.5) return {};
+  if (ops != nullptr) {
+    ops->push_back(def);
+    ops->insert(ops->end(), eops.begin(), eops.end());
+  }
+  return pw.getLhs();
+}
+
 // The `broadcast_in_dim(rsqrt(..))` operand of a multiply, with the other
 // one handed back.  Null when neither side is one.
 mlir::Value RsqrtSide(mlir::stablehlo::MulOp mul, mlir::Value* other) {
@@ -331,8 +424,7 @@ mlir::Value RsqrtSide(mlir::stablehlo::MulOp mul, mlir::Value* other) {
     auto bc =
         mlir::dyn_cast_or_null<mlir::stablehlo::BroadcastInDimOp>(
             a.getDefiningOp());
-    if (bc && mlir::isa_and_nonnull<mlir::stablehlo::RsqrtOp>(
-                  bc.getOperand().getDefiningOp())) {
+    if (bc && RsqrtOperand(bc.getOperand().getDefiningOp(), nullptr)) {
       if (other != nullptr) *other = b;
       return a;
     }
@@ -344,9 +436,13 @@ mlir::Value RsqrtSide(mlir::stablehlo::MulOp mul, mlir::Value* other) {
 // currently carries the feature axis (R-1 for a value at the norm's own
 // shape, 0 for the dot form's already-[N] operand).  Broadcasts and dtype
 // converts are transparent; splat adds accumulate into `offset`, which the
-// emit applies once, [N] wide, instead of at full rank.
+// emit applies once, [N] wide, instead of at full rank.  `offset_elem`
+// comes back as the dtype the CHAIN formed that offset in, which is the
+// weight's own or one f32 hop above it (keras' `1 + convert(w_bf16)`), and
+// the emit reproduces the same arithmetic there.
 mlir::Value PeelWeight(mlir::Value v, int64_t N, int64_t dim,
-                       std::vector<mlir::Operation*>* ops, double* offset) {
+                       std::vector<mlir::Operation*>* ops, double* offset,
+                       mlir::Type* offset_elem = nullptr) {
   std::optional<mlir::Type> add_elem;
   for (int guard = 0; guard < 12; guard++) {
     std::vector<int64_t> shape = ShapeOf(v);
@@ -365,15 +461,60 @@ mlir::Value PeelWeight(mlir::Value v, int64_t N, int64_t dim,
       v = c.getOperand();
       continue;
     }
+    // Before the [N] exit, not after it: keras' Qwen3.5 norms form `1 + w`
+    // at [N] WIDTH, where every other library adds its splat at full rank,
+    // and stopping at the first [N] value would hand the fused op the add
+    // instead of the parameter (two live [N] entries per norm per token).
+    //
+    // At [N] width peeling is an OPTIMIZATION, not a requirement -- the add's
+    // result is already a legal weight for the fused op -- so it is taken
+    // only when the add belongs to this norm alone.  A shared one (two norms
+    // over one scale, XLA having CSEd the add) absorbed here would escape
+    // the match and decline it whole; left standing it is simply the [N]
+    // vector the fused op reads.  Above [N] the peel is mandatory, and a
+    // shared chain declines there as it always has.
+    if (auto a = mlir::dyn_cast_or_null<mlir::stablehlo::AddOp>(def)) {
+      const bool at_n = shape.size() == 1 && dim == 0;
+      const bool nothing_folded_yet = offset == nullptr || *offset == 0.0;
+      if (at_n && nothing_folded_yet && !a.getResult().hasOneUse()) {
+        if (shape[0] != N) Bail("the weight is not [N]");
+        if (offset_elem != nullptr) *offset_elem = ElemOf(v);
+        return v;
+      }
+      bool took = false;
+      for (bool swap : {false, true}) {
+        mlir::Value keep = swap ? a.getRhs() : a.getLhs();
+        mlir::Value cst = swap ? a.getLhs() : a.getRhs();
+        std::vector<mlir::Operation*> cops;
+        auto d = SplatThroughCasts(cst, &cops);
+        if (!d.has_value()) continue;
+        if (offset != nullptr) *offset += *d;
+        add_elem = ElemOf(a.getResult());
+        ops->push_back(def);
+        ops->insert(ops->end(), cops.begin(), cops.end());
+        v = keep;
+        took = true;
+        break;
+      }
+      if (took) continue;
+      Bail("the weight add is not a splat offset");
+    }
     if (shape.size() == 1 && dim == 0) {
       if (shape[0] != N) Bail("the weight is not [N]");
-      // Folding a NONZERO offset down to the weight's own dtype has to be
-      // the same arithmetic the chain did (gemma 2/3 adds its 1 in bf16,
-      // alongside a bf16 weight).  An offset formed one dtype up would
-      // round differently, so decline rather than approximate it.
+      // Where the offset is formed decides how it rounds: gemma 2/3 adds
+      // its 1 in bf16 alongside a bf16 weight, keras adds it in f32 over a
+      // bf16 one.  Both are reproducible -- the emit casts the weight to
+      // `offset_elem` first -- but only these two: a third dtype would be
+      // arithmetic this rewrite never saw, so it declines instead of
+      // approximating.
+      mlir::Type oelem = ElemOf(v);
       if (offset != nullptr && *offset != 0.0 && add_elem.has_value() &&
-          *add_elem != ElemOf(v))
-        Bail("the weight offset is formed in a wider dtype");
+          *add_elem != oelem) {
+        if (!mlir::isa<mlir::Float32Type>(*add_elem))
+          Bail("the weight offset is formed in an unexpected dtype");
+        oelem = *add_elem;
+      }
+      if (offset_elem != nullptr) *offset_elem = oelem;
       return v;
     }
     if (def == nullptr) Bail("the weight apply reaches a block argument");
@@ -418,25 +559,6 @@ mlir::Value PeelWeight(mlir::Value v, int64_t N, int64_t dim,
       v = rs.getOperand();
       dim = src;
       continue;
-    }
-    if (auto a = mlir::dyn_cast<mlir::stablehlo::AddOp>(def)) {
-      bool took = false;
-      for (bool swap : {false, true}) {
-        mlir::Value keep = swap ? a.getRhs() : a.getLhs();
-        mlir::Value cst = swap ? a.getLhs() : a.getRhs();
-        std::vector<mlir::Operation*> cops;
-        auto d = SplatThroughCasts(cst, &cops);
-        if (!d.has_value()) continue;
-        if (offset != nullptr) *offset += *d;
-        add_elem = ElemOf(a.getResult());
-        ops->push_back(def);
-        ops->insert(ops->end(), cops.begin(), cops.end());
-        v = keep;
-        took = true;
-        break;
-      }
-      if (took) continue;
-      Bail("the weight add is not a splat offset");
     }
     Bail(absl::StrCat("the weight apply walks a ", OpName(def)));
   }
@@ -544,13 +666,14 @@ NormChain MatchNormalizedParts(mlir::Value xn, mlir::Value b10,
   auto b10op =
       mlir::cast<mlir::stablehlo::BroadcastInDimOp>(b10.getDefiningOp());
   ops.push_back(b10op);
-  auto rs = mlir::cast<mlir::stablehlo::RsqrtOp>(
-      b10op.getOperand().getDefiningOp());
-  ops.push_back(rs);
+  // `RsqrtSide` already proved this is one; either spelling.
+  mlir::Value rs_in =
+      RsqrtOperand(b10op.getOperand().getDefiningOp(), &ops);
+  if (!rs_in) Bail("the scale is not a reciprocal square root");
 
   // rsqrt(convert?(variance) + eps).
   auto add6 = mlir::dyn_cast_or_null<mlir::stablehlo::AddOp>(
-      rs.getOperand().getDefiningOp());
+      rs_in.getDefiningOp());
   if (!add6) Bail("no eps add");
   ops.push_back(add6);
   mlir::Value var_v;
@@ -683,6 +806,7 @@ std::unique_ptr<RmsNormMatch> MatchRoot(mlir::Operation* op) {
   mlir::Value w;                 // null when the norm has no learned scale
   mlir::Value bias;              // null unless a LayerNorm carries one
   double offset = 0.0;
+  mlir::Type offset_elem;        // the dtype the chain formed `offset` in
   std::string form;
 
   if (auto tr = mlir::dyn_cast<mlir::stablehlo::TransposeOp>(op)) {
@@ -707,7 +831,7 @@ std::unique_ptr<RmsNormMatch> MatchRoot(mlir::Operation* op) {
         !dn.getLhsContractingDimensions().empty() ||
         !dn.getRhsContractingDimensions().empty())
       Bail("the weight apply is not the batching multiply");
-    w = PeelWeight(dot.getLhs(), N, /*dim=*/0, &ops, &offset);
+    w = PeelWeight(dot.getLhs(), N, /*dim=*/0, &ops, &offset, &offset_elem);
     y = dot.getRhs();
     form = "dot";
   } else {
@@ -767,7 +891,8 @@ std::unique_ptr<RmsNormMatch> MatchRoot(mlir::Operation* op) {
           if (ShapeOf(a) != out_shape || ShapeOf(b) != out_shape)
             Bail("the scale apply has the wrong shape");
           ops.push_back(inner);
-          w = PeelWeight(other, N, static_cast<int64_t>(R) - 1, &ops, &offset);
+          w = PeelWeight(other, N, static_cast<int64_t>(R) - 1, &ops,
+                         &offset, &offset_elem);
           xs = b;
           rq = rsb;
           form = absl::StrCat(form, "scale");
@@ -776,7 +901,8 @@ std::unique_ptr<RmsNormMatch> MatchRoot(mlir::Operation* op) {
             Bail("the weight apply has the wrong shape");
           y = a;
           wsrc = b;
-          w = PeelWeight(wsrc, N, static_cast<int64_t>(R) - 1, &ops, &offset);
+          w = PeelWeight(wsrc, N, static_cast<int64_t>(R) - 1, &ops, &offset,
+                         &offset_elem);
           form = absl::StrCat(form, "mul");
         }
         took = true;
@@ -799,12 +925,31 @@ std::unique_ptr<RmsNormMatch> MatchRoot(mlir::Operation* op) {
   mlir::Type elem = ElemOf(x);
   if (!mlir::isa<mlir::FloatType>(elem) || mlir::isa<mlir::Float64Type>(elem))
     Bail("not a float norm");
-  // MLX types the result from x, w and b together, and the tape binds ONE
-  // result: a norm whose weight, bias or result lives in another dtype is
-  // not this op.
-  if (w && ElemOf(w) != elem) Bail("mixed dtypes");
-  if (bias && ElemOf(bias) != elem) Bail("mixed dtypes");
-  if (ElemOf(op->getResult(0)) != elem) Bail("mixed dtypes");
+  // MLX types the fused result from x, w and b TOGETHER -- `fast.cpp` takes
+  // `result_type(..)`, casts every operand to it and runs the kernel there
+  // -- and the emit rounds that once into the root's dtype.  The header
+  // states the rule this checks: the promoted dtype must not be narrower
+  // than the result the chain produced, or the fused op would compute in
+  // bf16 what the chain computed in f32.
+  //
+  // `offset_elem` stands in for the weight wherever a nonzero offset is
+  // folded: the emit forms `w + offset` there, so THAT is the dtype MLX
+  // promotes against.
+  mlir::Type compute = elem;
+  auto promote = [&](mlir::Type t) {
+    if (t == compute) return;
+    if (!IsRealFloat(t) || !IsRealFloat(compute)) Bail("mixed dtypes");
+    // Any two distinct dtypes among f16/bf16/f32 promote to f32 -- f16 and
+    // bf16 have no common narrower type.  MLX's own table, `dtype.cpp`
+    // `type_rules`: f16 x f32, bf16 x f32 and f16 x bf16 are all f32.
+    compute = mlir::Float32Type::get(t.getContext());
+  };
+  if (w) promote(offset != 0.0 ? offset_elem : ElemOf(w));
+  if (bias) promote(ElemOf(bias));
+  mlir::Type res = ElemOf(op->getResult(0));
+  if (compute != res && !(mlir::isa<mlir::Float32Type>(compute) &&
+                          IsRealFloat(res)))
+    Bail("mixed dtypes");
 
   // In the weightless form the root IS the normalize multiply, which
   // MatchNormalized walked as part of the chain.  A root is replaced, not
@@ -818,8 +963,14 @@ std::unique_ptr<RmsNormMatch> MatchRoot(mlir::Operation* op) {
   m->layer = ch.layer;
   m->eps = eps;
   m->offset = offset;
+  m->offset_f32 =
+      offset != 0.0 && w && mlir::isa<mlir::Float32Type>(offset_elem) &&
+      ElemOf(w) != offset_elem;
   m->name = absl::StrCat("N", N, "R", R, ".", form, bias ? "+b" : "",
-                         offset != 0.0 ? "+off" : "");
+                         offset != 0.0 ? (m->offset_f32 ? "+off32" : "+off")
+                                       : "",
+                         compute != elem ? "+up" : "",
+                         res != compute ? "+dn" : "");
   return m;
 }
 
@@ -866,6 +1017,13 @@ void AnalyzeNorm(mlir::func::FuncOp fn, RewritePlan* plan) {
           // narration keeps only rejects that got past the shape of a norm.
           static const char* const kQuiet[] = {
               "not the weight-apply", "the weight apply is not a dot",
+              // A transpose whose operand is a block argument -- a loop
+              // carry, or a captured stack.  The maxtext form needs a
+              // `dot_general` there, and a block argument is not one, so
+              // this is the same "not a norm at all" class as the two
+              // above; it accounted for 933 of the MoE band's reject lines
+              // and named none of them correctly.
+              "the weight apply is a block argument",
               "the weight apply is not the batching multiply",
               "not a norm downcast", "not a multiply", "a rank-0 norm",
               "not a norm bias",

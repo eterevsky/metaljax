@@ -404,9 +404,13 @@ struct RmsNormMatch {
   mlir::Value b;
   bool layer = false;
   double eps = 0.0;
-  // A splat folded off the weight -- maxtext's `w + 0`, gemma 2/3's
-  // `1 + w`.  The emit forms `w + offset` once, [N] wide.
+  // A splat folded off the weight -- maxtext's `w + 0`, gemma 2/3's and
+  // keras' `1 + w`.  The emit forms `w + offset` once, [N] wide.
   double offset = 0.0;
+  // ... in f32 rather than the weight's own dtype, when that is where the
+  // chain formed it (keras' Qwen3.5 norms add their 1 to `convert(w)`).
+  // The emit casts first, so the [N] arithmetic is the chain's.
+  bool offset_f32 = false;
   std::vector<mlir::Operation*> ops;
   std::string name;
 };

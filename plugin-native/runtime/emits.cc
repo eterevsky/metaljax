@@ -199,23 +199,36 @@ bool Program::step_emit(const Entry& e,
 
     case kRmsNorm: {
       // metal_norm.cc: jax's spelled-out RMS norm as MLX's fused kernel.
-      // ins [x] or [x, w]; attrs [out_dtype, has_weight]; fattrs [eps,
-      // weight_offset].  The kernel accumulates in f32; each library's chain
-      // rounds somewhere else, which metal_norm.cc measures and bounds.
+      // ins [x] or [x, w]; attrs [out_dtype, has_weight, has_bias,
+      // offset_in_f32]; fattrs [eps, weight_offset].  The kernel accumulates
+      // in f32; each library's chain rounds somewhere else, which
+      // metal_norm.cc measures and bounds.
+      //
+      // `fast::rms_norm` promotes: it types the result `result_type(x, w)`
+      // and casts both operands to it, so a bf16 activation with an f32
+      // scale computes wholly in f32 -- and the astype below is the chain's
+      // own final convert.  metal_norm.cc only matches when that promotion
+      // leaves no precision behind.
       //
       // `weight_offset` is the splat the match folded off the weight -- `w +
-      // 0` in maxtext, `1 + w` in gemma 2/3.  The chain formed it at FULL
-      // rank; forming it here is [N] wide and, the matcher having required
-      // the same dtype, the same arithmetic.
+      // 0` in maxtext, `1 + w` in gemma 2/3 and keras.  The chain formed it
+      // at FULL rank; forming it here is [N] wide, and in the dtype the
+      // chain used it in: keras adds its 1 to `convert(w_bf16 -> f32)`, so
+      // `offset_in_f32` casts before adding rather than rounding the sum
+      // back into bf16.
       mx::Dtype out_dt = dtype_of(at[0]);
       const bool has_w = at.size() > 1 && at[1] != 0;
+      const bool off_f32 = at.size() > 3 && at[3] != 0;
       std::optional<mx::array> w;
       if (has_w) {
         mx::array wv = in(1);
         const double off = e.fattrs.size() > 1 ? e.fattrs[1] : 0.0;
-        if (off != 0.0)
+        if (off != 0.0) {
+          if (off_f32 && wv.dtype() != mx::float32)
+            wv = mx::astype(wv, mx::float32);
           wv = mx::add(wv,
                        mx::array(static_cast<float>(off), wv.dtype()));
+        }
         w = wv;
       }
       mx::array out =
@@ -237,13 +250,17 @@ bool Program::step_emit(const Entry& e,
       mx::Dtype out_dt = dtype_of(at[0]);
       const bool has_w = at.size() > 1 && at[1] != 0;
       const bool has_b = at.size() > 2 && at[2] != 0;
+      const bool off_f32 = at.size() > 3 && at[3] != 0;
       int next = 1;
       std::optional<mx::array> w, b;
       if (has_w) {
         mx::array wv = in(next++);
         const double off = e.fattrs.size() > 1 ? e.fattrs[1] : 0.0;
-        if (off != 0.0)
+        if (off != 0.0) {
+          if (off_f32 && wv.dtype() != mx::float32)
+            wv = mx::astype(wv, mx::float32);
           wv = mx::add(wv, mx::array(static_cast<float>(off), wv.dtype()));
+        }
         w = wv;
       }
       if (has_b) b = in(next++);

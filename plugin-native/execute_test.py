@@ -3511,6 +3511,21 @@ module @rms_norm_form {
 #              bench row runs it; it is here because the offset fold is
 #              general and this is the evidence it was built from.
 #
+# The MoE band (rows 3/7/8/10) turned out NOT to be that one keras spelling:
+# its models carry their own norm classes, and both of them were declined
+# whole.  Captured the same way, under the bench harness's own dtype policy,
+# and saved under ~/.cache/metaljax-bench/logs/norm-coverage/:
+#
+#   keras_hub  row 8   qwen3_5_layers.Qwen3_5LayerNorm -- `(1 + w)` formed at
+#              [N] width AND in f32 over a bf16 parameter (717 declines per
+#              generate shape against 60 matches); Qwen3_5RMSNormGated is the
+#              60 that already matched
+#   keras_hub  row 3   gemma4_layers.{RMSNormalization, Gemma4VNorm,
+#              Gemma4FrozenNorm} -- `ops.power(var + eps, -0.5)` where every
+#              other library writes `rsqrt`, so the module contains no
+#              `stablehlo.rsqrt` at all and a 30-layer model recognized
+#              nothing, silently
+#
 # The text is the module the PLUGIN is handed, not the one jax prints: XLA's
 # parse legalizes chlo (gemma's `chlo.square` arrives as a multiply), CSEs,
 # and hoists the constants to the top.  What the matcher walks is this.
@@ -3749,6 +3764,229 @@ module @norm_keras_head_bf16 {
 }
 """
 
+
+# keras-hub qwen3.5 (`qwen3_5_layers.Qwen3_5LayerNorm`) -- row 8's input /
+# post-attention / q / k norms, and the biggest single decline in the MoE
+# band (717 per generate shape against 60 matches).  The `(1 + w)` scale is
+# formed at [N] WIDTH and in f32, over a bf16 parameter, so two things the
+# matcher used to refuse meet in one chain: the offset add sits above a
+# widening convert (a splat folded in a dtype the weight is not stored in),
+# and the value the weight chain reaches is f32 while x is bf16.
+#
+# Both are reproducible exactly -- the emit casts the weight to f32 before
+# adding, and MLX promotes the fused op to f32 and rounds once into bf16,
+# which is what the chain does -- and measured at 0 ULP, bit-identical to
+# the chain at 128/256/2560/4096/5120.
+_NORM_KERAS_Q35_OFF32_BF16 = """
+module @norm_keras_q35_off32_bf16 {
+  func.func public @main(%w: tensor<8xbf16>, %x: tensor<1x1x8xbf16>)
+      -> tensor<1x1x8xbf16> {
+    %one = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+    %two = stablehlo.constant dense<2> : tensor<i32>
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %xf = stablehlo.convert %x : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %twof = stablehlo.convert %two : (tensor<i32>) -> tensor<f32>
+    %btwo = stablehlo.broadcast_in_dim %twof, dims = []
+        : (tensor<f32>) -> tensor<1x1x8xf32>
+    %sq = stablehlo.power %xf, %btwo : tensor<1x1x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x1xf32>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %pe = stablehlo.add %div, %be : tensor<1x1x1xf32>
+    %rs = stablehlo.rsqrt %pe : tensor<1x1x1xf32>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x1x1xf32>) -> tensor<1x1x8xf32>
+    %y = stablehlo.multiply %xf, %b10 : tensor<1x1x8xf32>
+    %wf = stablehlo.convert %w : (tensor<8xbf16>) -> tensor<8xf32>
+    %bone = stablehlo.broadcast_in_dim %one, dims = []
+        : (tensor<f32>) -> tensor<8xf32>
+    %scale = stablehlo.add %bone, %wf : tensor<8xf32>
+    %bw = stablehlo.broadcast_in_dim %scale, dims = [2]
+        : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %sc = stablehlo.multiply %y, %bw : tensor<1x1x8xf32>
+    %out = stablehlo.convert %sc : (tensor<1x1x8xf32>) -> tensor<1x1x8xbf16>
+    return %out : tensor<1x1x8xbf16>
+  }
+}
+"""
+
+# The same layer at RANK 2, which is the shape row 8 actually decodes in
+# (one token, [batch, hidden]) -- the reduce loses the feature axis to a
+# rank-1 sum and the mean comes back through a [1, 1] broadcast.
+_NORM_KERAS_Q35_OFF32_R2 = """
+module @norm_keras_q35_off32_r2 {
+  func.func public @main(%w: tensor<8xbf16>, %x: tensor<1x8xbf16>)
+      -> tensor<1x8xbf16> {
+    %one = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+    %two = stablehlo.constant dense<2> : tensor<i32>
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %xf = stablehlo.convert %x : (tensor<1x8xbf16>) -> tensor<1x8xf32>
+    %twof = stablehlo.convert %two : (tensor<i32>) -> tensor<f32>
+    %btwo = stablehlo.broadcast_in_dim %twof, dims = []
+        : (tensor<f32>) -> tensor<1x8xf32>
+    %sq = stablehlo.power %xf, %btwo : tensor<1x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [1]
+        : (tensor<1x8xf32>, tensor<f32>) -> tensor<1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0]
+        : (tensor<1xf32>) -> tensor<1x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1xf32>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x1xf32>
+    %pe = stablehlo.add %div, %be : tensor<1x1xf32>
+    %rs = stablehlo.rsqrt %pe : tensor<1x1xf32>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x8xf32>
+    %y = stablehlo.multiply %xf, %b10 : tensor<1x8xf32>
+    %wf = stablehlo.convert %w : (tensor<8xbf16>) -> tensor<8xf32>
+    %bone = stablehlo.broadcast_in_dim %one, dims = []
+        : (tensor<f32>) -> tensor<8xf32>
+    %scale = stablehlo.add %bone, %wf : tensor<8xf32>
+    %bw = stablehlo.broadcast_in_dim %scale, dims = [1]
+        : (tensor<8xf32>) -> tensor<1x8xf32>
+    %sc = stablehlo.multiply %y, %bw : tensor<1x8xf32>
+    %out = stablehlo.convert %sc : (tensor<1x8xf32>) -> tensor<1x8xbf16>
+    return %out : tensor<1x8xbf16>
+  }
+}
+"""
+
+# keras-hub gemma4 (`gemma4_layers.RMSNormalization`) -- row 3, every norm in
+# the model.  Structurally the keras form above, except that the reciprocal
+# square root is spelled `ops.power(var + eps, -0.5)`: jax lowers that
+# literally, so row 3's modules carry NO `stablehlo.rsqrt` at all and the
+# matcher used to walk away silently ("no rsqrt side" is a quiet reject),
+# recognizing zero norms in a 30-layer model.  `chlo.square` arrives as a
+# plain multiply, which the matcher already read.
+_NORM_GEMMA4_POW_BF16 = """
+module @norm_gemma4_pow_bf16 {
+  func.func public @main(%w: tensor<8xbf16>, %x: tensor<1x1x8xbf16>)
+      -> tensor<1x1x8xbf16> {
+    %mhalf = stablehlo.constant dense<-5.000000e-01> : tensor<f32>
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %xf = stablehlo.convert %x : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %wf = stablehlo.convert %w : (tensor<8xbf16>) -> tensor<8xf32>
+    %sq = stablehlo.multiply %xf, %xf : tensor<1x1x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x1xf32>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %pe = stablehlo.add %div, %be : tensor<1x1x1xf32>
+    %bh = stablehlo.broadcast_in_dim %mhalf, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %rs = stablehlo.power %pe, %bh : tensor<1x1x1xf32>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x1x1xf32>) -> tensor<1x1x8xf32>
+    %y = stablehlo.multiply %xf, %b10 : tensor<1x1x8xf32>
+    %bw = stablehlo.broadcast_in_dim %wf, dims = [2]
+        : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %sc = stablehlo.multiply %y, %bw : tensor<1x1x8xf32>
+    %out = stablehlo.convert %sc : (tensor<1x1x8xf32>) -> tensor<1x1x8xbf16>
+    return %out : tensor<1x1x8xbf16>
+  }
+}
+"""
+
+# gemma4's `Gemma4VNorm`: the same power spelling with NO learned scale --
+# the value norm in every attention block and the router norm in every MoE
+# block.  Fuses to `fast::rms_norm(x, nullopt, eps)`, and it is the cell
+# that isolates the power-vs-rsqrt difference from the weight's: measured at
+# 0 ULP, bit-identical to the chain at every width.
+_NORM_GEMMA4_POW_NOSCALE_BF16 = """
+module @norm_gemma4_pow_noscale_bf16 {
+  func.func public @main(%x: tensor<1x1x8xbf16>) -> tensor<1x1x8xbf16> {
+    %mhalf = stablehlo.constant dense<-5.000000e-01> : tensor<f32>
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %xf = stablehlo.convert %x : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %sq = stablehlo.multiply %xf, %xf : tensor<1x1x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x1xf32>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %pe = stablehlo.add %div, %be : tensor<1x1x1xf32>
+    %bh = stablehlo.broadcast_in_dim %mhalf, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %rs = stablehlo.power %pe, %bh : tensor<1x1x1xf32>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x1x1xf32>) -> tensor<1x1x8xf32>
+    %y = stablehlo.multiply %xf, %b10 : tensor<1x1x8xf32>
+    %out = stablehlo.convert %y : (tensor<1x1x8xf32>) -> tensor<1x1x8xbf16>
+    return %out : tensor<1x1x8xbf16>
+  }
+}
+"""
+
+# The promotion rule's OTHER side, and the reason it is a rule rather than a
+# removed check: this is the gemma4 chain with its final downcast taken away,
+# so a bf16 x and a bf16 scale feed an f32 result.  MLX would type the fused
+# op `result_type(bf16, bf16)` = bf16 and compute the whole norm there, then
+# widen -- ~256 ULP of the f32 the chain actually produced.  It must NOT
+# fuse, and the count in `every_spelling_fires` is what proves it: a rewrite
+# that took it would show one match too many.
+_NORM_MIXED_NARROW_DECLINE = """
+module @norm_mixed_narrow_decline {
+  func.func public @main(%w: tensor<8xbf16>, %x: tensor<1x1x8xbf16>)
+      -> tensor<1x1x8xf32> {
+    %mhalf = stablehlo.constant dense<-5.000000e-01> : tensor<f32>
+    %eps = stablehlo.constant dense<9.99999997E-7> : tensor<f32>
+    %n = stablehlo.constant dense<8.000000e+00> : tensor<f32>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %xf = stablehlo.convert %x : (tensor<1x1x8xbf16>) -> tensor<1x1x8xf32>
+    %wf = stablehlo.convert %w : (tensor<8xbf16>) -> tensor<8xf32>
+    %sq = stablehlo.multiply %xf, %xf : tensor<1x1x8xf32>
+    %red = stablehlo.reduce(%sq init: %zero) applies stablehlo.add
+        across dimensions = [2]
+        : (tensor<1x1x8xf32>, tensor<f32>) -> tensor<1x1xf32>
+    %b4 = stablehlo.broadcast_in_dim %red, dims = [0, 1]
+        : (tensor<1x1xf32>) -> tensor<1x1x1xf32>
+    %bn = stablehlo.broadcast_in_dim %n, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %div = stablehlo.divide %b4, %bn : tensor<1x1x1xf32>
+    %be = stablehlo.broadcast_in_dim %eps, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %pe = stablehlo.add %div, %be : tensor<1x1x1xf32>
+    %bh = stablehlo.broadcast_in_dim %mhalf, dims = []
+        : (tensor<f32>) -> tensor<1x1x1xf32>
+    %rs = stablehlo.power %pe, %bh : tensor<1x1x1xf32>
+    %b10 = stablehlo.broadcast_in_dim %rs, dims = [0, 1, 2]
+        : (tensor<1x1x1xf32>) -> tensor<1x1x8xf32>
+    %y = stablehlo.multiply %xf, %b10 : tensor<1x1x8xf32>
+    %bw = stablehlo.broadcast_in_dim %wf, dims = [2]
+        : (tensor<8xf32>) -> tensor<1x1x8xf32>
+    %sc = stablehlo.multiply %y, %bw : tensor<1x1x8xf32>
+    return %sc : tensor<1x1x8xf32>
+  }
+}
+"""
 
 # TWO keras norms in one module, sharing the hoisted `broadcast(eps)`,
 # `broadcast(N)` and `broadcast(2)` between them -- which is what a real
@@ -4066,7 +4304,8 @@ def _norm_forms():
     """(label, module, form tag metal_norm.cc must narrate, dtype, matches).
 
     `matches` is how many norms the module must fuse -- one each, except the
-    stacked pair, which is here because BOTH of them have to.
+    stacked pair, which is here because BOTH of them have to, and the
+    narrowing-promotion cell, which must fuse NONE (tag `None`).
     """
     return [
         ("maxtext dot", _RMS_NORM_FORM, "R3.dot", "f32", 1),
@@ -4078,6 +4317,16 @@ def _norm_forms():
          "bf16", 1),
         ("keras power/downcast bf16", _NORM_KERAS_BF16, "R3.cvt", "bf16", 1),
         ("keras head-dim bf16", _NORM_KERAS_HEAD_BF16, "R4.cvt", "bf16", 1),
+        ("keras qwen3.5 1+w in f32", _NORM_KERAS_Q35_OFF32_BF16,
+         "R3.cvt.mul+off32+up+dn", "bf16", 1),
+        ("keras qwen3.5 1+w in f32, rank 2", _NORM_KERAS_Q35_OFF32_R2,
+         "R2.cvt.mul+off32+up+dn", "bf16", 1),
+        ("gemma4 power(-0.5) bf16", _NORM_GEMMA4_POW_BF16, "R3.cvt.mul",
+         "bf16", 1),
+        ("gemma4 power(-0.5) weightless", _NORM_GEMMA4_POW_NOSCALE_BF16,
+         "R3.cvt.noscale", "bf16", 1),
+        ("narrowing promotion declines", _NORM_MIXED_NARROW_DECLINE, None,
+         "f32", 0),
         ("two norms, shared constants", _NORM_TWO_STACKED, "R3.cvt", "bf16",
          2),
         ("flax rms f32", _NORM_FLAX_RMS_F32, "R3.scale", "f32", 1),
@@ -6899,13 +7148,15 @@ def _p31_norm(subprocess, pathlib, re):
     def every_spelling_fires():
         _fused, tags = arm({})
         forms = _norm_forms()
-        want = [tag for _l, _t, tag, _d, _n in forms]
+        want = [tag for _l, _t, tag, _d, _n in forms if tag is not None]
         missing = [t for t in want if not any(t in got for got in tags)]
         if missing:
             return False, f"no match tagged {missing} (saw {sorted(set(tags))})"
         # The count matters as much as the tags: the stacked pair shares its
         # hoisted constants, and a rewrite that claimed them would fuse ONE
-        # of the two with every tag still present.
+        # of the two with every tag still present -- and the narrowing-
+        # promotion cell (tag None) must fuse nothing, which only the count
+        # can see, since a wrong fusion there is still numerically close.
         n = sum(k for _l, _t, _g, _d, k in forms)
         if len(tags) != n:
             return False, (f"{len(tags)} matches over {len(forms)} modules, "

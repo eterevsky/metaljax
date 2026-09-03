@@ -7362,8 +7362,9 @@ absl::Status Lowering::LowerMla(mlir::Operation* op, const MlaMatch& m) {
 }
 
 // The RMS norm (metal_norm.cc).  ins [x] or [x, w]; attrs [out_dtype,
-// has_weight]; fattrs [eps, weight_offset].  MLX's weight argument is
-// optional, and a norm with `with_scale=False` has none to bind.
+// has_weight, has_bias, offset_in_f32]; fattrs [eps, weight_offset].  MLX's
+// weight argument is optional, and a norm with `with_scale=False` has none
+// to bind.
 absl::Status Lowering::LowerRmsNorm(mlir::Operation* op,
                                     const RmsNormMatch& m) {
   RETURN_IF_ERROR(CheckValue(m.x));
@@ -7383,7 +7384,8 @@ absl::Status Lowering::LowerRmsNorm(mlir::Operation* op,
   ASSIGN_OR_RETURN(int opcode, Opcode(m.layer ? "metaljax.layer_norm"
                                               : "metaljax.rms_norm"));
   EmitF(opcode, std::move(ins), {Bind(op->getResult(0))},
-        {static_cast<int64_t>(out_code), m.w ? 1 : 0, m.b ? 1 : 0},
+        {static_cast<int64_t>(out_code), m.w ? 1 : 0, m.b ? 1 : 0,
+         m.offset_f32 ? 1 : 0},
         {m.eps, m.offset}, ResultBytes(op));
   return absl::OkStatus();
 }
