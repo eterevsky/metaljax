@@ -21,7 +21,7 @@ notes/data/. Append a column per release / major optimization.*
 | 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | |
 | 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | **42.2** | |
 | 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 16.45 ʰ |
-| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 25.8 ʰ |
+| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 24.8 ʰ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | |
 | 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **24.8** ᴳ | 24.27 ʰ |
 | 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 9.0 ʰ |
@@ -263,7 +263,8 @@ Notes:
   123.7 → 16.0 ms); rows 10 / 14 / 11 on the merged binary with the
   dynamic-slice start plan (49f3ab9): row 10 = 24.27 (24.27 / 24.27 / 24.36,
   stream unchanged), row 14 = 27.2 (27.22 / 27.19), row 11 keras 9.0 / 8.9
-  (unchanged; its maxtext arm 10.14 / 10.04 against the 11.0 record); row 8 = 25.8 on the merged main binary with the
+  (unchanged; its maxtext arm 10.14 / 10.04 against the 11.0 record), row 8 =
+  24.8 (24.6 / 24.8 / 24.8, was 25.8 before the start plan; streams unchanged); row 8 = 25.8 on the merged main binary with the
   fused GDN step + keras norm coverage; row 21 = 148.4 on the merged main binary (fused GDN step + keras norm
   coverage; 148.4 / 155.3 / 147.4, median). The previous ʰ
   cells (rows 4/10/11/14) became frozen 0.11.7 cells.
