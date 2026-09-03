@@ -7217,27 +7217,51 @@ absl::Status Lowering::LowerSdpa(mlir::Operation* op, const SdpaMatch& m) {
   RecAttrs(m.v_rec, &attrs);
   attrs.push_back(m.dtype);
   attrs.push_back(m.out_dtype);
-  if (!m.has_mask) {
-    attrs.push_back(0);
-    RecAttrs(Rec{}, &attrs);
-  } else {
-    if (m.mask_kind != 0 && m.mask_kind != 1)
+  // One mask slot per distinct mask, cached; the `has_mask` attr is 0, 1 or 2
+  // and the executor MINIMUMs the two laid-out masks when it is 2 (they carry
+  // the same sentinel, so min is the AND of the two predicates).
+  auto mask_slot = [&](int kind, mlir::Value base_value, double konst,
+                       double mul) -> absl::StatusOr<int> {
+    if (kind != 0 && kind != 1)
       return Decline("an attention mask this tape cannot spell");
-    RETURN_IF_ERROR(CheckValue(m.mask_base));
-    ASSIGN_OR_RETURN(int base, Slot(m.mask_base));
-    const MaskKey key{base, m.mask_kind, m.mask_const, m.mask_mul, m.dtype};
+    RETURN_IF_ERROR(CheckValue(base_value));
+    ASSIGN_OR_RETURN(int base, Slot(base_value));
+    const MaskKey key{base, kind, konst, mul, m.dtype};
     auto hit = masks_.find(key);
     if (hit == masks_.end()) {
       const int s = nslots_++;
       ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.sdpa.mask"));
-      EmitF(opcode, {base}, {s},
-            {m.mask_kind, m.dtype, m.mask_mul != 1.0 ? 1 : 0},
-            {m.mask_const * m.mask_mul, m.mask_mul}, 0);
+      EmitF(opcode, {base}, {s}, {kind, m.dtype, mul != 1.0 ? 1 : 0},
+            {konst * mul, mul}, 0);
       hit = masks_.emplace(key, s).first;
     }
-    ins.push_back(hit->second);
-    attrs.push_back(1);
+    return hit->second;
+  };
+  if (!m.has_mask) {
+    attrs.push_back(0);
+    RecAttrs(Rec{}, &attrs);
+  } else {
+    ASSIGN_OR_RETURN(int slot, mask_slot(m.mask_kind, m.mask_base,
+                                         m.mask_const, m.mask_mul));
+    ins.push_back(slot);
+    attrs.push_back(m.has_mask2 ? 2 : 1);
     RecAttrs(m.mask_rec, &attrs);
+    if (m.has_mask2) {
+      ASSIGN_OR_RETURN(int slot2, mask_slot(m.mask2_kind, m.mask2_base,
+                                            m.mask2_const, m.mask2_mul));
+      ins.push_back(slot2);
+      RecAttrs(m.mask2_rec, &attrs);
+    }
+  }
+  if (!m.has_sinks) {
+    attrs.push_back(0);
+    RecAttrs(Rec{}, &attrs);
+  } else {
+    RETURN_IF_ERROR(CheckValue(m.sinks));
+    ASSIGN_OR_RETURN(int sink, Slot(m.sinks));
+    ins.push_back(sink);
+    attrs.push_back(1);
+    RecAttrs(m.sink_rec, &attrs);
   }
   // The output recipe is (reshape, transpose, reshape), each optional, and
   // each spelled the way `_rec_attrs` spells half of one.

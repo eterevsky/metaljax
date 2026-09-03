@@ -163,14 +163,19 @@ bool Program::step_emit(const Entry& e,
 
     case kSdpa: {
       // metaljax.sdpa.emit. attrs [q_rec, k_rec, v_rec, dtype, out_dtype,
-      //   mask?, mask_rec, out_pre, out_perm, out_post]; fattrs [scale].
-      // ins: [q, k, v, (mask)].
+      //   masks (0/1/2), mask_rec, (mask2_rec), sinks?, sink_rec,
+      //   out_pre, out_perm, out_post]; fattrs [scale].
+      // ins: [q, k, v, (mask), (mask2), (sinks)].
       Cursor c(at);
       Rec q_rec = read_rec(c), k_rec = read_rec(c), v_rec = read_rec(c);
       mx::Dtype dt = dtype_of(c.next());
       mx::Dtype out_dt = dtype_of(c.next());
-      bool has_mask = c.flag();
+      int64_t nmasks = c.next();
       Rec mask_rec = read_rec(c);
+      Rec mask2_rec;
+      if (nmasks == 2) mask2_rec = read_rec(c);
+      bool has_sinks = c.flag();
+      Rec sink_rec = read_rec(c);
       bool has_pre = c.flag();
       mx::Shape pre = c.shp();
       bool has_perm = c.flag();
@@ -184,11 +189,28 @@ bool Program::step_emit(const Entry& e,
       if (q.dtype() != dt) q = mx::astype(q, dt);
       if (k.dtype() != dt) k = mx::astype(k, dt);
       if (v.dtype() != dt) v = mx::astype(v, dt);
+      int next = 3;
       std::optional<mx::array> mask;
-      if (has_mask) mask = apply_rec(mask_rec, in(3));
+      if (nmasks >= 1) mask = apply_rec(mask_rec, in(next++));
+      if (nmasks == 2) {
+        // Two chained selects, one additive mask each.  MINIMUM, not sum:
+        // both carry the same sentinel C (metal_sdpa.cc pairs them only
+        // then), so min gives 0 where both keep and exactly C where either
+        // drops -- which is `select(p1 AND p2, L, C)`, the function the
+        // chained selects compute.  A sum would give 2C where both drop,
+        // and a row where every key is masked would then not come out
+        // uniform the way the literal chain does.
+        mask = mx::minimum(*mask, apply_rec(mask2_rec, in(next++)));
+      }
+      std::optional<mx::array> sinks;
+      if (has_sinks) {
+        mx::array s = apply_rec(sink_rec, in(next++));
+        if (s.dtype() != dt) s = mx::astype(s, dt);
+        sinks = s;
+      }
       mx::array out = mx::fast::scaled_dot_product_attention(
           q, k, v, static_cast<float>(e.fattrs[0]), /*mask_mode=*/"",
-          mask);
+          mask, sinks);
       if (has_pre) out = mx::reshape(out, pre);
       if (has_perm) out = mx::transpose(out, perm);
       if (has_post) out = mx::reshape(out, post);

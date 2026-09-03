@@ -77,6 +77,33 @@ constexpr int kMaxFanout = 32;
 // it is at least this fraction of the dtype's largest finite value, negated.
 // jax uses `finfo.min` (1.0) and maxtext -0.35 / -0.7 of `finfo.max`.
 constexpr double kMaskFraction = 0.1;
+// keras-hub's convention is a "large negative number" instead: `-1e4` in a
+// half dtype (bf16 rounds it to -9984) and `-1e9` in f32 -- see
+// `gpt_oss_attention.py::_compute_attention` and keras' own
+// `Softmax._large_negative_number`.  Those are mask sentinels too, but they
+// are NOT big enough for `L + C == C`, which is what makes the additive
+// rewrite of a `select` exact for kMaskFraction sentinels.  So a Tier-B
+// sentinel is not emitted as itself: the lowering gets kCanonicalFraction *
+// finite_max in its place, which restores exactness on both sides of the
+// split --
+//
+//   * a row with at least one unmasked key: the masked weight is
+//     `exp(C - max)`, and BOTH sentinels underflow it to exactly 0 (f32/bf16
+//     `exp` is 0 below about -88), so the softmax is bit-identical;
+//   * a row with every key masked: the literal gives a uniform row (all
+//     entries are C), and so does the canonical sentinel (all entries are
+//     `L + canonical == canonical`).  A Tier-B sentinel emitted as ITSELF
+//     would not -- `L + C` keeps the logits' spread -- which is the reason
+//     for the substitution.
+//
+// The one assumption is that the model's own logits never come within 88 of
+// the sentinel: -1e4 leaves 9896 of margin in bf16 and -1e9 leaves ~1e9 in
+// f32, and a model whose attention logits reached either has already stopped
+// being masked by its own graph.  The fraction is 0.35 rather than something
+// nearer 1 to leave headroom: the sentinel is scaled by any factor the logits
+// path folds into it (`mask_mul`), and it has to stay a finite number.
+constexpr double kMaskFloor = 1024.0;
+constexpr double kCanonicalFraction = 0.35;
 
 // This subgraph is not (provably) attention: run it literally.
 struct Reject {
@@ -125,6 +152,17 @@ double FiniteMax(const std::string& el) {
   if (el == "bf16") return 3.3895313892515355e38;
   if (el == "f16") return 65504.0;
   return 0.0;
+}
+
+// The sentinel to EMIT for a `select` whose false branch is the splat `c`, or
+// nothing when `c` is not a mask sentinel at all.  See kMaskFloor above for
+// why Tier B substitutes rather than passing `c` through.
+std::optional<double> MaskSentinel(double c, const std::string& el) {
+  if (!IsFloatEl(el) || !(c < 0)) return std::nullopt;
+  const double finite_max = FiniteMax(el);
+  if (std::isinf(c) || -c >= kMaskFraction * finite_max) return c;
+  if (-c >= kMaskFloor) return -kCanonicalFraction * finite_max;
+  return std::nullopt;
 }
 
 std::vector<int64_t> I64List(mlir::Operation* op, llvm::StringRef name) {
@@ -531,6 +569,28 @@ struct Cand {
   double scale = 1.0;
   MaskInfo mask;
   double mask_mul = 1.0;
+  // A SECOND select mask on the same logits path.  gpt-oss' sliding-window
+  // layers chain two (`where(causal, where(sliding, L, C), C)`); laid out as
+  // two additive masks they compose by MINIMUM -- 0 where both keep, the
+  // sentinel where either drops -- which is `select(p1 AND p2, L, C)`, the
+  // function the chain computes.
+  MaskInfo mask2;
+  double mask2_mul = 1.0;
+  // Attention sinks: a per-query-head logit concatenated onto the key axis
+  // before the softmax and sliced back off after it, so the denominator
+  // carries an extra `exp(sink)` term and the row sums to less than one.
+  // MLX's kernel takes it as `sinks` and does exactly that.
+  mlir::Value sinks;
+  const Frame* sink_frame = nullptr;
+  Roles sink_roles;
+  // The role of the axis the sink was joined onto, and of the axis the
+  // probability-path slice cut it back off.  Both must turn out to be the key
+  // axis, which is only discovered later (`CheckReduce`), so they are checked
+  // in `TrySide` once `k_atom` is known.
+  Role sink_axis;
+  Role slice_axis;
+  int64_t slice_kept = 0;   // the extent the slice kept on that axis
+  int64_t sink_width = 0;   // columns the concat appended; only 1 is fused
   mlir::Value exp_val;
   Roles exp_roles;
   // Frames outlive the walk that made them, and only the candidate owns them.
@@ -556,6 +616,15 @@ struct Snapshot {
   double scale = 1.0;
   MaskInfo mask;
   double mask_mul = 1.0;
+  MaskInfo mask2;
+  double mask2_mul = 1.0;
+  mlir::Value sinks;
+  const Frame* sink_frame = nullptr;
+  Roles sink_roles;
+  Role sink_axis;
+  Role slice_axis;
+  int64_t slice_kept = 0;
+  int64_t sink_width = 0;
   mlir::Value exp_val;
   Roles exp_roles;
   int atoms_n = 0;
@@ -574,6 +643,15 @@ Snapshot Save(const Cand& m) {
   s.scale = m.scale;
   s.mask = m.mask;
   s.mask_mul = m.mask_mul;
+  s.mask2 = m.mask2;
+  s.mask2_mul = m.mask2_mul;
+  s.sinks = m.sinks;
+  s.sink_frame = m.sink_frame;
+  s.sink_roles = m.sink_roles;
+  s.sink_axis = m.sink_axis;
+  s.slice_axis = m.slice_axis;
+  s.slice_kept = m.slice_kept;
+  s.sink_width = m.sink_width;
   s.exp_val = m.exp_val;
   s.exp_roles = m.exp_roles;
   s.atoms_n = m.atoms.n;
@@ -592,6 +670,15 @@ void Restore(Cand& m, const Snapshot& s) {
   m.scale = s.scale;
   m.mask = s.mask;
   m.mask_mul = s.mask_mul;
+  m.mask2 = s.mask2;
+  m.mask2_mul = s.mask2_mul;
+  m.sinks = s.sinks;
+  m.sink_frame = s.sink_frame;
+  m.sink_roles = s.sink_roles;
+  m.sink_axis = s.sink_axis;
+  m.slice_axis = s.slice_axis;
+  m.slice_kept = s.slice_kept;
+  m.sink_width = s.sink_width;
   m.exp_val = s.exp_val;
   m.exp_roles = s.exp_roles;
   m.atoms.n = s.atoms_n;
@@ -872,6 +959,10 @@ void Aligned(const Roles& got, const Roles& want,
 // --------------------------------------------------------------------------
 
 Roles Logits(Cand& m, mlir::Value v, const Frame* frame, int depth);
+Roles CheckReduce(Cand& m, mlir::Value v, const Frame* frame,
+                  const std::string& kind, const Anchors& anchors,
+                  const Roles& want_roles,
+                  const std::optional<std::set<Atom>>& missing);
 
 // sdpa.py `_at_dot1`.
 Roles AtDot1(Cand& m, mlir::Operation* dot, const Frame* frame) {
@@ -983,6 +1074,20 @@ Roles LogitsInner(Cand& m, mlir::Value v, const Frame* frame, int depth) {
                         ShapeOf(o->getResult(0)), m.atoms);
   }
 
+  if (name == "stablehlo.broadcast_in_dim") {
+    // gemma4's logits arrive through one of these: `ops.matmul` on a 5-D
+    // grouped layout squeezes the leading batch at b == 1 and jax puts it
+    // back as a broadcast rather than a reshape.  Carried by the same role
+    // algebra the down-walk uses -- and a broadcast that genuinely
+    // REPLICATES the logits gets a `*` atom, which no slot of the fused
+    // layout accepts, so it declines in `Recipe` instead of fusing wrongly.
+    Roles roles = Logits(m, o->getOperand(0), frame, depth + 1);
+    m.absorb(o, frame);
+    return RolesBroadcast(ShapeOf(o->getOperand(0)), roles,
+                          ShapeOf(o->getResult(0)),
+                          I64List(o, "broadcast_dimensions"), m.atoms);
+  }
+
   if (name == "stablehlo.multiply") {
     if (o->getNumOperands() != 2) Bail("multiply is not binary");
     for (int i = 0; i < 2; i++) {
@@ -1006,6 +1111,7 @@ Roles LogitsInner(Cand& m, mlir::Value v, const Frame* frame, int depth) {
         // (L + mask) * s == L*s + mask*s.
         m.mask_mul *= *s;
       }
+      if (m.mask2.has) m.mask2_mul *= *s;
       m.absorb(o, frame);
       return roles;
     }
@@ -1025,6 +1131,7 @@ Roles LogitsInner(Cand& m, mlir::Value v, const Frame* frame, int depth) {
     const double f = 1.0 / *s;
     m.scale *= f;
     if (m.mask.has) m.mask_mul *= f;
+    if (m.mask2.has) m.mask2_mul *= f;
     m.absorb(o, frame);
     return roles;
   }
@@ -1059,27 +1166,107 @@ Roles LogitsInner(Cand& m, mlir::Value v, const Frame* frame, int depth) {
     Roles roles;
     try {
       roles = Logits(m, o->getOperand(1), frame, depth + 1);
-    } catch (const Reject&) {
+    } catch (const Reject& r) {
       // select(pred, C, L) would need the predicate negated; jax does not
-      // emit it and guessing is not worth a silent sign error.
-      Bail("select's true branch does not lead to the dot");
+      // emit it and guessing is not worth a silent sign error.  The inner
+      // reason travels with it: without it the census cannot tell "this is
+      // not attention" from "this IS attention, spelled a way we miss".
+      Bail(absl::StrCat("select's true branch does not lead to the dot (",
+                        r.why, ")"));
     }
-    if (m.mask.has) Bail("two masks on one logits path");
     std::optional<double> c = SplatFloat(m, o->getOperand(2), frame);
     if (!c.has_value()) Bail("select's false branch is not a splat");
     const std::string el = ElName(o->getResult(0));
     if (!IsFloatEl(el)) Bail(absl::StrCat("select on ", el));
-    if (!(*c < 0 && (std::isinf(*c) || -*c >= kMaskFraction * FiniteMax(el)))) {
+    const std::optional<double> sentinel = MaskSentinel(*c, el);
+    if (!sentinel.has_value()) {
       // Not a mask sentinel: `select` and `add` are then genuinely different
       // functions, so this has to run literally.
       Bail(absl::StrFormat("select constant %g is not a mask sentinel", *c));
     }
-    m.mask.has = true;
-    m.mask.kind = 0;                         // "select"
-    m.mask.value = o->getOperand(0);
-    m.mask.frame = frame;
-    m.mask.roles = roles;
-    m.mask.konst = *c;
+    MaskInfo* slot = nullptr;
+    if (!m.mask.has) {
+      slot = &m.mask;
+    } else if (!m.mask2.has) {
+      // A second select composes with the first ONLY when both are selects
+      // emitting the same sentinel: the executor then takes their MINIMUM,
+      // which is `select(p1 AND p2, L, C)` exactly.  A select stacked on an
+      // additive bias does not compose that way (the bias is data, not a
+      // sentinel, and the minimum of the two is not either function), so
+      // that pair still declines.
+      if (m.mask.kind != 0 || m.mask.konst != *sentinel)
+        Bail("two masks on one logits path");
+      slot = &m.mask2;
+    } else {
+      Bail("three masks on one logits path");
+    }
+    slot->has = true;
+    slot->kind = 0;                          // "select"
+    slot->value = o->getOperand(0);
+    slot->frame = frame;
+    slot->roles = roles;
+    slot->konst = *sentinel;
+    m.absorb(o, frame);
+    return roles;
+  }
+
+  if (name == "stablehlo.subtract") {
+    // `logits - max(logits)`, keras' explicit stabilization before a softmax
+    // that subtracts its own max again (gpt-oss:
+    // `combined_logits - ops.max(combined_logits)` then `ops.softmax`).  A
+    // softmax is invariant under any shift that is constant along the key
+    // axis, so this is absorbed outright -- neither the scale nor the mask
+    // moves.  The subtrahend has to BE such a shift, which is exactly what
+    // `CheckReduce` proves: a max reduction over the key axis, computed from
+    // this candidate's own logits chain.
+    if (o->getNumOperands() != 2) Bail("subtract is not binary");
+    Roles roles = Logits(m, o->getOperand(0), frame, depth + 1);
+    if (frame != nullptr) Bail("the max shift lives inside a callee");
+    CheckReduce(m, o->getOperand(1), frame, "maximum", m.chain, roles,
+                std::nullopt);
+    m.absorb(o, frame);
+    return roles;
+  }
+
+  if (name == "stablehlo.concatenate") {
+    // Attention sinks: one extra per-head logit joined onto the key axis, so
+    // the softmax denominator gains an `exp(sink)` term.  MLX takes it as
+    // `sinks` and does the same join inside the kernel, so the whole concat
+    // is absorbed and the roles of the LOGITS half are what flows on -- the
+    // key atom keeps its true extent, which is what the K and V recipes are
+    // built from.
+    if (m.sink_width != 0) Bail("two sink concatenations on one logits path");
+    if (o->getNumOperands() != 2) Bail("concatenate is not binary");
+    const int64_t dim = o->getAttrOfType<mlir::IntegerAttr>("dimension")
+                            ? o->getAttrOfType<mlir::IntegerAttr>("dimension")
+                                  .getInt()
+                            : -1;
+    if (dim < 0) Bail("concatenate without a dimension");
+    Roles roles = Logits(m, o->getOperand(0), frame, depth + 1);
+    if (dim >= static_cast<int64_t>(roles.size()))
+      Bail("concatenate dimension out of range");
+    // The sink is a value of its own, not part of the logits chain: walk it
+    // down to the tensor the lowering can read, and take its roles from the
+    // concat's own alignment (concat matches every axis but `dim`).
+    const std::vector<int64_t> lshape = ShapeOf(o->getOperand(0));
+    const std::vector<int64_t> sshape = ShapeOf(o->getOperand(1));
+    if (lshape.size() != sshape.size())
+      Bail("concatenate operands disagree in rank");
+    if (sshape[dim] != 1)
+      Bail("an attention sink wider than one key is not fused");
+    Roles sroles = roles;
+    sroles[dim] = Role();
+    DownResult down = Down(m, o->getOperand(1), frame, /*stop=*/nullptr,
+                           /*enter_calls=*/false);
+    if (down.frame != nullptr) Bail("the sink is computed inside a callee");
+    m.sinks = down.value;
+    m.sink_frame = down.frame;
+    m.sink_roles = DownRoles(m, sroles, sshape, down.steps);
+    if (m.sink_roles.size() != ShapeOf(down.value).size())
+      Bail("sink roles do not match its rank");
+    m.sink_axis = roles[dim];
+    m.sink_width = 1;
+    AbsorbSteps(m, down.steps);
     m.absorb(o, frame);
     return roles;
   }
@@ -1257,6 +1444,89 @@ std::pair<Roles, bool> Probs(Cand& m, mlir::Value v, const Frame* frame,
     return {got.first, true};
   }
 
+  if (name == "stablehlo.slice") {
+    // The other half of an attention sink: `probs[..., :-1]` drops the sink
+    // column again before the values dot.  MLX's kernel drops its own, so the
+    // slice is absorbed -- but only when it is exactly that: unit strides,
+    // every axis kept whole except one, and (checked in `TrySide`, where the
+    // key axis is finally known) that axis the key axis, cut back to the
+    // extent the K operand actually has.
+    // The sink is only found by walking DOWN past this slice (the concat sits
+    // below the softmax), so recurse before asking whether there is one.
+    if (m.slice_kept != 0) Bail("two slices on the probability path");
+    std::pair<Roles, bool> got = Probs(m, o->getOperand(0), frame, depth + 1);
+    if (m.sink_width == 0)
+      Bail("a slice on the probability path without an attention sink");
+    const std::vector<int64_t> in_shape = ShapeOf(o->getOperand(0));
+    const std::vector<int64_t> starts = I64List(o, "start_indices");
+    const std::vector<int64_t> limits = I64List(o, "limit_indices");
+    const std::vector<int64_t> strides = I64List(o, "strides");
+    if (starts.size() != in_shape.size() || limits.size() != in_shape.size() ||
+        strides.size() != in_shape.size() || got.first.size() != in_shape.size())
+      Bail("slice indices do not match its rank");
+    int cut = -1;
+    for (size_t d = 0; d < in_shape.size(); d++) {
+      if (strides[d] != 1) Bail("a strided slice on the probability path");
+      if (starts[d] == 0 && limits[d] == in_shape[d]) continue;
+      if (cut >= 0) Bail("the slice cuts several axes");
+      if (starts[d] != 0) Bail("the slice does not start at zero");
+      cut = static_cast<int>(d);
+    }
+    if (cut < 0) Bail("the slice keeps every axis whole");
+    if (in_shape[cut] - limits[cut] != m.sink_width)
+      Bail("the slice does not cut exactly the attention sink");
+    m.slice_axis = got.first[cut];
+    m.slice_kept = limits[cut];
+    m.absorb(o, frame);
+    return got;
+  }
+
+  if (name == "stablehlo.select") {
+    // keras' `Softmax` layer re-applies its mask to the PROBABILITIES
+    // (`where(mask, probs, 0)`, softmax.py) after the divide.  Absorbed only
+    // when it is the very predicate this candidate already took as its logits
+    // mask and the other branch is a zero: every masked probability is then
+    // already exactly zero (the sentinel underflows `exp`), so the select is
+    // the identity.
+    //
+    // THE ONE DIVERGENCE, stated because it is not a rounding difference: on
+    // a row where EVERY key is masked the literal chain returns zeros and the
+    // fused kernel returns the uniform row.  Such a row carries no
+    // information either way, cannot arise at decode (a causal mask always
+    // keeps the current position), and gemma4 -- the model this spelling
+    // comes from -- overwrites exactly that row downstream with its own
+    // `no_attended_tokens` select.
+    if (o->getNumOperands() != 3) Bail("select is not ternary");
+    std::optional<double> c = SplatFloat(m, o->getOperand(2), frame);
+    if (!c.has_value() || *c != 0.0)
+      Bail("the probability select's other branch is not zero");
+    // The logits mask is only found by walking DOWN past this select, so
+    // recurse before asking whether the predicates are the same one.
+    std::pair<Roles, bool> got = Probs(m, o->getOperand(1), frame, depth + 1);
+    if (!m.mask.has || m.mask.kind != 0)
+      Bail("a select on the probability path without a select mask");
+    // Identity takes BOTH halves.  keras routes each `where` through a shared
+    // `@_where` callee, so inside it the predicate is the same broadcast op
+    // for every call site -- equal `mlir::Value`s that say nothing about
+    // which call this is -- while the call-site argument is only reachable by
+    // walking out through the frames.  Comparing just the first would equate
+    // two different masks; just the second would accept two different
+    // expansions of one predicate.
+    if (o->getOperand(0) != m.mask.value)
+      Bail("the probability select is not the logits mask");
+    const DownResult got_pred =
+        Down(m, o->getOperand(0), frame, /*stop=*/nullptr,
+             /*enter_calls=*/false);
+    const DownResult want_pred =
+        Down(m, m.mask.value, m.mask.frame, /*stop=*/nullptr,
+             /*enter_calls=*/false);
+    if (got_pred.value != want_pred.value ||
+        got_pred.frame != want_pred.frame)
+      Bail("the probability select is not the logits mask's call site");
+    m.absorb(o, frame);
+    return got;
+  }
+
   Bail(absl::StrCat(name, " on the probability path"));
 }
 
@@ -1284,7 +1554,7 @@ struct ResolvedMask {
 // forces the choice: MLX broadcasts it against `[B, N, Tq, Tk]`, so the axis
 // the mask varies along has to be `Tq`.
 std::optional<Atom> PickQueryAxis(Cand& m, const std::vector<Atom>& q_free,
-                                  ResolvedMask* out) {
+                                  ResolvedMask* out, ResolvedMask* out2) {
   auto largest = [&]() -> std::optional<Atom> {
     if (q_free.empty()) return std::nullopt;
     auto it = std::max_element(q_free.begin(), q_free.end(),
@@ -1294,38 +1564,49 @@ std::optional<Atom> PickQueryAxis(Cand& m, const std::vector<Atom>& q_free,
                                });
     return *it;
   };
-  if (!m.mask.has) {
-    out->has = false;
-    return largest();
-  }
   // Never descend into a callee here: the mask only has to be reduced to a
   // value the lowering can read and to the axes it varies along, and jax wraps
   // the mask's own construction in calls (`@tril`) whose insides are not ours
   // to skip.
-  DownResult down = Down(m, m.mask.value, m.mask.frame, /*stop=*/nullptr,
-                         /*enter_calls=*/false);
-  if (down.frame != nullptr) Bail("the mask is computed inside a callee");
-  const Roles base_roles =
-      DownRoles(m, m.mask.roles, ShapeOf(m.mask.value), down.steps);
-  if (base_roles.size() != ShapeOf(down.value).size())
-    Bail("mask roles do not match its rank");
-  std::set<Atom> have;
-  for (const Role& r : base_roles)
-    for (const Atom& a : r) have.insert(a);
+  auto resolve = [&](const MaskInfo& info, double mul, ResolvedMask* slot,
+                     std::vector<Atom>* varying) {
+    DownResult down = Down(m, info.value, info.frame, /*stop=*/nullptr,
+                           /*enter_calls=*/false);
+    if (down.frame != nullptr) Bail("the mask is computed inside a callee");
+    const Roles base_roles =
+        DownRoles(m, info.roles, ShapeOf(info.value), down.steps);
+    if (base_roles.size() != ShapeOf(down.value).size())
+      Bail("mask roles do not match its rank");
+    std::set<Atom> have;
+    for (const Role& r : base_roles)
+      for (const Atom& a : r) have.insert(a);
+    for (const Atom& a : q_free)
+      if (have.find(a) != have.end() &&
+          std::find(varying->begin(), varying->end(), a) == varying->end())
+        varying->push_back(a);
+    AbsorbSteps(m, down.steps);
+    slot->has = true;
+    slot->kind = info.kind;
+    slot->base = down.value;
+    slot->roles = base_roles;
+    slot->konst = info.konst;
+    slot->mul = mul;
+  };
+
+  if (!m.mask.has) {
+    out->has = false;
+    out2->has = false;
+    return largest();
+  }
   std::vector<Atom> varying;
-  for (const Atom& a : q_free)
-    if (have.find(a) != have.end()) varying.push_back(a);
+  resolve(m.mask, m.mask_mul, out, &varying);
+  if (m.mask2.has) resolve(m.mask2, m.mask2_mul, out2, &varying);
+  else out2->has = false;
+  // Both masks share one query slot: MLX broadcasts each against
+  // `[B, N, Tq, Tk]`, so a pair that varied along two different query axes
+  // could not both be expressed.
   if (varying.size() > 1) Bail("the mask varies along several query axes");
-  std::optional<Atom> q_atom =
-      varying.empty() ? largest() : std::optional<Atom>(varying[0]);
-  AbsorbSteps(m, down.steps);
-  out->has = true;
-  out->kind = m.mask.kind;
-  out->base = down.value;
-  out->roles = base_roles;
-  out->konst = m.mask.konst;
-  out->mul = m.mask_mul;
-  return q_atom;
+  return varying.empty() ? largest() : std::optional<Atom>(varying[0]);
 }
 
 // sdpa.py `_mask_recipe`: lay the mask out as the rank-4 tensor MLX
@@ -1578,8 +1859,23 @@ std::unique_ptr<SdpaMatch> TrySide(mlir::ModuleOp module,
   }
   if (ElName(qval) != ElName(vval)) Bail("mixed operand dtypes");
 
-  ResolvedMask mask;
-  const std::optional<Atom> q_atom = PickQueryAxis(m, q_free, &mask);
+  // The sink concat and the probability-path slice were validated
+  // structurally where they were found; the key axis is only known now.
+  if (m.sink_width != 0) {
+    if (m.sink_axis.size() != 1 || m.sink_axis[0] != *m.k_atom)
+      Bail("the attention sink is not joined onto the key axis");
+    if (m.slice_kept == 0)
+      Bail("an attention sink the probability path never slices off");
+    if (m.slice_axis.size() != 1 || m.slice_axis[0] != *m.k_atom)
+      Bail("the sink slice does not cut the key axis");
+    if (m.slice_kept != AtomSize(A, *m.k_atom))
+      Bail("the sink slice does not restore the key extent");
+  } else if (m.slice_kept != 0) {
+    Bail("a probability-path slice with no attention sink");
+  }
+
+  ResolvedMask mask, mask2;
+  const std::optional<Atom> q_atom = PickQueryAxis(m, q_free, &mask, &mask2);
   std::vector<Atom> extra;
   for (const Atom& a : q_free)
     if (!(q_atom.has_value() && a == *q_atom)) extra.push_back(a);
@@ -1643,6 +1939,15 @@ std::unique_ptr<SdpaMatch> TrySide(mlir::ModuleOp module,
       if (mask.has) {
         mm->mask_rec = MaskRecipe(m, mask, batch_atoms, n_atoms, qslot, A);
       }
+      if (mask2.has) {
+        mm->mask2_rec = MaskRecipe(m, mask2, batch_atoms, n_atoms, qslot, A);
+      }
+      if (m.sink_width != 0) {
+        // MLX wants the sinks as a bare `[N]` vector, one logit per query
+        // head, so every other axis of the sink has to be absent -- `Recipe`
+        // rejects it outright if the sink varies along a batch or query axis.
+        mm->sink_rec = Recipe(m.sink_roles, {n_atoms}, A);
+      }
       std::vector<Atom> order = batch_atoms;
       order.insert(order.end(), n_atoms.begin(), n_atoms.end());
       order.insert(order.end(), qslot.begin(), qslot.end());
@@ -1665,10 +1970,21 @@ std::unique_ptr<SdpaMatch> TrySide(mlir::ModuleOp module,
         mm->mask_const = mask.konst;
         mm->mask_mul = mask.mul;
       }
+      mm->has_mask2 = mask2.has;
+      if (mask2.has) {
+        mm->mask2_kind = mask2.kind;
+        mm->mask2_base = mask2.base;
+        mm->mask2_const = mask2.konst;
+        mm->mask2_mul = mask2.mul;
+      }
+      mm->has_sinks = m.sink_width != 0;
+      if (mm->has_sinks) mm->sinks = m.sinks;
       mm->name = absl::StrFormat(
-          "B%dN%dQ%dK%dD%d", GroupSize(A, batch_atoms), GroupSize(A, n_atoms),
+          "B%dN%dQ%dK%dD%d%s%s", GroupSize(A, batch_atoms),
+          GroupSize(A, n_atoms),
           q_atom.has_value() ? AtomSize(A, *q_atom) : 1,
-          AtomSize(A, *m.k_atom), GroupSize(A, d_atoms));
+          AtomSize(A, *m.k_atom), GroupSize(A, d_atoms),
+          mm->has_sinks ? "+sink" : "", mask2.has ? "+mask2" : "");
       return mm;
     } catch (const Reject& e) {
       last = e;
@@ -1683,14 +1999,19 @@ std::unique_ptr<SdpaMatch> TrySide(mlir::ModuleOp module,
 // right in `jax.nn.dot_product_attention` and maxtext, on the left in
 // hand-rolled einsum attention.
 std::unique_ptr<SdpaMatch> Try(mlir::ModuleOp module, mlir::Operation* dot2) {
+  std::string why[2];
   for (int side = 0; side < 2; side++) {
     try {
       return TrySide(module, dot2, side);
-    } catch (const Reject&) {
+    } catch (const Reject& r) {
+      why[side] = r.why;
       continue;
     }
   }
-  Bail("not attention");
+  // Both sides' reasons, because which one is the probabilities is exactly
+  // what was not established: the other side's message is usually the trivial
+  // one, and the census that reads this deduplicates the pair anyway.
+  Bail(why[0] == why[1] ? why[0] : absl::StrCat(why[0], " / ", why[1]));
 }
 
 // --------------------------------------------------------------------------
@@ -1798,13 +2119,19 @@ void AnalyzeSdpa(mlir::func::FuncOp fn, RewritePlan* plan) {
   }
 
   std::vector<std::unique_ptr<SdpaMatch>> cands;
+  // Why each candidate root was turned down, counted.  Most dots in a program
+  // are not attention at all, so this is only useful deduplicated -- and it is
+  // the only way to see, from a real model run, WHICH spelling a library uses
+  // that this file does not yet read.  METALJAX_DEBUG=1.
+  std::map<std::string, int> declines;
   const std::function<void(mlir::Block&)> scan = [&](mlir::Block& block) {
     for (mlir::Operation& op : block) {
       if (OpName(&op) != "stablehlo.dot_general") continue;
       std::unique_ptr<SdpaMatch> mm;
       try {
         mm = Try(module, &op);
-      } catch (const Reject&) {
+      } catch (const Reject& r) {
+        if (kDebug) declines[r.why] += 1;
         continue;
       } catch (const std::exception& e) {   // never break a program
         Debug(absl::StrCat("candidate failed (", e.what(), ")"));
@@ -1824,6 +2151,8 @@ void AnalyzeSdpa(mlir::func::FuncOp fn, RewritePlan* plan) {
   } else {
     WalkBlocks(main, scan);   // a detached function: itself and nothing else
   }
+  for (const std::pair<const std::string, int>& d : declines)
+    Debug(absl::StrCat("declined x", d.second, ": ", d.first));
   if (cands.empty()) return;
 
   // A candidate absorbed by another one cannot also be a root.
@@ -1844,12 +2173,23 @@ void AnalyzeSdpa(mlir::func::FuncOp fn, RewritePlan* plan) {
   const std::vector<SdpaMatch*> live = Exclusive(std::move(raw));
   llvm::DenseSet<SdpaMatch*> keep(live.begin(), live.end());
   size_t found = 0;
+  std::map<std::string, int> shapes;
   for (std::unique_ptr<SdpaMatch>& mm : uniq) {
     if (!keep.contains(mm.get())) continue;
     found++;
+    shapes[mm->name] += 1;
     plan->sdpa.push_back(std::move(mm));
   }
-  if (found > 0) Debug(absl::StrCat(found, " fused attention(s) recognized"));
+  if (found > 0) {
+    // The shapes as well as the count: `+sink` / `+mask2` are the only
+    // evidence that a keras row fused for the RIGHT reason, and a numeric
+    // check cannot show it (an unfused attention computes the same thing).
+    std::string names;
+    for (const std::pair<const std::string, int>& s : shapes)
+      absl::StrAppend(&names, names.empty() ? "" : " ", s.first, "x",
+                      s.second);
+    Debug(absl::StrCat(found, " fused attention(s) recognized: ", names));
+  }
 }
 
 }  // namespace metaljax

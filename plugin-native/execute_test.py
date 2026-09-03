@@ -2860,6 +2860,63 @@ def _recognizer_cases():
         logits = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale + bias
         return jnp.einsum("bhqk,bhkd->bhqd", jax.nn.softmax(logits, -1), v)
 
+    # --- the two keras-hub decode spellings, transcribed ----------------
+    #
+    # Both are `keras_hub 0.30.0` as the model_bench rows 7 and 3 run it, cut
+    # down to tiny dims.  They are written out rather than imported so the
+    # suite does not depend on keras-hub, and each line is the line it copies:
+    # the divergences from the qwen3/llama spelling above (which has fused
+    # since 0.2.x) are what these rows exist to cover.
+
+    def attn_gptoss(q, kk, vv, sinks, mslide, mcausal, scale, groups):
+        """`gpt_oss_attention.py::_compute_attention` (row 7).
+
+        Four things differ from `attn` above: the KV heads are lifted by an
+        explicit `ops.repeat`; the mask is a `where` onto a "large negative
+        number" (`-1e4`, which bf16 rounds to -9984) rather than `finfo.min`;
+        a learned per-head SINK logit is concatenated onto the key axis,
+        softmaxed, and sliced back off; and the softmax is preceded by its own
+        explicit max-subtract, so the graph carries TWO max reductions.  A
+        sliding-window layer (every other one) masks TWICE.
+        """
+        k = jnp.repeat(kk, groups, axis=2)
+        v = jnp.repeat(vv, groups, axis=2)
+        logits = jnp.einsum("bquh,bkuh->buqk", q, k)
+        logits = logits * jnp.asarray(scale, logits.dtype)
+        adder = jnp.asarray(-1e4, logits.dtype)
+        if mslide is not None:
+            logits = jnp.where(mslide[None, None, :, :], logits, adder)
+        logits = jnp.where(mcausal[None, None, :, :], logits, adder)
+        s = jnp.broadcast_to(sinks.reshape(1, -1, 1, 1),
+                             logits.shape[:3] + (1,))
+        combined = jnp.concatenate([logits, s], axis=-1)
+        combined = combined - jnp.max(combined, axis=-1, keepdims=True)
+        probs = jax.nn.softmax(combined, axis=-1)[..., :-1]
+        return jnp.einsum("buqk,bkuh->bquh", probs.astype(v.dtype), v)
+
+    def attn_gemma4(q, k, v, mask):
+        """`gemma4_attention.py::_compute_attention` (row 3).
+
+        Grouped query attention WITHOUT a repeat -- a 5-D `(b, kv, g, t, s)`
+        layout and two `ops.matmul`s; no scale at all (`query_normalization =
+        1.0`, Q/K norm replaces it); and `keras.layers.Softmax(dtype="f32",
+        mask=)`, which upcasts, selects `-1e9` onto the logits, softmaxes, and
+        then selects 0 onto the PROBABILITIES with the same predicate.
+        """
+        b, t, n, h = q.shape
+        kvh = k.shape[2]
+        g = n // kvh
+        qt = jnp.transpose(q.reshape(b, t, kvh, g, h), (0, 2, 3, 1, 4))
+        ke = jnp.expand_dims(jnp.transpose(k, (0, 2, 3, 1)), 2)
+        logits = jnp.matmul(qt, ke).astype(jnp.float32)
+        m = mask[:, None, None, :, :]
+        logits = jnp.where(m, logits, jnp.asarray(-1e9, jnp.float32))
+        p = jax.nn.softmax(logits, axis=-1)
+        p = jnp.where(m, p, jnp.asarray(0.0, jnp.float32)).astype(v.dtype)
+        ve = jnp.expand_dims(jnp.transpose(v, (0, 2, 1, 3)), 2)
+        r = jnp.transpose(jnp.matmul(p, ve), (0, 3, 1, 2, 4))
+        return r.reshape(b, t, n, h)
+
     out = []
 
     # --- qmm ---------------------------------------------------------
@@ -3019,6 +3076,59 @@ def _recognizer_cases():
     out.append(("sdpa two masks through one callee", attn_two_masks,
                 [q, k, v, _rand((2, 4, 8, 8), 46) * 0.1,
                  _rand((2, 4, 8, 8), 47) * 0.1 - 3.0], *DOT))
+
+    # --- the keras decode rows -----------------------------------------
+    # Decode shapes: one query, a filled cache, GQA 4-over-2.  The causal
+    # mask is the one a decode step really has (`i + start >= j`), which
+    # always keeps at least the current position -- so no row is fully
+    # masked, which is the condition under which the additive rewrite of a
+    # "large negative number" select is exact (metal_sdpa.cc kMaskFloor).
+    klen, heads, kvh, hd = 8, 4, 2, 16
+    causal = np.zeros((1, klen), bool)
+    causal[0, :5] = True                     # decode step 4 of an 8-slot cache
+    slide = np.zeros((1, klen), bool)
+    slide[0, 1:5] = True                     # ...with a 4-wide window
+    for dt, tol in (("float32", DOT), ("bfloat16", HALF)):
+        q = _rand((2, 1, heads, hd), 50).astype(dt) * 0.5
+        kk = _rand((2, klen, kvh, hd), 51).astype(dt) * 0.5
+        vv = _rand((2, klen, kvh, hd), 52).astype(dt) * 0.5
+        sinks = _rand((heads,), 53).astype(dt)
+        out.append((f"sdpa gpt-oss sink decode {dt}",
+                    lambda a, b, c, s, mc=causal, g=heads // kvh: attn_gptoss(
+                        a, b, c, s, None, jnp.asarray(mc), 0.25, g),
+                    [q, kk, vv, sinks], *tol))
+        out.append((f"sdpa gpt-oss sink sliding decode {dt}",
+                    lambda a, b, c, s, ms=slide, mc=causal,
+                    g=heads // kvh: attn_gptoss(
+                        a, b, c, s, jnp.asarray(ms), jnp.asarray(mc), 0.25, g),
+                    [q, kk, vv, sinks], *tol))
+        gq = _rand((2, 1, heads, hd), 54).astype(dt) * 0.5
+        gk = _rand((2, klen, kvh, hd), 55).astype(dt) * 0.5
+        gv = _rand((2, klen, kvh, hd), 56).astype(dt) * 0.5
+        gmask = np.repeat(causal[None], 2, axis=0)          # [b, t, s]
+        out.append((f"sdpa gemma4 grouped decode {dt}",
+                    lambda a, b, c, mm=gmask: attn_gemma4(
+                        a, b, c, jnp.asarray(mm)),
+                    [gq, gk, gv], *tol))
+
+    # The negative the widened sentinel rule must keep: a `select` whose
+    # false branch is a SMALL constant is not a mask, and fusing it as one
+    # would change the answer outright.  -8 is under kMaskFloor, so this must
+    # run literally -- the row passes either way, but `_keras_attn_tags`
+    # checks that nothing fused.
+    def attn_small_select(q, k, v, mask, scale):
+        logits = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        logits = jnp.where(mask, logits, jnp.asarray(-8.0, logits.dtype))
+        return jnp.einsum("bhqk,bhkd->bhqd", jax.nn.softmax(logits, -1), v)
+
+    q = _rand((2, 4, 8, 16), 60) * 0.5
+    k = _rand((2, 4, 8, 16), 61) * 0.5
+    v = _rand((2, 4, 8, 16), 62) * 0.5
+    smask = np.zeros((2, 4, 8, 8), bool)
+    smask[..., :5] = True
+    out.append(("sdpa small select constant is not a mask",
+                lambda a, b, c, mm=smask: attn_small_select(
+                    a, b, c, jnp.asarray(mm), 0.25), [q, k, v], *DOT))
     return out
 
 
@@ -6316,6 +6426,167 @@ print(f"[probe] checksum {float(np.asarray(jax.jit(run)(*a, 3)).sum()):.9e}")
 '''
 
 
+_KERAS_ATTN = r'''
+import os, numpy as np, jax, jax.numpy as jnp
+
+WHICH = os.environ["KERAS_ATTN_WHICH"]
+
+def gptoss(q, kk, vv, sinks, mslide, mcausal, groups):
+    k = jnp.repeat(kk, groups, axis=2)
+    v = jnp.repeat(vv, groups, axis=2)
+    logits = jnp.einsum("bquh,bkuh->buqk", q, k)
+    logits = logits * jnp.asarray(0.25, logits.dtype)
+    adder = jnp.asarray(-1e4, logits.dtype)
+    if mslide is not None:
+        logits = jnp.where(mslide[None, None, :, :], logits, adder)
+    logits = jnp.where(mcausal[None, None, :, :], logits, adder)
+    s = jnp.broadcast_to(sinks.reshape(1, -1, 1, 1), logits.shape[:3] + (1,))
+    c = jnp.concatenate([logits, s], axis=-1)
+    c = c - jnp.max(c, axis=-1, keepdims=True)
+    p = jax.nn.softmax(c, axis=-1)[..., :-1]
+    return jnp.einsum("buqk,bkuh->bquh", p.astype(v.dtype), v)
+
+def gemma4(q, k, v, mask):
+    b, t, n, h = q.shape
+    kvh = k.shape[2]
+    g = n // kvh
+    qt = jnp.transpose(q.reshape(b, t, kvh, g, h), (0, 2, 3, 1, 4))
+    ke = jnp.expand_dims(jnp.transpose(k, (0, 2, 3, 1)), 2)
+    logits = jnp.matmul(qt, ke).astype(jnp.float32)
+    m = mask[:, None, None, :, :]
+    logits = jnp.where(m, logits, jnp.asarray(-1e9, jnp.float32))
+    p = jax.nn.softmax(logits, axis=-1)
+    p = jnp.where(m, p, jnp.asarray(0.0, jnp.float32)).astype(v.dtype)
+    ve = jnp.expand_dims(jnp.transpose(v, (0, 2, 1, 3)), 2)
+    r = jnp.transpose(jnp.matmul(p, ve), (0, 3, 1, 2, 4))
+    return r.reshape(b, t, n, h)
+
+def small(q, k, v, mask):
+    logits = jnp.einsum("bhqd,bhkd->bhqk", q, k) * 0.25
+    logits = jnp.where(mask, logits, jnp.asarray(-8.0, logits.dtype))
+    return jnp.einsum("bhqk,bhkd->bhqd", jax.nn.softmax(logits, -1), v)
+
+rng = np.random.RandomState(7)
+KL, H, KVH, HD = 8, 4, 2, 16
+# D = 64 in the bf16 arm so MLX's fast `sdpa_vector` kernel takes it (it
+# wants a head dim in {64, 96, 128, 256}); D = 16 lands on fast.cpp's
+# fallback.  Both implement `sinks`, differently, so both need covering.
+DT = np.dtype(os.environ.get("KERAS_ATTN_DTYPE", "float32"))
+if DT.name == "bfloat16":
+    import ml_dtypes
+    DT = np.dtype(ml_dtypes.bfloat16)
+    HD = 64
+causal = np.zeros((1, KL), bool); causal[0, :5] = True
+slide = np.zeros((1, KL), bool); slide[0, 1:5] = True
+q = (rng.rand(2, 1, H, HD) * 0.5).astype(DT)
+kk = (rng.rand(2, KL, KVH, HD) * 0.5).astype(DT)
+vv = (rng.rand(2, KL, KVH, HD) * 0.5).astype(DT)
+sinks = rng.rand(H).astype(DT)
+
+if WHICH == "gptoss":
+    out = jax.jit(lambda a, b, c, s: gptoss(
+        a, b, c, s, None, jnp.asarray(causal), H // KVH))(q, kk, vv, sinks)
+elif WHICH == "gptoss_sliding":
+    out = jax.jit(lambda a, b, c, s: gptoss(
+        a, b, c, s, jnp.asarray(slide), jnp.asarray(causal),
+        H // KVH))(q, kk, vv, sinks)
+elif WHICH == "gemma4":
+    mask = np.repeat(causal[None], 2, axis=0)
+    out = jax.jit(lambda a, b, c: gemma4(a, b, c, jnp.asarray(mask)))(
+        q, kk, vv)
+else:
+    sq = (rng.rand(2, H, 1, HD) * 0.5).astype(np.float32)
+    sk = (rng.rand(2, H, KL, HD) * 0.5).astype(np.float32)
+    sm = np.zeros((2, H, 1, KL), bool); sm[..., :5] = True
+    out = jax.jit(lambda a, b, c: small(a, b, c, jnp.asarray(sm)))(sq, sk, sk)
+print(f"[probe] checksum {float(np.asarray(out).sum()):.9e}")
+'''
+
+
+def _keras_attn_tags(subprocess, tempfile, pathlib, re):
+    """(label, check) pairs for the two keras-hub decode attention spellings.
+
+    Rows 7 (`GptOssCausalLM`) and 3 (`Gemma4CausalLM`) recognized ZERO fused
+    attentions before this: the numeric rows in `_recognizer_cases` pass
+    whether or not they fuse, because an unfused attention computes the same
+    thing.  What has to be proven is that each one fuses, that it fuses for
+    the RIGHT reason (the `+sink` / `+mask2` tags in the recognizer's own
+    narration), that the widened mask-sentinel rule still refuses a `select`
+    whose constant is merely small, and that `METALJAX_SDPA=0` turns all of
+    it off.
+    """
+
+    def run(which, extra_env=(), dtype="float32"):
+        env = dict(os.environ)
+        env["METALJAX_DEBUG"] = "1"
+        env["KERAS_ATTN_WHICH"] = which
+        env["KERAS_ATTN_DTYPE"] = dtype
+        env.update(dict(extra_env))
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(_KERAS_ATTN)
+            script = fh.name
+        try:
+            return subprocess.run([sys.executable, script], env=env,
+                                  capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(script)
+            except OSError:
+                pass
+
+    _FUSED = re.compile(
+        r"sdpa: (\d+) fused attention\(s\) recognized: (.*)")
+
+    def census(which, extra_env=(), dtype="float32"):
+        proc = run(which, extra_env, dtype)
+        err = proc.stderr or ""
+        n, names = 0, ""
+        for m in _FUSED.finditer(err):
+            n += int(m.group(1))
+            names += " " + m.group(2)
+        sums = [float(ln.split()[2]) for ln in (proc.stdout or "").splitlines()
+                if ln.startswith("[probe] checksum ")]
+        return n, names, (sums[0] if sums else None), proc
+
+    def fuses(which, want_tag, dtype="float32"):
+        n, names, ssum, proc = census(which, dtype=dtype)
+        if ssum is None:
+            return False, f"{which} did not run: {(proc.stderr or '')[-300:]}"
+        off_n, _, off_sum, _ = census(which, {"METALJAX_SDPA": "0"}, dtype)
+        # In f32 the fused kernel reproduces the literal chain exactly; in
+        # bf16 it does NOT and must not be asked to -- it accumulates the
+        # probabilities in f32, which is the documented sdpa class (and, as
+        # `hd64.py` measures against a float64 reference, the more accurate
+        # side).  So the bf16 arm checks the TAG, not the checksum.
+        tol = 1e-5 if dtype == "float32" else 2e-2
+        ok = (n == 1 and want_tag in names and off_n == 0
+              and off_sum is not None
+              and abs(ssum - off_sum) <= tol * max(abs(ssum), 1.0))
+        return ok, (f"{n} fused{names} (want 1 with {want_tag}); "
+                    f"SDPA=0 gives {off_n}; "
+                    f"checksum {ssum:.9g} vs {off_sum:.9g} unfused")
+
+    return [
+        ("gpt-oss decode attention fuses with its sink",
+         lambda: fuses("gptoss", "+sink")),
+        ("a gpt-oss sliding layer fuses both of its masks",
+         lambda: fuses("gptoss_sliding", "+sink+mask2")),
+        ("gemma4 grouped decode attention fuses",
+         lambda: fuses("gemma4", "B2N")),
+        # ...and in bf16 at D = 64, which is the dtype and the head dim the
+        # rows actually run and the only way into MLX's fast vector kernel.
+        ("gpt-oss fuses in bf16 through the vector kernel",
+         lambda: fuses("gptoss_sliding", "D64+sink+mask2", "bfloat16")),
+        ("gemma4 fuses in bf16 through the vector kernel",
+         lambda: fuses("gemma4", "D64", "bfloat16")),
+        ("a small select constant is still not a mask",
+         lambda: (lambda c: (c[0] == 0,
+                             f"{c[0]} fused{c[1]} (want none)"))(
+             census("small"))),
+    ]
+
+
 def _p26_callee_sdpa(subprocess, tempfile, pathlib, re):
     """(label, check) pairs for the callee-scoped attention recognizer.
 
@@ -7707,6 +7978,8 @@ def main():
                          + _p28_benefit_gate(subprocess, tempfile, pathlib,
                                              __import__("re"))
                          + _p26_callee_sdpa(subprocess, tempfile, pathlib,
+                                            __import__("re"))
+                         + _keras_attn_tags(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _governor(subprocess, tempfile, pathlib,
                                      __import__("re"))):

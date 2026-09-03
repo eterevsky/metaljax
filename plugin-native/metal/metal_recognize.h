@@ -163,6 +163,31 @@ struct SdpaMatch {
   double mask_mul = 1.0;
   Rec mask_rec;
 
+  // A SECOND mask on the same logits path -- gpt-oss' sliding-window layers
+  // chain `where(causal, where(sliding, L, C), C)`.  Two additive masks
+  // compose by MINIMUM once each is laid out -- 0 where both keep and exactly
+  // the sentinel where either drops, which is `select(p1 AND p2, L, C)`, the
+  // function the chained selects compute.  (A SUM would give 2C where both
+  // drop, and a row with every key masked would then not come out uniform
+  // the way the literal chain does.)  `metal_sdpa.cc` pairs two masks only
+  // when both are selects emitting the same sentinel, which is what makes
+  // the minimum the AND of the two predicates.
+  bool has_mask2 = false;
+  int mask2_kind = 0;
+  mlir::Value mask2_base;
+  double mask2_const = 0.0;
+  double mask2_mul = 1.0;
+  Rec mask2_rec;
+
+  // Attention sinks (gpt-oss): a learned per-query-head logit that the graph
+  // concatenates onto the key axis before the softmax and slices back off
+  // after it, so the row sums to less than one.  MLX's kernel takes it as
+  // `sinks` -- a bare `[N]` vector -- and joins and drops its own column, so
+  // the concat, the slice, and the wider softmax all disappear.
+  bool has_sinks = false;
+  mlir::Value sinks;
+  Rec sink_rec;
+
   // The output recipe: reshape, transpose, reshape (sdpa.py `_out_recipe`).
   bool has_pre = false;
   std::vector<int64_t> pre;
