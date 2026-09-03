@@ -494,8 +494,16 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //                       [B, G, K, Ntail]), 2 the lhs ([B, G, Mtail, K])
 //   kBitcastConvert     [dtype, kind]           kind: 0 same width,
 //                                               1 narrowing, 2 widening
-//   kDynamicSlice       [rank, clamp bounds..., sizes...]
-//   kDynamicUpdateSlice [rank, clamp bounds...]  (sizes = update's shape)
+//   kDynamicSlice       [rank, clamp bounds..., sizes..., <start plan>]
+//   kDynamicUpdateSlice [rank, clamp bounds..., <start plan>]
+//                       (sizes = update's shape)
+//                       <start plan> = [nstart, (axis, is_const, value)
+//                       x nstart]: the axes that get a start at all, with
+//                       a constant one already clamped.  Every other axis
+//                       starts at zero, which is what MLX does with an axis
+//                       outside the list -- see metal_lowering.cc
+//                       `AppendStartPlan` for why the zeros are worth not
+//                       building.
 //   kGather             [empty?, out dtype, [out shape],
 //                        [batch shape], split?, index_vector_dim,
 //                        [slice sizes], <index plan>, [reshape], [perm]]

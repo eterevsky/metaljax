@@ -9,11 +9,27 @@
 
 #include "program.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <vector>
 
 namespace metaljax {
+namespace {
+
+// The kill switch for the dynamic-slice start plan, so it can be A/B'd
+// against the same binary (the engine's convention: a perf rewrite is
+// switchable off, and a measurement pins ONE binary).
+bool StartPlanEnabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("METALJAX_DS_PLAN");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+}  // namespace
 
 bool Program::step_shape(const Entry& e,
                          std::vector<std::optional<mx::array>>& env,
@@ -79,6 +95,22 @@ bool Program::step_shape(const Entry& e,
       // transpose, then the operand reshapes to an interim shape with a
       // 1 in every dim it does not name and broadcasts out. The perm and
       // the interim shape are static, so tape.py resolved both.
+      //
+      // NOT DONE, and the reason is worth keeping. The interim reshape is
+      // usually pure LEFT PADDING -- [2048] to [1,1,2048] on the way out --
+      // and `mx::broadcast_to` right-aligns exactly like numpy, so in that
+      // shape it could be skipped: MLX fuses `Broadcast` and does not fuse
+      // `Reshape` (mlx/compile.cpp `is_fusable`), so the reshape splits the
+      // fusion group and leaves a node for a compiled body to walk at every
+      // replay. Skipping it MEASURED AS A THREAD HAZARD: with the reshape
+      // gone the broadcast's operand is the payload/argument leaf itself,
+      // and `execute_test`'s 32-executes-on-8-threads case then failed
+      // "There is no Stream(gpu, 2) in current thread" in 3 of 8 runs
+      // (0 of 8 with it, 0 of 4 on the base binary) -- the P30 hazard class
+      // where a node carries the creating thread's thread-unsafe stream.
+      // The reshape is what was keeping those leaves one node away from a
+      // fused kernel's input list. Worth ~1 node per broadcast; not worth
+      // that. Numbers in ~/.cache/metaljax-bench/logs/row10-bookkeeping.
       mx::array x = in(0);
       size_t p = 0;
       bool do_transpose = at[p++] != 0;
@@ -262,28 +294,78 @@ bool Program::step_shape(const Entry& e,
       // ops/shape.py _dynamic_slice / _dynamic_update_slice. XLA clamps
       // the start indices so the window stays inside the operand; the
       // clamp bounds are shape arithmetic, resolved at lowering.
+      //
+      // Only the axes in the lowering's START PLAN get a start at all
+      // (metal_lowering.cc `AppendStartPlan` carries the reasoning): MLX
+      // starts every axis outside `ax` at zero, and jax spells all but one
+      // of a slice's starts as a rank-0 zero constant. Building those zeros
+      // cost an `ExpandDims` each plus the `stack`'s `Concatenate`, and
+      // none of those is in MLX's fusable set, so a compiled loop body
+      // walked them again at every replay.
+      //
+      // The one-axis case -- every scanned-layer weight read and every KV
+      // cache write -- passes the clamped index STRAIGHT THROUGH as the
+      // rank-0 array it already is: `normalize_dynamic_slice_inputs` takes
+      // a zero- or one-dimensional start, so there is nothing left to
+      // build.
       const bool update = e.op == kDynamicUpdateSlice;
       const size_t first = update ? 2 : 1;
-      int64_t rank = at[0];
-      std::vector<mx::array> parts;
-      parts.reserve(static_cast<size_t>(rank));
-      for (int64_t i = 0; i < rank; i++)
-        parts.push_back(
-            mx::reshape(mx::astype(in(first + static_cast<size_t>(i)),
-                                   mx::int32),
-                        mx::Shape{}));
-      mx::Shape bounds = shape(at, 1, rank);
-      std::vector<int> ax(static_cast<size_t>(rank));
-      for (int64_t i = 0; i < rank; i++) ax[i] = static_cast<int>(i);
-      mx::array starts =
-          mx::clip(mx::stack(parts), mx::array(0, mx::int32),
-                   mx::array(bounds.begin(),
-                             mx::Shape{static_cast<int>(rank)}, mx::int32));
+      const int64_t rank = at[0];
+      const mx::Shape bounds = shape(at, 1, rank);
+      const size_t plan_at =
+          static_cast<size_t>(update ? 1 + rank : 1 + 2 * rank);
+      auto raw_start = [&](int64_t axis) {
+        return mx::reshape(
+            mx::astype(in(first + static_cast<size_t>(axis)), mx::int32),
+            mx::Shape{});
+      };
+      std::vector<int> ax;
+      std::optional<mx::array> starts;
+      if (!StartPlanEnabled()) {
+        // The pre-plan spelling, kept verbatim as the A/B arm: every axis
+        // gets a start, they stack into one [rank] vector, and ONE clip
+        // bounds the whole vector. Reproducing it exactly is the point --
+        // an off-arm that differed by so much as a node would show up in
+        // the measurement as part of the plan's win.
+        std::vector<mx::array> parts;
+        parts.reserve(static_cast<size_t>(rank));
+        ax.resize(static_cast<size_t>(rank));
+        for (int64_t i = 0; i < rank; i++) {
+          ax[static_cast<size_t>(i)] = static_cast<int>(i);
+          parts.push_back(raw_start(i));
+        }
+        starts = mx::clip(
+            mx::stack(parts), mx::array(0, mx::int32),
+            mx::array(bounds.begin(), mx::Shape{static_cast<int>(rank)},
+                      mx::int32));
+      } else {
+        const int64_t nstart = at[plan_at];
+        std::vector<mx::array> parts;
+        parts.reserve(static_cast<size_t>(nstart));
+        ax.resize(static_cast<size_t>(nstart));
+        for (int64_t j = 0; j < nstart; j++) {
+          const size_t p = plan_at + 1 + 3 * static_cast<size_t>(j);
+          const int64_t axis = at[p];
+          ax[static_cast<size_t>(j)] = static_cast<int>(axis);
+          // A `1` here says the operand was a constant and this is its
+          // already-clamped value; otherwise clamp the data start against
+          // this axis's bound, exactly as the vector clip above did.
+          parts.push_back(
+              at[p + 1] != 0
+                  ? mx::array(static_cast<int>(at[p + 2]), mx::int32)
+                  : mx::clip(raw_start(axis), mx::array(0, mx::int32),
+                             mx::array(static_cast<int>(
+                                           bounds[static_cast<size_t>(axis)]),
+                                       mx::int32)));
+        }
+        // One start needs no vector at all: MLX takes a rank-0 start.
+        starts = parts.size() == 1 ? parts[0] : mx::stack(parts);
+      }
       if (update) {
-        env[e.outs[0]] = mx::slice_update(in(0), in(1), starts, ax);
+        env[e.outs[0]] = mx::slice_update(in(0), in(1), *starts, ax);
       } else {
         env[e.outs[0]] =
-            mx::slice(in(0), starts, ax, shape(at, 1 + rank, rank));
+            mx::slice(in(0), *starts, ax, shape(at, 1 + rank, rank));
       }
       break;
     }

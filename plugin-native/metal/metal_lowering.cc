@@ -6,6 +6,7 @@ Licensed under the Apache License, Version 2.0.
 #include "metal/metal_lowering.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2406,6 +2407,13 @@ class Lowering {
   // narrowed, by qmm.py's row-locality rules); nothing here re-derives it.
   const llvm::DenseSet<mlir::Value>* row_blocked_ = nullptr;
   int64_t row_c_ = 0;
+  // The dynamic-slice START PLAN's tally for this frame, narrated once in
+  // `Finish` under METALJAX_DEBUG: how many slice/update ops carried a plan
+  // and how many per-axis starts it resolved away.  A recognizer narrates
+  // what it matched; this is the same courtesy for a rewrite that leaves the
+  // entry count untouched and would otherwise be invisible.
+  int64_t plan_ops_ = 0;
+  int64_t plan_axes_dropped_ = 0;
   bool Narrowed(mlir::Value v) const {
     return row_blocked_ != nullptr && row_blocked_->contains(v);
   }
@@ -3152,6 +3160,70 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDotGeneral(
   return attrs;
 }
 
+// The START PLAN, appended to both dynamic-slice attribute layouts.
+//
+// stablehlo gives a dynamic_slice one start operand PER AXIS, and jax fills
+// all but one of them with a rank-0 zero constant: a scanned-layer weight
+// read is `dynamic_slice(stack, i, 0, 0, 0)`, a KV cache write is
+// `dynamic_update_slice(cache, v, pos, 0, 0, 0, 0)`.  MLX's dynamic slice
+// takes an `axes` list and starts the axes NOT in it at zero
+// (`compute_dynamic_offset` sums `start[j] * strides[axes[j]]`), so those
+// zeros never had to be built at all -- and building them is not free.
+// `mx::stack` of R rank-0 scalars is R `ExpandDims` nodes and one
+// `Concatenate`, none of them in MLX's fusable set (mlx/compile.cpp
+// `is_fusable` = unary | binary | ternary | broadcast), so a compiled loop
+// body walked R + 1 EXTRA graph nodes per slice at every replay.  On row 10
+// (DeepSeek-V2-Lite decode) that was 103 of the MoE layer body's non-fusable
+// nodes -- 12 dynamic_slice and 11 dynamic_update_slice, ranks 2..5, replayed
+// 26 times per token -- for arithmetic whose answer is zero.
+//
+// So: keep only the axes that need a runtime start (the ones whose operand is
+// not a compile-time constant) plus any whose CLAMPED constant is non-zero,
+// and resolve the rest here.  With exactly one such axis the start is passed
+// as the rank-0 clamped index itself (`normalize_dynamic_slice_inputs`
+// accepts a zero- or one-dimensional start), which is zero extra nodes.
+//
+// Bit-exact by construction: the clamp a constant axis gets here is the same
+// `clip(astype(c, int32), 0, dim - size)` the handler applied to it, computed
+// on the same value, and an omitted axis starts at 0 -- which is what
+// clamping a zero constant yields for every non-negative bound.  The
+// `static_cast<int32_t>` mirrors `mx::astype(..., int32)`'s truncation, so a
+// wide constant that wrapped there wraps identically here.
+//
+// Layout: `[nstart, (axis, is_const, value) x nstart]`.  `is_const` axes
+// carry their resolved start; the others read operand `first + axis` and
+// clip it against that axis's bound.  `nstart >= 1` always -- an all-zero
+// plan keeps one constant-zero axis rather than inventing an empty-start
+// spelling MLX would have to validate.
+//
+// Returns how many per-axis starts the plan resolved away, for the frame's
+// `ds plan:` tally.
+int64_t AppendStartPlan(mlir::Operation* op, size_t first,
+                        const std::vector<int64_t>& bounds,
+                        std::vector<int64_t>* attrs) {
+  std::vector<std::array<int64_t, 3>> plan;
+  for (size_t i = 0; i < bounds.size(); i++) {
+    std::optional<int64_t> c =
+        SplatInt(op->getOperand(first + i).getDefiningOp());
+    if (!c.has_value()) {
+      plan.push_back({static_cast<int64_t>(i), 0, 0});
+      continue;
+    }
+    int64_t v = static_cast<int32_t>(*c);
+    v = std::min<int64_t>(std::max<int64_t>(v, 0), bounds[i]);
+    if (v != 0) plan.push_back({static_cast<int64_t>(i), 1, v});
+  }
+  if (plan.empty()) plan.push_back({0, 1, 0});
+  attrs->push_back(static_cast<int64_t>(plan.size()));
+  for (const std::array<int64_t, 3>& e : plan) {
+    attrs->push_back(e[0]);
+    attrs->push_back(e[1]);
+    attrs->push_back(e[2]);
+  }
+  return static_cast<int64_t>(bounds.size()) -
+         static_cast<int64_t>(plan.size());
+}
+
 // tape.py `_lower_dynamic_slice`.  XLA CLAMPS the start indices so the window
 // stays inside the operand; MLX's own slice clamps nothing, so the bounds are
 // shape arithmetic resolved here and the handler builds the clip from them.
@@ -3170,9 +3242,13 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDynamicSlice(
     return Decline("dynamic_slice index arity mismatch");
   if (src.size() != sizes.size())
     return Decline("dynamic_slice slice_sizes rank");
+  std::vector<int64_t> bounds(sizes.size());
+  for (size_t i = 0; i < sizes.size(); i++) bounds[i] = src[i] - sizes[i];
   std::vector<int64_t> attrs{static_cast<int64_t>(sizes.size())};
-  for (size_t i = 0; i < sizes.size(); i++) attrs.push_back(src[i] - sizes[i]);
+  attrs.insert(attrs.end(), bounds.begin(), bounds.end());
   attrs.insert(attrs.end(), sizes.begin(), sizes.end());
+  plan_axes_dropped_ += AppendStartPlan(op, 1, bounds, &attrs);
+  plan_ops_++;
   return attrs;
 }
 
@@ -3186,8 +3262,12 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDynamicUpdateSlice(
     return Decline("dynamic_update_slice index arity mismatch");
   if (src.size() != sizes.size())
     return Decline("dynamic_update_slice operand ranks disagree");
+  std::vector<int64_t> bounds(sizes.size());
+  for (size_t i = 0; i < sizes.size(); i++) bounds[i] = src[i] - sizes[i];
   std::vector<int64_t> attrs{static_cast<int64_t>(sizes.size())};
-  for (size_t i = 0; i < sizes.size(); i++) attrs.push_back(src[i] - sizes[i]);
+  attrs.insert(attrs.end(), bounds.begin(), bounds.end());
+  plan_axes_dropped_ += AppendStartPlan(op, 2, bounds, &attrs);
+  plan_ops_++;
   return attrs;
 }
 
@@ -8041,6 +8121,13 @@ absl::StatusOr<Lowering::Built> Lowering::Finish(
     mx::eval(pending_payload_evals_);
     pending_payload_evals_.clear();
   }
+
+  if (kDebug && plan_ops_ > 0)
+    std::fprintf(stderr,
+                 "[metaljax-native] ds plan: %lld dynamic slice/update op(s), "
+                 "%lld start axes resolved away\n",
+                 static_cast<long long>(plan_ops_),
+                 static_cast<long long>(plan_axes_dropped_));
 
   // P30: the tape post-passes, ahead of liveness (each rewrites entries_ and
   // the output slots; drops are derived from what survives).

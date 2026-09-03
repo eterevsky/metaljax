@@ -3546,6 +3546,49 @@ def _module_cases():
         # 1e-6 band this section compares at.
         ("rms norm fingerprint", _RMS_NORM_FORM,
          [_rand((2, 1, 8), 264), _rand((8,), 265)]),
+        # P34: every branch of the dynamic-slice START PLAN
+        # (metal_lowering.cc `AppendStartPlan`), written as raw modules
+        # because jax canonicalises an all-constant dynamic_slice into a
+        # static `stablehlo.slice` and never emits the mixed spellings at
+        # all.  The plan decides which axes reach MLX and with what start,
+        # so a wrong one is silent wrongness: a window read from the wrong
+        # offset.  Each case is compared against jax-CPU running the same
+        # module, and each start is chosen to need CLAMPING in at least one
+        # direction somewhere in the set.
+        ("dynamic_slice: one dynamic axis of four", _DS_PLAN_ONE_DYNAMIC,
+         [np.arange(2 * 3 * 4 * 5, dtype=np.float32).reshape(2, 3, 4, 5),
+          np.int32(1)]),
+        ("dynamic_slice: one dynamic axis, clamped high",
+         _DS_PLAN_ONE_DYNAMIC,
+         [np.arange(2 * 3 * 4 * 5, dtype=np.float32).reshape(2, 3, 4, 5),
+          np.int32(9)]),
+        ("dynamic_slice: one dynamic axis, clamped low", _DS_PLAN_ONE_DYNAMIC,
+         [np.arange(2 * 3 * 4 * 5, dtype=np.float32).reshape(2, 3, 4, 5),
+          np.int32(-4)]),
+        ("dynamic_slice: constant non-zero starts", _DS_PLAN_MIXED,
+         [np.arange(20, dtype=np.float32).reshape(4, 5), np.int32(2)]),
+        ("dynamic_slice: constant starts past the end", _DS_PLAN_MIXED,
+         [np.arange(20, dtype=np.float32).reshape(4, 5), np.int32(-7)]),
+        ("dynamic_slice: every start constant", _DS_PLAN_ALL_CONST,
+         [np.arange(20, dtype=np.float32).reshape(4, 5)]),
+        ("dynamic_slice: every start a constant zero", _DS_PLAN_ALL_ZERO,
+         [np.arange(20, dtype=np.float32).reshape(4, 5)]),
+        ("dynamic_update_slice: one dynamic axis of four",
+         _DUS_PLAN_ONE_DYNAMIC,
+         [np.zeros((2, 3, 4, 5), np.float32),
+          np.full((1, 3, 4, 5), 7.0, np.float32), np.int32(1)]),
+        ("dynamic_update_slice: one dynamic axis, clamped",
+         _DUS_PLAN_ONE_DYNAMIC,
+         [np.zeros((2, 3, 4, 5), np.float32),
+          np.full((1, 3, 4, 5), 7.0, np.float32), np.int32(6)]),
+        ("dynamic_update_slice: constant non-zero starts", _DUS_PLAN_MIXED,
+         [np.zeros((4, 5), np.float32), np.full((2, 2), -3.0, np.float32),
+          np.int32(1)]),
+        ("dynamic_update_slice: every start constant", _DUS_PLAN_ALL_CONST,
+         [np.zeros((4, 5), np.float32), np.full((2, 2), -3.0, np.float32)]),
+        ("dynamic_update_slice: every start a constant zero",
+         _DUS_PLAN_ALL_ZERO,
+         [np.zeros((4, 5), np.float32), np.full((2, 2), -3.0, np.float32)]),
         ("mla two-span decode attention", _MLA_TWO_SPAN,
          [_rand((1, 1, 2, 4), 266) * 0.5, _rand((1, 4, 2, 4), 267) * 0.5,
           _rand((1, 4, 2, 4), 268) * 0.5,
@@ -3561,6 +3604,155 @@ def _module_cases():
           np.array([[1, 0, 1, 1]], np.int32),
           _rand((1, 2, 2, 4), 274) * 0.5, _rand((1, 2, 2, 4), 275) * 0.5,
           np.array([[1, 1]], np.int32)]),
+    ]
+
+
+# P34: the dynamic-slice START PLAN's branches.
+#
+# `AppendStartPlan` (metal_lowering.cc) decides which axes reach MLX's
+# dynamic slice at all and which starts it resolves at lowering, so what
+# these pin is the OFFSET the window is read from -- the one thing a wrong
+# plan gets wrong silently.  Four shapes of plan, each in a slice and an
+# update flavour:
+#
+#   ONE_DYNAMIC   one data start, the rest constant zeros -- every scanned
+#                 layer's weight read and every KV cache write, and the
+#                 case the plan exists for (rank 4: three zeros dropped)
+#   MIXED         a data start on one axis and a NON-ZERO constant on
+#                 another, so the plan must carry a resolved value
+#   ALL_CONST     no data start at all, all of them non-zero
+#   ALL_ZERO      no data start and nothing non-zero: the plan's
+#                 degenerate case, which keeps one constant-zero axis
+#
+# jax emits none of these but the first: it folds an all-constant
+# dynamic_slice into `stablehlo.slice`.  Hence raw modules.
+_DS_PLAN_ONE_DYNAMIC = """
+module @ds_plan_one_dynamic {
+  func.func public @main(%x: tensor<2x3x4x5xf32>, %i: tensor<i32>)
+      -> tensor<1x3x4x5xf32> {
+    %z = stablehlo.constant dense<0> : tensor<i32>
+    %0 = stablehlo.dynamic_slice %x, %i, %z, %z, %z, sizes = [1, 3, 4, 5]
+        : (tensor<2x3x4x5xf32>, tensor<i32>, tensor<i32>, tensor<i32>,
+           tensor<i32>) -> tensor<1x3x4x5xf32>
+    return %0 : tensor<1x3x4x5xf32>
+  }
+}
+"""
+
+_DS_PLAN_MIXED = """
+module @ds_plan_mixed {
+  func.func public @main(%x: tensor<4x5xf32>, %i: tensor<i32>)
+      -> tensor<2x2xf32> {
+    %c = stablehlo.constant dense<3> : tensor<i32>
+    %0 = stablehlo.dynamic_slice %x, %i, %c, sizes = [2, 2]
+        : (tensor<4x5xf32>, tensor<i32>, tensor<i32>) -> tensor<2x2xf32>
+    return %0 : tensor<2x2xf32>
+  }
+}
+"""
+
+_DS_PLAN_ALL_CONST = """
+module @ds_plan_all_const {
+  func.func public @main(%x: tensor<4x5xf32>) -> tensor<2x2xf32> {
+    %a = stablehlo.constant dense<2> : tensor<i32>
+    %b = stablehlo.constant dense<7> : tensor<i32>
+    %0 = stablehlo.dynamic_slice %x, %a, %b, sizes = [2, 2]
+        : (tensor<4x5xf32>, tensor<i32>, tensor<i32>) -> tensor<2x2xf32>
+    return %0 : tensor<2x2xf32>
+  }
+}
+"""
+
+_DS_PLAN_ALL_ZERO = """
+module @ds_plan_all_zero {
+  func.func public @main(%x: tensor<4x5xf32>) -> tensor<2x2xf32> {
+    %z = stablehlo.constant dense<0> : tensor<i32>
+    %0 = stablehlo.dynamic_slice %x, %z, %z, sizes = [2, 2]
+        : (tensor<4x5xf32>, tensor<i32>, tensor<i32>) -> tensor<2x2xf32>
+    return %0 : tensor<2x2xf32>
+  }
+}
+"""
+
+_DUS_PLAN_ONE_DYNAMIC = """
+module @dus_plan_one_dynamic {
+  func.func public @main(%x: tensor<2x3x4x5xf32>, %u: tensor<1x3x4x5xf32>,
+      %i: tensor<i32>) -> tensor<2x3x4x5xf32> {
+    %z = stablehlo.constant dense<0> : tensor<i32>
+    %0 = stablehlo.dynamic_update_slice %x, %u, %i, %z, %z, %z
+        : (tensor<2x3x4x5xf32>, tensor<1x3x4x5xf32>, tensor<i32>,
+           tensor<i32>, tensor<i32>, tensor<i32>) -> tensor<2x3x4x5xf32>
+    return %0 : tensor<2x3x4x5xf32>
+  }
+}
+"""
+
+_DUS_PLAN_MIXED = """
+module @dus_plan_mixed {
+  func.func public @main(%x: tensor<4x5xf32>, %u: tensor<2x2xf32>,
+      %i: tensor<i32>) -> tensor<4x5xf32> {
+    %c = stablehlo.constant dense<3> : tensor<i32>
+    %0 = stablehlo.dynamic_update_slice %x, %u, %i, %c
+        : (tensor<4x5xf32>, tensor<2x2xf32>, tensor<i32>, tensor<i32>)
+        -> tensor<4x5xf32>
+    return %0 : tensor<4x5xf32>
+  }
+}
+"""
+
+_DUS_PLAN_ALL_CONST = """
+module @dus_plan_all_const {
+  func.func public @main(%x: tensor<4x5xf32>, %u: tensor<2x2xf32>)
+      -> tensor<4x5xf32> {
+    %a = stablehlo.constant dense<1> : tensor<i32>
+    %b = stablehlo.constant dense<9> : tensor<i32>
+    %0 = stablehlo.dynamic_update_slice %x, %u, %a, %b
+        : (tensor<4x5xf32>, tensor<2x2xf32>, tensor<i32>, tensor<i32>)
+        -> tensor<4x5xf32>
+    return %0 : tensor<4x5xf32>
+  }
+}
+"""
+
+_DUS_PLAN_ALL_ZERO = """
+module @dus_plan_all_zero {
+  func.func public @main(%x: tensor<4x5xf32>, %u: tensor<2x2xf32>)
+      -> tensor<4x5xf32> {
+    %z = stablehlo.constant dense<0> : tensor<i32>
+    %0 = stablehlo.dynamic_update_slice %x, %u, %z, %z
+        : (tensor<4x5xf32>, tensor<2x2xf32>, tensor<i32>, tensor<i32>)
+        -> tensor<4x5xf32>
+    return %0 : tensor<4x5xf32>
+  }
+}
+"""
+
+
+def _start_plan_forms():
+    """(label, module, inputs) for `_p34_start_plan`'s narration arm.
+
+    The same modules `_module_cases` compares against jax-CPU, gathered so a
+    child can run them all in ONE process and the parent can read a single
+    `ds plan:` tally per program off its stderr.  The rank-4 pair is the
+    shape the plan exists for -- one data start, three constant zeros.
+    """
+    x4 = np.arange(2 * 3 * 4 * 5, dtype=np.float32).reshape(2, 3, 4, 5)
+    u4 = np.full((1, 3, 4, 5), 7.0, np.float32)
+    x2 = np.arange(20, dtype=np.float32).reshape(4, 5)
+    u2 = np.full((2, 2), -3.0, np.float32)
+    return [
+        ("ds rank4 one dynamic", _DS_PLAN_ONE_DYNAMIC, [x4, np.int32(1)]),
+        ("ds mixed", _DS_PLAN_MIXED, [x2, np.int32(2)]),
+        ("ds all const", _DS_PLAN_ALL_CONST, [x2]),
+        ("ds all zero", _DS_PLAN_ALL_ZERO, [x2]),
+        ("dus rank4 one dynamic", _DUS_PLAN_ONE_DYNAMIC,
+         [np.zeros((2, 3, 4, 5), np.float32), u4, np.int32(1)]),
+        ("dus mixed", _DUS_PLAN_MIXED, [np.zeros((4, 5), np.float32), u2,
+                                        np.int32(1)]),
+        ("dus all const", _DUS_PLAN_ALL_CONST,
+         [np.zeros((4, 5), np.float32), u2]),
+        ("dus all zero", _DUS_PLAN_ALL_ZERO,
+         [np.zeros((4, 5), np.float32), u2]),
     ]
 
 
@@ -8260,6 +8452,78 @@ def _p33_gdn(subprocess, pathlib, re):
             ("gdn chained 8 steps == jax-CPU", chained_steps_agree_with_cpu)]
 
 
+def _p34_start_plan(subprocess, pathlib, re):
+    """The dynamic-slice START PLAN: it fires, and it changes no answer.
+
+    `AppendStartPlan` (metal_lowering.cc) keeps only the axes that need a
+    runtime start and resolves the rest at lowering, so the handler stops
+    building a `stack` of rank-0 zeros -- an `ExpandDims` per axis plus a
+    `Concatenate`, none of them in MLX's fusable set, all of them walked
+    again at every replay of a compiled loop body.
+
+    Nothing about the tape's SHAPE changes -- same entries, same slots --
+    so unlike a recognizer this rewrite is invisible to a tape census.  What
+    is pinned here is therefore the narration (it fires, on the axis counts
+    the modules declare) and, against the kill switch, that the answers are
+    identical to the LAST BIT: this is pure index bookkeeping and there is
+    no tolerance to spend.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+
+    def arm(env_extra):
+        import json
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--start-plan-forms"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("DSP "):
+                label, payload = line[4:].split("\t", 1)
+                answers[label] = np.array(json.loads(payload))
+        tally = [(int(a), int(b)) for a, b in re.findall(
+            r"ds plan: (\d+) dynamic slice/update op\(s\), "
+            r"(\d+) start axes resolved away", proc.stderr)]
+        return answers, tally
+
+    def the_plan_fires_and_counts():
+        _a, tally = arm({})
+        if not tally:
+            return False, "no `ds plan:` narration at all"
+        ops = sum(t[0] for t in tally)
+        dropped = sum(t[1] for t in tally)
+        # Eight forms, one slice or update each. What each sheds: the two
+        # rank-4 forms drop their three constant-zero axes (3 + 3), the two
+        # all-zero forms collapse to the plan's single kept axis (1 + 1),
+        # and the mixed / all-constant forms drop nothing -- both of THEIR
+        # axes have a non-zero clamped start, which the plan must carry.
+        # 8 ops, 8 axes.
+        if ops < 8:
+            return False, f"only {ops} ops carried a plan, wanted >= 8"
+        if dropped < 8:
+            return False, f"only {dropped} axes resolved away, wanted >= 8"
+        return True, f"{ops} ops, {dropped} start axes resolved away"
+
+    def the_kill_switch_is_bit_exact():
+        on, _ = arm({})
+        off, tally = arm({"METALJAX_DS_PLAN": "0"})
+        if not tally:
+            return False, "the off arm lost the narration too (lowering knob?)"
+        bad = [k for k in on
+               if on[k].shape != off[k].shape
+               or not np.array_equal(on[k], off[k])]
+        if bad:
+            return False, f"{len(bad)} form(s) differ: {bad[:3]}"
+        return True, f"{len(on)} forms bit-identical with the plan off"
+
+    return [("ds start plan fires", the_plan_fires_and_counts),
+            ("ds start plan is bit-exact", the_kill_switch_is_bit_exact)]
+
+
 def _p32_mla(subprocess, pathlib, re):
     """The multi-span decode attention's coverage of BOTH head geometries.
 
@@ -8598,6 +8862,18 @@ def main():
             print(f"MLA {label}\t"
                   f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
         return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--start-plan-forms":
+        # The START PLAN's modules, run through the plugin: answers to
+        # stdout, the `ds plan:` tally to stderr.  The plan is a lowering
+        # decision, so one execute of each module is all it takes.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import json as _json
+        for label, text, ins in _start_plan_forms():
+            out = _run_module(text, ins)[0]
+            print(f"DSP {label}\t"
+                  f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
+        return 0
     if len(sys.argv) > 2 and sys.argv[1] == "--eager-arm":
         os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
         os.environ["JAX_PLATFORMS"] = "metal"
@@ -8773,6 +9049,8 @@ def main():
                          + _p31_norm(subprocess, pathlib, __import__("re"))
                          + _p32_mla(subprocess, pathlib, __import__("re"))
                          + _p33_gdn(subprocess, pathlib, __import__("re"))
+                         + _p34_start_plan(subprocess, pathlib,
+                                           __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,
