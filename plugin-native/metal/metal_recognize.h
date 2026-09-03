@@ -441,6 +441,82 @@ struct RmsNormMatch {
 };
 
 // --------------------------------------------------------------------------
+// gated delta net decode step (metal_gdn.cc)
+// --------------------------------------------------------------------------
+
+// The Qwen3.5 family's linear-attention layer (keras-hub
+// `qwen3_5_gated_delta_net.py`, `_recurrent_gated_delta_rule`) at
+// `seq_len == 1`: every `else` branch is taken and `for t in range(seq_len)`
+// unrolls to ONE step, so there is no scan and no chunked recurrence -- just
+// ~220 straight-line ops per layer, of which the delta rule proper is
+//
+//     S <- S * exp(g)                       [B, Hv, Dk, Dv]
+//     kv <- sum_dk S[dk, dv] * k[dk]        [B, Hv, Dv]
+//     d  <- (v - kv) * beta                 [B, Hv, Dv]
+//     S  <- S + k[dk] * d[dv]               the new recurrent cache
+//     o  <- sum_dk S[dk, dv] * q[dk]        [B, Hv, Dv]
+//
+// spelled with the [B, Hv, Dk, Dv] state BROADCAST against rank-3 vectors, so
+// the 2.1 MB f32 state is materialised FIVE times per layer per token (~0.63
+// GB/token on row 8's 30 GDN layers).  The rewrite runs the whole step as one
+// generated Metal kernel that reads the state once and writes it once, with
+// the two `_l2norm`s -- which `AnalyzeNorm` declines, the mean not being a
+// divide -- and the layout/dtype glue folded into the same kernel.
+//
+// MULTI-OUTPUT.  The new state escapes (it is the layer's recurrent cache),
+// so this is the one recognizer whose fused entry has two results: the
+// output at `root` and the new state at `state_root`.  Both ops are absorbed
+// and both are bound by `LowerGdn`; the escape fixpoint is told about both,
+// and `state_root` is required to precede `root` with every outside user of
+// its result after `root`, which is what makes one entry able to define it.
+//
+// Numerics.  The kernel does exactly the chain's arithmetic, element for
+// element, and replays the dtype NARROWINGS the matcher observed (the
+// bf16-rounded `_l2norm` result, the state's dead bf16 round trip) so the
+// only difference is the ORDER of the two dk reductions -- the same class of
+// change as any fused attention, and a tighter one.  A half-matched pattern
+// lowers as ordinary ops (the recognizer file rule above).
+struct GdnMatch {
+  mlir::Operation* root = nullptr;        // the reduce that produces `o`
+  mlir::Operation* state_root = nullptr;  // the add that produces the new S
+
+  // The operands, as far back as the peel could bind them.  q and k carry
+  // `Hk` heads (`Hv / Hk` value heads share one key head, keras' `ops.repeat`
+  // -- absorbed, the kernel indexes `hk = hv / (Hv / Hk)`); the emit reshapes
+  // each to its canonical rank-3 form, which is what it already is in memory.
+  mlir::Value q;      // [B, Hk, Dk]
+  mlir::Value k;      // [B, Hk, Dk]
+  mlir::Value v;      // [B, Hv, Dv]
+  mlir::Value g;      // [B, Hv]   log-space decay (the kernel exps it)
+  mlir::Value beta;   // [B, Hv]   write gate
+  mlir::Value state;  // [B, Hv, Dk, Dv]
+
+  int64_t B = 0, Hv = 0, Hk = 0, Dk = 0, Dv = 0;
+
+  // The pre-scale the graph folded onto q (`1 / sqrt(Dk)`), applied after
+  // the norm exactly as the chain does.
+  double scale = 1.0;
+  // The `_l2norm` chains, when the peel absorbed them.  `narrow` is the tape
+  // dtype code the chain rounded the rsqrt and the normalized product to, or
+  // -1 when it stayed in f32.
+  bool l2q = false, l2k = false;
+  double eps_q = 0.0, eps_k = 0.0;
+  int narrow_q = -1, narrow_k = -1;
+  // The state's convert(f32 -> T) -> convert(T -> f32) round trip, when the
+  // peel absorbed it: keras autocasts the layer's cache operand and converts
+  // straight back, which is 2 entries and 2 x 2.1 MB of pure waste -- but it
+  // ROUNDS, so the kernel rounds too.
+  int narrow_state = -1;
+
+  // Tape dtype codes for the six operands and the two results.
+  int q_dtype = 0, k_dtype = 0, v_dtype = 0, g_dtype = 0, beta_dtype = 0;
+  int state_dtype = 0, out_dtype = 0, new_state_dtype = 0;
+
+  std::vector<mlir::Operation*> ops;  // the ops this match absorbs
+  std::string name;
+};
+
+// --------------------------------------------------------------------------
 // the plan
 // --------------------------------------------------------------------------
 
@@ -451,6 +527,7 @@ struct RewritePlan {
   std::vector<std::unique_ptr<RaggedMatch>> ragged;
   std::vector<std::unique_ptr<StackedDotMatch>> stacked;
   std::vector<std::unique_ptr<MlaMatch>> mla;
+  std::vector<std::unique_ptr<GdnMatch>> gdn;
   std::vector<std::unique_ptr<RmsNormMatch>> norm;
 
   // Ops a recognizer absorbed: no entry, no slot, never executed.
@@ -462,6 +539,7 @@ struct RewritePlan {
   llvm::DenseMap<mlir::Operation*, RaggedMatch*> ragged_roots;
   llvm::DenseMap<mlir::Operation*, StackedDotMatch*> stacked_roots;
   llvm::DenseMap<mlir::Operation*, MlaMatch*> mla_roots;
+  llvm::DenseMap<mlir::Operation*, GdnMatch*> gdn_roots;
   llvm::DenseMap<mlir::Operation*, RmsNormMatch*> norm_roots;
 
   // The packed arrays, in the order the tape's trailing inputs take them.
@@ -475,7 +553,7 @@ struct RewritePlan {
   bool empty() const {
     return qmm_roots.empty() && sdpa_roots.empty() && moe_roots.empty() &&
            ragged_roots.empty() && stacked_roots.empty() &&
-           mla_roots.empty() && norm_roots.empty();
+           mla_roots.empty() && gdn_roots.empty() && norm_roots.empty();
   }
   // Recompute `skip` and the root maps from the matches that are still live.
   void rebuild();
@@ -560,6 +638,12 @@ void AnalyzeStackedDot(mlir::func::FuncOp fn, RewritePlan* plan);
 // ADD, which no dot-rooted recognizer claims.  Purely structural.
 // METALJAX_MLA=0 disables it.
 void AnalyzeMla(mlir::func::FuncOp fn, RewritePlan* plan);
+
+// The gated-delta-net decode steps (metal_gdn.cc).  Runs BEFORE
+// `AnalyzeNorm`, which is the point: the two `_l2norm` chains inside the
+// block are norms the fused kernel computes itself, and whichever recognizer
+// runs first owns them.  Purely structural.  METALJAX_GDN=0 disables it.
+void AnalyzeGdn(mlir::func::FuncOp fn, RewritePlan* plan);
 
 // The RMS norms (metal_norm.cc).  Runs LAST; roots at the weight-apply
 // transpose.  Purely structural.  METALJAX_NORM=0 disables it.

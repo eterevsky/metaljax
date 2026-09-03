@@ -1003,6 +1003,9 @@ void AnalyzeNorm(mlir::func::FuncOp fn, RewritePlan* plan) {
   for (const auto& m : plan->ragged) take(m->root, m->ops);
   for (const auto& m : plan->stacked) take(m->root, m->ops);
   for (const auto& m : plan->mla) take(m->root, m->ops);
+  // ...and the gated delta steps, which run before this pass precisely so
+  // that the two `_l2norm`s inside a GDN block are theirs (metal_gdn.cc).
+  for (const auto& m : plan->gdn) take(m->root, m->ops);
 
   std::vector<std::unique_ptr<RmsNormMatch>> found;
   llvm::DenseSet<mlir::Operation*> visited_fns;

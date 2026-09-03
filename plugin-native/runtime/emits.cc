@@ -11,6 +11,8 @@
 
 #include "program.h"
 
+#include "gdn.h"
+
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -216,6 +218,56 @@ bool Program::step_emit(const Entry& e,
       if (has_post) out = mx::reshape(out, post);
       if (out.dtype() != out_dt) out = mx::astype(out, out_dt);
       env[e.outs[0]] = out;
+      break;
+    }
+
+    case kGdnStep: {
+      // metal_gdn.cc: the Qwen3.5 gated-delta-net decode step, as ONE
+      // generated Metal kernel (runtime/gdn.cc).  ins [q, k, v, g, beta,
+      // state]; attrs [B, Hv, Hk, Dk, Dv, q,k,v,g,beta,state dtypes,
+      // out_dtype, new_state_dtype, l2q, l2k, narrow_q, narrow_k,
+      // narrow_state]; fattrs [scale, eps_q, eps_k].  A `narrow_*` of -1 is
+      // "the chain stayed in f32"; anything else is the dtype it rounded
+      // through, which the kernel replays.
+      //
+      // TWO RESULTS -- outs [o, new_state] -- because the new recurrent
+      // state escapes into the layer's cache.  The kernel was built and
+      // proven at lowering time (gdn.h explains why it cannot be proven
+      // here); a source Metal refused runs the same arithmetic on MLX ops.
+      Cursor c(at);
+      GdnSpec sp;
+      sp.B = c.next();
+      sp.Hv = c.next();
+      sp.Hk = c.next();
+      sp.Dk = c.next();
+      sp.Dv = c.next();
+      sp.q = dtype_of(c.next());
+      sp.k = dtype_of(c.next());
+      sp.v = dtype_of(c.next());
+      sp.g = dtype_of(c.next());
+      sp.beta = dtype_of(c.next());
+      c.next();  // the state dtype: f32 by construction, carried for the dump
+      mx::Dtype out_dt = dtype_of(c.next());
+      mx::Dtype state_dt = dtype_of(c.next());
+      sp.l2q = c.flag();
+      sp.l2k = c.flag();
+      const int64_t nq = c.next(), nk = c.next(), ns = c.next();
+      sp.narrow_q = nq < 0 ? mx::float32 : dtype_of(nq);
+      sp.narrow_k = nk < 0 ? mx::float32 : dtype_of(nk);
+      sp.round_state = ns >= 0;
+      sp.narrow_state = ns < 0 ? mx::float32 : dtype_of(ns);
+      sp.scale = e.fattrs[0];
+      sp.eps_q = e.fattrs[1];
+      sp.eps_k = e.fattrs[2];
+
+      std::vector<mx::array> res =
+          GdnRun(sp, in(0), in(1), in(2), in(3), in(4), in(5));
+      mx::array o = res[0];
+      mx::array sn = res[1];
+      if (o.dtype() != out_dt) o = mx::astype(o, out_dt);
+      if (sn.dtype() != state_dt) sn = mx::astype(sn, state_dt);
+      env[e.outs[0]] = o;
+      env[e.outs[1]] = sn;
       break;
     }
 

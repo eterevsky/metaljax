@@ -2455,6 +2455,7 @@ void RewritePlan::rebuild() {
   ragged_roots.clear();
   stacked_roots.clear();
   mla_roots.clear();
+  gdn_roots.clear();
   norm_roots.clear();
   for (const auto& m : qmm) {
     if (m->disabled) continue;
@@ -2483,6 +2484,13 @@ void RewritePlan::rebuild() {
   }
   for (const auto& m : mla) {
     mla_roots[m->root] = m.get();
+    for (mlir::Operation* o : m->ops) skip.insert(o);
+  }
+  for (const auto& m : gdn) {
+    // Only the OUTPUT root is dispatched: the second result (the new
+    // recurrent state) is bound by `LowerGdn` off the same entry, and its
+    // defining op is absorbed like any other.
+    gdn_roots[m->root] = m.get();
     for (mlir::Operation* o : m->ops) skip.insert(o);
   }
   for (const auto& m : norm) {

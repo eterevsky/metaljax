@@ -147,6 +147,13 @@ enum Op : int {
   // the mean subtracted, the variance as a clamped moment difference --
   // becomes MLX's fused `fast::layer_norm(x, w, b, eps)`.
   kLayerNorm,
+  // The gated-delta-net decode step (metal_gdn.cc): the Qwen3.5 linear-
+  // attention layer at seq_len 1 -- the delta-rule recurrence, the two
+  // `_l2norm`s and the layout glue -- as ONE generated Metal kernel that
+  // reads the [B, Hv, Dk, Dv] f32 state once and writes it once.  The only
+  // emit with TWO results: the output, and the new recurrent state, which
+  // the layer writes back into its cache.
+  kGdnStep,
   // M5b: a counted loop msl_scan planned into one generated Metal kernel,
   // and a site where the handler computes on the HOST. Both were lowered by
   // src/metaljax/tape.py; the pseudo-names below are how it asked for them.

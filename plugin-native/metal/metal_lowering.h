@@ -97,6 +97,7 @@ struct LoweredProgram {
   int64_t num_sdpa = 0;
   int64_t num_ragged = 0;
   int64_t num_stacked = 0;
+  int64_t num_gdn = 0;
   // The StableHLO this tape was built from, as MLIR bytecode -- the program
   // `GetHloModules` (PJRT's `OptimizedProgram`) hands back, converted to HLO
   // on demand.  Kept serialized rather than as a live module because the

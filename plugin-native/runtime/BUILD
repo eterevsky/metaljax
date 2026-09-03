@@ -28,6 +28,7 @@ cc_library(
         "control.cc",
         "dtypes.cc",
         "emits.cc",
+        "gdn.cc",
         "host.cc",
         "host_callback.cc",
         "host_lapack.cc",
@@ -44,6 +45,7 @@ cc_library(
         "runtime.cc",
     ],
     hdrs = [
+        "gdn.h",
         "host_callback.h",
         "host_lapack.h",
         "msl.h",

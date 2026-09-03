@@ -38,6 +38,7 @@ Licensed under the Apache License, Version 2.0.
 #include "metal/metal_msl.h"
 #include "metal/metal_names.h"
 #include "metal/metal_recognize.h"
+#include "gdn.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -893,6 +894,9 @@ bool FoldableOp(int op) {
     case kMoeTail:
     case kRaggedDot:
     case kStackedDot:
+    // The gated delta step holds recurrent state and launches a generated
+    // kernel: never evaluated at lower time.
+    case kGdnStep:
     case kApproxTopK:
     case kConv:
     case kConstant:
@@ -1460,6 +1464,9 @@ int64_t RootCostUnit(const RewritePlan& plan, mlir::Operation* op) {
   // The multi-span attention: one fused sdpa plus the span concats and the
   // mask build.
   if (plan.mla_roots.count(op)) return 6;
+  // The gated delta step: one generated kernel in place of ~80 ops, but it
+  // is a kernel and not a view -- priced like a fused attention.
+  if (plan.gdn_roots.count(op)) return 4;
   if (plan.norm_roots.count(op)) return 1;
   return 0;
 }
@@ -2175,6 +2182,7 @@ class Lowering {
   absl::Status LowerRagged(mlir::Operation* op, const RaggedMatch& m);
   absl::Status LowerStackedDot(mlir::Operation* op, const StackedDotMatch& m);
   absl::Status LowerMla(mlir::Operation* op, const MlaMatch& m);
+  absl::Status LowerGdn(mlir::Operation* op, const GdnMatch& m);
   absl::Status LowerRmsNorm(mlir::Operation* op, const RmsNormMatch& m);
   // One node of the pair-space plan, as one tape entry; `slots` holds the
   // slot each earlier node landed in.
@@ -6856,6 +6864,15 @@ absl::Status Lowering::LowerOp(mlir::Operation* op) {
       RETURN_IF_ERROR(CheckValue(op->getResult(0)));
       return LowerMla(op, *mla->second);
     }
+    auto gdn = ctx_->plan->gdn_roots.find(op);
+    if (gdn != ctx_->plan->gdn_roots.end()) {
+      // The one recognizer with two results, so no single-result gate: the
+      // output is this op's, and the new recurrent state is `state_root`'s,
+      // which was absorbed and is bound here (metal_gdn.cc).
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      RETURN_IF_ERROR(CheckValue(gdn->second->state_root->getResult(0)));
+      return LowerGdn(op, *gdn->second);
+    }
     auto norm = ctx_->plan->norm_roots.find(op);
     if (norm != ctx_->plan->norm_roots.end()) {
       if (op->getNumResults() != 1)
@@ -7382,6 +7399,84 @@ absl::Status Lowering::LowerMla(mlir::Operation* op, const MlaMatch& m) {
   attrs.push_back(static_cast<int64_t>(out_code));
   EmitF(opcode, std::move(ins), {Bind(op->getResult(0))}, std::move(attrs),
         {m.mask_true, m.mask_false}, ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// The gated-delta-net decode step (metal_gdn.cc).  ins [q, k, v, g, beta,
+// state]; outs [o, new_state]; attrs [B, Hv, Hk, Dk, Dv, the six operand
+// dtypes, out_dtype, new_state_dtype, l2q, l2k, narrow_q, narrow_k,
+// narrow_state]; fattrs [scale, eps_q, eps_k].  A `narrow_*` of -1 means the
+// chain stayed in f32 at that point; anything else is the dtype it rounded
+// through, which runtime/gdn.cc's kernel replays.
+//
+// TWO RESULTS.  The new recurrent state escapes into the layer's cache, so
+// `state_root` -- an absorbed op, with no slot of its own -- is bound here
+// alongside the root's own result.  `AnalyzeGdn` proved that it precedes the
+// root and that every outside reader of it follows the root, which is what
+// makes one entry able to define both.
+//
+// The kernel is BUILT AND PROVEN HERE, synchronously.  MLX generates the
+// Metal library at eval, a build error on an async worker aborts the
+// process, and this entry is meant to be traced into an enclosing
+// `mx::compile` graph where there is nothing to evaluate -- so the last safe
+// moment is this one, on the first execute, outside any trace.  A source
+// Metal will not build simply leaves the emit on its MLX fallback: the same
+// arithmetic, op by op, which is the correct slow program.
+absl::Status Lowering::LowerGdn(mlir::Operation* op, const GdnMatch& m) {
+  std::vector<int> ins;
+  for (mlir::Value v : {m.q, m.k, m.v, m.g, m.beta, m.state}) {
+    RETURN_IF_ERROR(CheckValue(v));
+    ASSIGN_OR_RETURN(int slot, Slot(v));
+    ins.push_back(slot);
+  }
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.gdn_step"));
+  std::vector<int64_t> attrs{m.B,
+                             m.Hv,
+                             m.Hk,
+                             m.Dk,
+                             m.Dv,
+                             static_cast<int64_t>(m.q_dtype),
+                             static_cast<int64_t>(m.k_dtype),
+                             static_cast<int64_t>(m.v_dtype),
+                             static_cast<int64_t>(m.g_dtype),
+                             static_cast<int64_t>(m.beta_dtype),
+                             static_cast<int64_t>(m.state_dtype),
+                             static_cast<int64_t>(m.out_dtype),
+                             static_cast<int64_t>(m.new_state_dtype),
+                             m.l2q ? 1 : 0,
+                             m.l2k ? 1 : 0,
+                             static_cast<int64_t>(m.narrow_q),
+                             static_cast<int64_t>(m.narrow_k),
+                             static_cast<int64_t>(m.narrow_state)};
+
+  GdnSpec spec;
+  spec.B = m.B;
+  spec.Hv = m.Hv;
+  spec.Hk = m.Hk;
+  spec.Dk = m.Dk;
+  spec.Dv = m.Dv;
+  spec.q = dtype_of(m.q_dtype);
+  spec.k = dtype_of(m.k_dtype);
+  spec.v = dtype_of(m.v_dtype);
+  spec.g = dtype_of(m.g_dtype);
+  spec.beta = dtype_of(m.beta_dtype);
+  spec.l2q = m.l2q;
+  spec.l2k = m.l2k;
+  spec.eps_q = m.eps_q;
+  spec.eps_k = m.eps_k;
+  spec.narrow_q = m.narrow_q < 0 ? mx::float32 : dtype_of(m.narrow_q);
+  spec.narrow_k = m.narrow_k < 0 ? mx::float32 : dtype_of(m.narrow_k);
+  spec.round_state = m.narrow_state >= 0;
+  spec.narrow_state =
+      m.narrow_state < 0 ? mx::float32 : dtype_of(m.narrow_state);
+  spec.scale = m.scale;
+  GdnProve(spec);
+
+  const int64_t bytes =
+      ValueBytes(op->getResult(0)) + ValueBytes(m.state_root->getResult(0));
+  EmitF(opcode, std::move(ins),
+        {Bind(op->getResult(0)), Bind(m.state_root->getResult(0))},
+        std::move(attrs), {m.scale, m.eps_q, m.eps_k}, bytes);
   return absl::OkStatus();
 }
 
@@ -8346,6 +8441,10 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
     // ...and the multi-span decode attentions: rooted at the combine
     // ADD, which no dot-rooted recognizer claims.
     AnalyzeMla(main, &plan);
+    // ...and the gated-delta-net decode steps, BEFORE the norms: the two
+    // `_l2norm`s inside the block are norms the fused kernel computes
+    // itself, and whichever recognizer runs first owns them.
+    AnalyzeGdn(main, &plan);
     // ...and the RMS norms, LAST.
     AnalyzeNorm(main, &plan);
     plan.rebuild();
@@ -8424,6 +8523,7 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
   lowered->num_sdpa = static_cast<int64_t>(plan.sdpa.size());
   lowered->num_ragged = static_cast<int64_t>(plan.ragged.size());
   lowered->num_stacked = static_cast<int64_t>(plan.stacked.size());
+  lowered->num_gdn = static_cast<int64_t>(plan.gdn.size());
   return lowered;
 }
 
