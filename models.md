@@ -14,17 +14,17 @@ notes/data/. Append a column per release / major optimization.*
 
 | # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 | 0.11.6 | 0.11.7 | HEAD |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | **126.1** | |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | **57.3** | |
+| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | **126.1** | 123.9 ʰ |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | **57.3** | 56.4 ʰ |
 | 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | **33.4** | 31.4 ʰ |
 | 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | **24.0** | |
-| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | |
+| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | 40.8 ʰ |
 | 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | **42.2** | |
 | 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 16.45 ʰ |
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 24.8 ʰ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | |
 | 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **24.8** ᴳ | 24.27 ʰ |
-| 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 9.0 ʰ |
+| 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 8.3 ʰ |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | |
 | 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | |
 | 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | 27.2 ʰ |
@@ -264,7 +264,14 @@ Notes:
   dynamic-slice start plan (49f3ab9): row 10 = 24.27 (24.27 / 24.27 / 24.36,
   stream unchanged), row 14 = 27.2 (27.22 / 27.19), row 11 keras 9.0 / 8.9
   (unchanged; its maxtext arm 10.14 / 10.04 against the 11.0 record), row 8 =
-  24.8 (24.6 / 24.8 / 24.8, was 25.8 before the start plan; streams unchanged); row 8 = 25.8 on the merged main binary with the
+  24.8 (24.6 / 24.8 / 24.8, was 25.8 before the start plan; streams unchanged);
+  with the structural while-pipeline gate (235a14a; command-buffer cadence
+  still 800): row 11 keras = 8.3 (8.3 / 8.3 / 8.3, was 9.0), row 5 = 40.8
+  (40.7 / 40.8), row 2 = 56.4 (56.4 / 56.4), row 1 = 123.9 (one run), row 19
+  452 ms/step (one run, flat within its 445–450 band, not recorded); streams
+  identical to the records on every row. A cadence of 100 would take row 11
+  to 6.6 but costs texmo suite-106 1.0 % geomean (one config −7 %) — Oleg's
+  call, pending; row 8 = 25.8 on the merged main binary with the
   fused GDN step + keras norm coverage; row 21 = 148.4 on the merged main binary (fused GDN step + keras norm
   coverage; 148.4 / 155.3 / 147.4, median). The previous ʰ
   cells (rows 4/10/11/14) became frozen 0.11.7 cells.
