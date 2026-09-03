@@ -16,7 +16,7 @@ notes/data/. Append a column per release / major optimization.*
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | **126.1** | |
 | 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | **57.3** | |
-| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | **33.4** | |
+| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | **33.4** | 31.4 ʰ |
 | 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | **24.0** | |
 | 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | |
 | 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | **42.2** | |
@@ -258,7 +258,9 @@ Notes:
   9.0 on the keras-hub harness (see ᵐ; measured on the 0.11.7 release
   binary, band 8.5–9.0); row 14 = 27.64 after the GQA attention
   recognizer (43d4ad6); row 7 = 16.45 after the keras attention
-  recognizer (f1fbe30); row 8 = 25.8 on the merged main binary with the
+  recognizer (f1fbe30); row 3 = 31.4 on the merged main binary (keras
+  norm coverage + attention; 31.6 / 31.4 / 31.4, 127 tokens emitted, prefill
+  123.7 → 16.0 ms); row 8 = 25.8 on the merged main binary with the
   fused GDN step + keras norm coverage; row 21 = 148.4 on the merged main binary (fused GDN step + keras norm
   coverage; 148.4 / 155.3 / 147.4, median). The previous ʰ
   cells (rows 4/10/11/14) became frozen 0.11.7 cells.
