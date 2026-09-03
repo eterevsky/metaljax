@@ -13,7 +13,12 @@ The dropped cross-command-buffer fence is FIXED in the vendored
 `libmlx_metaljax` the release links (notes/mlx-patch-diagnosis.md); the
 budget-sweeping CANARIES that pinned the corruption on stock MLX were
 removed 2026-08-18 (Oleg's call -- on the vendored build no swept budget
-corrupts, so every canary failed by design; history at 29bb8eb).
+corrupts, so every canary failed by design; history at 29bb8eb).  That fix
+is also why the shipped kernel budget is a PERFORMANCE number now rather
+than a correctness one -- re-swept 2026-09-03, nothing corrupts; see the
+bounds test below.  (800 is retained while the row-11 vs texmo trade-off of
+a lower cadence is decided; plugin-native/metal/metal_client.cc has the
+numbers.)
 
 What stays, ported to the PJRT route at the Stage-1 retirement, are the
 CORRECTNESS detectors over the two real assets that caught the corruption
@@ -73,17 +78,31 @@ def test_command_buffer_budgets_are_bounded():
     libc.getenv.restype = ctypes.c_char_p
     ops = int(libc.getenv(b"MLX_MAX_OPS_PER_BUFFER"))
     mb = int(libc.getenv(b"MLX_MAX_MB_PER_BUFFER"))
-    # The bounds are the MEASURED clean bands of the two assets in this
-    # file, swept on 114b4d4 (stock MLX; logs in
-    # notes/mlx-command-buffer-split.md). The kernel budget's clean band is
-    # 450..1300 with the shipped byte budget. The byte budget is bounded
-    # both ways: >=512 or stock MLX corrupts the split scan; <=2048 or one
-    # command buffer can accumulate tens of GB of unpageable transient
-    # intermediates and panic the machine (SD3.5 MMDiT at 1024^2 did,
-    # twice). Moving either value outside these bands means re-running the
-    # sweep, not widening the test.
-    assert 450 <= ops <= 1300
-    assert 512 <= mb <= 2048
+    # The bounds are the MEASURED bands, and the two are no longer the same
+    # KIND of bound.
+    #
+    # The kernel budget's old floor of 450 was a corruption floor swept on
+    # 114b4d4 against STOCK MLX. It expired with the fence fix
+    # (notes/mlx-patch-diagnosis.md): the 2026-09-03 sweep on the vendored
+    # fork found no corrupting budget at all -- every detector in this file
+    # clean at 25/50/100/200/400/800 ops and 40/64/128 MB, and the 8B bf16
+    # prefill canary (FAIL(5), norm 1.000e+00 on stock MLX at 800/512 AND at
+    # 40 MB) returning ONE answer at all of them
+    # (~/.cache/metaljax-bench/logs/row11-overlap/canary-results.txt). So the
+    # kernel budget is a performance choice now (800 kept while the row-11
+    # vs texmo trade-off is decided -- plugin-native/metal/metal_client.cc
+    # has the ladder), and the band here just says it was swept.
+    #
+    # The byte budget's UPPER bound is not a corruption bound and has not
+    # expired: above ~2048 one command buffer can accumulate tens of GB of
+    # unpageable transient intermediates and panic the machine (SD3.5 MMDiT
+    # at 1024^2 did, twice) -- the no-panic contract. Its lower bound is the
+    # swept floor.
+    #
+    # Moving either value outside these bands means re-running that sweep,
+    # not widening the test.
+    assert 25 <= ops <= 1300
+    assert 40 <= mb <= 2048
 
 
 # --- subprocess driver ------------------------------------------------------

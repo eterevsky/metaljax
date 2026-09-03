@@ -101,19 +101,55 @@ bool EnvFlag(const char* name) {
 
 // MLX's own budgets.  THIS FILE OWNS THEM (0.11.6): they used to be pinned
 // by src/metaljax/__init__.py for the Stage 1 engine, which was retired
-// along with the rest of that package -- the measurements behind the
-// numbers are kept in CLAUDE.md and notes/mlx-command-buffer-split.md.
-// Both are CORRECTNESS, not tuning:
+// along with the rest of that package.
 //
-//  * `MLX_MAX_MB_PER_BUFFER`: splitting one eval across command buffers
-//    corrupts results in MLX 0.32 -- silently, and differently on every call
-//    (notes/mlx-command-buffer-split.md).  At MLX's 40 MB default a
-//    `bytes|gru.512` training chunk through this plugin computed weights ~1e-2
-//    off jax-CPU on 2 of 5 runs and exactly right on the other 3; at 512 it is
-//    right 5 of 5, which is what the Stage 1 engine has always run at.
-//  * `MLX_MAX_OPS_PER_BUFFER`: 800 rather than 400, because 400 exactly is a
-//    corrupting alignment for a 28-layer init scan (CLAUDE.md, and
-//    tests/test_command_buffer.py replays it).
+// MLX commits a Metal command buffer once the current one holds
+// `MLX_MAX_OPS_PER_BUFFER` kernels or `MLX_MAX_MB_PER_BUFFER` megabytes, and
+// the GPU runs a committed buffer while the CPU encodes the next -- so the
+// cadence is what decides how much of an eval's CPU encode is hidden behind
+// its device work.  MLX's own defaults for this chip class are 50/50
+// (`mlx/backend/metal/device.cpp`, arch suffix 's').
+//
+//  * `MLX_MAX_OPS_PER_BUFFER` = 800, RETAINED PENDING A DECISION.  It is a
+//    PERFORMANCE number now, not a correctness one (see HISTORY below), and
+//    the 2026-09-03 sweep says a lower cadence pays on host-overlap-bound
+//    decode: row 11 keras (Qwen3-0.6B, one compiled whole-model body per
+//    token, ~2.7 ms/token of CPU encode against ~6.3 ms of device) reads
+//    9.1 ms/token at 800, 7.2 at 100 (saturating by ~200; 100 beat 200 on an
+//    interleaved 4+4 tie-break), with nothing heavier paying for the extra
+//    commits: gemma4-12B decode 60.3 -> 59.3, maxtext 0.6B train 447.7 ->
+//    449.2, the 8B bf16 prefill canary 394.5 -> 381.3.  BUT the texmo
+//    suite-106 pays: geomean -1.0 % at 100, one config (mid14 lrnn.512.2
+//    b64 l128, the big-recurrent-chunk family) -7.0 % on a clean monotone
+//    ladder (200: -3.9 %).  A regression on the acceptance workload is
+//    Oleg's call (release rule 2), so 800 stays until he picks; flipping it
+//    is this one line.  Logs: ~/.cache/metaljax-bench/logs/row11-overlap/.
+//  * `MLX_MAX_MB_PER_BUFFER` = 512 is unchanged, and it is the value the
+//    NO-PANIC contract was measured at: it bounds how much unpageable
+//    transient intermediate one command buffer can accumulate (above ~2048
+//    the SD3.5 MMDiT at 1024^2 panicked the machine, twice).
+//
+//  * HISTORY -- why these were 800/512 and called CORRECTNESS until now.
+//    Splitting one eval across command buffers used to corrupt results in
+//    MLX 0.32, silently and differently on every call
+//    (notes/mlx-command-buffer-split.md): at MLX's own 40 MB budget a
+//    `bytes|gru.512` training chunk computed weights ~1e-2 off jax-CPU on 2
+//    of 5 runs, and 400 ops exactly was a corrupting alignment for a
+//    28-layer init scan.  `notes/mlx-patch-diagnosis.md` located the defect
+//    -- `compute_dynamic_offset` registering an array that aliases the
+//    caller's index buffer as a command-encoder temporary, which
+//    `end_encoding()` then erases from the cross-encoder fence bookkeeping,
+//    so a dynamic slice runs at a stale offset whenever a command-buffer
+//    boundary falls between producer and consumer -- and the vendored fork
+//    carries the fix (upstream 7e8b4ccc / PR #4099, in no release).  The
+//    2026-09-03 canary battery re-swept every budget on the fork and found
+//    NO corrupting one: `tests/test_command_buffer.py`'s three detectors
+//    clean at 25/50/100/200/400/800 ops and at 40/64/128 MB, and the 8B
+//    bf16 prefill canary -- which on stock MLX failed FAIL(5), norm
+//    1.000e+00, at BOTH 800/512 and 40 MB -- now returns one answer
+//    (max_abs_err 9.277e-03, the known benign bf16-vs-CPU residual) at
+//    800/512, 100/512, 25/512 and 800/40 alike.  So the cadence is a
+//    tuning knob again, and `tests/test_command_buffer.py` keeps watching.
 //  * `MLX_METAL_GPU_ARCH`: the M5's f32 GEMM goes through the neural
 //    accelerators at ~4e-3 unless the kernel arch is pinned back a
 //    generation.  `src/jax_plugins/metal/__init__.py` also sets this before

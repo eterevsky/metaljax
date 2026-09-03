@@ -54,7 +54,7 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 | `METALJAX_SDPA` | `1` | debug-bisect | =0 disables the fused-attention rewrite (Stage 1 and plugin-native) |
 | `METALJAX_SYNC` | `0` | debug-bisect | (see src/metaljax/engine.py) |
 | `METALJAX_TRACE_BUDGET` | `20000` | user knob | max ops in one mx.compile trace (default 20000) |
-| `METALJAX_WHILE_PIPELINE` | `1` | debug-bisect | =0 restores the serial (two-round-trip) dynamic while on the native engine |
+| `METALJAX_WHILE_PIPELINE` | `1` | debug-bisect | =0 restores the serial (two-round-trip) dynamic while on the native engine. A dynamic while pipelines when its body COMPILES (one graph call to speculate) whatever its tape size; an EAGER body pipelines only up to 256 entries, and a value >1 replaces that eager threshold |
 | `MJDBG_NODSIZE` | `None` | debug-bisect | narrow vector-mode dot cap for bisection |
 | `MJDBG_NOHOIST` | `None` | debug-bisect | (see src/metaljax/msl_scan.py) |
 | `MJDBG_NONESTED` | `None` | debug-bisect | (see src/metaljax/msl_scan.py) |

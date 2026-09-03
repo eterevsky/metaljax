@@ -103,6 +103,14 @@ class BodyRunner {
     }
   }
 
+  // Is an iteration ONE compiled graph call, or `num_ops()` interpreted
+  // entries? What a speculative build costs -- and therefore whether the
+  // dynamic loop below should pipeline -- is that difference and nothing
+  // else. Read once, at loop entry: a body that later loses its compiled
+  // graph to `drop_compiled` (a recovery path, and a degraded one already)
+  // keeps the layout the loop started with.
+  bool compiled() const { return compiled_; }
+
  private:
   void bind() {
     compiled_ = body_->may_compile(repeat_);
@@ -335,19 +343,36 @@ void Program::run_while(const Entry& e,
   // out not to run is simply dropped -- unless the body reads something
   // back to the host, which would make "building" it mean RUNNING it.
   //
-  // AND is it worth it? Building costs ~per-op Python-free but real
-  // work; the saved host round trip is ~150 us. On a 4-matmul synthetic
-  // body the build is noise and pipelining won 1.9x; on a whole-model
-  // decode body (~2000 entries) the speculative build costs ~4.5 ms/tok
-  // and LOSES (row 5 measured 65.1 vs 60.6 with pipeline off). Gate on
-  // tape size: above ~256 entries the round trip is the cheaper side.
-  // g_cfg.while_pipeline doubles as the threshold when > 1.
+  // AND is it worth it? That depends on ONE structural fact -- whether an
+  // iteration is a compiled graph call or `num_ops()` interpreted entries
+  // -- because that is what a SPECULATIVE build costs, against a saved
+  // host round trip of ~150 us.
+  //
+  //   * A COMPILED body always pipelines. Building it is one
+  //     `body->compiled()(flat)` call whatever its tape holds: measured
+  //     ~0.7 ms on row 11's keras arm, a 1,844-entry whole-model decode
+  //     body, where pipelining is worth -0.8 ms/token (9.0 -> 8.2, four
+  //     runs, `pipelined_steps=127`, tokens identical).
+  //   * An EAGER body keeps the entry-count rule. There the build really
+  //     is per-op work: on a ~2000-entry decode body it cost ~4.5 ms/tok
+  //     and LOST (row 5 measured 65.1 vs 60.6 with pipeline off), and
+  //     above ~256 entries the round trip is the cheaper side.
+  //
+  // The old gate applied the eager rule to both, which is how the keras
+  // arm -- one compiled graph replayed once per token -- ended up paying
+  // two blocking host round trips per token to save a build it was not
+  // doing (notes: row11-keras-diag/diagnosis.md 3a).
+  //
+  // g_cfg.while_pipeline doubles as the eager threshold when > 1, and 0
+  // still disables pipelining outright for both kinds (METALJAX_WHILE_-
+  // PIPELINE, the bisection knob).
   const int64_t max_entries =
       g_cfg.while_pipeline > 1 ? g_cfg.while_pipeline : 256;
-  const bool pipeline =
-      g_cfg.while_pipeline > 0 &&
-      static_cast<int64_t>(body->num_ops()) <= max_entries &&
-      !body->reads_host() && !cond->reads_host();
+  const bool cheap_to_speculate =
+      runner.compiled() ||
+      static_cast<int64_t>(body->num_ops()) <= max_entries;
+  const bool pipeline = g_cfg.while_pipeline > 0 && cheap_to_speculate &&
+                        !body->reads_host() && !cond->reads_host();
   if (!pipeline) {
     g_stats.serial_loops++;
     for (;;) {

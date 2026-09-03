@@ -581,6 +581,24 @@ def _window_set_skewed(x, n, u):
     return jax.lax.scatter(x, j.reshape(1, 1), u.reshape(1, -1), dnums)
 
 
+# A dynamic-while body of ~400 tape entries -- past `control.cc`'s 256-entry
+# eager threshold, so a body that COMPILES is the only way this loop pipelines.
+# Every step adds a small integer to an f32 that stays well under 2**24, which
+# is what lets the case be compared EXACTLY: the trip count is then a fact
+# about the loop, not a rounding accident.  (Each iteration adds 799; from 1.0
+# the loop runs 7 times and stops at 5594.)
+_DYNAMIC_BIG_STEPS = 400
+
+
+def _dynamic_big_body(s):
+    import jax.numpy as jnp
+
+    v, n = s
+    for k in range(_DYNAMIC_BIG_STEPS):
+        v = v + jnp.float32(k % 3 + 1)
+    return (v, n + 1)
+
+
 def _cases():
     import jax
     import jax.numpy as jnp
@@ -1020,6 +1038,22 @@ def _cases():
              lambda s: s[0] < 100.0,
              lambda s: (s[0] * 2.0, s[1] + 1), (x, jnp.int32(0))),
          [np.float32(1.5)], *F32),
+        # The same arm with a body too big for the eager entry-count rule
+        # (`_dynamic_big_body` is ~400 entries against control.cc's 256), and
+        # therefore the first case that runs a COMPILED body through the
+        # pipelined dynamic loop -- LLM decode's shape, where the whole model
+        # is one graph replayed per token behind a data-dependent stop.
+        #
+        # It is a trip-count test, not an arithmetic one.  Speculation builds
+        # iteration t+1 before iteration t's condition is read, so a bug that
+        # committed the mis-speculated last one would return one iteration too
+        # many; the carry reports BOTH the value and the count, and every
+        # quantity in it is a small integer in f32, so EXACT means the trip
+        # count is pinned exactly.
+        ("while_loop (dynamic trip, big compiled body)",
+         lambda x: jax.lax.while_loop(
+             lambda s: s[0] < 5000.0, _dynamic_big_body, (x, jnp.int32(0))),
+         [np.float32(1.0)], *EXACT),
         # A loop whose bound is CAPTURED rather than constant: the counted
         # encoding's bound_kind 2, indexing the cond's capture list.
         ("fori_loop (captured bound)",
@@ -8638,6 +8672,109 @@ def _p32_mla(subprocess, pathlib, re):
             ("mla fused == jax-CPU", fused_agrees_with_cpu)]
 
 
+def _p35_while_pipeline(subprocess, pathlib, re):
+    """Which dynamic whiles pipeline, and that the layout cannot change an
+    answer.
+
+    A dynamic (data-dependent) `while` can hide its two host round trips per
+    iteration by building iteration t+1 and its condition BEFORE reading
+    iteration t's condition back.  Whether that pays is one structural fact:
+    a COMPILED body speculates for one graph call, an EAGER one for
+    `num_ops()` interpreted entries.  `control.cc` used to gate both on the
+    entry count, which cost row 11's keras arm (a 1,844-entry whole-model
+    decode body, compiled, replayed once per token) 0.8 ms/token in blocking
+    round trips it was not saving a build with.
+
+    So the gate is pinned from both sides -- a big body pipelines when it
+    compiles and goes serial when it does not -- and, because a speculative
+    build that got COMMITTED would run one iteration too many, every arm's
+    answer is compared against the serial one.  The carry reports the trip
+    count, so "one iteration too many" is visible as a number.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+    BIG = "while_loop (dynamic trip, big compiled body)"
+    SMALL = "while_loop (dynamic trip)"
+
+    def arm(env_extra):
+        import json
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--dynamic-while"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("WHILE "):
+                label, payload = line[6:].split("\t", 1)
+                answers[label] = json.loads(payload)
+        # One executable per case, each narrating its own census line.
+        census = [(int(a), int(b)) for a, b in re.findall(
+            r"serial_loops=(\d+) pipelined_loops=(\d+)", proc.stderr)]
+        return answers, census
+
+    def totals(census):
+        return (sum(s for s, _p in census), sum(p for _s, p in census))
+
+    def a_compiled_body_pipelines():
+        answers, census = arm({})
+        serial, piped = totals(census)
+        if BIG not in answers or SMALL not in answers:
+            return False, f"ran {sorted(answers)}"
+        # Two dynamic loops in the run, both eligible: the small one by the
+        # entry count, the big one only because its body compiles.
+        if (serial, piped) != (0, 2):
+            return False, (f"serial_loops={serial} pipelined_loops={piped}, "
+                           "wanted 0/2")
+        return True, "both dynamic loops pipelined"
+
+    def an_eager_big_body_stays_serial():
+        """METALJAX_BODY_COMPILE=0 leaves the body interpreted, and then the
+        entry-count rule is the whole gate again -- the protection the row-5
+        calibration bought (65.1 vs 60.6 ms/step with pipelining forced on an
+        op-by-op decode body)."""
+        _answers, census = arm({"METALJAX_BODY_COMPILE": "0"})
+        serial, piped = totals(census)
+        if (serial, piped) != (1, 1):
+            return False, (f"serial_loops={serial} pipelined_loops={piped}, "
+                           "wanted 1/1 (the big body serial, the small one "
+                           "still pipelined)")
+        return True, "the eager 400-entry body went serial"
+
+    def the_knob_still_disables():
+        _answers, census = arm({"METALJAX_WHILE_PIPELINE": "0"})
+        serial, piped = totals(census)
+        if (serial, piped) != (2, 0):
+            return False, (f"serial_loops={serial} pipelined_loops={piped}, "
+                           "wanted 2/0")
+        return True, "METALJAX_WHILE_PIPELINE=0 serialized both"
+
+    def the_layout_cannot_move_an_answer():
+        """Same ops, same order, only the sync points move -- so the answers
+        must be BIT-identical, trip count included.  This is the check that a
+        mis-speculated final iteration would fail."""
+        base, _ = arm({})
+        bad = []
+        for label, extra in (("serial", {"METALJAX_WHILE_PIPELINE": "0"}),
+                             ("eager body", {"METALJAX_BODY_COMPILE": "0"})):
+            other, _ = arm(extra)
+            for case in (BIG, SMALL):
+                if base.get(case) != other.get(case):
+                    bad.append(f"{case} differs under the {label} layout: "
+                               f"{base.get(case)} vs {other.get(case)}")
+        if bad:
+            return False, "; ".join(bad)
+        return True, f"3 layouts agree exactly, {BIG} = {base[BIG]}"
+
+    return [("a compiled while body pipelines", a_compiled_body_pipelines),
+            ("an eager big body stays serial", an_eager_big_body_stays_serial),
+            ("while-pipeline knob still disables", the_knob_still_disables),
+            ("loop layout cannot move an answer",
+             the_layout_cannot_move_an_answer)]
+
+
 def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
     """Re-run every case through the SAME dylib under `env_extra` and compare.
 
@@ -8813,6 +8950,21 @@ def main():
         xs = _rand((128, 32, 64), 932) * f32(0.1)
         ws = [_rand((64, 64), 933 + i) * f32(0.1) for i in range(3)]
         jax.jit(_msl_gru)(h0, xs, *ws)
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--dynamic-while":
+        # The two dynamic-trip while rows alone, so the parent can read one
+        # serial/pipelined census per arm out of the narration, and compare
+        # the ANSWERS across loop layouts (the trip count is in the carry).
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        import json as _json
+        for name, fn, args, _rtol, _atol in _cases():
+            if not name.startswith("while_loop (dynamic trip"):
+                continue
+            out = _flatten(jax.jit(fn)(*args))
+            print(f"WHILE {name}\t"
+                  f"{_json.dumps([v.astype(np.float64).ravel().tolist() for v in out])}")
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--norm-forms":
         # Every RMS-norm spelling the model table runs, through whichever
@@ -9051,6 +9203,8 @@ def main():
                          + _p33_gdn(subprocess, pathlib, __import__("re"))
                          + _p34_start_plan(subprocess, pathlib,
                                            __import__("re"))
+                         + _p35_while_pipeline(subprocess, pathlib,
+                                               __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,

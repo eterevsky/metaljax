@@ -538,9 +538,16 @@ executes on the Metal device through plain `jax.numpy`.
   `applegpu_g16g` before MLX builds its device; opt out with
   METALJAX_MATMUL_PRECISION=default. Owned by
   `plugin-native/metal/metal_client.cc` (a static initializer that also
-  pins MLX_MAX_OPS_PER_BUFFER=800 / MLX_MAX_MB_PER_BUFFER=512, the measured
-  command-buffer bands); the loader repeats the GPU_ARCH default before
-  dlopen. `src/metaljax/__init__.py` sets nothing.
+  pins MLX_MAX_OPS_PER_BUFFER=800 / MLX_MAX_MB_PER_BUFFER=512); the loader
+  repeats the GPU_ARCH default before dlopen. `src/metaljax/__init__.py`
+  sets nothing. The kernel budget is no longer a correctness pin: the
+  vendored fork's fence fix retired the command-buffer-split corruption
+  (re-swept 2026-09-03, no budget corrupts; canary battery in
+  `~/.cache/metaljax-bench/logs/row11-overlap/`). Lowering it to 100
+  measured −1.9 ms/token on row 11 but −1.0 % geomean on texmo suite-106
+  (one config −7 %) — Oleg's call under release rule 2, pending; 800 stays
+  meanwhile. The byte budget stays 512: its upper bound is the no-panic
+  one (unpageable transients).
 - All PJRT events are born ready — `jax.block_until_ready` is a **no-op** on
   this backend, so time through `np.asarray` (or `mx::eval`), never through
   block_until_ready.
