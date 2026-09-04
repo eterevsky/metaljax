@@ -26,13 +26,13 @@ notes/data/. Append a column per release / major optimization.*
 | 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **24.8** ᴳ | 24.27 ʰ | 10.5 ˣ |
 | 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 8.3 ʰ | 3.0 ˣ |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | | 52.8 ˣ |
-| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | | 67.8 ᶜ |
-| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | 27.2 ʰ | 143.4 ᶜ |
-| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | **388.4** ᵛ | | 2118 ᶜ |
+| 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | | |
+| 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | 27.2 ʰ | |
+| 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | **388.4** ᵛ | | |
 | 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | **86.68** | | 29.8 ᵗ |
 | 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | **1249.3 / 4961.6** | | 654 / 2998 ᵗ |
 | 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | | 135.6 ᵗ |
-| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | | 1402 ᶜ |
+| 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | | |
 | 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | **56.2** ᴳ | | 28.0 ˣ |
 | 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | **154.9** | 148.4 ʰ | 98.2 ˡ |
 
@@ -40,12 +40,11 @@ Notes:
 
 - **goal** = the best non-metaljax cell for the row in STATUS.md's table,
   at the same precision (STATUS.md's like-for-like rule, fn 10): ˣ mlx-lm,
-  ˡ llama.cpp, ᵗ torch-MPS, ᶜ jax-CPU (used only where no other framework
-  runs the row). Copied from STATUS.md on 2026-09-03; STATUS.md stays the
+  ˡ llama.cpp, ᵗ torch-MPS. jax-CPU is never a goal (Oleg, 2026-09-03):
+  rows with no other framework stay empty. Copied from STATUS.md on
+  2026-09-03; STATUS.md stays the
   source of truth and carries the caveats behind these cells: row 4's goal
-  is the dated 2026-08-03 mlx-lm git-main cell (fn 7); row 13's goal is
-  jax-CPU only because XLA:CPU unpacks the int4 weights in-graph while
-  metaljax keeps them packed, 2.7 vs 10.2 GB (fn 8); row 18 is torch with
+  is the dated 2026-08-03 mlx-lm git-main cell (fn 7); row 18 is torch with
   the SDPA math fallback (fn 3); row 17's comparators are fn 9; and the
   llama.cpp cells carry a 4 % two-pass band (fn 10), wider than their lead
   over mlx-lm on rows 3 and 6, so ˡ vs ˣ there is a coin toss.
