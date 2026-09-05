@@ -791,7 +791,9 @@ bool EnvOn(const char* name) {
 //    must reproduce the all-eager plugin exactly (interpreter.COMPILE_ENABLED).
 //  * `kTraceBudget` -- ops one mx::compile trace may hold, counted loops
 //    unrolled.  MLX retains every intermediate of a trace, so an oversized one
-//    exhausts Metal's ~500k live-buffer limit.
+//    exhausts Metal's ~500k live-buffer limit.  Compared against `GateCost`:
+//    the smaller of the MLIR walk (`BlockCost`) and the post-pass tape
+//    (T2, 0.11.7 gap rows).
 //  * `kBodyCompile` -- METALJAX_BODY_COMPILE=0 keeps everything compiled
 //    EXCEPT while bodies (the targeted mitigation for the command-buffer
 //    corruption, which bites REPLAYED bodies).
@@ -1004,6 +1006,14 @@ struct LowerContext {
   absl::flat_hash_map<mlir::Block*, bool> pure;        // interp._pure_cache
   // interp._traceable_cache, keyed by the loop's BODY block as the Python is.
   absl::flat_hash_map<mlir::Block*, bool> traceable;
+  // T2 (0.11.7 gap rows, item 2): the POST-PASS tape cost of every block
+  // this lowering has finished -- what `Lowering::Finish` counted after
+  // CSE/fold/DCE, a region entry charged its trips (`Pending::trace_cost`).
+  // Filled by `LowerBlock`, read by the two compile gates through
+  // `GateCost`.
+  // Absent for a block not yet lowered, which the gates treat as "MLIR
+  // count only", i.e. exactly the decision they took before this map existed.
+  absl::flat_hash_map<mlir::Block*, int64_t> tape_cost;
   // interp._bytes_gated: blocks the byte gate has already reported. A RECORD,
   // not an authority -- the decision depends on how many copies are asked for.
   absl::flat_hash_set<mlir::Block*> gated;
@@ -1415,26 +1425,34 @@ int64_t BlockCost(LowerContext& ctx, mlir::Block& block);
 // ops/gather.py), so charge the whole expansion rather than a single body.
 // Never fails -- every uncertain answer falls back to one body, which is what
 // the Python function's bare `except` does.
-int64_t ScatterCost(LowerContext& ctx, mlir::Operation* op) {
-  int64_t body = 0;
-  for (mlir::Region& r : op->getRegions())
-    for (mlir::Block& b : r.getBlocks()) body += BlockCost(ctx, b);
+//
+// `ScatterExpansion` is the multiplier alone (how many times the body is
+// charged), shared with the tape-side walk so the two estimators expand the
+// same scatter the same number of times.
+int64_t ScatterExpansion(mlir::Operation* op) {
   auto unique = op->getAttrOfType<mlir::BoolAttr>("unique_indices");
-  if (unique && unique.getValue()) return body;
-  if (ScatterCombiner(op) != Combiner::kApply) return body;
-  if (op->getNumOperands() < 2) return body;
+  if (unique && unique.getValue()) return 1;
+  if (ScatterCombiner(op) != Combiner::kApply) return 1;
+  if (op->getNumOperands() < 2) return 1;
   auto t = mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(1).getType());
   auto dn = op->getAttrOfType<mlir::stablehlo::ScatterDimensionNumbersAttr>(
       "scatter_dimension_numbers");
-  if (!t || !dn) return body;
+  if (!t || !dn) return 1;
   const int64_t ivd = dn.getIndexVectorDim();
   int64_t n = 1;
   for (int64_t i = 0; i < t.getRank(); i++) {
     if (i == ivd) continue;
-    if (t.getShape()[i] < 0) return body;
+    if (t.getShape()[i] < 0) return 1;
     n *= t.getShape()[i];
   }
-  return std::max<int64_t>(n, 1) * body;
+  return std::max<int64_t>(n, 1);
+}
+
+int64_t ScatterCost(LowerContext& ctx, mlir::Operation* op) {
+  int64_t body = 0;
+  for (mlir::Region& r : op->getRegions())
+    for (mlir::Block& b : r.getBlocks()) body += BlockCost(ctx, b);
+  return ScatterExpansion(op) * body;
 }
 
 // --------------------------------------------------------------------------
@@ -1636,6 +1654,44 @@ int64_t BlockCost(LowerContext& ctx, mlir::Block& block) {
 int64_t FlushPeriod(int64_t cost) {
   return std::max<int64_t>(
       1, std::min<int64_t>(64, 25000 / std::max<int64_t>(cost, 1)));
+}
+
+// T2 (0.11.7 gap rows, item 2): the op count a compile GATE compares with
+// `kTraceBudget`.
+//
+// `BlockCost` walks the MLIR: every op of the block, plus every op of every
+// region body (a reduce's two-op combiner, a scatter's apply body), plus
+// every callee's body behind each call, plus the terminators.  What a trace
+// HOLDS is the tape -- the post-pass tape, after CSE has merged the copies
+// jax re-emits and DCE has dropped what nothing reads, with a reduce as ONE
+// entry whose body is an attribute.  On the LoRA E2B train step the two
+// disagree by 1.7x: 27,308 MLIR units against 16,094 tape entries, and the
+// gate read the first, so a 40 GB step that traces in one graph ran op by
+// op through 22 blocking flushes (gap-rows/row18/report.md section 2;
+// METALJAX_TRACE_BUDGET=30000 was -79 ms/step).
+//
+// So a gate asks for the SMALLER of the two.  Not the tape alone: the two
+// walks differ in granularity both ways (an op that lowers to several
+// entries -- a dot with its transposes, a convert onto an emulated grid --
+// counts more on the tape than in the IR), and every recorded compile
+// decision was taken on the MLIR count, so a program it admitted must stay
+// admitted.  The tape count only ever ADMITS what the MLIR walk
+// over-charged; nothing this rule touches can flip to eager.  The cadence
+// numbers a body's cost also sizes -- the eager flush period, the chunk
+// count K, `chunkable`, the loop-clear cadence the executor reads from
+// attrs[7] -- stay on the MLIR count: those are the sync points every loop
+// measurement was taken at, and a gate is the one decision the tape count
+// corrects.
+//
+// A block whose tape is not known yet (nothing has lowered it) is gated on
+// the MLIR count alone -- the decision as it was.  In practice both gates
+// ask AFTER the block was lowered: the main gate at the end of `Run`, a
+// body's gate after `LowerRegion`.  (`WhileTraceable`, the unroll-in-trace
+// question, deliberately does NOT use this -- see the comment there.)
+int64_t GateCost(LowerContext& ctx, mlir::Block& block, int64_t mlir_cost) {
+  auto it = ctx.tape_cost.find(&block);
+  if (it == ctx.tape_cost.end()) return mlir_cost;
+  return std::min(mlir_cost, it->second);
 }
 
 // --------------------------------------------------------------------------
@@ -1962,6 +2018,17 @@ bool WhileTraceable(LowerContext& ctx, mlir::Operation* op) {
       // own refusal, and a deliberate DIVERGENCE from ops/control.py, whose
       // `_while_traceable` had the budget tests only (Stage 1's engine
       // recovered from the refusal more cheaply than this one).
+      // The op budget here stays on the MLIR walk, NOT on `GateCost` (T2
+      // tried the tape count at this site and measured it: the texmo bench
+      // chunk is a 64-trip scan -- trip == kUnrollMax -- and admitting it on
+      // its tape turned an eager loop over a K=16 chunked compiled body into
+      // one 64-step trace, 8-15 % slower on db01-b64l256, db04-b16l128,
+      // db04-b128l128, mid12-b64l128 and mid13-b64l128 in every one of four
+      // suite-106 arms; the one model row it flipped, row 14's 28-trip layer
+      // scan, was perf-neutral, 27.3 ms/tok either way.  Unrolling into an
+      // enclosing trace is a different question from whether a body may be
+      // compiled at all, and the budget was never a good proxy for it;
+      // logs/t2-tracebudget/findings.txt section 6.)
       ok = trip <= kUnrollMax &&
            trip * BlockCost(ctx, body) <= kTraceBudget &&
            BlockIsPure(ctx, body) &&
@@ -2130,6 +2197,12 @@ class Lowering {
     // which is what makes this entry a `kMslScan` rather than a `kWhile`.
     // Last, so every aggregate initialization above stays as it was.
     std::shared_ptr<MslPlan> msl;
+    // T2: what this entry adds to the frame's traced op count BEYOND its
+    // own 1 -- a while's trips x its body's tape (`BlockCost`'s arithmetic
+    // on the tape side), a scatter's expansion x its apply body, a branch's
+    // regions, 8 for a generated msl kernel.  Set by the region-carrying
+    // emit sites after `Emit`; 0 for every straight-line entry.
+    int64_t trace_cost = 0;
   };
 
   // One block lowered into THIS frame: the block's own arguments first, then
@@ -2168,6 +2241,9 @@ class Lowering {
     std::vector<mlir::Value> free;
     std::vector<int> caps;
     std::vector<int> outputs;
+    // T2: the child frame's post-pass tape cost (`tape_cost_` below), so the
+    // entry that carries this region can charge it (times its trips).
+    int64_t tape_cost = 0;
     std::vector<Taint> taints;
     DumpNode dump;
   };
@@ -2289,6 +2365,7 @@ class Lowering {
     std::vector<int> caps;
     std::shared_ptr<Program> program;
     DumpNode dump;
+    int64_t tape_cost = 0;   // T2: the body frame's post-pass tape cost
   };
   absl::StatusOr<GenericBody> LowerGenericBody(size_t n,
                                                const std::vector<int64_t>& dims,
@@ -2486,6 +2563,11 @@ class Lowering {
   // time.
   bool region_ = false;
   std::vector<Pending> entries_;
+  // T2: this frame's post-pass tape cost -- `Finish` sums 1 + `trace_cost`
+  // over what survived CSE/fold/DCE.  `LowerBlock` publishes it in
+  // `ctx_->tape_cost` for the gates, and `LowerRegion` hands it to the
+  // parent's entry.
+  int64_t tape_cost_ = 0;
   std::vector<std::string> calls_;   // callees currently being inlined
   // The two aliasing taints, consumed by the output-copy rule in `Run` and
   // carried across frames by `MapTaint`.  `arg_alias_` maps a slot to the
@@ -4907,6 +4989,7 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
             : "scatter computed-body",
         Product(plan.batch_shape)));
   }
+  int64_t trace_cost = 0;
   if (method_code == 7 || method_code == 8) {
     mlir::Block& body = sc.getUpdateComputation().front();
     if (body.getNumArguments() != 2) return Decline("scatter body arity");
@@ -4917,6 +5000,9 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
     ins.insert(ins.end(), region.caps.begin(), region.caps.end());
     regions.push_back(std::move(region.program));
     if (kDumpTape) dumps.push_back(std::move(region.dump));
+    // T2: the tape-side `ScatterCost` -- the apply body once per update
+    // the sequential arm replays it for.
+    trace_cost = ScatterExpansion(op) * region.tape_cost;
   }
   attrs.insert(attrs.end(), extra.begin(), extra.end());
 
@@ -4925,6 +5011,7 @@ absl::Status Lowering::LowerScatter(mlir::Operation* op) {
   Emit(opcode, std::move(ins), std::move(outs), std::move(attrs),
        std::move(payload), ResultBytes(op), std::move(regions),
        std::move(dumps));
+  entries_.back().trace_cost = trace_cost;
   return absl::OkStatus();
 }
 
@@ -5172,9 +5259,11 @@ absl::Status Lowering::LowerReduce(mlir::Operation* op) {
   std::vector<DumpNode> dumps;
   if (kDumpTape) dumps.push_back(std::move(gb.dump));
   ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.reduce.generic"));
+  const int64_t body_tape = gb.tape_cost;
   Emit(opcode, std::move(ins), std::move(outs), std::move(gb.attrs),
        std::nullopt, ResultBytes(op), {std::move(gb.program)},
        std::move(dumps));
+  entries_.back().trace_cost = body_tape;   // T2: as BlockCost, body once
   return absl::OkStatus();
 }
 
@@ -5202,6 +5291,7 @@ absl::StatusOr<Lowering::GenericBody> Lowering::LowerGenericBody(
   out.attrs.push_back(static_cast<int64_t>(region.caps.size()));
   out.caps = std::move(region.caps);
   out.program = std::move(region.program);
+  out.tape_cost = region.tape_cost;
   out.dump = std::move(region.dump);
   return out;
 }
@@ -5260,13 +5350,14 @@ absl::Status Lowering::LowerReduceWindow(mlir::Operation* op) {
   auto emit = [&](std::vector<int64_t> attrs,
                   std::vector<std::shared_ptr<Program>> regions,
                   std::vector<DumpNode> dumps,
-                  bool taint_all) -> absl::Status {
+                  bool taint_all, int64_t trace_cost = 0) -> absl::Status {
     std::vector<int> outs;
     for (mlir::Value r : op->getResults()) outs.push_back(Bind(r));
     if (taint_all) TaintFromAll(ins, outs);
     ASSIGN_OR_RETURN(int opcode, Opcode("stablehlo.reduce_window"));
     Emit(opcode, ins, std::move(outs), std::move(attrs), std::nullopt,
          ResultBytes(op), std::move(regions), std::move(dumps));
+    entries_.back().trace_cost = trace_cost;   // T2: as BlockCost, body once
     return absl::OkStatus();
   };
 
@@ -5354,8 +5445,9 @@ absl::Status Lowering::LowerReduceWindow(mlir::Operation* op) {
   ins.insert(ins.end(), gb.caps.begin(), gb.caps.end());
   std::vector<DumpNode> dumps;
   if (kDumpTape) dumps.push_back(std::move(gb.dump));
+  const int64_t body_tape = gb.tape_cost;
   return emit(std::move(attrs), {std::move(gb.program)}, std::move(dumps),
-              true);
+              true, body_tape);
 }
 
 // ops/sort.py `_sort`, the arm whose comparator ends in a compare -- which is
@@ -6178,6 +6270,7 @@ absl::StatusOr<Lowering::Region> Lowering::LowerRegion(mlir::Block& block) {
   out.program = std::move(built.program);
   out.outputs = built.outputs;
   out.dump = std::move(built.dump);
+  out.tape_cost = child.tape_cost_;
   for (int s : out.outputs) out.taints.push_back(child.TaintOf(s));
   return out;
 }
@@ -6273,6 +6366,12 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
 
   const int64_t cost = BlockCost(*ctx_, body_block);
   const int64_t period = FlushPeriod(cost);
+  // T2: the op count the compile GATE reads -- the smaller of the MLIR walk
+  // and the body's post-pass tape (`GateCost`; the body was lowered above,
+  // so its tape is known).  Everything CADENCE-shaped below -- `period`,
+  // `chunkable`, `kmax`, the `cost` the executor reads back from attrs[7]
+  // -- stays on the MLIR count on purpose.
+  const int64_t gate_cost = GateCost(*ctx_, body_block, cost);
 
   // The compile decisions (tape.py `_while`, P5).  Two budgets, solved for the
   // two things the executor is allowed to do with a body: replay K iterations
@@ -6303,9 +6402,14 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
   const int64_t kmax = std::max<int64_t>(
       1, std::min<int64_t>({by_cost, kChunkMax,
                             BytesChunks(*ctx_, body_block)}));
+  // The single-step gate solved for `repeat`, on `gate_cost`.  For a body
+  // the MLIR count admits this is >= `by_cost` >= `kmax`, so nothing the
+  // executor asks for changes; for one it refused and the tape admits, it
+  // is the difference between a compiled body and an op-by-op replay.
+  const int64_t by_gate = kTraceBudget / std::max<int64_t>(gate_cost, 1);
   int64_t body_compile_max = 0;
   if (kCompileEnabled && kBodyCompile && pure)
-    body_compile_max = std::max<int64_t>(0, std::min(by_cost, by_bytes));
+    body_compile_max = std::max<int64_t>(0, std::min(by_gate, by_bytes));
   if (body_compile_max > 0 && have_regions) {
     std::vector<int> anchors = UnderivedOutputs(body_block, body.free);
     if (kDumpTape) {
@@ -6324,10 +6428,12 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
   // integers say it directly.  Diagnostic only: nothing here decides anything.
   if (kDebug) {
     std::fprintf(stderr,
-                 "[metaljax-native] while gate: cost=%lld bytes=%lldMB "
+                 "[metaljax-native] while gate: cost=%lld tape=%lld "
+                 "bytes=%lldMB "
                  "budget=%lld by_cost=%lld by_bytes=%lld pure=%d "
                  "body_compile=%lld chunkable=%lld kmax=%lld period=%lld\n",
                  static_cast<long long>(cost),
+                 static_cast<long long>(have_regions ? body.tape_cost : cost),
                  static_cast<long long>(BlockBytes(*ctx_, body_block) >> 20),
                  static_cast<long long>(kTraceBudget),
                  static_cast<long long>(by_cost),
@@ -6417,6 +6523,18 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
   Emit(opcode, std::move(ins), std::move(outs), std::move(attrs), std::nullopt,
        ResultBytes(op), std::move(regions), std::move(dumps));
   entries_.back().msl = std::move(lowered.plan);
+  // T2: the tape-side `BlockCost` of this loop -- a planned loop is one
+  // generated kernel (8, as the cost walk charges it); an interpreted one is
+  // its body's tape once per trip, the trip PESSIMISTIC (1024) unless
+  // static, exactly as `BlockCost` charges the MLIR body.
+  if (plan != nullptr) {
+    entries_.back().trace_cost = 8;
+  } else if (have_regions) {
+    const int64_t trip = static_trip.has_value()
+                             ? std::max<int64_t>(*static_trip, 1)
+                             : int64_t{1024};
+    entries_.back().trace_cost = trip * body.tape_cost;
+  }
   return absl::OkStatus();
 }
 
@@ -6756,6 +6874,7 @@ absl::Status Lowering::LowerBranch(mlir::Operation* op) {
   std::vector<std::shared_ptr<Program>> regions;
   std::vector<DumpNode> dumps;
   std::vector<std::vector<Taint>> per_branch;
+  int64_t branch_tape = 0;
   for (mlir::Region& region : op->getRegions()) {
     mlir::Block& blk = region.front();
     if (blk.getNumArguments() != 0)
@@ -6770,6 +6889,7 @@ absl::Status Lowering::LowerBranch(mlir::Operation* op) {
     per_branch.push_back(std::move(mapped));
     regions.push_back(std::move(br.program));
     if (kDumpTape) dumps.push_back(std::move(br.dump));
+    branch_tape += br.tape_cost;   // T2: every branch, as BlockCost charges
   }
   if (regions.empty()) return Decline("a branch op with no regions");
 
@@ -6785,6 +6905,7 @@ absl::Status Lowering::LowerBranch(mlir::Operation* op) {
   ASSIGN_OR_RETURN(int opcode, Opcode(View(op->getName().getStringRef())));
   Emit(opcode, std::move(ins), std::move(outs), std::move(attrs), std::nullopt,
        ResultBytes(op), std::move(regions), std::move(dumps));
+  entries_.back().trace_cost = branch_tape;
   return absl::OkStatus();
 }
 
@@ -8136,6 +8257,13 @@ absl::StatusOr<Lowering::Built> Lowering::Finish(
   FoldConstants(outs);
   DcePass(outs);
 
+  // T2: the traced op count of what SURVIVED the passes -- one per entry,
+  // plus what a region-carrying entry unrolls to (`Pending::trace_cost`).
+  // This is the tape-side twin of `BlockCost`, and `GateCost` takes the
+  // smaller of the two.
+  tape_cost_ = 0;
+  for (const Pending& e : entries_) tape_cost_ += 1 + e.trace_cost;
+
   // Per-op drop lists: the slots whose last use is that op (tape.py
   // `_liveness`).  Straight-line, so this is "highest index that reads it";
   // a result nothing reads is let go at the op that produced it, and an
@@ -8219,6 +8347,10 @@ absl::StatusOr<Lowering::Built> Lowering::LowerBlock(
                                            captures.size()) + npacks,
                           outputs));
   built.returned = std::move(returned);
+  // T2: publish this block's post-pass tape cost for the gates (`GateCost`).
+  // A callee block inlined at two call sites lowers the same way twice, so
+  // the later write repeats the earlier value.
+  ctx_->tape_cost[&block] = tape_cost_;
   return built;
 }
 
@@ -8405,10 +8537,17 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
   // -- a jitted parameter init is 365 ops and 15 GB of traffic.  Over either,
   // the program runs op by op, where last-use pruning and the byte-denominated
   // eager flush bound it and the compiled path does not.
+  //
+  // T2: the op budget is asked on `GateCost` -- the smaller of the MLIR
+  // walk and this frame's post-pass tape (`tape_cost_`, which `LowerBlock`
+  // above just published).  The LoRA E2B train step is the motivating row:
+  // cost 27,308 on the IR, 16,094 entries on the tape that runs.
   const int64_t cost = BlockCost(*ctx_, block);
+  const int64_t tape = tape_cost_;
+  const int64_t gate_cost = GateCost(*ctx_, block, cost);
   const bool pure = BlockIsPure(*ctx_, block);
   const bool compile_main =
-      kCompileEnabled && pure && cost <= kTraceBudget &&
+      kCompileEnabled && pure && gate_cost <= kTraceBudget &&
       BytesOk(*ctx_, block, 1, "main", /*whole=*/true);
   lowered.compiled = compile_main;
   if (compile_main) {
@@ -8424,9 +8563,10 @@ absl::StatusOr<LoweredProgram> Lowering::Run(mlir::func::FuncOp fn) {
   }
   if (kDebug) {
     std::fprintf(stderr,
-                 "[metaljax-native] main: pure=%d cost=%lld bytes=%.1fMB "
-                 "compile=%d\n",
+                 "[metaljax-native] main: pure=%d cost=%lld tape=%lld "
+                 "bytes=%.1fMB compile=%d\n",
                  static_cast<int>(pure), static_cast<long long>(cost),
+                 static_cast<long long>(tape),
                  static_cast<double>(ProgramBytes(*ctx_, block)) /
                      static_cast<double>(1 << 20),
                  static_cast<int>(compile_main));

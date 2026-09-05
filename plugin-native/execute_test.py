@@ -7299,6 +7299,27 @@ print(f"[probe] checksum {float(np.asarray(jax.jit(run)(*a, 3)).sum()):.9e}")
 '''
 
 
+_P36_TAPE_GATE = r"""
+import os, json, numpy as np, jax, jax.numpy as jnp
+
+# A chain of INTEGER rounds, each holding a full reduce.  Integers because
+# the contract compares the compiled and the eager answers for BIT identity,
+# and an int32 sum is exact in any order and any fusion; a chain because CSE
+# must find nothing to merge (each round depends on the last), so the gap
+# between the two counts is entirely the reduce bodies and the terminators
+# BlockCost charges and the tape does not carry.
+N = int(os.environ.get("P36_ROUNDS", "300"))
+
+def f(x):
+    for _ in range(N):
+        x = (x * 3 + jnp.sum(x)) % 1000003
+    return x
+
+y = np.asarray(jax.jit(f)(jnp.arange(64, dtype=jnp.int32)))
+print("[probe] answer " + json.dumps([int(v) for v in y]))
+"""
+
+
 _KERAS_ATTN = r'''
 import os, numpy as np, jax, jax.numpy as jnp
 
@@ -7501,12 +7522,18 @@ def _p26_callee_sdpa(subprocess, tempfile, pathlib, re):
     # compile: a plain tape at `CompileAndLoad`, then a fused one at the first
     # execute, which is the tape that runs), so the first line is always the
     # undiscounted cost even in the fused arm.
-    _GATE = re.compile(r"while gate: cost=(\d+) .*? body_compile=(\d+)")
+    # T2: the gate compares the budget with the SMALLER of the MLIR walk
+    # (`cost=`) and the body's post-pass tape (`tape=`), so the budget this
+    # contract derives is taken from that gate cost -- the fused tape is
+    # one entry where the chain was ~30, so the discount is still there.
+    _GATE = re.compile(r"while gate: cost=(\d+)(?: tape=(\d+))? .*? "
+                       r"body_compile=(\d+)")
 
     def arm(extra_env):
         proc = run(extra_env)
         err = proc.stderr or ""
-        gates = [(int(m.group(1)), int(m.group(2)))
+        gates = [(min(int(m.group(1)),
+                      int(m.group(2) or m.group(1))), int(m.group(3)))
                  for m in _GATE.finditer(err)]
         return proc, {
             "fused": sum(int(m.group(1)) for m in _FUSED.finditer(err)),
@@ -7566,7 +7593,7 @@ def _p26_callee_sdpa(subprocess, tempfile, pathlib, re):
             return False, (f"the gate changed the answer: {gated['sum']} vs "
                            f"{ungated['sum']}")
         ok = gated["compile"] > 0 and ungated["compile"] == 0
-        return ok, (f"cost {on['cost']} fused / {off['cost']} unfused; at "
+        return ok, (f"gate cost {on['cost']} fused / {off['cost']} unfused; at "
                     f"budget {budget} body_compile="
                     f"{gated['compile']} / {ungated['compile']}")
 
@@ -8057,7 +8084,8 @@ def _p21_msl(subprocess, pathlib, re):
                 return None, None, (proc.stderr or proc.stdout
                                     ).splitlines()[-1][:80]
             mb = [float(x) for x in re.findall(
-                r"main: pure=\d+ cost=\d+ bytes=([\d.]+)MB", proc.stderr)]
+                r"main: pure=\d+ cost=\d+ (?:tape=\d+ )?bytes=([\d.]+)MB",
+                proc.stderr)]
             plans = len(re.findall(r"msl_scan: compiled plan", proc.stderr))
             if not mb:
                 return None, None, "no byte narration"
@@ -8775,6 +8803,125 @@ def _p35_while_pipeline(subprocess, pathlib, re):
              the_layout_cannot_move_an_answer)]
 
 
+def _p36_tape_gate(subprocess, tempfile, pathlib, re):
+    """The trace budget is asked of the post-pass TAPE, not only the MLIR.
+
+    `BlockCost` charges every op of every region body -- a reduce's two-op
+    combiner, a scatter's apply body, every callee behind a call, the
+    terminators -- while the tape that runs carries a reduce as ONE entry and
+    has been through CSE and DCE.  The LoRA E2B train step read 27,308 on the
+    IR against 16,094 entries, and at the 20,000 default it ran op by op
+    through 22 blocking flushes (gap-rows/row18, -79 ms/step under
+    METALJAX_TRACE_BUDGET=30000).  Since T2 the main gate, the while-body
+    gate and `WhileTraceable` compare the budget with the SMALLER of the two
+    counts (`GateCost`), so a program the MLIR count admits stays admitted
+    and one it over-charged compiles when its tape fits.
+
+    Nothing here hard-codes a count.  The probe narrates both (`cost=<mlir>
+    tape=<entries>`), the budget the contract tests with is derived from
+    them, and the answer is INTEGER so the compiled and the eager arms must
+    agree bit for bit -- the layout of the decision cannot move a number.
+    """
+    _MAIN = re.compile(r"main: pure=\d+ cost=(\d+) tape=(\d+) "
+                       r"bytes=[\d.]+MB compile=(\d)")
+
+    def run(extra_env):
+        env = dict(os.environ)
+        env["METALJAX_DEBUG"] = "1"
+        env.update(extra_env)
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(_P36_TAPE_GATE)
+            script = fh.name
+        try:
+            proc = subprocess.run([sys.executable, script], env=env,
+                                  capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(script)
+            except OSError:
+                pass
+        err = proc.stderr or ""
+        # The probe's own program is the BIG main; the harness's tiny
+        # transfers narrate too, so take the largest cost.
+        gates = sorted((int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                       for m in _MAIN.finditer(err))
+        answer = next((ln[len("[probe] answer "):]
+                       for ln in proc.stdout.splitlines()
+                       if ln.startswith("[probe] answer ")), None)
+        return proc, (gates[-1] if gates else None), answer
+
+    state = {}
+
+    def both_counts_are_narrated():
+        proc, gate, answer = run({})
+        if proc.returncode != 0:
+            return False, (proc.stderr or "").strip()[-140:]
+        if gate is None:
+            return False, "no `main: pure= cost= tape=` line narrated"
+        cost, tape, compiled = gate
+        if not (0 < tape < cost):
+            return False, (f"cost={cost} tape={tape}: the reduce chain "
+                           "should cost MORE on the IR than on the tape")
+        if not compiled:
+            return False, f"cost={cost} tape={tape} yet compile=0 at default"
+        state.update(cost=cost, tape=tape, answer=answer)
+        return True, f"cost={cost} (MLIR) tape={tape}, compiled at default"
+
+    def an_overcharged_main_compiles_on_its_tape():
+        if "cost" not in state:
+            return False, "the run above did not complete"
+        cost, tape = state["cost"], state["tape"]
+        # Strictly between the two counts: the tape fits, the IR does not.
+        budget = (cost + tape) // 2
+        proc, gate, answer = run({"METALJAX_TRACE_BUDGET": str(budget)})
+        if proc.returncode != 0:
+            return False, (proc.stderr or "").strip()[-140:]
+        if gate is None or gate[2] != 1:
+            return False, (f"budget {budget} between tape {tape} and cost "
+                           f"{cost}: compile={gate[2] if gate else '?'} "
+                           "(want 1)")
+        state["between"] = answer
+        return True, f"budget {budget}: cost={cost} > budget >= tape={tape}, compile=1"
+
+    def a_main_over_both_counts_still_runs_eager():
+        if "cost" not in state:
+            return False, "the run above did not complete"
+        tape = state["tape"]
+        budget = max(1, tape // 2)
+        proc, gate, answer = run({"METALJAX_TRACE_BUDGET": str(budget)})
+        if proc.returncode != 0:
+            return False, (proc.stderr or "").strip()[-140:]
+        if gate is None or gate[2] != 0:
+            return False, (f"budget {budget} under tape {tape}: "
+                           f"compile={gate[2] if gate else '?'} (want 0)")
+        state["under"] = answer
+        return True, f"budget {budget} < tape {tape}: compile=0"
+
+    def the_gate_cannot_move_an_answer():
+        want = state.get("answer")
+        if want is None:
+            return False, "no answer from the default run"
+        arms = {"between": state.get("between"),
+                "under (eager)": state.get("under")}
+        proc, _gate, off = run({"METALJAX_COMPILE": "0"})
+        if proc.returncode != 0:
+            return False, (proc.stderr or "").strip()[-140:]
+        arms["METALJAX_COMPILE=0"] = off
+        bad = [k for k, v in arms.items() if v != want]
+        if bad:
+            return False, "differs from the compiled answer: " + ", ".join(bad)
+        return True, "4 layouts agree bit for bit (int32 chain)"
+
+    return [("both gate counts are narrated", both_counts_are_narrated),
+            ("an over-charged main compiles on its tape",
+             an_overcharged_main_compiles_on_its_tape),
+            ("a main over both counts stays eager",
+             a_main_over_both_counts_still_runs_eager),
+            ("the tape gate cannot move an answer",
+             the_gate_cannot_move_an_answer)]
+
+
 def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
     """Re-run every case through the SAME dylib under `env_extra` and compare.
 
@@ -9205,6 +9352,8 @@ def main():
                                            __import__("re"))
                          + _p35_while_pipeline(subprocess, pathlib,
                                                __import__("re"))
+                         + _p36_tape_gate(subprocess, tempfile, pathlib,
+                                          __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,
