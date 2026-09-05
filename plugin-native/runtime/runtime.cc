@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <algorithm>
@@ -42,6 +43,55 @@ int64_t timing_now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+mx::metal::DispatchStats DispatchSnapshotSettled() {
+  mx::metal::DispatchStats s = mx::metal::dispatch_stats();
+  const int64_t t0 = timing_now_ns();
+  while (s.completed_command_buffers < s.command_buffers &&
+         timing_now_ns() - t0 < 5'000'000) {
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
+    s = mx::metal::dispatch_stats();
+  }
+  return s;
+}
+
+std::string DispatchDelta(const mx::metal::DispatchStats& a,
+                          const mx::metal::DispatchStats& b, int64_t steps) {
+  const unsigned long long dispatches = b.dispatches - a.dispatches;
+  const unsigned long long cbufs = b.command_buffers - a.command_buffers;
+  const unsigned long long empty =
+      b.empty_command_buffers - a.empty_command_buffers;
+  // What the completion handlers had booked by the second snapshot; the
+  // buffers still in flight are `pending`, and their GPU time is not here.
+  const unsigned long long pending =
+      b.command_buffers - b.completed_command_buffers;
+  const double wall_ms = static_cast<double>(b.now_ns - a.now_ns) * 1e-6;
+  // `span` merges overlapping buffers, so wall - span is the device's idle
+  // time in the window; `sum` is the plain per-buffer total (equal unless
+  // two queues overlapped); `gap` the idle between consecutive buffers;
+  // `queue` the total commit-to-GPU-start latency.
+  const double busy_ms = static_cast<double>(b.gpu_span_ns - a.gpu_span_ns) * 1e-6;
+  const double sum_ms = static_cast<double>(b.gpu_busy_ns - a.gpu_busy_ns) * 1e-6;
+  const double gap_ms = static_cast<double>(b.gpu_gap_ns - a.gpu_gap_ns) * 1e-6;
+  const double queue_ms = static_cast<double>(b.queue_ns - a.queue_ns) * 1e-6;
+  const double idle_ms = std::max(wall_ms - busy_ms, 0.0);
+  char buf[512];
+  int n = std::snprintf(
+      buf, sizeof buf,
+      "dispatches=%llu cbufs=%llu(+empty %llu) gpu_busy_ms=%.2f(sum %.2f) "
+      "gpu_idle_ms=%.2f gap_ms=%.2f queue_ms=%.2f wall_ms=%.2f pending=%llu",
+      dispatches, cbufs, empty, busy_ms, sum_ms, idle_ms, gap_ms, queue_ms,
+      wall_ms, pending);
+  if (steps > 0 && n > 0 && static_cast<size_t>(n) < sizeof buf) {
+    const double st = static_cast<double>(steps);
+    std::snprintf(buf + n, sizeof buf - static_cast<size_t>(n),
+                  " per_step: dispatches=%.1f cbufs=%.2f gpu_busy_ms=%.3f "
+                  "gpu_idle_ms=%.3f wall_ms=%.3f",
+                  dispatches / st, cbufs / st, busy_ms / st, idle_ms / st,
+                  wall_ms / st);
+  }
+  return std::string(buf);
 }
 
 // Narration. Deliberately not routed through Python: these fire from paths

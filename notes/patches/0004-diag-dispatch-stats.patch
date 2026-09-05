@@ -1,0 +1,266 @@
+From 4a5d6dbf2fc29c810c98ee68a67e5cee05d0ca7d Mon Sep 17 00:00:00 2001
+From: Oleg Eterevsky <oleg@eterevsky.com>
+Date: Fri, 4 Sep 2026 10:06:51 +0200
+Subject: [PATCH] metal: process-wide dispatch counter and per-command-buffer
+ GPU timestamps (diagnostic)
+
+Adds `metal::dispatch_stats()` -- a Metal-header-free snapshot of how many
+compute dispatches and command buffers the backend has committed and how
+long the GPU spent on them -- so an embedder can price a workload in
+kernels rather than in graph nodes.
+
+* `dispatches`: accumulated at `CommandEncoder::commit` from `buffer_ops_`
+  (the count the encoder already keeps for its commit cadence), so the
+  dispatch hot path is untouched; one relaxed atomic add per command buffer.
+* `command_buffers` / `empty_command_buffers` / `completed_command_buffers`.
+* GPU times from `MTLCommandBuffer::GPUStartTime/GPUEndTime` read in the
+  completion handler: `gpu_busy_ns` (plain sum), `gpu_span_ns` (overlapping
+  buffers merged), `gpu_gap_ns` (idle between consecutive buffers),
+  `queue_ns` (host commit -> GPU start).  All on the CLOCK_UPTIME_RAW base
+  the Metal timestamps use; `now_ns` lets two snapshots bracket a window.
+* MLX_DISPATCH_TRACE=1 prints one line per command buffer as it completes.
+
+Stubbed in no_metal.cpp.  Off the hot path entirely; nothing changes for
+callers that never read it.
+---
+ mlx/backend/metal/device.cpp   | 123 ++++++++++++++++++++++++++++++++-
+ mlx/backend/metal/metal.h      |  41 +++++++++++
+ mlx/backend/metal/no_metal.cpp |   4 ++
+ 3 files changed, 167 insertions(+), 1 deletion(-)
+
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 479cd109..846611c2 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1,6 +1,11 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
++#include <algorithm>
++#include <atomic>
++#include <cstdio>
+ #include <cstdlib>
++#include <ctime>
++#include <mutex>
+ #include <sstream>
+ 
+ #include <fmt/format.h>
+@@ -301,8 +306,109 @@ MTL::Library* load_library(
+   throw std::runtime_error(msg.str());
+ }
+ 
++// DIAGNOSTIC: the process-wide dispatch / command-buffer accounting behind
++// metal::dispatch_stats().  It is touched once per command buffer (at commit
++// and in the completion handler), never per dispatch -- the per-buffer
++// dispatch count is CommandEncoder::buffer_ops_, which the encoder keeps
++// anyway for its commit cadence.
++struct DispatchAccounting {
++  std::atomic<uint64_t> dispatches{0};
++  std::atomic<uint64_t> command_buffers{0};
++  std::atomic<uint64_t> empty_command_buffers{0};
++  std::atomic<uint64_t> completed{0};
++  std::atomic<uint64_t> gpu_busy_ns{0};
++  std::atomic<uint64_t> gpu_span_ns{0};
++  std::atomic<uint64_t> gpu_gap_ns{0};
++  std::atomic<uint64_t> queue_ns{0};
++  // Orders the span merge across queues (completion handlers may run
++  // concurrently for different streams).
++  std::mutex span_mtx;
++  double last_gpu_end{0}; // seconds, the GPU timestamp base
++};
++
++// Immortal on purpose: completion handlers run on Metal's queue threads and
++// the last of them can fire while static destructors are already running,
++// so the accounting must outlive every command buffer -- a leaked object,
++// never a destroyed mutex.
++DispatchAccounting& dispatch_accounting() {
++  static DispatchAccounting* accounting = new DispatchAccounting();
++  return *accounting;
++}
++
++// CLOCK_UPTIME_RAW is mach_absolute_time in nanoseconds: the base
++// MTLCommandBuffer's GPUStartTime / GPUEndTime (CACurrentMediaTime) use.
++uint64_t dispatch_clock_ns() {
++  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++}
++
++// MLX_DISPATCH_TRACE=1 prints one line per command buffer as it completes.
++int dispatch_trace() {
++  static int level = env::get_var("MLX_DISPATCH_TRACE", 0);
++  return level;
++}
++
++void record_command_buffer_completion(
++    MTL::CommandBuffer* cbuf,
++    int ops,
++    uint64_t commit_ns,
++    uint64_t index) {
++  auto& acct = dispatch_accounting();
++  const double start = cbuf->GPUStartTime();
++  const double end = cbuf->GPUEndTime();
++  uint64_t busy = 0, span = 0, gap = 0, queue = 0;
++  if (start > 0 && end > start) {
++    busy = static_cast<uint64_t>((end - start) * 1e9);
++    const double commit_s = static_cast<double>(commit_ns) * 1e-9;
++    if (start > commit_s) {
++      queue = static_cast<uint64_t>((start - commit_s) * 1e9);
++    }
++    std::lock_guard lk(acct.span_mtx);
++    const double from = std::max(start, acct.last_gpu_end);
++    if (end > from) {
++      span = static_cast<uint64_t>((end - from) * 1e9);
++    }
++    if (acct.last_gpu_end > 0 && start > acct.last_gpu_end) {
++      gap = static_cast<uint64_t>((start - acct.last_gpu_end) * 1e9);
++    }
++    acct.last_gpu_end = std::max(acct.last_gpu_end, end);
++  }
++  acct.gpu_busy_ns.fetch_add(busy, std::memory_order_relaxed);
++  acct.gpu_span_ns.fetch_add(span, std::memory_order_relaxed);
++  acct.gpu_gap_ns.fetch_add(gap, std::memory_order_relaxed);
++  acct.queue_ns.fetch_add(queue, std::memory_order_relaxed);
++  // Last, with release semantics: a reader that sees `completed` covering
++  // this buffer also sees its times.
++  acct.completed.fetch_add(1, std::memory_order_release);
++  if (dispatch_trace()) {
++    fprintf(
++        stderr,
++        "[mlx-dispatch] cb=%llu ops=%d queue=%.1fus gpu=%.1fus gap=%.1fus\n",
++        static_cast<unsigned long long>(index),
++        ops,
++        queue * 1e-3,
++        busy * 1e-3,
++        gap * 1e-3);
++  }
++}
++
+ } // namespace
+ 
++DispatchStats dispatch_stats() {
++  auto& acct = dispatch_accounting();
++  DispatchStats s;
++  s.completed_command_buffers = acct.completed.load(std::memory_order_acquire);
++  s.dispatches = acct.dispatches.load(std::memory_order_relaxed);
++  s.command_buffers = acct.command_buffers.load(std::memory_order_relaxed);
++  s.empty_command_buffers =
++      acct.empty_command_buffers.load(std::memory_order_relaxed);
++  s.gpu_busy_ns = acct.gpu_busy_ns.load(std::memory_order_relaxed);
++  s.gpu_span_ns = acct.gpu_span_ns.load(std::memory_order_relaxed);
++  s.gpu_gap_ns = acct.gpu_gap_ns.load(std::memory_order_relaxed);
++  s.queue_ns = acct.queue_ns.load(std::memory_order_relaxed);
++  s.now_ns = dispatch_clock_ns();
++  return s;
++}
++
+ CommandEncoder::CommandEncoder(
+     Device& d,
+     int index,
+@@ -526,11 +632,25 @@ bool CommandEncoder::needs_commit() const {
+ }
+ 
+ void CommandEncoder::commit(std::function<void()> completion) {
++  // Dispatch accounting (metal::dispatch_stats): one relaxed add per
++  // command buffer, the host commit time for the completion handler below.
++  auto& acct = dispatch_accounting();
++  const int ops = buffer_ops_;
++  const uint64_t commit_ns = dispatch_clock_ns();
++  const uint64_t cb_index =
++      acct.command_buffers.fetch_add(1, std::memory_order_relaxed) + 1;
++  acct.dispatches.fetch_add(ops, std::memory_order_relaxed);
++  if (ops == 0) {
++    acct.empty_command_buffers.fetch_add(1, std::memory_order_relaxed);
++  }
+   buffer_->addCompletedHandler(
+       [&error_ = error_,
+        wait_events = std::move(wait_events_),
+        signal_events = std::move(signal_events_),
+-       completion = std::move(completion)](MTL::CommandBuffer* cbuf) {
++       completion = std::move(completion),
++       ops,
++       commit_ns,
++       cb_index](MTL::CommandBuffer* cbuf) {
+         if (completion) {
+           completion();
+         }
+@@ -561,6 +681,7 @@ void CommandEncoder::commit(std::function<void()> completion) {
+             event->signal(value);
+           }
+         }
++        record_command_buffer_completion(cbuf, ops, commit_ns, cb_index);
+       });
+   buffer_->commit();
+   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
+diff --git a/mlx/backend/metal/metal.h b/mlx/backend/metal/metal.h
+index d686c297..ed2f79d3 100644
+--- a/mlx/backend/metal/metal.h
++++ b/mlx/backend/metal/metal.h
+@@ -2,6 +2,7 @@
+ 
+ #pragma once
+ 
++#include <cstdint>
+ #include <string>
+ #include <unordered_map>
+ #include <variant>
+@@ -27,4 +28,44 @@ MLX_API const
+ MLX_API void set_metallib_path(const std::string& path);
+ MLX_API const std::string& get_metallib_path();
+ 
++/** Process-wide dispatch and command-buffer accounting (diagnostic).
++ *
++ * Every compute dispatch the Metal backend encodes goes through
++ * `CommandEncoder::dispatch_threads` / `dispatch_threadgroups` and every
++ * command buffer through `CommandEncoder::commit`, so these counters are
++ * exact for the work the GPU was handed.  They are cumulative since
++ * process start: take two snapshots and subtract.  `dispatches` is
++ * accumulated at commit time (the encoder already keeps the per-buffer
++ * count for its commit cadence), so a snapshot lags the open command
++ * buffer by at most one buffer's worth of dispatches; at any blocking
++ * eval it is exact.
++ *
++ * The GPU fields come from `MTLCommandBuffer` timestamps read in the
++ * completion handlers, so a snapshot taken right after a blocking eval
++ * can still miss the last buffer: compare `completed_command_buffers`
++ * with `command_buffers`.  Spans from different queues can overlap, which
++ * is why both the plain sum (`gpu_busy_ns`) and the merged occupancy
++ * (`gpu_span_ns`) are kept; `gpu_gap_ns` is the idle time between one
++ * buffer's GPU end and the next buffer's GPU start.
++ *
++ * All times are nanoseconds on the host's CLOCK_UPTIME_RAW base -- the
++ * base `GPUStartTime` / `GPUEndTime` report -- so `now_ns` from two
++ * snapshots gives the wall time of the window they bracket.
++ *
++ * Set MLX_DISPATCH_TRACE=1 to also print one line per command buffer as
++ * it completes.
++ */
++struct DispatchStats {
++  uint64_t dispatches = 0; // compute dispatches committed
++  uint64_t command_buffers = 0; // command buffers committed
++  uint64_t empty_command_buffers = 0; // ...of which carried no dispatch
++  uint64_t completed_command_buffers = 0; // ...whose completion handler ran
++  uint64_t gpu_busy_ns = 0; // sum over completed buffers of end - start
++  uint64_t gpu_span_ns = 0; // the same with overlapping buffers merged
++  uint64_t gpu_gap_ns = 0; // idle between consecutive buffers on the GPU
++  uint64_t queue_ns = 0; // sum of GPU start - host commit time
++  uint64_t now_ns = 0; // host clock when the snapshot was taken
++};
++MLX_API DispatchStats dispatch_stats();
++
+ } // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/no_metal.cpp b/mlx/backend/metal/no_metal.cpp
+index 3b72ad00..d69b0bb0 100644
+--- a/mlx/backend/metal/no_metal.cpp
++++ b/mlx/backend/metal/no_metal.cpp
+@@ -23,6 +23,10 @@ device_info() {
+ 
+ void set_metallib_path(const std::string& path) {}
+ 
++DispatchStats dispatch_stats() {
++  return {};
++}
++
+ const std::string& get_metallib_path() {
+   throw std::runtime_error(
+       "[metal::get_metallib_path] Cannot get metallib path without metal backend");
+-- 
+2.50.1 (Apple Git-155)
+

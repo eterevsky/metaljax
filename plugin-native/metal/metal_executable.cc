@@ -309,6 +309,11 @@ MetalLoadedExecutable::RunOnce(
 
   std::vector<mx::array> outs;
   const Stats before = g_stats;
+  // The vendored MLX's dispatch accounting for the same window (debug only:
+  // the snapshot is a handful of atomic loads, and nothing reads it
+  // otherwise).
+  const mx::metal::DispatchStats dispatch_before =
+      kDebug ? mx::metal::dispatch_stats() : mx::metal::DispatchStats{};
   try {
     const std::vector<mx::array> kept =
         kVerifyCompile ? inputs : std::vector<mx::array>{};
@@ -420,8 +425,10 @@ MetalLoadedExecutable::RunOnce(
         absl::StrCat("metaljax-native: ", name_, " failed: ", e.what()));
   }
   if (kDebug) {
-    std::fprintf(stderr, "[metaljax-native] %s: %s\n", name_.c_str(),
-                 StatsDelta(before, g_stats).c_str());
+    std::fprintf(stderr, "[metaljax-native] %s: %s %s\n", name_.c_str(),
+                 StatsDelta(before, g_stats).c_str(),
+                 DispatchDelta(dispatch_before, DispatchSnapshotSettled())
+                     .c_str());
     std::fflush(stderr);
   }
 

@@ -373,17 +373,34 @@ void Program::run_while(const Entry& e,
       static_cast<int64_t>(body->num_ops()) <= max_entries;
   const bool pipeline = g_cfg.while_pipeline > 0 && cheap_to_speculate &&
                         !body->reads_host() && !cond->reads_host();
+  // METALJAX_DEBUG=1: one line per dynamic loop with the vendored MLX's
+  // dispatch accounting over the loop -- kernels and command buffers per
+  // iteration, and the device's busy vs idle share of the loop's wall time.
+  // The snapshot is taken at the last condition read, a blocking point, so
+  // everything the loop submitted has been committed; the last buffer may
+  // still be completing (`pending`).
+  const mx::metal::DispatchStats loop_ds0 =
+      g_cfg.debug ? mx::metal::dispatch_stats() : mx::metal::DispatchStats{};
+  int64_t loop_steps = 0;
+  auto narrate_loop = [&](const char* mode) {
+    if (!g_cfg.debug) return;
+    debug_line(std::string("[metaljax-native] while(") + mode +
+               "): steps=" + std::to_string(loop_steps) + " " +
+               DispatchDelta(loop_ds0, DispatchSnapshotSettled(), loop_steps));
+  };
   if (!pipeline) {
     g_stats.serial_loops++;
     for (;;) {
       mx::array pred = cond_of(vals);
       if (!item_bool(pred)) break;
       vals = runner.run_one(vals);
+      loop_steps++;
       // Flush the carry, not nothing: the cond only forces the values it
       // reads, so anything else in the carry (a KV cache) would pile up as
       // unevaluated graph across iterations.
       loop_flush(vals, cost);
     }
+    narrate_loop("serial");
     write_results(e, env, vals);
     return;
   }
@@ -424,6 +441,7 @@ void Program::run_while(const Entry& e,
     }
   }
   vals = runner.run_one(vals);
+  loop_steps++;
   loop_flush(vals, cost);
   mx::array pred = cond_of(vals);
   for (;;) {
@@ -445,8 +463,10 @@ void Program::run_while(const Entry& e,
     pending.push_back(pred);
     loop_submit(pending);                    // (2) submit, do not wait
     g_stats.pipelined_steps++;
+    loop_steps++;
     loop_account(cost);                      // (3) same cadence, same clears
   }
+  narrate_loop("pipelined");
   write_results(e, env, vals);
 }
 

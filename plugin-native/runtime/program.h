@@ -326,6 +326,24 @@ bool is_resource_limit(const std::exception& e);
 // Monotonic nanoseconds (steady_clock), for the METALJAX_TIMING counters.
 int64_t timing_now_ns();
 
+// METALJAX_DEBUG=1: the vendored MLX's dispatch / command-buffer accounting
+// (`mx::metal::dispatch_stats`, fork patch notes/patches/0004-diag-dispatch-
+// stats.patch) as one narration fragment for the window two snapshots
+// bracket -- how many kernels the device was handed, in how many command
+// buffers, and how much of the window's wall time it spent running them.
+// `steps` > 0 (a decode loop's iterations) adds per-step figures.  Read
+// only under the debug flag: the counters cost nothing to keep and nothing
+// to leave unread.
+std::string DispatchDelta(const mx::metal::DispatchStats& before,
+                          const mx::metal::DispatchStats& after,
+                          int64_t steps = 0);
+// A snapshot for the END of a window: waits (bounded, 5 ms) for the
+// completion handlers of every committed command buffer, so the GPU times
+// of the last buffer -- finished on the device by the time a blocking eval
+// returns, but booked on a Metal queue thread a few microseconds later --
+// are in.  Debug-only, like every reader of these counters.
+mx::metal::DispatchStats DispatchSnapshotSettled();
+
 // Breaking reference cycles before a buffer-limit retry is an embedder's
 // business, not the tape's: what pins the buffers mx::clear_cache cannot free
 // is dead Python objects in refcycles (CLAUDE.md item 19), and Python's cycle
