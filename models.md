@@ -31,7 +31,7 @@ notes/data/. Append a column per release / major optimization.*
 | 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | **388.4** ᵛ | | |
 | 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | **86.68** | | 29.8 ᵗ |
 | 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | **1249.3 / 4961.6** | | 654 / 2998 ᵗ |
-| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | | 135.6 ᵗ |
+| 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | 258.8 ʰ | 135.6 ᵗ |
 | 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | | |
 | 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | **56.2** ᴳ | | 28.0 ˣ |
 | 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | **154.9** | 148.4 ʰ | 98.2 ˡ |
@@ -284,7 +284,9 @@ Notes:
   452 ms/step (one run, flat within its 445–450 band, not recorded); streams
   identical to the records on every row. A cadence of 100 would take row 11
   to 6.6 but costs texmo suite-106 1.0 % geomean (one config −7 %) — Oleg's
-  call, pending; row 8 = 25.8 on the merged main binary with the
+  call, pending; row 18 = 258.8 on main with the post-pass-tape compile
+  gate (4de653c; 258.9 / 258.7, was 338.8 on the same machine state, step-0
+  loss 2.9247 → 2.9195 = the compiled path's class); row 8 = 25.8 on the merged main binary with the
   fused GDN step + keras norm coverage; row 21 = 148.4 on the merged main binary (fused GDN step + keras norm
   coverage; 148.4 / 155.3 / 147.4, median). The previous ʰ
   cells (rows 4/10/11/14) became frozen 0.11.7 cells.
