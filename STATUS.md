@@ -20,14 +20,14 @@ parentheses is peak footprint where measured.
 | 7 | gpt-oss-20b | ✗ ¹ | **19.8** | **8.8** (13.8 GB, native MXFP4) | — | 6.7 ¹⁶ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | **28.5** (73 GB) | **13.7** | — | 15.3 ¹⁰ |
 | 9 | R1-Distill-32B | ✗ 131 GB | **190.8** (67 GB) | 131.8 | — | 114.9 ¹⁰ |
-| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ² | **24.8** ¹¹ (92 GB) | 10.5 | — | 10.7 ¹⁰ |
-| 11 | Qwen3-0.6B (keras-hub decode) | 29.4 | **9.0** ¹³ | 3.0 | — | 3.4 ¹⁰ |
+| 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ² | **25.9** ¹¹ (86 GB) | 10.5 | — | 10.7 ¹⁰ |
+| 11 | Qwen3-0.6B (keras-hub decode) | 29.4 | **9.0** ¹³ | 3.2 ¹³ | — | 3.4 ¹⁰ |
 | 12 | Mixtral 8×7B bf16 | ✗ | **85.6** (90 GB) | 52.8 ¹⁷ (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ⁸ | **77.0** | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **29.88** | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | **388.4** (73 GB) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **86.68** | — | 29.8 (b32: 591) | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ⁴ | **1249.3** @512², **4961.6** @1024² | ✗ ⁹ | 654 @512², 2998 @1024² ⁹ ¹⁸ | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ⁴ | **1249.3** @512², **4961.6** @1024² | ✗ ⁹ | 553 @512², 3078 @1024² ⁹ ¹⁸ | — |
 | 18 | LoRA E2B train (ms/step) | 2048 | **362.1** | — | 135.6 ³ | — |
 | 19 | maxtext train 0.6B (ms/step) | 1402 | **444.6** | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | **56.2** (101 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
@@ -97,10 +97,11 @@ load ~20–30×.
     where llama.cpp leads mlx-lm by only 1.08× (98.2 vs 106.4).
 11. Row 10 protocol: runs with `METALJAX_MEM_SYS_MB=107520` (its
     documented envelope; the shipped default sits under this row's
-    restore transient). The metaljax cell decodes the adapter's 5-token
-    default prompt for 8 tokens (loop-only average); the comparators
-    decode the 51-token manifest prompt for 64–128 tokens, so our cell
-    sits at a shallower KV depth than theirs.
+    restore transient). Since 2026-09-06 the cell decodes the manifest
+    prompt (50 DeepSeek tokens in a 64-slot prefill) for 128 tokens,
+    loop-only average of 127 steps, on the 0.11.7 release binary (25.93 /
+    25.95, peak 84–86 GB) — the comparators' workload; the earlier 24.8
+    used the adapter's 5-token default prompt for 8 tokens.
 12. Greedy token agreement vs jax-CPU: rows 5/6 are exact 64/64, and
     row 11 is exact over 64 GENERATED tokens (checked past the
     51-token prompt — stronger than the harness's first-64-ids check);
@@ -117,7 +118,9 @@ load ~20–30×.
     identical metal-vs-CPU. Pre-switch cells are NOT comparable (see
     models.md ᵐ); the maxtext arm stays measured beside rows 14/19
     (same-day control 12.22 ms/tok). Cell band 8.5–9.0 tracking
-    machine state; 9.0 is the unguarded gate-protocol median.
+    machine state; 9.0 is the unguarded gate-protocol median. The mlx-lm cell is the same
+    128-token window (3.2 / 3.2, 2026-09-06; the earlier 3.0 was a
+    64-token generate).
 14. Row 21 CPU: 55.6 GB of bf16 weights plus the checkpoint's own page
     cache reaches ~116 GB of 128; two guarded attempts (the second with
     the load throttled to 0.4 GB/s) were killed during the load at RSS
@@ -135,9 +138,10 @@ load ~20–30×.
     (its config says bf16); the metaljax cell is bf16. Same byte width
     and kernel path, different 16-bit format: provisional until
     re-measured on the upstream bf16 checkpoint.
-18. Row 17 torch: diffusers also loads and runs the T5-XXL encoder
-    (333-token MMDiT context vs the keras preset's 154 with t5=None), so
-    torch computes strictly more per step; both sides bf16 MMDiT with
-    CFG 7.0 (our CLIP-L/G run fp16 as the preset pins them). The cell is
-    an upper bound on the like-for-like number until re-measured with
-    the T5 encoder off.
+18. Row 17 torch: diffusers run with the T5-XXL encoder OFF
+    (text_encoder_3=None, max_sequence_length 77 → the same 154-token
+    MMDiT context as the keras preset's t5=None), 2026-09-06; both sides
+    bf16 MMDiT with CFG 7.0 (our CLIP-L/G fp16 as the preset pins them).
+    Same-session T5-on controls reproduced the previous cells (648.8 /
+    3155.3 vs 654 / 2998; the 1024² session ran ~5 % slower than the
+    2026-08-03 one, so the 3078 carries that offset).

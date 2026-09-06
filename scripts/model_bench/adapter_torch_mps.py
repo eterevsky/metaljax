@@ -727,9 +727,20 @@ def run_diffusion(repo=SD35_REPO, revision=SD35_REV, device="mps",
                       "surface of Mars, golden hour, 50mm")
     tdtype = getattr(torch, dtype)
 
+    # Harness VARIANT (goal-audit follow-up, STATUS fn 18): SD35_NO_T5=1
+    # drops the T5-XXL encoder the way the keras preset does (t5=None), so
+    # the MMDiT sees the same 154-token context (77 CLIP + a 77-wide
+    # zero-filled T5 slot -- diffusers fills the slot with zeros when
+    # `text_encoder_3 is None`) instead of the default 77 + 256 = 333.
+    # Unset (the default) leaves both calls byte-identical to the recorded
+    # 654 / 2998 cells.
+    no_t5 = os.environ.get("SD35_NO_T5") == "1"
+    load_kw = dict(text_encoder_3=None, tokenizer_3=None) if no_t5 else {}
+    gen_kw = dict(max_sequence_length=77) if no_t5 else {}
+
     t0 = time.monotonic()
     pipe = StableDiffusion3Pipeline.from_pretrained(
-        repo, revision=revision, torch_dtype=tdtype)
+        repo, revision=revision, torch_dtype=tdtype, **load_kw)
     pipe = pipe.to(device)
     _sync(device)
     load_s = time.monotonic() - t0
@@ -737,7 +748,7 @@ def run_diffusion(repo=SD35_REPO, revision=SD35_REV, device="mps",
     def gen(n):
         g = torch.Generator(device="cpu").manual_seed(seed)
         return pipe(text, num_inference_steps=n, height=image_size,
-                    width=image_size, generator=g).images[0]
+                    width=image_size, generator=g, **gen_kw).images[0]
 
     short = max(2, num_steps // 5)
     _, warmup_s = _timed(gen, device, short)
@@ -757,6 +768,9 @@ def run_diffusion(repo=SD35_REPO, revision=SD35_REV, device="mps",
                # the metaljax cell's failure mode was an all-black image,
                # so state the verdict rather than leaving it to the reader
                non_black=bool(a.std() > 5 and a.max() > 32))
+    if no_t5:   # variant-only keys; the default record stays as recorded
+        out.update(no_t5=True, max_sequence_length=77,
+                   mmdit_context_tokens=154)
     if out_png:
         img.save(out_png)
         out["image_path"] = str(out_png)

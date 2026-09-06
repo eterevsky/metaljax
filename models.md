@@ -23,14 +23,14 @@ notes/data/. Append a column per release / major optimization.*
 | 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 14.2 ʰ | 8.8 ˣ |
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 23.4 ʰ | 13.7 ˣ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | | 114.9 ˡ |
-| 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **24.8** ᴳ | 22.6 ʰ | 10.5 ˣ |
-| 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 7.5 ʰ | 3.0 ˣ |
+| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **25.9** ᵖ | 22.6 ʰ | 10.5 ˣ |
+| 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 7.5 ʰ | 3.2 ˣ |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | | |
 | 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | | |
 | 14 | qwix-int8 0.6B | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | 26.9 ʰ | |
 | 15 | qwix-int8 8B | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | **388.4** ᵛ | | |
 | 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | **86.68** | | 29.8 ᵗ |
-| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | **1249.3 / 4961.6** | | 654 / 2998 ᵗ |
+| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | **1249.3 / 4961.6** | | 553 / 3078 ᵗ |
 | 18 | LoRA E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | 258.8 ʰ | 135.6 ᵗ |
 | 19 | maxtext train 0.6B (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | | |
 | 20 | 235B-A22B 3-bit (mlx-only) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | **56.2** ᴳ | | 28.0 ˣ |
@@ -54,7 +54,17 @@ Notes:
   row 12's goal is EMPTY until mlx-lm is re-measured on a bf16
   checkpoint (the mirror is float16, fn 17); row 17's torch goal is an
   upper bound (torch also runs the T5-XXL encoder, fn 18); row 4's
-  mlx-lm goal is a dated cell whose run record is lost (fn 7).
+  mlx-lm goal is a dated cell whose run record is lost (fn 7). Follow-ups
+  2026-09-06: row 11's mlx-lm goal re-measured at our 128-token window =
+  3.2; row 17's torch goal re-measured with T5 off = 553 / 3078 (no longer
+  an upper bound); row 4's pinned mlx-lm refuses the checkpoint, so 10.5
+  stays flagged.
+- ᵖ **Row 10 changed workload on 2026-09-06**: the cell now decodes the
+  manifest prompt (50 tokens in a 64-slot prefill) for 128 tokens like the
+  comparators (25.9 on the 0.11.7 release binary); every earlier cell used
+  the adapter's 5-token default prompt for 8 tokens (24.8 on the same
+  binary) and is not comparable across the switch. The HEAD cell 22.6 is
+  still on the old workload until re-measured.
   It sits last, beside HEAD, so the current status of a row is the last two
   cells.
 - **0.11.1** (2026-08-02): pre-buffer-fix era, mixed command-buffer
