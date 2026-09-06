@@ -1721,9 +1721,242 @@ int TapeCodeOf(mlir::Value v) {
   return *code;
 }
 
+// --------------------------------------------------------------------------
+// grouped-query attention: absorbing the KV head repeat (gap-rows item 6)
+// --------------------------------------------------------------------------
+//
+// keras-hub (Qwen3-MoE, gpt-oss, ...) spells grouped-query attention as an
+// explicit `ops.repeat(k, G, axis=head)` of the Hkv cached heads up to the H
+// query heads BEFORE the two dots -- in StableHLO a `broadcast_in_dim` that
+// inserts (or expands a unit) group axis right after the kv-head axis, and a
+// `reshape` that merges the pair into H.  Recognized by the chain above, the
+// fused call received the MATERIALIZED repeat: 2 x [B, T, H, D] written and
+// read back per layer per token (~1.07 GB/token on row 20, 48 copies on row
+// 7).  MLX's kernel takes Hkv < H directly -- query head h reads kv head
+// h / G, which is exactly the order `repeat` lays the copies out in (kv head
+// MAJOR, copy minor) -- so the pair is peeled off both operands and the
+// un-repeated arrays are handed over with recipes into `[B, Hkv, T, D]`.
+// Data movement only: the kernel reads the same values in the same order,
+// so the answer is bit-identical to the repeated form's (`_p37_gqa` in
+// execute_test.py pins it against METALJAX_SDPA_GQA=0).  Three rules keep
+// that true, each a decline back to the PLAIN fusion (never to the literal
+// chain -- the match itself stands either way):
+//
+//   * Only data movement is peeled (reshape / transpose / the repeat pair):
+//     a `convert` between the repeat and the dot would change what the
+//     kernel reads, so it stops the walk.
+//   * BOTH K and V un-repeat, to the same Hkv, or neither does: MLX requires
+//     equal kv-head counts, and a half-absorbed pair is not expressible.
+//   * MLX's kernel choice must not move.  Its decode ("vector") kernel takes
+//     Tq * G <= 32 only (`use_fallback`), and routes GQA at Tk >= 4096 to a
+//     2-pass variant whose reduction order differs from the 1-pass the
+//     repeated form runs; either would change the numerics, so those
+//     geometries keep the repeat (and say so under METALJAX_DEBUG=1).
+//
+// METALJAX_SDPA_GQA=0 turns the absorb off.
+
+bool GqaEnabled() {
+  static const bool on = !EnvOff("METALJAX_SDPA_GQA");
+  return on;
+}
+
+// The axis a `broadcast_in_dim` expands from 1 (or inserts) to G > 1, when it
+// expands exactly one axis and passes every other one through -- the shape
+// of a `repeat`.  -1 otherwise.
+int64_t RepeatAxis(mlir::Operation* bc) {
+  const std::vector<int64_t> in = ShapeOf(bc->getOperand(0));
+  const std::vector<int64_t> out = ShapeOf(bc->getResult(0));
+  const std::vector<int64_t> dims = I64List(bc, "broadcast_dimensions");
+  if (dims.size() != in.size()) return -1;
+  std::vector<bool> kept(out.size(), false);
+  int64_t axis = -1;
+  for (size_t i = 0; i < dims.size(); i++) {
+    const int64_t d = dims[i];
+    if (d < 0 || d >= static_cast<int64_t>(out.size()) || kept[d]) return -1;
+    kept[d] = true;
+    if (in[i] == out[d]) continue;
+    if (in[i] != 1 || axis >= 0) return -1;
+    axis = d;
+  }
+  for (size_t d = 0; d < out.size(); d++) {
+    if (kept[d] || out[d] == 1) continue;
+    if (axis >= 0) return -1;
+    axis = static_cast<int64_t>(d);
+  }
+  return axis;
+}
+
+// A size-1 atom carries no information and a reshape may glue it onto any
+// neighbour (`RolesReshape` walks the atom stream in order), after which
+// `Recipe`'s adjacency check refuses a layout that is in fact reachable.  The
+// un-repeat re-derives its operand's recipe through a reshape, so it works on
+// roles and groups with the unit atoms dropped: `Recipe` then places the
+// role-less axes last and its reshape drops them, and a group emptied this
+// way has extent 1, which is the slot's true size.
+Roles StripUnits(const Roles& roles, const Atoms& atoms) {
+  Roles out;
+  for (const Role& r : roles) {
+    Role keep;
+    for (const Atom& a : r)
+      if (AtomSize(atoms, a) != 1) keep.push_back(a);
+    out.push_back(std::move(keep));
+  }
+  return out;
+}
+
+std::vector<Atom> StripUnitAtoms(const std::vector<Atom>& atoms_in,
+                                 const Atoms& atoms) {
+  std::vector<Atom> out;
+  for (const Atom& a : atoms_in)
+    if (AtomSize(atoms, a) != 1) out.push_back(a);
+  return out;
+}
+
+struct Unrepeated {
+  mlir::Value x;                       // the un-repeated operand
+  Rec rec;                             // its recipe into [B, Hkv, T, D]
+  std::vector<mlir::Operation*> ops;   // the peeled ops, outermost first
+  int64_t hkv = 0;
+};
+
+// Peel `repeat(x, G, axis=head)` off one operand of a matched attention.
+// `val` is the operand as the dot read it and `roles` its role vector;
+// `h_atom` is the head atom to split (the LAST head atom: the query heads are
+// `(kv head, copy)` with the kv head major, which is MLX's `h // G` pairing
+// only when the split atom is the minor-most of the N slot).  Nothing is
+// absorbed here -- the caller applies the result or drops it whole.
+std::optional<Unrepeated> Unrepeat(
+    Cand& m, mlir::Value val, const Roles& roles, const Atom& h_atom,
+    const std::vector<Atom>& batch_atoms, const std::vector<Atom>& head_atoms,
+    const Atom& k_atom, const std::vector<Atom>& tail_atoms,
+    const llvm::DenseSet<mlir::Operation*>* claimed, std::string* why) {
+  auto decline = [&](const std::string& s) {
+    *why = s;
+    return std::optional<Unrepeated>();
+  };
+  if (!val.hasOneUse()) return decline("the repeated operand has other readers");
+  std::vector<Step> steps;
+  mlir::Operation* reshape = nullptr;
+  mlir::Operation* bcast = nullptr;
+  mlir::Value cur = val;
+  for (int i = 0; i < kMaxDepth && reshape == nullptr; i++) {
+    mlir::Operation* o = Owner(cur);
+    if (o == nullptr) return decline("no repeat on the operand");
+    const std::string n = OpName(o);
+    if (n == "stablehlo.reshape") {
+      mlir::Operation* b = Owner(o->getOperand(0));
+      if (b != nullptr && OpName(b) == "stablehlo.broadcast_in_dim" &&
+          RepeatAxis(b) >= 0) {
+        if (!o->getOperand(0).hasOneUse())
+          return decline("the repeat's broadcast has other readers");
+        reshape = o;
+        bcast = b;
+        break;
+      }
+    }
+    // Only pure data movement is peeled: a convert in between would change
+    // what the kernel reads.
+    if (n != "stablehlo.reshape" && n != "stablehlo.transpose" &&
+        n != "sdy.sharding_constraint")
+      return decline("no repeat on the operand");
+    if (!o->getOperand(0).hasOneUse())
+      return decline("an operand of the repeat chain has other readers");
+    steps.push_back(Step{o, nullptr});
+    cur = o->getOperand(0);
+  }
+  if (reshape == nullptr) return decline("no repeat on the operand");
+  if (claimed != nullptr) {
+    bool taken = claimed->contains(reshape) || claimed->contains(bcast);
+    for (const Step& st : steps) taken = taken || claimed->contains(st.op);
+    if (taken) return decline("the repeat belongs to a quantized matmul");
+  }
+
+  const std::vector<int64_t> s_x = ShapeOf(bcast->getOperand(0));
+  const std::vector<int64_t> s_b = ShapeOf(bcast->getResult(0));
+  const std::vector<int64_t> s_r = ShapeOf(reshape->getResult(0));
+  const int64_t j = RepeatAxis(bcast);
+  const int64_t G = s_b[j];
+  try {
+    const Roles r_out =
+        DownRoles(m, StripUnits(roles, m.atoms), ShapeOf(val), steps);
+    if (r_out.size() != s_r.size())
+      return decline("repeat roles do not match its rank");
+    int a = -1;
+    for (size_t d = 0; d < r_out.size(); d++) {
+      if (r_out[d].size() == 1 && r_out[d][0] == h_atom) {
+        a = static_cast<int>(d);
+        break;
+      }
+    }
+    if (a < 0)
+      return decline("the query-head axis is not a whole axis of the "
+                     "repeated operand");
+    const int64_t H = AtomSize(m.atoms, h_atom);
+    if (G <= 1 || H % G != 0)
+      return decline("the repeat count does not divide the head count");
+    const int64_t hkv = H / G;
+    // Split the head atom into (kv head, copy): the same atom narrowed to
+    // Hkv, followed by a replicated one of extent G.  Hkv == 1 (multi-query
+    // attention) leaves no kv-head atom at all.
+    Atoms A2 = m.atoms;
+    if (hkv > 1) A2.size[h_atom] = hkv;
+    const Atom g = A2.bcast(G);
+    Roles r2 = r_out;
+    r2[static_cast<size_t>(a)] = hkv > 1 ? Role{h_atom, g} : Role{g};
+    const Roles b_roles = RolesReshape(s_r, r2, s_b, A2);
+    if (b_roles.size() != s_b.size() ||
+        b_roles[static_cast<size_t>(j)] != Role{g})
+      return decline("the repeat is not kv-head major");
+    const Roles x_roles = RolesUnbroadcast(
+        b_roles, s_x, s_b, I64List(bcast, "broadcast_dimensions"));
+    if (x_roles.size() != s_x.size())
+      return decline("un-repeated roles do not match its rank");
+    std::vector<Atom> head2;
+    for (const Atom& h : head_atoms)
+      if (hkv > 1 || h != h_atom) head2.push_back(h);
+    Unrepeated u;
+    u.x = bcast->getOperand(0);
+    u.rec = Recipe(x_roles,
+                   {StripUnitAtoms(batch_atoms, A2), StripUnitAtoms(head2, A2),
+                    StripUnitAtoms({k_atom}, A2),
+                    StripUnitAtoms(tail_atoms, A2)},
+                   A2);
+    u.hkv = hkv;
+    for (const Step& st : steps) u.ops.push_back(st.op);
+    u.ops.push_back(reshape);
+    u.ops.push_back(bcast);
+    return u;
+  } catch (const Reject& r) {
+    return decline(r.why);
+  }
+}
+
+// MLX's kernel choice for the geometry the REPEATED form runs (every head
+// count equal), and whether handing over Hkv < H would move it.  Mirrors
+// `ScaledDotProductAttention::use_fallback` and the 2-pass route in the
+// vendored mlx/backend/metal/scaled_dot_product_attention.cpp: the vector
+// kernel wants `Tq * G <= 32`, and routes a grouped call at Tk >= 4096 to its
+// 2-pass variant.  The full-attention and composite paths take the grouping
+// without changing kernels.
+std::optional<std::string> KernelMoves(int64_t Tq, int64_t Tk, int64_t D,
+                                       int64_t Dv, int64_t G) {
+  const bool vector_dim =
+      (D == Dv && (D == 64 || D == 96 || D == 128 || D == 256)) ||
+      (D == 192 && Dv == 128);
+  const bool vector = Tq <= 8 && Tq <= Tk && vector_dim;
+  if (!vector) return std::nullopt;
+  if (Tq * G > 32)
+    return absl::StrFormat("Tq*G = %d > 32 would leave MLX's vector kernel",
+                           Tq * G);
+  if (Tk >= 4096)
+    return "Tk >= 4096 would route MLX to its 2-pass vector kernel";
+  return std::nullopt;
+}
+
 // sdpa.py `_try_side`.
-std::unique_ptr<SdpaMatch> TrySide(mlir::ModuleOp module,
-                                   mlir::Operation* dot2, int pside) {
+std::unique_ptr<SdpaMatch> TrySide(
+    mlir::ModuleOp module, mlir::Operation* dot2, int pside,
+    const llvm::DenseSet<mlir::Operation*>* claimed) {
   Cand m;
   m.module = module;
   std::pair<Roles, bool> got =
@@ -1985,6 +2218,52 @@ std::unique_ptr<SdpaMatch> TrySide(mlir::ModuleOp module,
           q_atom.has_value() ? AtomSize(A, *q_atom) : 1,
           AtomSize(A, *m.k_atom), GroupSize(A, d_atoms),
           mm->has_sinks ? "+sink" : "", mask2.has ? "+mask2" : "");
+
+      // The KV head repeat, absorbed (see "grouped-query attention" above).
+      // Applied only once every recipe of this split has succeeded, and
+      // never partially: K and V either both hand over Hkv heads or the
+      // plain fusion above stands as it is.
+      if (GqaEnabled() && !head_atoms.empty()) {
+        const Atom h_atom = head_atoms.back();
+        std::string why;
+        std::optional<Unrepeated> uk =
+            Unrepeat(m, kval, k_roles, h_atom, batch_atoms, head_atoms,
+                     *m.k_atom, d_atoms, claimed, &why);
+        std::optional<Unrepeated> uv;
+        if (uk.has_value()) {
+          uv = Unrepeat(m, vval, vroles, h_atom, batch_atoms, head_atoms,
+                        *m.k_atom, v_atoms, claimed, &why);
+          if (uv.has_value() && uv->hkv != uk->hkv) {
+            uv.reset();
+            why = "K and V repeat by different counts";
+          }
+        }
+        if (uk.has_value() && uv.has_value()) {
+          const int64_t H = AtomSize(A, h_atom);
+          const int64_t n_q = GroupSize(A, n_atoms);
+          const int64_t n_kv = n_q / (H / uk->hkv);
+          const std::optional<std::string> moves = KernelMoves(
+              q_atom.has_value() ? AtomSize(A, *q_atom) : 1,
+              AtomSize(A, *m.k_atom), GroupSize(A, d_atoms),
+              GroupSize(A, v_atoms), n_q / n_kv);
+          if (moves.has_value()) {
+            mm->gqa_why = *moves;
+          } else {
+            mm->k = uk->x;
+            mm->k_rec = uk->rec;
+            mm->v = uv->x;
+            mm->v_rec = uv->rec;
+            mm->ops.insert(mm->ops.end(), uk->ops.begin(), uk->ops.end());
+            mm->ops.insert(mm->ops.end(), uv->ops.begin(), uv->ops.end());
+            mm->gqa = true;
+            mm->gqa_h = H;
+            mm->gqa_hkv = uk->hkv;
+            mm->name += "+gqa";
+          }
+        } else if (why != "no repeat on the operand") {
+          mm->gqa_why = why;
+        }
+      }
       return mm;
     } catch (const Reject& e) {
       last = e;
@@ -1998,11 +2277,13 @@ std::unique_ptr<SdpaMatch> TrySide(mlir::ModuleOp module,
 // or reject.  Either operand can be the probabilities: jax puts them on the
 // right in `jax.nn.dot_product_attention` and maxtext, on the left in
 // hand-rolled einsum attention.
-std::unique_ptr<SdpaMatch> Try(mlir::ModuleOp module, mlir::Operation* dot2) {
+std::unique_ptr<SdpaMatch> Try(
+    mlir::ModuleOp module, mlir::Operation* dot2,
+    const llvm::DenseSet<mlir::Operation*>* claimed) {
   std::string why[2];
   for (int side = 0; side < 2; side++) {
     try {
-      return TrySide(module, dot2, side);
+      return TrySide(module, dot2, side, claimed);
     } catch (const Reject& r) {
       why[side] = r.why;
       continue;
@@ -2129,7 +2410,7 @@ void AnalyzeSdpa(mlir::func::FuncOp fn, RewritePlan* plan) {
       if (OpName(&op) != "stablehlo.dot_general") continue;
       std::unique_ptr<SdpaMatch> mm;
       try {
-        mm = Try(module, &op);
+        mm = Try(module, &op, &claimed);
       } catch (const Reject& r) {
         if (kDebug) declines[r.why] += 1;
         continue;
@@ -2174,12 +2455,24 @@ void AnalyzeSdpa(mlir::func::FuncOp fn, RewritePlan* plan) {
   llvm::DenseSet<SdpaMatch*> keep(live.begin(), live.end());
   size_t found = 0;
   std::map<std::string, int> shapes;
+  // The GQA repeats: absorbed ones narrated per match (the census reads
+  // `gqa absorbed (H=.. Hkv=..)` off this), the ones a rule kept
+  // materialized tallied by reason.
+  std::map<std::string, int> kept_repeats;
   for (std::unique_ptr<SdpaMatch>& mm : uniq) {
     if (!keep.contains(mm.get())) continue;
     found++;
     shapes[mm->name] += 1;
+    if (mm->gqa) {
+      Debug(absl::StrFormat("gqa absorbed (H=%d Hkv=%d) %s", mm->gqa_h,
+                            mm->gqa_hkv, mm->name));
+    } else if (!mm->gqa_why.empty()) {
+      kept_repeats[mm->gqa_why] += 1;
+    }
     plan->sdpa.push_back(std::move(mm));
   }
+  for (const std::pair<const std::string, int>& k : kept_repeats)
+    Debug(absl::StrCat("gqa repeat kept x", k.second, ": ", k.first));
   if (found > 0) {
     // The shapes as well as the count: `+sink` / `+mask2` are the only
     // evidence that a keras row fused for the RIGHT reason, and a numeric

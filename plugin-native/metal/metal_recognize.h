@@ -201,6 +201,18 @@ struct SdpaMatch {
   int dtype = 0;
   int out_dtype = 0;
 
+  // Grouped-query attention with the KV head repeat ABSORBED (metal_sdpa.cc,
+  // "grouped-query attention"): `k` / `v` are then the un-repeated cached
+  // heads and their recipes lay them out as `[B, Hkv, T, D]`, which MLX's
+  // kernel takes directly (query head h reads kv head h / G).  `gqa_h` is
+  // the repeated head extent the graph spelled and `gqa_hkv` the one the
+  // kernel receives; `gqa_why` says why a repeat that WAS found stayed
+  // materialized (empty when there was none, or it was absorbed).
+  bool gqa = false;
+  int64_t gqa_h = 0;
+  int64_t gqa_hkv = 0;
+  std::string gqa_why;
+
   // The ops this match absorbs: the whole softmax chain, which never reaches
   // the tape.
   std::vector<mlir::Operation*> ops;

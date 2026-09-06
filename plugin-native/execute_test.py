@@ -1177,6 +1177,37 @@ def _cases():
          lambda h0, w, xs: jax.lax.scan(
              lambda h, x: (jnp.tanh(h @ w * 0.5 + x), None), h0, xs)[0],
          [_rand((4, 8), 52), _rand((8, 8), 53), _rand((512, 4, 8), 54)], *DOT),
+        # A trip that is NOT a multiple of kmax (90 = 5 x 16 + 10): the ten
+        # single-step replays of the remainder lead the five chunks and each
+        # one is submitted (control.cc `run_chunked`, T4).  Long enough not
+        # to unroll into the main (kUnrollMax = 64), and the batch mean is a
+        # cross-lane reduce msl_scan declines -- the matmul body above is a
+        # coop cell, and a generated kernel replaces the loop that would
+        # otherwise be chunked.  The chunk-plan contract below pins the
+        # schedule and its bit-exactness across K; this row is the plain CPU
+        # comparison.
+        ("chunked replay with a remainder (90 x matmul body)",
+         lambda h0, w, xs: jax.lax.scan(
+             lambda h, x: (jnp.tanh(h @ w * 0.5 + x)
+                           - jnp.mean(h, axis=0, keepdims=True), None),
+             h0, xs)[0],
+         [_rand((4, 8), 56), _rand((8, 8), 57), _rand((90, 4, 8), 58)], *DOT),
+        # The same remainder loop with a STACKED OUTPUT: scan's `ys` is a
+        # carried accumulator written one slab per step by a
+        # dynamic_update_slice chain (metal_lowering.cc `AccumulatorBytes`).
+        # 90 x [4, 4096] f32 = 5.6 MB of accumulator, big enough for the
+        # chunk-plan contract below to see it in the gate narration and to
+        # veto the byte bound on it with a small METALJAX_CHUNK_ACC_MB.  The
+        # slab is tanh(h) @ w2, bounded: the carry itself grows to ~90 here
+        # and h @ w2 cancelled to 1.5e-4 absolute on small elements.
+        ("chunked replay with a stacked output (90 x matmul body)",
+         lambda h0, w, w2, xs: jax.lax.scan(
+             lambda h, x: (jnp.tanh(h @ w * 0.5 + x)
+                           - jnp.mean(h, axis=0, keepdims=True),
+                           jnp.tanh(h) @ w2),
+             h0, xs)[1],
+         [_rand((4, 8), 56), _rand((8, 8), 57), _rand((8, 4096), 59),
+          _rand((90, 4, 8), 58)], *DOT),
         # A counted loop small enough to UNROLL into the enclosing trace
         # (ops/control._while_traceable): the whole main compiles, the loop
         # among it, so nothing here reaches run_while's eager arm at all.
@@ -3638,6 +3669,14 @@ def _module_cases():
           np.array([[1, 0, 1, 1]], np.int32),
           _rand((1, 2, 2, 4), 274) * 0.5, _rand((1, 2, 2, 4), 275) * 0.5,
           np.array([[1, 1]], np.int32)]),
+        # keras-hub's grouped-query decode attention with the KV head repeat
+        # spelled out (rows 7 / 20), both f32 forms: the composite path and
+        # the multi-query unit-axis spelling.  `_p37_gqa` pins that the
+        # repeat is ABSORBED and that the answer is bit-identical to the
+        # repeated fusion's; this row pins the answer against jax-CPU.
+    ] + [
+        (f"keras gqa repeat {label}", text, _gqa_inputs(text))
+        for label, text, _absorbed, dt, _why in _gqa_forms() if dt == "f32"
     ]
 
 
@@ -5738,6 +5777,222 @@ def _mla_forms():
         ("gqa bf16 D=64 (fused kernel)", _MLA_GQA_TWO_SPAN_BF16_D64,
          "H4Hkv2D64", "bf16"),
     ]
+
+
+def _keras_gqa_module(dt, H, Hkv, D, T, spelling="insert"):
+    """keras-hub's grouped-query decode attention, verbatim from the lowered
+    Qwen3-MoE step (`qwen3_moe_attention.py`, 2-layer tiny model dumped on
+    CPU): `ops.repeat(k, G, axis=2)` is a rank-raising `broadcast_in_dim`
+    that INSERTS the group axis right after the kv-head axis, then a reshape
+    merging the pair into H (kv head major); the two dots batch over (b, h)
+    with the query carrying a unit axis, the scores land in f32, the causal
+    `where` goes through a shared callee with keras' -2.38e38 sentinel, the
+    softmax subtracts its own max, and the probabilities convert back to the
+    model dtype before the values dot.
+
+    Three spellings of the repeat: `insert` (the one above), `unit` (jax's
+    other lowering of `jnp.repeat`: a reshape to a unit axis, then a same-rank
+    broadcast expanding it), and `tile` -- the group axis inserted BEFORE the
+    kv-head axis, which is `ops.tile`, a different function (query head h
+    reads kv head h % Hkv); the recognizer must keep that repeat
+    materialized, and the plain fusion must still compute it.
+    """
+    G = H // Hkv
+    acc = "f32"
+    algo = ""
+    tag = f"{dt}_h{H}_kv{Hkv}_d{D}_t{T}_{spelling}"
+
+    def rep(name, src):
+        if spelling == "insert":
+            return (f"    %{name}b = stablehlo.broadcast_in_dim %{src}, "
+                    f"dims = [0, 1, 2, 4] : (tensor<1x{T}x{Hkv}x{D}x{dt}>) "
+                    f"-> tensor<1x{T}x{Hkv}x{G}x{D}x{dt}>\n"
+                    f"    %{name} = stablehlo.reshape %{name}b : "
+                    f"(tensor<1x{T}x{Hkv}x{G}x{D}x{dt}>) "
+                    f"-> tensor<1x{T}x{H}x{D}x{dt}>\n")
+        if spelling == "unit":
+            return (f"    %{name}u = stablehlo.reshape %{src} : "
+                    f"(tensor<1x{T}x{Hkv}x{D}x{dt}>) "
+                    f"-> tensor<1x{T}x{Hkv}x1x{D}x{dt}>\n"
+                    f"    %{name}b = stablehlo.broadcast_in_dim %{name}u, "
+                    f"dims = [0, 1, 2, 3, 4] : "
+                    f"(tensor<1x{T}x{Hkv}x1x{D}x{dt}>) "
+                    f"-> tensor<1x{T}x{Hkv}x{G}x{D}x{dt}>\n"
+                    f"    %{name} = stablehlo.reshape %{name}b : "
+                    f"(tensor<1x{T}x{Hkv}x{G}x{D}x{dt}>) "
+                    f"-> tensor<1x{T}x{H}x{D}x{dt}>\n")
+        assert spelling == "tile", spelling
+        return (f"    %{name}b = stablehlo.broadcast_in_dim %{src}, "
+                f"dims = [0, 1, 3, 4] : (tensor<1x{T}x{Hkv}x{D}x{dt}>) "
+                f"-> tensor<1x{T}x{G}x{Hkv}x{D}x{dt}>\n"
+                f"    %{name} = stablehlo.reshape %{name}b : "
+                f"(tensor<1x{T}x{G}x{Hkv}x{D}x{dt}>) "
+                f"-> tensor<1x{T}x{H}x{D}x{dt}>\n")
+
+    # The probabilities convert back to the model dtype before the values
+    # dot; in f32 there is nothing to convert and the dot reads them as is.
+    probs = ("    %pc = stablehlo.convert %p : "
+             f"(tensor<1x1x{H}x1x{T}x{acc}>) -> tensor<1x1x{H}x1x{T}x{dt}>\n"
+             if dt != acc else "")
+    pv = "pc" if dt != acc else "p"
+    return f"""
+module @keras_gqa_{tag} {{
+  func.func private @_where_{tag}(%p: tensor<1x1x{H}x1x{T}xi1>,
+      %x: tensor<1x{H}x1x1x{T}x{acc}>, %c: tensor<{acc}>)
+      -> tensor<1x1x{H}x1x{T}x{acc}> {{
+    %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<{acc}>) -> tensor<1x{H}x1x{T}x{acc}>
+    %1 = stablehlo.broadcast_in_dim %0, dims = [1, 2, 3, 4] : (tensor<1x{H}x1x{T}x{acc}>) -> tensor<1x1x{H}x1x{T}x{acc}>
+    %2 = stablehlo.transpose %x, dims = [3, 0, 1, 2, 4] : (tensor<1x{H}x1x1x{T}x{acc}>) -> tensor<1x1x{H}x1x{T}x{acc}>
+    %3 = stablehlo.select %p, %2, %1 : tensor<1x1x{H}x1x{T}xi1>, tensor<1x1x{H}x1x{T}x{acc}>
+    return %3 : tensor<1x1x{H}x1x{T}x{acc}>
+  }}
+  func.func public @main(%q: tensor<1x1x{H}x{D}x{dt}>,
+      %k: tensor<1x{T}x{Hkv}x{D}x{dt}>, %v: tensor<1x{T}x{Hkv}x{D}x{dt}>,
+      %mask: tensor<1x{T}xi1>) -> tensor<1x1x{H}x{D}x{dt}> {{
+{rep("kr", "k")}{rep("vr", "v")}
+    %q5 = stablehlo.reshape %q : (tensor<1x1x{H}x{D}x{dt}>) -> tensor<1x1x{H}x1x{D}x{dt}>
+    %m3 = stablehlo.broadcast_in_dim %mask, dims = [0, 2] : (tensor<1x{T}xi1>) -> tensor<1x1x{T}xi1>
+    %m4 = stablehlo.broadcast_in_dim %m3, dims = [0, 2, 3] : (tensor<1x1x{T}xi1>) -> tensor<1x1x1x{T}xi1>
+    %m5 = stablehlo.broadcast_in_dim %m4, dims = [0, 1, 3, 4] : (tensor<1x1x1x{T}xi1>) -> tensor<1x1x1x1x{T}xi1>
+    %s = stablehlo.dot_general %q5, %kr, batching_dims = [0, 2] x [0, 2], contracting_dims = [4] x [3], precision = [DEFAULT, DEFAULT]{algo} : (tensor<1x1x{H}x1x{D}x{dt}>, tensor<1x{T}x{H}x{D}x{dt}>) -> tensor<1x{H}x1x1x{T}x{acc}>
+    %sc = stablehlo.constant dense<2.500000e-01> : tensor<{acc}>
+    %scb = stablehlo.broadcast_in_dim %sc, dims = [] : (tensor<{acc}>) -> tensor<1x{H}x1x1x{T}x{acc}>
+    %l = stablehlo.multiply %s, %scb : tensor<1x{H}x1x1x{T}x{acc}>
+    %t = stablehlo.constant dense<true> : tensor<i1>
+    %tb = stablehlo.broadcast_in_dim %t, dims = [] : (tensor<i1>) -> tensor<1x{H}x1x{T}xi1>
+    %tb5 = stablehlo.broadcast_in_dim %tb, dims = [1, 2, 3, 4] : (tensor<1x{H}x1x{T}xi1>) -> tensor<1x1x{H}x1x{T}xi1>
+    %mt = stablehlo.transpose %m5, dims = [2, 0, 1, 3, 4] : (tensor<1x1x1x1x{T}xi1>) -> tensor<1x1x1x1x{T}xi1>
+    %mb = stablehlo.broadcast_in_dim %mt, dims = [0, 1, 2, 3, 4] : (tensor<1x1x1x1x{T}xi1>) -> tensor<1x1x{H}x1x{T}xi1>
+    %pred = stablehlo.and %tb5, %mb : tensor<1x1x{H}x1x{T}xi1>
+    %neg = stablehlo.constant dense<-2.38197633E+38> : tensor<{acc}>
+    %w = call @_where_{tag}(%pred, %l, %neg) : (tensor<1x1x{H}x1x{T}xi1>, tensor<1x{H}x1x1x{T}x{acc}>, tensor<{acc}>) -> tensor<1x1x{H}x1x{T}x{acc}>
+    %ninf = stablehlo.constant dense<0xFF800000> : tensor<{acc}>
+    %mx = stablehlo.reduce(%w init: %ninf) applies stablehlo.maximum across dimensions = [4] : (tensor<1x1x{H}x1x{T}x{acc}>, tensor<{acc}>) -> tensor<1x1x{H}x1x{acc}>
+    %ninf2 = stablehlo.constant dense<0xFF800000> : tensor<{acc}>
+    %nb = stablehlo.broadcast_in_dim %ninf2, dims = [] : (tensor<{acc}>) -> tensor<1x1x{H}x1x{acc}>
+    %mx2 = stablehlo.maximum %nb, %mx : tensor<1x1x{H}x1x{acc}>
+    %mx3 = stablehlo.broadcast_in_dim %mx2, dims = [0, 1, 2, 3] : (tensor<1x1x{H}x1x{acc}>) -> tensor<1x1x{H}x1x1x{acc}>
+    %mx4 = stablehlo.broadcast_in_dim %mx3, dims = [0, 1, 2, 3, 4] : (tensor<1x1x{H}x1x1x{acc}>) -> tensor<1x1x{H}x1x{T}x{acc}>
+    %sub = stablehlo.subtract %w, %mx4 : tensor<1x1x{H}x1x{T}x{acc}>
+    %e = stablehlo.exponential %sub : tensor<1x1x{H}x1x{T}x{acc}>
+    %zero = stablehlo.constant dense<0.000000e+00> : tensor<{acc}>
+    %sum = stablehlo.reduce(%e init: %zero) applies stablehlo.add across dimensions = [4] : (tensor<1x1x{H}x1x{T}x{acc}>, tensor<{acc}>) -> tensor<1x1x{H}x1x{acc}>
+    %sb = stablehlo.broadcast_in_dim %sum, dims = [0, 1, 2, 3] : (tensor<1x1x{H}x1x{acc}>) -> tensor<1x1x{H}x1x1x{acc}>
+    %sb2 = stablehlo.broadcast_in_dim %sb, dims = [0, 1, 2, 3, 4] : (tensor<1x1x{H}x1x1x{acc}>) -> tensor<1x1x{H}x1x{T}x{acc}>
+    %p = stablehlo.divide %e, %sb2 : tensor<1x1x{H}x1x{T}x{acc}>
+{probs}    %o = stablehlo.dot_general %vr, %{pv}, batching_dims = [0, 2] x [1, 2], contracting_dims = [1] x [4], precision = [DEFAULT, DEFAULT] : (tensor<1x{T}x{H}x{D}x{dt}>, tensor<1x1x{H}x1x{T}x{dt}>) -> tensor<1x{H}x{D}x1x1x{dt}>
+    %o2 = stablehlo.transpose %o, dims = [3, 0, 4, 1, 2] : (tensor<1x{H}x{D}x1x1x{dt}>) -> tensor<1x1x1x{H}x{D}x{dt}>
+    %o3 = stablehlo.transpose %o2, dims = [1, 2, 3, 0, 4] : (tensor<1x1x1x{H}x{D}x{dt}>) -> tensor<1x1x{H}x1x{D}x{dt}>
+    %o4 = stablehlo.reshape %o3 : (tensor<1x1x{H}x1x{D}x{dt}>) -> tensor<1x1x{H}x{D}x{dt}>
+    return %o4 : tensor<1x1x{H}x{D}x{dt}>
+  }}
+}}
+"""
+
+
+def _gqa_forms():
+    """(label, module, absorbed (H, Hkv) or None, dtype, kept-reason) for the
+    keras GQA repeat (gap-rows item 6).
+
+    What is pinned: that the repeat is peeled at the row-7 and row-20 head
+    geometries and in both dtypes, through MLX's composite path (D = 16),
+    its vector kernel (D = 64 / 128) and at Hkv = 1 (multi-query, no kv-head
+    atom left); that a group-MAJOR repeat (`tile`) is refused and still
+    fuses plainly; and that the two geometries where MLX would change
+    kernels (Tk >= 4096 routes a grouped decode to the 2-pass variant) keep
+    the repeat rather than move the numerics.  The Tq * G > 32 rule is
+    exercised by `_p37_gqa`'s jitted prefill case.
+    """
+    return [
+        ("keras f32 H=8 Hkv=2 D=16", _keras_gqa_module("f32", 8, 2, 16, 8),
+         (8, 2), "f32", None),
+        ("keras bf16 H=8 Hkv=2 D=64", _keras_gqa_module("bf16", 8, 2, 64, 8),
+         (8, 2), "bf16", None),
+        ("keras bf16 H=64 Hkv=4 D=128 (row 20)",
+         _keras_gqa_module("bf16", 64, 4, 128, 8), (64, 4), "bf16", None),
+        ("keras f32 MQA H=4 Hkv=1 D=64 (unit spelling)",
+         _keras_gqa_module("f32", 4, 1, 64, 16, "unit"), (4, 1), "f32", None),
+        # Group-major repeats decline on two different checks, by geometry:
+        # with G != Hkv the atom stream cannot even form the group axis;
+        # with G == Hkv it can, and the pairing check is what refuses it.
+        ("keras bf16 H=8 Hkv=2 D=64 tile (group major)",
+         _keras_gqa_module("bf16", 8, 2, 64, 8, "tile"), None, "bf16",
+         "reshape splits an axis"),
+        ("keras bf16 H=4 Hkv=2 D=64 tile (group major, G == Hkv)",
+         _keras_gqa_module("bf16", 4, 2, 64, 8, "tile"), None, "bf16",
+         "the repeat is not kv-head major"),
+        ("keras bf16 H=4 Hkv=2 D=64 Tk=4096",
+         _keras_gqa_module("bf16", 4, 2, 64, 4096), None, "bf16",
+         "Tk >= 4096 would route MLX to its 2-pass vector kernel"),
+    ]
+
+
+def _gqa_jit_forms():
+    """(label, fn, args, absorbed (H, Hkv) or None, dtype, kept-reason): the
+    jitted PREFILL-shaped GQA attentions (`jnp.repeat` spelled, Tq > 1) that
+    the raw decode modules cannot reach -- MLX's full-attention kernel (Tq >
+    8, D = 64) and its composite path (D = 16) with a grouping, both of which
+    take the un-repeated heads; and the one geometry its vector kernel
+    refuses grouped (Tq = 4 over G = 16: Tq * G > 32), which must keep its
+    repeat."""
+    import jax
+    import jax.numpy as jnp
+
+    def prefill(q, kk, vv, mask, groups, scale):
+        k = jnp.repeat(kk, groups, axis=2)
+        v = jnp.repeat(vv, groups, axis=2)
+        logits = jnp.einsum("bquh,bkuh->buqk", q, k) * scale
+        logits = jnp.where(mask[None, None, :, :], logits,
+                           jnp.asarray(-1e4, logits.dtype))
+        return jnp.einsum("buqk,bkuh->bquh",
+                          jax.nn.softmax(logits, -1).astype(v.dtype), v)
+
+    def case(label, dt, Tq, H, Hkv, D, T, seed, absorbed, why):
+        pm = np.tril(np.ones((Tq, T), bool), k=T - Tq)
+        args = [_rand((1, Tq, H, D), seed).astype(dt) * 0.5,
+                _rand((1, T, Hkv, D), seed + 1).astype(dt) * 0.5,
+                _rand((1, T, Hkv, D), seed + 2).astype(dt) * 0.5,
+                jnp.asarray(pm)]
+        fn = (lambda q, k, v, m, g=H // Hkv, s=D ** -0.5:
+              prefill(q, k, v, m, g, s))
+        return (label, fn, args, absorbed,
+                "f32" if dt == "float32" else "bf16", why)
+
+    return [
+        case("prefill Tq=4 H=64 Hkv=4 D=64", "float32", 4, 64, 4, 64, 8, 300,
+             None, "Tq*G = 64 > 32 would leave MLX's vector kernel"),
+        case("prefill Tq=16 H=8 Hkv=2 D=64 f32 (full kernel)", "float32",
+             16, 8, 2, 64, 32, 310, (8, 2), None),
+        case("prefill Tq=16 H=8 Hkv=2 D=64 bf16 (full kernel)", "bfloat16",
+             16, 8, 2, 64, 32, 320, (8, 2), None),
+        case("prefill Tq=16 H=8 Hkv=2 D=16 bf16 (composite)", "bfloat16",
+             16, 8, 2, 16, 32, 330, (8, 2), None),
+    ]
+
+
+def _gqa_inputs(text):
+    """Deterministic inputs for one keras GQA module, read off @main: random
+    floats, and a padding mask that keeps the first three quarters of the
+    cache (so every row has an unmasked key and the additive rewrite of the
+    sentinel select is exact)."""
+    import re as _re
+    import ml_dtypes
+    sig = _re.search(r"func\.func public @main\((.*?)\)\s*->", text,
+                     _re.S).group(1)
+    rng = np.random.default_rng(2006)
+    args = []
+    for a in _re.findall(r"tensor<([^>]*)>", sig):
+        *dims, dt = a.split("x")
+        shape = tuple(int(d) for d in dims)
+        if dt == "i1":
+            keep = np.zeros(shape, bool)
+            keep[..., :max(1, (shape[-1] * 3) // 4)] = True
+            args.append(keep)
+            continue
+        v = (rng.standard_normal(shape) * 0.5).astype(np.float32)
+        args.append(v.astype({"f32": np.float32,
+                              "bf16": ml_dtypes.bfloat16}[dt]))
+    return args
 
 
 def _mla_inputs(text):
@@ -8700,6 +8955,130 @@ def _p32_mla(subprocess, pathlib, re):
             ("mla fused == jax-CPU", fused_agrees_with_cpu)]
 
 
+def _p37_gqa(subprocess, pathlib, re):
+    """The keras GQA head repeat, absorbed into the fused attention
+    (gap-rows item 6).
+
+    keras-hub lifts the Hkv cached heads to the H query heads with an
+    explicit `ops.repeat` BEFORE the attention the recognizer matches, so the
+    fused kernel used to read a materialized copy of K and V -- ~1.07 GB per
+    token on row 20, 48 copies on row 7.  MLX's kernel takes Hkv < H
+    directly, and `repeat` lays the copies out in exactly its `h // G`
+    order, so peeling the pair off is data movement only.  No numeric row
+    can see any of that (the repeated fusion computes the same thing), so
+    what is pinned is the MATCH: that the repeat is absorbed at the row-7 /
+    row-20 geometries in both dtypes and both jax spellings, tagged with the
+    head counts the matcher read; that a group-major `tile` is refused and
+    the two kernel-moving geometries keep their repeat; that
+    METALJAX_SDPA_GQA=0 restores the plain fusion; that the absorbed answer
+    equals the plain fusion's TO THE LAST BIT; and that it is jax-CPU's at
+    the documented fused-attention bar.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+
+    def arm(env_extra, platform="metal"):
+        import json
+        child = dict(os.environ)
+        if platform == "cpu":
+            child.pop("METALJAX_PLUGIN_PATH", None)
+            child["JAX_PLATFORMS"] = "cpu"
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--gqa-forms"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if not line.startswith("GQA "):
+                continue
+            label, payload = line[4:].split("\t", 1)
+            answers[label] = np.array(json.loads(payload))
+        absorbed = re.findall(
+            r"sdpa: gqa absorbed \(H=(\d+) Hkv=(\d+)\) (\S+)", proc.stderr)
+        kept = re.findall(r"sdpa: gqa repeat kept x(\d+): (.*)", proc.stderr)
+        fused = sum(int(n) for n in re.findall(
+            r"sdpa: (\d+) fused attention\(s\) recognized", proc.stderr))
+        return answers, absorbed, kept, fused
+
+    def worst(a, b):
+        scale = max(float(np.max(np.abs(b))), 1e-30)
+        return float(np.max(np.abs(a - b))) / scale
+
+    BAR = {"bf16": 2 * 2.0**-7, "f32": 1e-6}
+    forms = _gqa_forms()
+    # (label, absorbed, dtype, kept-reason) over both tables.
+    expect = ([(l, ab, dt, w) for l, _t, ab, dt, w in forms]
+              + [(l, ab, dt, w) for l, _f, _a, ab, dt, w in _gqa_jit_forms()])
+    n_programs = len(expect)
+
+    def the_repeat_is_absorbed():
+        _answers, absorbed, kept, fused = arm({})
+        if fused != n_programs:
+            return False, f"{fused} fused attentions over {n_programs} programs"
+        want = [(str(h), str(hkv)) for _l, ab, _d, _w in expect
+                if ab is not None for h, hkv in [ab]]
+        got = [(h, hkv) for h, hkv, _name in absorbed]
+        if sorted(got) != sorted(want):
+            return False, f"absorbed {got}, wanted {want}"
+        if any("+gqa" not in name for _h, _hkv, name in absorbed):
+            return False, f"an absorbed match is not tagged +gqa: {absorbed}"
+        # The ones that must KEEP their repeat, each for its own reason:
+        # the two group-major tiles, the 2-pass geometry, and the Tq * G >
+        # 32 prefill.
+        reasons = [w for _l, _ab, _d, w in expect if w is not None]
+        missing = [r for r in reasons
+                   if not any(r in why for _n, why in kept)]
+        if missing:
+            return False, f"no 'repeat kept' for {missing} (saw {kept})"
+        return True, (f"{len(absorbed)} absorbed "
+                      f"{' '.join(f'H{h}/Hkv{k}' for h, k in got)}; "
+                      f"{len(kept)} kept as spelled")
+
+    def the_kill_switch_keeps_the_plain_fusion():
+        _answers, absorbed, _kept, fused = arm({"METALJAX_SDPA_GQA": "0"})
+        if absorbed:
+            return False, f"{len(absorbed)} absorbed under METALJAX_SDPA_GQA=0"
+        if fused != n_programs:
+            return False, (f"{fused} fused attentions over {n_programs} "
+                           "programs with the absorb off")
+        return True, f"{fused} plain fusions, none absorbed"
+
+    def absorbed_equals_plain_bit_for_bit():
+        with_, absorbed, _k, _f = arm({})
+        without, _a, _k2, _f2 = arm({"METALJAX_SDPA_GQA": "0"})
+        if not absorbed:
+            return False, "nothing was absorbed"
+        bad = [label for label in with_
+               if with_[label].tobytes() != without[label].tobytes()]
+        if bad:
+            return False, "not bit-identical: " + "; ".join(bad)
+        return True, (f"{len(with_)} answers identical to the last bit "
+                      "across the switch")
+
+    def fused_agrees_with_cpu():
+        fused, _a, _k, _f = arm({})
+        cpu, absorbed, _k2, _f2 = arm({}, platform="cpu")
+        if absorbed:
+            return False, "the CPU arm loaded the plugin"
+        bad = []
+        for label, _ab, dt, _w in expect:
+            e = worst(fused[label], cpu[label])
+            if e > BAR[dt]:
+                bad.append(f"{label} {e:.2e} > {BAR[dt]:.0e}")
+        if bad:
+            return False, "; ".join(bad)
+        return True, f"{len(fused)} programs agree with jax-CPU"
+
+    return [("gqa repeat absorbed into sdpa", the_repeat_is_absorbed),
+            ("gqa kill switch keeps the plain fusion",
+             the_kill_switch_keeps_the_plain_fusion),
+            ("gqa absorbed == plain, bit for bit",
+             absorbed_equals_plain_bit_for_bit),
+            ("gqa fused == jax-CPU", fused_agrees_with_cpu)]
+
+
 def _p35_while_pipeline(subprocess, pathlib, re):
     """Which dynamic whiles pipeline, and that the layout cannot change an
     answer.
@@ -8922,6 +9301,253 @@ def _p36_tape_gate(subprocess, tempfile, pathlib, re):
              the_gate_cannot_move_an_answer)]
 
 
+def _p38_chunk_plan(subprocess, pathlib, re):
+    """The chunked replay's schedule and its byte bound (T4, findings2).
+
+    A counted compiled loop replays K iterations per compiled graph
+    (`run_chunked`): trip/K submitted K-chunks, then the trip%K single-step
+    replays left LAZY for the final flush.  The schedule is narrated once
+    per (trip, K) under METALJAX_DEBUG and that line is what this pins --
+    the plan, the submissions, the blocking flushes, the in-flight window
+    (METALJAX_CHUNK_INFLIGHT, 4: how many submitted chunks the host may run
+    ahead of the device), against `run_chunked`'s own arithmetic from the
+    `cost` the lowering narrates.
+
+    K itself comes from the lowering's gate: METALJAX_CHUNK_MAX (16), the
+    cost and byte budgets, and since T4 a BYTE BOUND per chunk
+    (METALJAX_CHUNK_BYTES_MB, 2048) on the body's bytes net of its write-only
+    accumulators -- the stacked outputs a scan writes one slab per iteration
+    by dynamic_update_slice, charged their whole stack by BlockBytes --
+    withheld when those accumulators exceed METALJAX_CHUNK_ACC_MB (64),
+    because every chunk boundary copies them (the submission pins the
+    carries).  The gate narrates `real=` and `acc=` so both halves are
+    checkable here: the stacked-output row shows accumulator bytes and a
+    zero net body, the plain rows show none.  Only the sync points move
+    between layouts, so the carries are BIT-identical across every K.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+    REM = "chunked replay with a remainder (90 x matmul body)"
+    FULL = "chunked replay (512 x matmul body)"
+    STK = "chunked replay with a stacked output (90 x matmul body)"
+    PLAN = re.compile(r"chunked loop: trip=(\d+) K=(\d+) plan=(\d+)x(\d+)\+(\d+)x1 "
+                      r"submits=(\d+) flushes=(\d+) inflight=(\d+)")
+    GATE = re.compile(r"while gate: cost=(\d+)(?: tape=\d+)? bytes=(\d+)MB .*?kmax=(\d+) "
+                      r"period=\d+ real=(\d+)MB acc=(\d+)MB( \(accumulators "
+                      r"veto the chunk byte bound\))?")
+
+    def arm(env_extra):
+        import json
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        # The 512-step row is a coop cell msl_scan replaces with a generated
+        # kernel; this contract is about the CHUNKED replay, so the kernel
+        # path is off in every arm (the other rows decline it anyway).
+        child["METALJAX_MSL"] = "0"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--chunk-plan"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("CHUNK "):
+                label, payload = line[6:].split("\t", 1)
+                answers[label] = json.loads(payload)
+        # The runtime narrates its schedule on stdout, the lowering its gate
+        # on stderr.  Plans are keyed by (trip, K); the stacked row and the
+        # remainder row share trip=90, so both are kept as a list.
+        plans = {}
+        inflight = set()
+        for t, k, n, kk, r, sub, f, w in PLAN.findall(proc.stdout):
+            plans.setdefault(int(t), []).append(
+                (int(k), int(n), int(kk), int(r), int(sub), int(f)))
+            inflight.add(int(w))
+        arm.inflight = inflight
+        gates = [(int(c), int(b), int(k), int(real), int(acc), bool(veto))
+                 for c, b, k, real, acc, veto in GATE.findall(proc.stderr)]
+        return answers, plans, gates
+
+    def expected(trip, K, cost):
+        """`run_chunked`'s arithmetic: the chunks first, submitted, a blocking
+        flush every `sync_every` of them, the singles lazy, one final flush."""
+        sync_every = max(1, 75000 // max(K * cost, 1))
+        nchunks, rem = divmod(trip, K)
+        blocking = nchunks // sync_every
+        return (K, nchunks, K, rem, nchunks - blocking, blocking + 1)
+
+    def gate_for(gates, pred):
+        for g in gates:
+            if pred(g):
+                return g
+        return None
+
+    def the_chunks_lead_and_the_singles_trail():
+        answers, plans, gates = arm({})
+        for case in (REM, FULL, STK):
+            if case not in answers:
+                return False, f"ran {sorted(answers)}"
+        if not gates:
+            return False, "no `while gate:` narration"
+        if 90 not in plans or 512 not in plans:
+            return False, f"schedules narrated for trips {sorted(plans)}"
+        # Every gate of these rows is cost ~10-20; take each plan's own
+        # cost from the gate that produced the same K.
+        for trip in (90, 512):
+            for plan in plans[trip]:
+                K = plan[0]
+                g = gate_for(gates, lambda g: g[2] == K)
+                cost = g[0] if g else gates[0][0]
+                want = expected(trip, K, cost)
+                if plan != want:
+                    return False, (f"trip={trip}: narrated K={plan[0]} plan="
+                                   f"{plan[1]}x{plan[2]}+{plan[3]}x1 submits="
+                                   f"{plan[4]} flushes={plan[5]}, wanted "
+                                   f"K={want[0]} plan={want[1]}x{want[2]}+"
+                                   f"{want[3]}x1 submits={want[4]} "
+                                   f"flushes={want[5]} (cost {cost})")
+        if any(p[0] != 16 for t in plans for p in plans[t]):
+            return False, f"default K is not 16: {plans}"
+        if arm.inflight != {4}:
+            return False, f"default in-flight window narrated as {arm.inflight}"
+        _answers, _plans, _gates = arm({"METALJAX_CHUNK_INFLIGHT": "1"})
+        if arm.inflight != {1}:
+            return False, f"CHUNK_INFLIGHT=1 narrated as {arm.inflight}"
+        k, n, _kk, rem, sub, f = plans[90][0]
+        return True, (f"trip=90: {n} chunks of {k} submitted, {rem} singles "
+                      f"lazy, {sub} submits + {f} flush, 4 in flight; "
+                      f"trip=512: {plans[512][0][4]} submits + "
+                      f"{plans[512][0][5]} flush")
+
+    def the_gate_sees_the_accumulator():
+        _answers, _plans, gates = arm({})
+        stacked = gate_for(gates, lambda g: g[4] >= 5)
+        if stacked is None:
+            return False, f"no gate with acc>=5MB: {gates}"
+        cost, bytes_mb, kmax, real, acc, veto = stacked
+        if bytes_mb < 5 or real > 1 or veto:
+            return False, (f"stacked row: bytes={bytes_mb}MB real={real}MB "
+                           f"acc={acc}MB veto={veto}")
+        plain = [g for g in gates if g[4] == 0]
+        if not plain or any(g[3] != g[1] for g in plain):
+            return False, f"plain rows: {plain}"
+        return True, (f"stacked row bytes={bytes_mb}MB real={real}MB "
+                      f"acc={acc}MB (kmax={kmax}); {len(plain)} plain rows "
+                      f"acc=0 real=bytes")
+
+    def the_knob_still_sets_k():
+        bad = []
+        for kmax, want in ((2, (2, 45, 2, 0)), (4, (4, 22, 4, 2)),
+                           (30, (30, 3, 30, 0))):
+            _answers, plans, gates = arm({"METALJAX_CHUNK_MAX": str(kmax)})
+            if 90 not in plans:
+                bad.append(f"CHUNK_MAX={kmax}: no schedule for trip=90")
+                continue
+            for got in plans[90]:
+                if got[:4] != want:
+                    bad.append(f"CHUNK_MAX={kmax}: K={got[0]} plan={got[1]}x"
+                               f"{got[2]}+{got[3]}x1, wanted K={want[0]} "
+                               f"plan={want[1]}x{want[2]}+{want[3]}x1")
+                    break
+                g = gate_for(gates, lambda g: g[2] == kmax)
+                cost = g[0] if g else 0
+                if got != expected(90, kmax, cost):
+                    bad.append(f"CHUNK_MAX={kmax}: submits={got[4]} "
+                               f"flushes={got[5]}, wanted "
+                               f"{expected(90, kmax, cost)[4:]}")
+                    break
+        if bad:
+            return False, "; ".join(bad)
+        return True, "K=2/4/30 narrate 45x2+0x1 / 22x4+2x1 / 3x30+0x1"
+
+    def the_byte_bound_caps_k():
+        """METALJAX_CHUNK_BYTES_MB bounds a chunk's traffic net of the
+        accumulators: these bodies are kilobytes (0 MB after the shift), so
+        the budget in MB is the iteration count itself -- 7 MB is K=7 for
+        all three rows, the stacked one included (its 5 MB of accumulator
+        is under the 64 MB veto and excluded from the net); 1 MB is the
+        floor K=2."""
+        bad = []
+        for mb, want in (("7", (7, 12, 7, 6)), ("1", (2, 45, 2, 0))):
+            _answers, plans, gates = arm({"METALJAX_CHUNK_BYTES_MB": mb})
+            got = plans.get(90, [])
+            if len(got) != 2:
+                bad.append(f"CHUNK_BYTES_MB={mb}: {len(got)} trip=90 plans")
+                continue
+            for p in got:
+                if p[:4] != want:
+                    bad.append(f"CHUNK_BYTES_MB={mb}: K={p[0]} plan={p[1]}x"
+                               f"{p[2]}+{p[3]}x1, wanted K={want[0]} plan="
+                               f"{want[1]}x{want[2]}+{want[3]}x1")
+                    break
+        if bad:
+            return False, "; ".join(bad)
+        return True, "7 MB -> K=7 (12x7+6x1) on both trip-90 rows; 1 MB -> K=2"
+
+    def big_accumulators_veto_the_byte_bound():
+        """With the veto cap under the stacked row's 5 MB, its K stays at
+        CHUNK_MAX while the plain remainder row still shrinks to 7."""
+        _answers, plans, gates = arm({"METALJAX_CHUNK_BYTES_MB": "7",
+                                      "METALJAX_CHUNK_ACC_MB": "4"})
+        got = sorted(plans.get(90, []))
+        if [p[0] for p in got] != [7, 16]:
+            return False, f"trip=90 plans: {got}"
+        vetoed = gate_for(gates, lambda g: g[5])
+        if vetoed is None or vetoed[2] != 16 or vetoed[4] < 5:
+            return False, f"veto gate: {vetoed}"
+        return True, (f"stacked row acc={vetoed[4]}MB vetoed -> K=16 "
+                      f"(5x16+10x1); plain row K=7")
+
+    def a_single_step_loop_narrates_no_chunks():
+        """K=1 is not a chunked replay at all (run_while's BodyRunner arm),
+        and a schedule narrated for it would be a schedule nothing ran."""
+        _answers, plans, _gates = arm({"METALJAX_CHUNK_MAX": "1"})
+        if plans:
+            return False, f"CHUNK_MAX=1 narrated a chunk schedule: {plans}"
+        return True, "CHUNK_MAX=1 replays single steps, no schedule"
+
+    def the_schedule_cannot_move_an_answer():
+        """Same iterations in the same order; only the sync points and the
+        graph boundaries move -- so every K, the single-step replay included,
+        must hand back the same bits."""
+        base, _, _ = arm({})
+        bad = []
+        for label, extra in (("CHUNK_MAX=1", {"METALJAX_CHUNK_MAX": "1"}),
+                             ("CHUNK_MAX=2", {"METALJAX_CHUNK_MAX": "2"}),
+                             ("CHUNK_MAX=4", {"METALJAX_CHUNK_MAX": "4"}),
+                             ("CHUNK_MAX=30", {"METALJAX_CHUNK_MAX": "30"}),
+                             ("CHUNK_BYTES_MB=7",
+                              {"METALJAX_CHUNK_BYTES_MB": "7"}),
+                             ("CHUNK_BYTES_MB=7,ACC_MB=4",
+                              {"METALJAX_CHUNK_BYTES_MB": "7",
+                               "METALJAX_CHUNK_ACC_MB": "4"}),
+                             ("CHUNK_INFLIGHT=1",
+                              {"METALJAX_CHUNK_INFLIGHT": "1"}),
+                             ("CHUNK_INFLIGHT=2,CHUNK_MAX=2",
+                              {"METALJAX_CHUNK_INFLIGHT": "2",
+                               "METALJAX_CHUNK_MAX": "2"})):
+            other, _, _ = arm(extra)
+            for case in (REM, FULL, STK):
+                if base.get(case) != other.get(case):
+                    bad.append(f"{case} differs at {label}")
+        if bad:
+            return False, "; ".join(bad)
+        return True, ("K=16 (default), 1, 2, 4, 30, 7, 7+veto, and in-flight "
+                      "windows 1 and 2 agree bit for bit")
+
+    return [("the chunks lead, the singles trail lazily",
+             the_chunks_lead_and_the_singles_trail),
+            ("the gate sees the accumulator", the_gate_sees_the_accumulator),
+            ("chunk-max knob still sets K", the_knob_still_sets_k),
+            ("chunk byte bound caps K", the_byte_bound_caps_k),
+            ("big accumulators veto the byte bound",
+             big_accumulators_veto_the_byte_bound),
+            ("single-step loop narrates no chunks",
+             a_single_step_loop_narrates_no_chunks),
+            ("chunk schedule cannot move an answer",
+             the_schedule_cannot_move_an_answer)]
+
+
 def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
     """Re-run every case through the SAME dylib under `env_extra` and compare.
 
@@ -9113,6 +9739,21 @@ def main():
             print(f"WHILE {name}\t"
                   f"{_json.dumps([v.astype(np.float64).ravel().tolist() for v in out])}")
         return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--chunk-plan":
+        # The two chunked-replay rows alone (one with a remainder, one
+        # without), so the parent can read one `chunked loop:` schedule per
+        # loop out of the narration and compare the ANSWERS across K.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        import json as _json
+        for name, fn, args, _rtol, _atol in _cases():
+            if not name.startswith("chunked replay"):
+                continue
+            out = _flatten(jax.jit(fn)(*args))
+            print(f"CHUNK {name}\t"
+                  f"{_json.dumps([v.astype(np.float64).ravel().tolist() for v in out])}")
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--norm-forms":
         # Every RMS-norm spelling the model table runs, through whichever
         # backend the caller put in the environment.  The answers go to
@@ -9159,6 +9800,27 @@ def main():
         for label, text, _tag, _dt in _mla_forms():
             out = _run_module(text, _mla_inputs(text))[0]
             print(f"MLA {label}\t"
+                  f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--gqa-forms":
+        # The keras GQA repeat forms, plus one jitted PREFILL at the row-20
+        # head geometry (Tq = 4 over G = 16, which MLX's vector kernel would
+        # refuse grouped: the absorb must keep that repeat).  Answers to
+        # stdout, the plugin's narration to stderr -- the parent reads what
+        # was ABSORBED there, and compares the answers bit for bit against
+        # the METALJAX_SDPA_GQA=0 arm.
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        import json as _json
+        for label, text, _absorbed, _dt, _why in _gqa_forms():
+            out = _run_module(text, _gqa_inputs(text))[0]
+            print(f"GQA {label}\t"
+                  f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
+        import jax
+        for label, fn, args, _ab, _dt, _why in _gqa_jit_forms():
+            out = np.asarray(jax.jit(fn)(*args))
+            print(f"GQA {label}\t"
                   f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--start-plan-forms":
@@ -9347,6 +10009,7 @@ def main():
                          + _p21_msl(subprocess, pathlib, __import__("re"))
                          + _p31_norm(subprocess, pathlib, __import__("re"))
                          + _p32_mla(subprocess, pathlib, __import__("re"))
+                         + _p37_gqa(subprocess, pathlib, __import__("re"))
                          + _p33_gdn(subprocess, pathlib, __import__("re"))
                          + _p34_start_plan(subprocess, pathlib,
                                            __import__("re"))
@@ -9354,6 +10017,8 @@ def main():
                                                __import__("re"))
                          + _p36_tape_gate(subprocess, tempfile, pathlib,
                                           __import__("re"))
+                         + _p38_chunk_plan(subprocess, pathlib,
+                                           __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,
