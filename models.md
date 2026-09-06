@@ -17,10 +17,10 @@ notes/data/. Append a column per release / major optimization.*
 | 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | **126.1** | 123.9 ʰ | 111.2 ˡ |
 | 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | **57.3** | 56.4 ʰ | 44.2 ˡ |
 | 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | **33.4** | 31.4 ʰ | 16.9 ˡ |
-| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | **24.0** | | 10.5 ˣ |
+| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | **24.0** | 20.0 ʰ | 10.5 ˣ |
 | 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | 40.8 ʰ | 29.6 ˡ |
 | 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | **42.2** | | 29.2 ˡ |
-| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 16.45 ʰ | 6.7 ˡ |
+| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 15.9 ʰ | 6.7 ˡ |
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 24.8 ʰ | 13.7 ˣ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | | 114.9 ˡ |
 | 10 | DeepSeek-V2-Lite | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **24.8** ᴳ | 24.27 ʰ | 10.5 ˣ |
@@ -286,7 +286,10 @@ Notes:
   to 6.6 but costs texmo suite-106 1.0 % geomean (one config −7 %) — Oleg's
   call, pending; row 18 = 258.8 on main with the post-pass-tape compile
   gate (4de653c; 258.9 / 258.7, was 338.8 on the same machine state, step-0
-  loss 2.9247 → 2.9195 = the compiled path's class); row 8 = 25.8 on the merged main binary with the
+  loss 2.9247 → 2.9195 = the compiled path's class); rows 4 / 7 re-measured on the
+  235a14a main binary during the gap-rows profiling: row 4 = 20.0 (six
+  runs, stream identical to the gate's), row 7 = 15.9 (four runs, stream
+  identical); row 8 = 25.8 on the merged main binary with the
   fused GDN step + keras norm coverage; row 21 = 148.4 on the merged main binary (fused GDN step + keras norm
   coverage; 148.4 / 155.3 / 147.4, median). The previous ʰ
   cells (rows 4/10/11/14) became frozen 0.11.7 cells.
