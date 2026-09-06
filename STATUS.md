@@ -17,17 +17,17 @@ parentheses is peak footprint where measured.
 | 4 | gemma4-E2B bf16 | 67.5 (bf16→f32) ⁵ | **24.0** ¹² | 10.5 ⁷ | — | — |
 | 5 | Qwen3-8B bf16 | 207.0 (bf16→f32) ⁵ | **42.0** (17 GB) | 30.4 | 38.1 | 29.6 ¹⁰ |
 | 6 | Llama-3.1-8B bf16 | 203.6 (bf16→f32) ⁵ | **42.2** | 29.4 | 35.5 | 29.2 ¹⁰ |
-| 7 | gpt-oss-20b | ✗ ¹ | **19.8** | **8.8** (13.8 GB, native MXFP4) | — | 6.7 (native MXFP4) ¹⁰ |
+| 7 | gpt-oss-20b | ✗ ¹ | **19.8** | **8.8** (13.8 GB, native MXFP4) | — | 6.7 ¹⁶ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | **28.5** (73 GB) | **13.7** | — | 15.3 ¹⁰ |
 | 9 | R1-Distill-32B | ✗ 131 GB | **190.8** (67 GB) | 131.8 | — | 114.9 ¹⁰ |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ² | **24.8** ¹¹ (92 GB) | 10.5 | — | 10.7 ¹⁰ |
 | 11 | Qwen3-0.6B (keras-hub decode) | 29.4 | **9.0** ¹³ | 3.0 | — | 3.4 ¹⁰ |
-| 12 | Mixtral 8×7B bf16 | ✗ | **85.6** (90 GB) | **52.8** (93.4 GB) | — | — |
+| 12 | Mixtral 8×7B bf16 | ✗ | **85.6** (90 GB) | 52.8 ¹⁷ (93.4 GB) | — | — |
 | 13 | gemma4-E2B keras-int4 (packed) | **67.8** ⁸ | **77.0** | — | — | — |
 | 14 | maxtext qwix-int8 0.6B | 143.4 | **29.88** | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | **388.4** (73 GB) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **86.68** | — | 29.8 (b32: 591) | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ⁴ | **1249.3** @512², **4961.6** @1024² | ✗ ⁹ | 654 @512², 2998 @1024² ⁹ | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ⁴ | **1249.3** @512², **4961.6** @1024² | ✗ ⁹ | 654 @512², 2998 @1024² ⁹ ¹⁸ | — |
 | 18 | LoRA E2B train (ms/step) | 2048 | **362.1** | — | 135.6 ³ | — |
 | 19 | maxtext train 0.6B (ms/step) | 1402 | **444.6** | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | **56.2** (101 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
@@ -64,8 +64,10 @@ load ~20–30×.
    the E-series KV-sharing layout (E2B) — those two cells are mlx-lm
    git main (2026-08-03 install), and row 2's 58.3 could not be
    re-measured since (0.31.3 refuses the cached checkpoint). Row 1's
-   133.1 is a 2026-08-31 re-measure, same prompt and token count as
-   the metaljax cell.
+   133.1 is a 2026-08-31 re-measure on the same manifest prompt and
+   token count as the metaljax cell (the metaljax cell chat-templates it,
+   ~63 tokens vs ~52 raw). The E2B cell's raw run record is lost (its
+   token count is unknown); it stands as dated until re-measured.
 8. Row 13: packed int4 stays packed on metaljax (2.7 vs 10.2 GB — the
    only sub-byte JAX path that keeps it), while XLA:CPU fuses the
    in-graph unpack into a small net win (67.8 vs 79.2 bf16) — which is
@@ -84,13 +86,21 @@ load ~20–30×.
     only at the SAME precision as the metaljax cell — custom kernels
     are fair game, different quantization is not. Kept cells: bf16
     (rows 1/2/3/5/6/8/9/10/11/21, dtype-verified), native MXFP4
-    (row 7, both sides), 3-bit (row 20, both sides). Mixtral (row 12)
+    experts with bf16 attention/embeddings/head (row 7: metaljax and
+    mlx-lm; the ggml-org GGUF is not, fn 16), 3-bit (row 20, both
+    sides). Same precision means the same weight, activation and KV
+    width (a 16-bit KV cache of either format counts as the same), and
+    the same computation: same checkpoint, prompt window, generated
+    token count, batch, resolution and encoder set. Mixtral (row 12)
     is proven quant-only across all 9 publishing providers, so its
     llama.cpp cell is legitimately empty. Row 21 is the one bf16 row
     where llama.cpp leads mlx-lm by only 1.08× (98.2 vs 106.4).
 11. Row 10 protocol: runs with `METALJAX_MEM_SYS_MB=107520` (its
     documented envelope; the shipped default sits under this row's
-    restore transient).
+    restore transient). The metaljax cell decodes the adapter's 5-token
+    default prompt for 8 tokens (loop-only average); the comparators
+    decode the 51-token manifest prompt for 64–128 tokens, so our cell
+    sits at a shallower KV depth than theirs.
 12. Greedy token agreement vs jax-CPU: rows 5/6 are exact 64/64, and
     row 11 is exact over 64 GENERATED tokens (checked past the
     51-token prompt — stronger than the harness's first-64-ids check);
@@ -116,3 +126,18 @@ load ~20–30×.
     dense path on the same bf16 checkpoint; it emits EOS at 93 of 128
     tokens, so its per-token average sits at a shallower KV depth than
     the metaljax cell's.
+16. Row 7 llama.cpp: the ggml-org MXFP4 GGUF stores attention q/k/v/o,
+    token embeddings and the untied head at Q8_0 (2.56 GB/token vs the
+    3.70 GB/token of the bf16 attention/head metaljax and mlx-lm run):
+    not like-for-like under fn 10, kept for reference only; the row's
+    goal is mlx-lm.
+17. Row 12 mlx-lm: the mlx-community mirror stores float16 tensors
+    (its config says bf16); the metaljax cell is bf16. Same byte width
+    and kernel path, different 16-bit format: provisional until
+    re-measured on the upstream bf16 checkpoint.
+18. Row 17 torch: diffusers also loads and runs the T5-XXL encoder
+    (333-token MMDiT context vs the keras preset's 154 with t5=None), so
+    torch computes strictly more per step; both sides bf16 MMDiT with
+    CFG 7.0 (our CLIP-L/G run fp16 as the preset pins them). The cell is
+    an upper bound on the like-for-like number until re-measured with
+    the T5 encoder off.
