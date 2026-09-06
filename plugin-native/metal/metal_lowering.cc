@@ -2287,6 +2287,621 @@ void RenderDump(const DumpNode& node, const std::string& indent,
   }
 }
 
+
+// --------------------------------------------------------------------------
+// The KV in-place rewrite (task B1, gap-rows item 7)
+// --------------------------------------------------------------------------
+//
+// keras-hub's decode loop carries ONE stacked KV cache -- [B, layers, 2, T,
+// H, D] on Qwen3 (20.5 MB at T=179), [1, 35, 2, T, 1, 512] on gemma4-E2B --
+// and rebuilds it every token: each layer slices its slab out of the carry,
+// `dynamic_update_slice`s the new row into the slab (MLX copies the slab:
+// 366 KB), reads attention off the result, and the body ends with
+// `concatenate(k, v)` per layer and `concatenate(layer_0 ... layer_27)` over
+// the layers, hierarchically -- three more copies of the whole cache.  On
+// row 11 that is ~257 of the token's 1,013 dispatches and 164 MB of traffic
+// for a 0.2 MB change.
+//
+// The rewrite is an algebraic identity on the tape: a concatenate whose
+// parts are (unit-dim reshapes of) slices of the carry with windows replaced
+// EQUALS the carry with those windows replaced, so the rebuild becomes a
+// chain of `kv_update`s (one `mx::slice_update` each) ON the carry, in
+// program order, and every value the body read off the old tree -- a layer's
+// updated slab, or the slab before its update -- becomes a VIEW of the chain
+// at the point the body reads it.  Bit-exact: only data movement changes.
+//
+// What makes the chain write in place rather than copy is the vendored MLX's
+// donation through the stream's own pins (`array::is_donatable(true)`,
+// notes/patches/0005-donate-through-stream-pins.patch): MLX pins every input
+// of every encoded kernel until its command buffer completes, so a cache the
+// previous token's attention read -- or this token's -- could never donate
+// before that patch, and a `slice_update` copied the whole cache each time.
+// The executor already releases its handle on the carry before submitting
+// the iteration (control.cc run_while, "the cond_of trap").  `depends` ties
+// each update after the readers of the chain's previous state so those
+// readers' views are gone by the time the update evaluates -- the natural
+// residual-stream dependency already orders them on a transformer; the tie
+// makes it a rule.
+//
+// The match is structural and generic (nothing keras-specific): a while body
+// argument X returned at its own position as a `concatenate` tree over
+// values that COVER a region of X -- built from X by `slice` (unit strides),
+// unit-dim-only `reshape` and `broadcast_in_dim`, `dynamic_update_slice`,
+// and `concatenate` whose parts tile one axis -- with the root covering all
+// of X.  Every axis of every value in the tree maps to an axis of X or is a
+// unit axis, in order (no transposes), so a value's content is exactly one
+// rectangular window of the chain.  Declined, with the reason narrated under
+// METALJAX_DEBUG: a part whose value is read after a later update that
+// overlaps it (an in-place write would change what it reads: gemma4's
+// `select(mask, new, dynamic_slice(slab))` reads the slab BEFORE its update,
+// which is fine), a concatenate whose parts overlap or leave a gap, a
+// dynamic dimension, a transpose or a real broadcast on the path.  Not
+// matched (silently): a rebuild that sits inside a `func.call` -- jax wraps
+// fori_loop / scan bodies in a `closed_call`, and the analysis reads the
+// while body's own block, which is how keras-hub's generate loop (a
+// while_loop with an inline body) is spelled; seeing through the call is
+// the natural extension if a scan-shaped cache ever needs it.
+//
+// METALJAX_KV_INPLACE=0 restores the literal tape (the A/B arm).
+const bool kKvInplace = EnvOn("METALJAX_KV_INPLACE");
+
+namespace kv {
+
+// A rectangular window of the carry: per carry axis, its offset and extent.
+struct Region {
+  std::vector<int64_t> off, ext;
+  bool intersects(const Region& o) const {
+    for (size_t j = 0; j < off.size(); j++) {
+      if (off[j] >= o.off[j] + o.ext[j] || o.off[j] >= off[j] + ext[j])
+        return false;
+    }
+    return true;
+  }
+  bool full(const std::vector<int64_t>& dims) const {
+    for (size_t j = 0; j < off.size(); j++)
+      if (off[j] != 0 || ext[j] != dims[j]) return false;
+    return true;
+  }
+};
+
+// What a value of the tree IS: the window of the carry it covers, and for
+// each of its own axes the carry axis it stands for (-1: a unit axis of its
+// own).  Mapped axes are strictly increasing -- the tree has no transposes.
+struct Cover {
+  Region region;
+  std::vector<int> amap;
+  std::vector<int64_t> shape;
+};
+
+// How to read one tree value off the chain: a slice of the chain to its
+// window, reshaped (unit dims only) to the value's shape.
+struct ViewSpec {
+  int carry;
+  Region region;
+  std::vector<int64_t> shape;
+};
+
+// One start-vector cell of an update, per carry axis.  kind 0: the constant
+// `value`.  kind 1: `raw` (the program's start operand) clipped to
+// [0, bound] -- XLA's clamp in the SLAB's frame -- plus `value`, the slab's
+// offset on that axis.
+struct Cell {
+  int kind = 0;
+  int64_t value = 0;
+  int64_t bound = 0;
+  mlir::Value raw;
+};
+
+// A `dynamic_update_slice` of the tree, restated on the carry.
+struct Site {
+  mlir::Operation* op = nullptr;
+  int carry = 0;
+  int64_t pos = 0;
+  Region slab;                     // the operand's window: what it may touch
+  std::vector<int64_t> upd_shape;  // the update, in the carry's rank
+  std::vector<Cell> cells;
+  int group = -1;
+  int row = -1;
+};
+
+// Updates sharing the same raw start values share one `kv_starts` matrix.
+struct Group {
+  int carry = 0;
+  std::vector<mlir::Value> raws;
+  std::vector<int> sites;
+};
+
+struct Carry {
+  int arg = 0;
+  mlir::Value x;
+  mlir::Operation* root = nullptr;
+  std::vector<int64_t> shape;
+  int parts = 0;
+  int updates = 0;
+};
+
+struct Plan {
+  std::vector<Carry> carries;
+  std::vector<Site> sites;
+  std::vector<Group> groups;
+  llvm::DenseMap<mlir::Operation*, int> absorbed;  // tree op -> carry
+  llvm::DenseMap<mlir::Operation*, int> site_of;   // update op -> site
+  llvm::DenseMap<mlir::Value, ViewSpec> views;     // tree value -> its window
+};
+
+std::vector<int64_t> DimsOf(mlir::Value v, bool* ok) {
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(v.getType());
+  if (!t || !t.hasStaticShape()) {
+    *ok = false;
+    return {};
+  }
+  return std::vector<int64_t>(t.getShape().begin(), t.getShape().end());
+}
+
+// Ops whose result MAY share its operand's storage in this engine (a view,
+// an alias, or an inlined callee that could return either), so a read of
+// their result is a read of the operand as far as ordering goes.  Used in
+// both directions the rewrite needs -- to push the position of a read past
+// the views it goes through (the safety check), and to find the kernel that
+// actually reads a chain view (the `depends` tie).  Over-inclusive is the
+// safe direction for both.
+bool MaybeView(absl::string_view name) {
+  return name == "stablehlo.reshape" || name == "stablehlo.transpose" ||
+         name == "stablehlo.slice" || name == "stablehlo.broadcast_in_dim" ||
+         name == "stablehlo.bitcast_convert" || name == "stablehlo.convert" ||
+         name == "stablehlo.concatenate" || name == "stablehlo.dynamic_slice" ||
+         name == "stablehlo.optimization_barrier" ||
+         name == "sdy.sharding_constraint" || name == "sdy.reshard" ||
+         name == "func.call" || name == "stablehlo.composite";
+}
+
+// A structural key for a start operand: jax spells the clamp of the
+// position once PER dynamic_update_slice (`select(compare(...), add, ...)`
+// over the same block arguments and constants), so the 56 updates of a
+// 28-layer body carry 56 distinct MLIR values that are one expression.
+// The tape's CSE merges them later; the starts matrix has to know now, or
+// every update gets a `kv_starts` kernel of its own (measured: +55
+// dispatches/token on row 11's first cut).  Keyed on the op name, its
+// attributes and its operands' keys, block arguments by index; anything
+// deeper than a short clamp chain keeps its identity.
+std::string StructKey(mlir::Value v, llvm::DenseMap<mlir::Value, std::string>& memo,
+                      int depth) {
+  auto it = memo.find(v);
+  if (it != memo.end()) return it->second;
+  std::string key;
+  if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+    key = absl::StrCat("arg", arg.getArgNumber());
+  } else {
+    mlir::Operation* op = v.getDefiningOp();
+    if (op == nullptr || depth > 24 || op->getNumRegions() > 0) {
+      key = absl::StrCat("v", reinterpret_cast<uintptr_t>(v.getAsOpaquePointer()));
+    } else {
+      key = std::string(View(op->getName().getStringRef()));
+      std::string attrs;
+      llvm::raw_string_ostream os(attrs);
+      op->getAttrDictionary().print(os);
+      absl::StrAppend(&key, attrs, "(");
+      for (mlir::Value in : op->getOperands())
+        absl::StrAppend(&key, StructKey(in, memo, depth + 1), ",");
+      absl::StrAppend(&key, ")#", mlir::cast<mlir::OpResult>(v).getResultNumber());
+    }
+  }
+  memo[v] = key;
+  return key;
+}
+
+class Analyzer {
+ public:
+  Analyzer(mlir::Block& block, Plan* plan) : block_(block), plan_(plan) {
+    int64_t i = 0;
+    for (mlir::Operation& op : block) pos_[&op] = i++;
+  }
+
+  // Try every carry returned as a concatenate; narrate declines.
+  void Run() {
+    mlir::Operation* term = block_.getTerminator();
+    if (term == nullptr) return;
+    const unsigned n = block_.getNumArguments();
+    if (term->getNumOperands() != n) return;
+    for (unsigned c = 0; c < n; c++) {
+      mlir::Value x = block_.getArgument(c);
+      mlir::Value r = term->getOperand(c);
+      if (r == x) continue;
+      mlir::Operation* root = r.getDefiningOp();
+      if (root == nullptr ||
+          View(root->getName().getStringRef()) != "stablehlo.concatenate")
+        continue;
+      if (r.getType() != x.getType()) continue;
+      absl::Status st = TryCarry(static_cast<int>(c), x, root);
+      if (!st.ok() && kDebug) {
+        std::fprintf(stderr,
+                     "[metaljax-native] kv inplace declined carry %u: %s\n",
+                     c, std::string(st.message()).c_str());
+      }
+    }
+  }
+
+ private:
+  absl::Status TryCarry(int c, mlir::Value x, mlir::Operation* root) {
+    bool ok = true;
+    std::vector<int64_t> xdims = DimsOf(x, &ok);
+    if (!ok) return Decline("a dynamic dimension");
+    if (xdims.empty()) return Decline("a rank-0 carry");
+    x_ = x;
+    xdims_ = xdims;
+    memo_.clear();
+    tree_.clear();
+    dus_.clear();
+    ASSIGN_OR_RETURN(const Cover* cover, CoverOf(root->getResult(0)));
+    if (!cover->region.full(xdims_))
+      return Decline("the rebuilt value does not cover the whole carry");
+    if (cover->shape != xdims_)
+      return Decline("the rebuilt value's shape is not the carry's");
+    if (dus_.empty()) {
+      // A pure re-stack: nothing to write, the carry is returned as it came.
+      // Worth doing (it drops the copies) and needs no chain: the root
+      // aliases the argument.
+    }
+
+    // The safety rule: a tree value read after an update that overlaps its
+    // window would read the in-place write.  A read through views counts at
+    // the position of the first op that is not (maybe) a view.
+    llvm::DenseSet<mlir::Operation*> tree_set(tree_.begin(), tree_.end());
+    std::vector<std::pair<mlir::Operation*, int64_t>> sites;  // (dus, pos)
+    for (mlir::Operation* d : dus_) sites.emplace_back(d, Pos(d));
+    auto check_reads = [&](mlir::Value v, const Region& region,
+                           int64_t def_pos) -> absl::Status {
+      const int64_t last = LastReadPos(v, tree_set, 0);
+      if (last < 0) return absl::OkStatus();   // no external reader
+      for (const auto& [d, p] : sites) {
+        if (p <= def_pos) continue;
+        const Cover* w = memo_.find(d->getOperand(0))->second.get();
+        if (w->region.intersects(region) && last > p) {
+          return Decline(absl::StrCat(
+              "a value of the tree is read after an overlapping update (read "
+              "at op ", last, ", update at op ", p, ")"));
+        }
+      }
+      return absl::OkStatus();
+    };
+    RETURN_IF_ERROR(check_reads(x_, cover->region, -1));
+    for (const auto& kv : memo_) {
+      mlir::Value v = kv.first;
+      if (v == x_) continue;
+      mlir::Operation* def = v.getDefiningOp();
+      RETURN_IF_ERROR(check_reads(v, kv.second->region, Pos(def)));
+    }
+
+    // Accepted.  Record the carry, its tree, its updates and their cells.
+    const int carry = static_cast<int>(plan_->carries.size());
+    Carry entry;
+    entry.arg = c;
+    entry.x = x;
+    entry.root = root;
+    entry.shape = xdims_;
+    entry.updates = static_cast<int>(dus_.size());
+    entry.parts = static_cast<int>(root->getNumOperands());
+    plan_->carries.push_back(entry);
+    for (mlir::Operation* op : tree_) plan_->absorbed[op] = carry;
+    for (const auto& kv : memo_) {
+      if (kv.first == x_) continue;
+      ViewSpec spec;
+      spec.carry = carry;
+      spec.region = kv.second->region;
+      spec.shape = kv.second->shape;
+      plan_->views[kv.first] = spec;
+    }
+    std::sort(dus_.begin(), dus_.end(),
+              [&](mlir::Operation* a, mlir::Operation* b) {
+                return Pos(a) < Pos(b);
+              });
+    const size_t R = xdims_.size();
+    for (mlir::Operation* d : dus_) {
+      const Cover& w = *memo_.find(d->getOperand(0))->second;
+      bool uok = true;
+      std::vector<int64_t> udims = DimsOf(d->getOperand(1), &uok);
+      if (!uok || udims.size() != w.shape.size())
+        return Decline("an update whose rank is not its operand's");
+      Site site;
+      site.op = d;
+      site.carry = carry;
+      site.pos = Pos(d);
+      site.slab = w.region;
+      site.upd_shape.assign(R, 1);
+      site.cells.assign(R, Cell{});
+      for (size_t j = 0; j < R; j++) site.cells[j].value = w.region.off[j];
+      for (size_t k = 0; k < w.shape.size(); k++) {
+        const int j = w.amap[k];
+        if (j < 0) {
+          if (udims[k] != 1)
+            return Decline("an update wider than a unit axis of its operand");
+          continue;
+        }
+        site.upd_shape[static_cast<size_t>(j)] = udims[k];
+        const int64_t bound = w.shape[k] - udims[k];
+        Cell& cell = site.cells[static_cast<size_t>(j)];
+        mlir::Value start = d->getOperand(2 + k);
+        std::optional<int64_t> cst = SplatInt(start.getDefiningOp());
+        if (cst.has_value()) {
+          int64_t s = static_cast<int32_t>(*cst);
+          s = std::min<int64_t>(std::max<int64_t>(s, 0), bound);
+          cell.kind = 0;
+          cell.value = w.region.off[static_cast<size_t>(j)] + s;
+        } else if (bound == 0) {
+          cell.kind = 0;   // XLA clamps a full-extent start to zero
+        } else {
+          cell.kind = 1;
+          cell.bound = bound;
+          cell.raw = start;
+        }
+      }
+      // The starts-matrix group: the sites of this carry with the same raw
+      // start values, in the same axis order -- "same" structurally
+      // (StructKey), each raw replaced by the first value seen with its
+      // key, which is defined before every later site that uses it.
+      std::vector<mlir::Value> raws;
+      for (Cell& cell : site.cells) {
+        if (cell.kind != 1) continue;
+        const std::string k = StructKey(cell.raw, key_memo_, 0);
+        auto rep = raw_reps_.find(k);
+        if (rep == raw_reps_.end()) rep = raw_reps_.emplace(k, cell.raw).first;
+        cell.raw = rep->second;
+        if (std::find(raws.begin(), raws.end(), cell.raw) == raws.end())
+          raws.push_back(cell.raw);
+      }
+      int g = -1;
+      for (size_t i = 0; i < plan_->groups.size(); i++) {
+        if (plan_->groups[i].carry == carry && plan_->groups[i].raws == raws) {
+          g = static_cast<int>(i);
+          break;
+        }
+      }
+      if (g < 0) {
+        g = static_cast<int>(plan_->groups.size());
+        plan_->groups.push_back(Group{carry, raws, {}});
+      }
+      site.group = g;
+      site.row = static_cast<int>(plan_->groups[static_cast<size_t>(g)].sites.size());
+      plan_->groups[static_cast<size_t>(g)].sites.push_back(
+          static_cast<int>(plan_->sites.size()));
+      plan_->site_of[d] = static_cast<int>(plan_->sites.size());
+      plan_->sites.push_back(std::move(site));
+    }
+    if (kDebug) {
+      std::string shape;
+      for (int64_t d : xdims_) absl::StrAppend(&shape, shape.empty() ? "" : ",", d);
+      std::fprintf(stderr,
+                   "[metaljax-native] kv inplace: carry %d [%s] parts=%d "
+                   "updates=%d tree=%zu groups=%zu\n",
+                   c, shape.c_str(), entry.parts, entry.updates, tree_.size(),
+                   plan_->groups.size());
+    }
+    return absl::OkStatus();
+  }
+
+  // The latest program position at which `v` is read outside the tree,
+  // following (maybe-)views; -1 if never.  The terminator counts as
+  // position infinity (a returned value is read after everything).
+  int64_t LastReadPos(mlir::Value v,
+                      const llvm::DenseSet<mlir::Operation*>& tree_set,
+                      int depth) {
+    int64_t last = -1;
+    for (mlir::Operation* u : v.getUsers()) {
+      if (tree_set.contains(u)) continue;
+      if (u->getBlock() != &block_) {
+        // A read from inside a nested region: it happens when the region's
+        // op runs.  Walk up to the op in this block.
+        mlir::Operation* p = u;
+        while (p != nullptr && p->getBlock() != &block_)
+          p = p->getParentOp();
+        if (p == nullptr) return std::numeric_limits<int64_t>::max();
+        last = std::max(last, Pos(p));
+        continue;
+      }
+      if (u == block_.getTerminator())
+        return std::numeric_limits<int64_t>::max();
+      int64_t p = Pos(u);
+      if (depth < 16 && MaybeView(View(u->getName().getStringRef()))) {
+        for (mlir::Value r : u->getResults())
+          p = std::max(p, LastReadPos(r, tree_set, depth + 1));
+      }
+      last = std::max(last, p);
+    }
+    return last;
+  }
+
+  absl::StatusOr<const Cover*> CoverOf(mlir::Value v) {
+    auto it = memo_.find(v);
+    if (it != memo_.end()) return it->second.get();
+    auto cover = std::make_unique<Cover>();
+    if (v == x_) {
+      cover->region.off.assign(xdims_.size(), 0);
+      cover->region.ext = xdims_;
+      cover->amap.resize(xdims_.size());
+      for (size_t j = 0; j < xdims_.size(); j++)
+        cover->amap[j] = static_cast<int>(j);
+      cover->shape = xdims_;
+      const Cover* p = cover.get();
+      memo_[v] = std::move(cover);
+      return p;
+    }
+    mlir::Operation* op = v.getDefiningOp();
+    if (op == nullptr) return Decline("a part rooted at another argument");
+    if (op->getBlock() != &block_)
+      return Decline("a part defined outside the body");
+    if (op->getNumResults() != 1) return Decline("a multi-result part");
+    bool ok = true;
+    cover->shape = DimsOf(v, &ok);
+    if (!ok) return Decline("a dynamic dimension in the tree");
+    const absl::string_view name = View(op->getName().getStringRef());
+    if (name == "stablehlo.slice") {
+      auto sl = mlir::cast<mlir::stablehlo::SliceOp>(op);
+      ASSIGN_OR_RETURN(const Cover* w, CoverOf(op->getOperand(0)));
+      cover->region = w->region;
+      cover->amap = w->amap;
+      for (size_t k = 0; k < w->shape.size(); k++) {
+        const int64_t s = sl.getStartIndices()[k], l = sl.getLimitIndices()[k];
+        if (sl.getStrides()[k] != 1) return Decline("a strided slice");
+        const int j = w->amap[k];
+        if (j < 0) {
+          if (s != 0 || l != 1) return Decline("a slice of a unit axis");
+          continue;
+        }
+        cover->region.off[static_cast<size_t>(j)] += s;
+        cover->region.ext[static_cast<size_t>(j)] = l - s;
+      }
+    } else if (name == "stablehlo.reshape") {
+      ASSIGN_OR_RETURN(const Cover* w, CoverOf(op->getOperand(0)));
+      cover->region = w->region;
+      // Unit dims only: the non-unit dims pair up in order.
+      std::vector<int> nz;
+      for (size_t k = 0; k < w->shape.size(); k++)
+        if (w->shape[k] != 1) nz.push_back(static_cast<int>(k));
+      size_t m = 0;
+      cover->amap.assign(cover->shape.size(), -1);
+      for (size_t k = 0; k < cover->shape.size(); k++) {
+        if (cover->shape[k] == 1) continue;
+        if (m >= nz.size() || w->shape[static_cast<size_t>(nz[m])] != cover->shape[k])
+          return Decline("a reshape that is not a unit-dim insertion/removal");
+        cover->amap[k] = w->amap[static_cast<size_t>(nz[m])];
+        m++;
+      }
+      if (m != nz.size())
+        return Decline("a reshape that is not a unit-dim insertion/removal");
+    } else if (name == "stablehlo.broadcast_in_dim") {
+      auto bc = mlir::cast<mlir::stablehlo::BroadcastInDimOp>(op);
+      ASSIGN_OR_RETURN(const Cover* w, CoverOf(op->getOperand(0)));
+      cover->region = w->region;
+      cover->amap.assign(cover->shape.size(), -1);
+      int64_t prev = -1;
+      llvm::ArrayRef<int64_t> dims = bc.getBroadcastDimensions();
+      if (dims.size() != w->shape.size())
+        return Decline("broadcast_dimensions rank");
+      for (size_t k = 0; k < dims.size(); k++) {
+        if (dims[k] <= prev) return Decline("a transposing broadcast");
+        prev = dims[k];
+        if (cover->shape[static_cast<size_t>(dims[k])] != w->shape[k])
+          return Decline("a real broadcast on the path");
+        cover->amap[static_cast<size_t>(dims[k])] = w->amap[k];
+      }
+      for (size_t k = 0; k < cover->shape.size(); k++) {
+        if (cover->amap[k] < 0 && cover->shape[k] != 1 &&
+            std::find(dims.begin(), dims.end(), static_cast<int64_t>(k)) == dims.end())
+          return Decline("a real broadcast on the path");
+      }
+    } else if (name == "stablehlo.dynamic_update_slice") {
+      if (op->getNumOperands() < 2) return Decline("a bare update");
+      ASSIGN_OR_RETURN(const Cover* w, CoverOf(op->getOperand(0)));
+      if (op->getNumOperands() - 2 != w->shape.size())
+        return Decline("update index arity");
+      cover->region = w->region;
+      cover->amap = w->amap;
+      dus_.push_back(op);
+    } else if (name == "stablehlo.concatenate") {
+      auto cat = mlir::cast<mlir::stablehlo::ConcatenateOp>(op);
+      const int64_t ax = cat.getDimension();
+      std::vector<const Cover*> parts;
+      for (mlir::Value p : op->getOperands()) {
+        ASSIGN_OR_RETURN(const Cover* pc, CoverOf(p));
+        parts.push_back(pc);
+      }
+      if (parts.empty()) return Decline("an empty concatenate");
+      cover->amap = parts[0]->amap;
+      cover->region = parts[0]->region;
+      if (parts.size() > 1) {
+        // The parts agree on every axis but one, along which they tile.
+        int jstar = -1;
+        for (const Cover* p : parts) {
+          if (p->amap != parts[0]->amap)
+            return Decline("concatenate parts with different axis maps");
+          for (size_t j = 0; j < xdims_.size(); j++) {
+            if (p->region.off[j] == parts[0]->region.off[j] &&
+                p->region.ext[j] == parts[0]->region.ext[j])
+              continue;
+            if (jstar >= 0 && jstar != static_cast<int>(j))
+              return Decline("concatenate parts that differ on two axes");
+            jstar = static_cast<int>(j);
+          }
+        }
+        if (jstar < 0) return Decline("concatenate parts with the same window");
+        if (cover->amap[static_cast<size_t>(ax)] >= 0 &&
+            cover->amap[static_cast<size_t>(ax)] != jstar)
+          return Decline("concatenate along an axis the parts do not differ on");
+        // ...and any mapped axis between must not cross jstar (order).
+        for (size_t k = 0; k < cover->amap.size(); k++) {
+          if (cover->amap[k] < 0 || k == static_cast<size_t>(ax)) continue;
+          if ((k < static_cast<size_t>(ax)) != (cover->amap[k] < jstar))
+            return Decline("concatenate axis out of the carry's axis order");
+        }
+        cover->amap[static_cast<size_t>(ax)] = jstar;
+        int64_t next = parts[0]->region.off[static_cast<size_t>(jstar)];
+        for (const Cover* p : parts) {
+          if (p->region.off[static_cast<size_t>(jstar)] != next)
+            return Decline("concatenate parts that overlap or leave a gap");
+          next += p->region.ext[static_cast<size_t>(jstar)];
+        }
+        cover->region.ext[static_cast<size_t>(jstar)] =
+            next - parts[0]->region.off[static_cast<size_t>(jstar)];
+      }
+    } else {
+      return Decline(absl::StrCat("a part built by ", name));
+    }
+    // The invariant every node keeps: its shape is its window, axis by axis.
+    if (cover->amap.size() != cover->shape.size())
+      return Decline("axis map rank");
+    int prev = -1;
+    for (size_t k = 0; k < cover->shape.size(); k++) {
+      const int j = cover->amap[k];
+      if (j < 0) {
+        if (cover->shape[k] != 1) return Decline("an unmapped non-unit axis");
+        continue;
+      }
+      if (j <= prev) return Decline("a transposed axis");
+      prev = j;
+      if (cover->shape[k] != cover->region.ext[static_cast<size_t>(j)])
+        return Decline("a shape that is not its window");
+    }
+    for (size_t j = 0; j < xdims_.size(); j++) {
+      if (cover->region.ext[j] > 1 &&
+          std::find(cover->amap.begin(), cover->amap.end(), static_cast<int>(j)) == cover->amap.end())
+        return Decline("a window axis dropped from the shape");
+      if (cover->region.off[j] < 0 ||
+          cover->region.off[j] + cover->region.ext[j] > xdims_[j])
+        return Decline("a window outside the carry");
+    }
+    tree_.push_back(op);
+    const Cover* p = cover.get();
+    memo_[v] = std::move(cover);
+    return p;
+  }
+
+  int64_t Pos(mlir::Operation* op) const {
+    auto it = pos_.find(op);
+    return it == pos_.end() ? std::numeric_limits<int64_t>::max() : it->second;
+  }
+
+  mlir::Block& block_;
+  Plan* plan_;
+  llvm::DenseMap<mlir::Operation*, int64_t> pos_;
+  llvm::DenseMap<mlir::Value, std::string> key_memo_;
+  absl::flat_hash_map<std::string, mlir::Value> raw_reps_;
+  mlir::Value x_;
+  std::vector<int64_t> xdims_;
+  llvm::DenseMap<mlir::Value, std::unique_ptr<Cover>> memo_;
+  std::vector<mlir::Operation*> tree_;
+  std::vector<mlir::Operation*> dus_;
+};
+
+// The plan for one while body, or null when nothing in it rebuilds a carry.
+std::unique_ptr<Plan> Analyze(mlir::Block& block) {
+  auto plan = std::make_unique<Plan>();
+  Analyzer(block, plan.get()).Run();
+  if (plan->carries.empty()) return nullptr;
+  return plan;
+}
+
+}  // namespace kv
+
 class Lowering {
  public:
   explicit Lowering(LowerContext* ctx) : ctx_(ctx) {}
@@ -2372,6 +2987,28 @@ class Lowering {
   void CsePass(std::vector<int>& outputs);
   void FoldConstants(std::vector<int>& outputs);
   void DcePass(const std::vector<int>& outputs);
+
+  // The KV in-place rewrite (kv::Plan above): this frame's plan, or null;
+  // the chain slot per rewritten carry; the readers of chain views since
+  // each carry's last update (what its next `depends` ties); the slots that
+  // are views of a chain state; the `kv_starts` slot per group.
+  std::unique_ptr<kv::Plan> kv_;
+  std::vector<int> kv_chain_;
+  std::vector<size_t> kv_reader_mark_;
+  std::vector<int> kv_readers_;
+  absl::flat_hash_set<int> kv_view_slots_;
+  std::vector<int> kv_group_slot_;
+  int64_t kv_views_ = 0, kv_depends_ = 0;
+  absl::Status LowerOpImpl(mlir::Operation* op);
+  absl::Status KvLowerAbsorbed(mlir::Operation* op, int carry);
+  absl::Status KvLowerSite(int site);
+  absl::StatusOr<int> KvMaterialize(mlir::Value v);
+  void KvAfterOp(mlir::Operation* op);
+  void KvInherit(int dst, int src) {
+    auto it = arg_alias_.find(src);
+    if (it != arg_alias_.end()) arg_alias_[dst] = it->second;
+    if (const_view_.count(src) > 0) const_view_.insert(dst);
+  }
 
   // One region block as a sub-Program, lowered in a CHILD frame (tape.py's
   // `_region`).  `caps` are the capture slots in THIS frame, in the order
@@ -2791,8 +3428,11 @@ bool Lowering::IsFloatElement(mlir::Value v) {
 
 absl::StatusOr<int> Lowering::Slot(mlir::Value v) {
   auto it = slots_.find(v);
-  if (it == slots_.end())
+  if (it == slots_.end()) {
+    // A value of a rewritten cache tree is read off the chain on demand.
+    if (kv_ && kv_->views.contains(v)) return KvMaterialize(v);
     return Decline("a value defined outside the entry block");
+  }
   return it->second;
 }
 
@@ -6380,6 +7020,16 @@ absl::StatusOr<Lowering::Region> Lowering::LowerRegion(mlir::Block& block) {
   if (block.empty()) return Decline("an empty region");
   Region out;
   out.free = FreeValues(block);
+  // A rewritten cache tree's value captured by a nested region is read
+  // here, at the region's position: give it its view of the chain first.
+  if (kv_) {
+    for (mlir::Value v : out.free) {
+      if (!slots_.contains(v) && kv_->views.contains(v)) {
+        ASSIGN_OR_RETURN(int s, KvMaterialize(v));
+        (void)s;
+      }
+    }
+  }
   for (mlir::Value v : out.free) {
     auto it = slots_.find(v);
     if (it != slots_.end()) {
@@ -7144,7 +7794,181 @@ absl::Status Lowering::InlineBlock(mlir::Block& block,
   return absl::OkStatus();
 }
 
+// --------------------------------------------------------------------------
+// the KV in-place rewrite's emits (kv::Plan; the analysis is above)
+// --------------------------------------------------------------------------
+
 absl::Status Lowering::LowerOp(mlir::Operation* op) {
+  if (kv_) {
+    auto it = kv_->absorbed.find(op);
+    if (it != kv_->absorbed.end()) return KvLowerAbsorbed(op, it->second);
+  }
+  absl::Status st = LowerOpImpl(op);
+  if (st.ok() && kv_) KvAfterOp(op);
+  return st;
+}
+
+// A tree op never lowers as itself: the root IS the chain, an update site
+// extends the chain, and any other node is read off the chain on demand
+// (KvMaterialize, from `Slot`).
+absl::Status Lowering::KvLowerAbsorbed(mlir::Operation* op, int carry) {
+  const kv::Carry& c = kv_->carries[static_cast<size_t>(carry)];
+  if (op == c.root) {
+    Alias(op->getResult(0), kv_chain_[static_cast<size_t>(carry)]);
+    if (kDebug)
+      std::fprintf(stderr,
+                   "[metaljax-native] kv inplace: rewrote carry %d: "
+                   "updates=%d views=%lld depends=%lld\n",
+                   c.arg, c.updates, static_cast<long long>(kv_views_),
+                   static_cast<long long>(kv_depends_));
+    return absl::OkStatus();
+  }
+  auto it = kv_->site_of.find(op);
+  if (it != kv_->site_of.end()) return KvLowerSite(it->second);
+  return absl::OkStatus();
+}
+
+// One update of the chain: `depends` on the readers of its previous state,
+// the update reshaped to the carry's rank, the group's starts matrix (built
+// once), and the `kv_update`.
+absl::Status Lowering::KvLowerSite(int idx) {
+  kv::Site& site = kv_->sites[static_cast<size_t>(idx)];
+  mlir::Operation* op = site.op;
+  int& chain = kv_chain_[static_cast<size_t>(site.carry)];
+  const size_t R = site.upd_shape.size();
+  size_t& mark = kv_reader_mark_[static_cast<size_t>(site.carry)];
+  if (mark < kv_readers_.size()) {
+    std::vector<int> ins{chain};
+    ins.insert(ins.end(), kv_readers_.begin() + static_cast<long>(mark),
+               kv_readers_.end());
+    const int out = nslots_++;
+    ASSIGN_OR_RETURN(int dep, Opcode("metaljax.depends"));
+    Emit(dep, std::move(ins), {out}, {}, std::nullopt, 0);
+    KvInherit(out, chain);
+    chain = out;
+    kv_depends_++;
+  }
+  mark = kv_readers_.size();
+
+  ASSIGN_OR_RETURN(int u, Slot(op->getOperand(1)));
+  bool ok = true;
+  const std::vector<int64_t> udims = kv::DimsOf(op->getOperand(1), &ok);
+  if (!ok) return Decline("a dynamic update");
+  if (udims != site.upd_shape) {
+    std::vector<int64_t> attrs{static_cast<int64_t>(R)};
+    attrs.insert(attrs.end(), site.upd_shape.begin(), site.upd_shape.end());
+    const int u2 = nslots_++;
+    Emit(kReshape, {u}, {u2}, std::move(attrs), std::nullopt, 0);
+    u = u2;
+  }
+
+  kv::Group& g = kv_->groups[static_cast<size_t>(site.group)];
+  if (kv_group_slot_[static_cast<size_t>(site.group)] < 0) {
+    const size_t n = g.sites.size();
+    std::vector<int32_t> cm(n * R), bm(n * R), sm(n * R);
+    for (size_t i = 0; i < n; i++) {
+      const kv::Site& si = kv_->sites[static_cast<size_t>(g.sites[i])];
+      for (size_t j = 0; j < R; j++) {
+        const kv::Cell& cell = si.cells[j];
+        cm[i * R + j] = static_cast<int32_t>(cell.value);
+        bm[i * R + j] = static_cast<int32_t>(cell.bound);
+        int32_t sel = 0;
+        if (cell.kind == 1) {
+          sel = 1 + static_cast<int32_t>(
+                        std::find(g.raws.begin(), g.raws.end(), cell.raw) -
+                        g.raws.begin());
+        }
+        sm[i * R + j] = sel;
+      }
+    }
+    auto payload = [&](const std::vector<int32_t>& v) {
+      const int s = nslots_++;
+      mx::array a(v.begin(), mx::Shape{static_cast<int>(n), static_cast<int>(R)},
+                  mx::int32);
+      Emit(kConstant, {}, {s}, {}, std::move(a),
+           static_cast<int64_t>(n * R * sizeof(int32_t)));
+      const_view_.insert(s);
+      return s;
+    };
+    std::vector<int> ins{payload(cm), payload(bm), payload(sm)};
+    for (mlir::Value raw : g.raws) {
+      ASSIGN_OR_RETURN(int rs, Slot(raw));
+      ins.push_back(rs);
+    }
+    const int out = nslots_++;
+    ASSIGN_OR_RETURN(int ks, Opcode("metaljax.kv_starts"));
+    Emit(ks, std::move(ins), {out}, {static_cast<int64_t>(g.raws.size())},
+         std::nullopt, static_cast<int64_t>(n * R * sizeof(int32_t)));
+    kv_group_slot_[static_cast<size_t>(site.group)] = out;
+  }
+
+  std::vector<int64_t> attrs{site.row, static_cast<int64_t>(R)};
+  for (size_t j = 0; j < R; j++) attrs.push_back(static_cast<int64_t>(j));
+  const int out = nslots_++;
+  ASSIGN_OR_RETURN(int ku, Opcode("metaljax.kv_update"));
+  Emit(ku, {chain, u, kv_group_slot_[static_cast<size_t>(site.group)]}, {out},
+       std::move(attrs), std::nullopt, ValueBytes(op->getOperand(1)));
+  chain = out;
+  return absl::OkStatus();
+}
+
+// A tree value read by something outside the tree: a slice of the chain AS
+// IT STANDS at this point of the walk (the analysis proved no later update
+// overlaps the window before this read), reshaped to the value's shape.
+absl::StatusOr<int> Lowering::KvMaterialize(mlir::Value v) {
+  auto it = kv_->views.find(v);
+  if (it == kv_->views.end()) return Decline("not a tree value");
+  const kv::ViewSpec& spec = it->second;
+  const int chain = kv_chain_[static_cast<size_t>(spec.carry)];
+  const size_t R = spec.region.off.size();
+  std::vector<int64_t> attrs{static_cast<int64_t>(R)};
+  attrs.insert(attrs.end(), spec.region.off.begin(), spec.region.off.end());
+  for (size_t j = 0; j < R; j++)
+    attrs.push_back(spec.region.off[j] + spec.region.ext[j]);
+  for (size_t j = 0; j < R; j++) attrs.push_back(1);
+  int s = nslots_++;
+  Emit(kSlice, {chain}, {s}, std::move(attrs), std::nullopt, 0);
+  KvInherit(s, chain);
+  kv_view_slots_.insert(s);
+  if (spec.shape != spec.region.ext) {
+    std::vector<int64_t> rattrs{static_cast<int64_t>(spec.shape.size())};
+    rattrs.insert(rattrs.end(), spec.shape.begin(), spec.shape.end());
+    const int s2 = nslots_++;
+    Emit(kReshape, {s}, {s2}, std::move(rattrs), std::nullopt, 0);
+    KvInherit(s2, s);
+    kv_view_slots_.insert(s2);
+    s = s2;
+  }
+  slots_[v] = s;
+  kv_views_++;
+  return s;
+}
+
+// After an ordinary op: if it read a chain view, its results are either
+// views too (a maybe-view op) or the readers the next update ties after.
+void Lowering::KvAfterOp(mlir::Operation* op) {
+  bool reads = false;
+  for (mlir::Value in : op->getOperands()) {
+    auto it = slots_.find(in);
+    if (it != slots_.end() && kv_view_slots_.count(it->second) > 0) {
+      reads = true;
+      break;
+    }
+  }
+  if (!reads) return;
+  const bool view = kv::MaybeView(View(op->getName().getStringRef()));
+  for (mlir::Value r : op->getResults()) {
+    auto it = slots_.find(r);
+    if (it == slots_.end()) continue;
+    if (view) {
+      kv_view_slots_.insert(it->second);
+    } else {
+      kv_readers_.push_back(it->second);
+    }
+  }
+}
+
+absl::Status Lowering::LowerOpImpl(mlir::Operation* op) {
   const llvm::StringRef ref = op->getName().getStringRef();
   const absl::string_view name = View(ref);
 
@@ -8479,6 +9303,22 @@ absl::StatusOr<Lowering::Built> Lowering::LowerBlock(
     const int s = nslots_++;
     arg_alias_[s] = {s};
     pack_slots_.push_back(s);
+  }
+
+  // The KV in-place rewrite: a while body that rebuilds a stacked cache
+  // carry from slices of it becomes a chain of window writes on the carry
+  // (kv::Analyze; the emits are KvLowerSite / KvMaterialize below).
+  if (kKvInplace && region_) {
+    kv_ = kv::Analyze(block);
+    if (kv_) {
+      kv_group_slot_.assign(kv_->groups.size(), -1);
+      for (const kv::Carry& c : kv_->carries) {
+        const int s = slots_.find(c.x)->second;
+        kv_chain_.push_back(s);
+        kv_reader_mark_.push_back(0);
+        kv_view_slots_.insert(s);
+      }
+    }
   }
 
   std::vector<mlir::Value> returned;

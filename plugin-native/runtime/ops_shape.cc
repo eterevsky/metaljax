@@ -370,6 +370,74 @@ bool Program::step_shape(const Entry& e,
       break;
     }
 
+    // --- the KV in-place rewrite (metal_lowering.cc `KvInplace`) ---
+    case kKvStarts: {
+      // Row i of the result is the start vector of the i-th cache update:
+      // the constant part, plus for every dynamic cell its raw start
+      // clipped to that cell's bound (XLA's clamp, in the SLAB's frame the
+      // program spelled it in) -- all elementwise over one small int32
+      // matrix, which MLX fuses into one kernel per token however many
+      // updates share it.  D distinct raw starts, one column selector each.
+      const int64_t nd = at[0];
+      mx::array acc = in(0);
+      const mx::array& bound = in(1);
+      const mx::array& sel = in(2);
+      for (int64_t d = 0; d < nd; d++) {
+        mx::array raw = mx::reshape(
+            mx::astype(in(3 + static_cast<size_t>(d)), mx::int32),
+            mx::Shape{});
+        mx::array clipped = mx::clip(mx::broadcast_to(raw, bound.shape()),
+                                     mx::array(0, mx::int32), bound);
+        acc = mx::add(
+            acc, mx::where(mx::equal(sel, mx::array(static_cast<int>(d + 1),
+                                                    mx::int32)),
+                           clipped, mx::array(0, mx::int32)));
+      }
+      env[e.outs[0]] = acc;
+      break;
+    }
+    case kKvUpdate: {
+      // One in-place window write on the cache carry.  `starts` is the
+      // kKvStarts matrix (or a constant one); this update's row is a view
+      // of it.  Whether MLX writes the window into the operand's buffer or
+      // copies the operand first is its `is_donatable(true)` call at eval
+      // time -- the fork's donation through this stream's pins -- and the
+      // answer is data movement only, never a value.
+      const int row = static_cast<int>(at[0]);
+      const int64_t rank = at[1];
+      std::vector<int> ax(static_cast<size_t>(rank));
+      for (int64_t i = 0; i < rank; i++)
+        ax[static_cast<size_t>(i)] = static_cast<int>(at[2 + i]);
+      // The row as a 1-D VIEW: flatten the (contiguous) matrix once and
+      // slice the row out of the flat vector.  Slicing the 2-D matrix and
+      // reshaping the [1, rank] row would cost a copy kernel per update
+      // (MLX reshapes a strided slice by copying) -- measured: 56 extra
+      // dispatches per token on row 11's first cut.
+      const mx::array& starts = in(2);
+      const int n = static_cast<int>(rank);
+      mx::array flat = mx::reshape(starts, mx::Shape{-1});
+      mx::array start =
+          mx::slice(flat, mx::Shape{row * n}, mx::Shape{row * n + n});
+      env[e.outs[0]] = mx::slice_update(in(0), in(1), start, ax);
+      break;
+    }
+    case kDepends: {
+      // The cache, ordered after the kernels that read its previous state:
+      // MLX evaluates a dependency before the arrays that depend on it, so
+      // by the time the next in-place update runs those readers are done
+      // and their views of the buffer released -- which is what lets the
+      // update donate.  A Depends node moves no data.
+      std::vector<mx::array> deps;
+      deps.reserve(e.ins.size() - 1);
+      for (size_t i = 1; i < e.ins.size(); i++) deps.push_back(in(i));
+      if (deps.empty()) {
+        env[e.outs[0]] = in(0);
+      } else {
+        env[e.outs[0]] = mx::depends({in(0)}, deps)[0];
+      }
+      break;
+    }
+
     default:
       return false;
   }

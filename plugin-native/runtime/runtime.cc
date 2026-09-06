@@ -76,13 +76,20 @@ std::string DispatchDelta(const mx::metal::DispatchStats& a,
   const double gap_ms = static_cast<double>(b.gpu_gap_ns - a.gpu_gap_ns) * 1e-6;
   const double queue_ms = static_cast<double>(b.queue_ns - a.queue_ns) * 1e-6;
   const double idle_ms = std::max(wall_ms - busy_ms, 0.0);
-  char buf[512];
+  // Slice updates that wrote into their operand's buffer vs copied it
+  // first (the KV in-place rewrite's donation, metal_lowering.cc kv::).
+  const unsigned long long kv_donated =
+      b.slice_update_donated - a.slice_update_donated;
+  const unsigned long long kv_copied =
+      b.slice_update_copied - a.slice_update_copied;
+  char buf[640];
   int n = std::snprintf(
       buf, sizeof buf,
       "dispatches=%llu cbufs=%llu(+empty %llu) gpu_busy_ms=%.2f(sum %.2f) "
-      "gpu_idle_ms=%.2f gap_ms=%.2f queue_ms=%.2f wall_ms=%.2f pending=%llu",
+      "gpu_idle_ms=%.2f gap_ms=%.2f queue_ms=%.2f wall_ms=%.2f pending=%llu "
+      "slice_update_donated=%llu slice_update_copied=%llu",
       dispatches, cbufs, empty, busy_ms, sum_ms, idle_ms, gap_ms, queue_ms,
-      wall_ms, pending);
+      wall_ms, pending, kv_donated, kv_copied);
   if (steps > 0 && n > 0 && static_cast<size_t>(n) < sizeof buf) {
     const double st = static_cast<double>(steps);
     std::snprintf(buf + n, sizeof buf - static_cast<size_t>(n),

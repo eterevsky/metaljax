@@ -1,0 +1,654 @@
+From 3eb41d5f2e605fe1995bbb3e105e2ac28f9a8028 Mon Sep 17 00:00:00 2001
+From: Oleg Eterevsky <oleg@eterevsky.com>
+Date: Sun, 6 Sep 2026 10:29:33 +0200
+Subject: [PATCH] Donate a slice update's operand through the stream's own
+ command-buffer pins
+
+`SliceUpdate` and `DynamicSliceUpdate` copy their whole operand into the
+output before writing the window unless the operand is donatable.  On the
+Metal backend an operand that any kernel of a still-live command buffer
+read is never donatable: `gpu::eval` keeps a `shared_ptr<Data>` on every
+input of every primitive it encodes until the buffer completes, so
+`array::is_donatable()` -- a use-count test -- sees a second holder.  For
+a decode loop's KV cache (read by the layer's attention, then written by
+the next layer's update, then read by the next token's attention) that
+is every update: an 8 KiB write costs a 20 MiB copy, every time.
+
+Those pins keep the buffer ALIVE while the GPU may still read it; on the
+stream that encoded the reads they are not an observer of its contents,
+because a kernel encoded later on the same stream is ordered after them:
+within an encoder by the write-after-read barrier `register_output_array`
+already inserts, across encoders by a fence.  This patch lets the two
+slice updates donate through such pins, and makes that ordering explicit:
+
+* `array::Data` gains a 64-bit pin word (count, count from the open
+  encoder generation, the generation, the stream), maintained by
+  compare-and-swap from `detail::pin_data` / `unpin_data`.
+* `array::is_donatable(bool through_stream_pins)`: with the flag, a
+  buffer whose extra holders are exactly the pins of the calling
+  stream is donatable; the strict `is_donatable()` is unchanged, and so
+  is every primitive that calls it.  Pins from another stream, or from
+  more encoders than the word counts, keep the strict answer.
+* `gpu::eval` sets a per-thread eval context (stream, encoder generation)
+  around `eval_gpu`, and pins through the encoder (`CommandEncoder::pin`,
+  one pin per encoder per buffer, one completion handler per command
+  buffer instead of one per primitive).  The handler releases the pins
+  BEFORE the scheduler's and the dispatch accounting's completion
+  notices.
+* A donation that saw through pins of encoders that have already ended
+  marks the encoder, and `end_encoding` then waits on the fence of every
+  encoder still in flight -- fence waits apply to the whole compute pass,
+  so the pass runs after everything committed ahead of it.  Paid only by
+  an encoder that donated that way.
+* `SliceUpdate::eval_gpu` (Metal) and `DynamicSliceUpdate::eval_gpu`
+  (gpu) donate a row-contiguous, same-dtype operand through the pins.
+  `metal::dispatch_stats()` reports how many did and how many copied.
+
+The CUDA backend never sets the eval context, so `is_donatable(true)` is
+the strict test there and nothing changes.
+---
+ mlx/array.cpp                  | 129 +++++++++++++++++++++++++++++++++
+ mlx/array.h                    |  62 ++++++++++++++++
+ mlx/backend/gpu/primitives.cpp |  26 +++++--
+ mlx/backend/metal/device.cpp   |  81 ++++++++++++++++++++-
+ mlx/backend/metal/device.h     |  34 +++++++++
+ mlx/backend/metal/eval.cpp     |  41 +++++++----
+ mlx/backend/metal/indexing.cpp |  21 +++++-
+ mlx/backend/metal/metal.h      |   4 +
+ 8 files changed, 372 insertions(+), 26 deletions(-)
+
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+index 07d3acd6..299b0162 100644
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -1,4 +1,5 @@
+ // Copyright © 2023-2024 Apple Inc.
++#include <algorithm>
+ #include <functional>
+ #include <unordered_map>
+ 
+@@ -10,6 +11,134 @@
+ 
+ namespace mlx::core {
+ 
++namespace detail {
++
++EvalContext& eval_context() {
++  static thread_local EvalContext ctx;
++  return ctx;
++}
++
++DonationCounters& donation_counters() {
++  // Immortal: a completion handler may still count after static
++  // destruction has begun.
++  static DonationCounters* counters = new DonationCounters();
++  return *counters;
++}
++
++namespace {
++
++// The layout of `array::Data::pins` (array.h).
++constexpr uint64_t kPinsMask = 0xFFull;
++constexpr int kGenPinsShift = 8;
++constexpr uint64_t kGenPinsMask = 0xFFull << kGenPinsShift;
++constexpr int kGenShift = 16;
++constexpr uint64_t kGenMask = 0xFFFFFFFFull << kGenShift;
++constexpr int kStreamShift = 48;
++constexpr int64_t kStreamNone = -1;
++constexpr int64_t kStreamMixed = -2;
++
++inline int64_t pins_stream(uint64_t w) {
++  return static_cast<int16_t>(static_cast<uint16_t>(w >> kStreamShift));
++}
++inline uint64_t pack(int64_t stream, uint32_t gen, uint32_t gen_pins,
++                     uint32_t pins) {
++  return (static_cast<uint64_t>(static_cast<uint16_t>(static_cast<int16_t>(stream)))
++          << kStreamShift) |
++      (static_cast<uint64_t>(gen) << kGenShift) |
++      (static_cast<uint64_t>(gen_pins & 0xFF) << kGenPinsShift) |
++      static_cast<uint64_t>(pins & 0xFF);
++}
++
++} // namespace
++
++void pin_data(std::atomic<uint64_t>& pins, int stream, uint32_t gen) {
++  uint64_t old = pins.load(std::memory_order_relaxed);
++  for (;;) {
++    const uint32_t n = static_cast<uint32_t>(old & kPinsMask);
++    const uint32_t ng = static_cast<uint32_t>((old & kGenPinsMask) >> kGenPinsShift);
++    const uint32_t g = static_cast<uint32_t>((old & kGenMask) >> kGenShift);
++    const int64_t s = pins_stream(old);
++    uint64_t next;
++    if (n == 0) {
++      next = pack(stream, gen, 1, 1);
++    } else if (n >= 255 || s == kStreamMixed || s != stream) {
++      // Several streams, or more encoders than the word can count: the
++      // strict test from here on until every pin is gone.
++      next = pack(kStreamMixed, 0, 0, std::min<uint32_t>(n + 1, 255));
++    } else if (g == gen) {
++      next = pack(stream, gen, ng + 1, n + 1);
++    } else {
++      next = pack(stream, gen, 1, n + 1);
++    }
++    if (pins.compare_exchange_weak(
++            old, next, std::memory_order_release, std::memory_order_relaxed)) {
++      return;
++    }
++  }
++}
++
++void unpin_data(std::atomic<uint64_t>& pins) {
++  uint64_t old = pins.load(std::memory_order_relaxed);
++  for (;;) {
++    const uint32_t n = static_cast<uint32_t>(old & kPinsMask);
++    uint64_t next;
++    if (n <= 1) {
++      next = array::Data::kNoPins;
++    } else {
++      // A pin that completes belongs to an encoder that has ended, never
++      // to the open generation, so only the total moves.  (When the word
++      // saturated at 255 the count is a floor; it still reaches zero,
++      // because every pin that was counted is released.)
++      next = (old & ~kPinsMask) | static_cast<uint64_t>(n - 1);
++    }
++    if (pins.compare_exchange_weak(
++            old, next, std::memory_order_release, std::memory_order_relaxed)) {
++      return;
++    }
++  }
++}
++
++} // namespace detail
++
++bool array::is_donatable(bool through_stream_pins) const {
++  if (array_desc_.use_count() != 1) {
++    return false;
++  }
++  const long holders = array_desc_->data.use_count();
++  if (holders == 1) {
++    return true;
++  }
++  if (!through_stream_pins) {
++    return false;
++  }
++  const detail::EvalContext& ctx = detail::eval_context();
++  if (ctx.stream < 0) {
++    return false;
++  }
++  // The word before the holder count: a pin is released (unpin) BEFORE its
++  // shared_ptr<Data> is dropped, and taken AFTER it is copied, so a reader
++  // that sees the word sees at least as many holders -- any skew between
++  // the two reads only ever makes the equality below fail.
++  const uint64_t w = array_desc_->data->pins.load(std::memory_order_acquire);
++  if (detail::pins_stream(w) != ctx.stream) {
++    return false;
++  }
++  const long pins = static_cast<long>(w & detail::kPinsMask);
++  if (holders != 1 + pins) {
++    return false; // a view, a temporary, another array: a real observer
++  }
++  const uint32_t g = static_cast<uint32_t>((w & detail::kGenMask) >> detail::kGenShift);
++  const long open = (g == ctx.gen)
++      ? static_cast<long>((w & detail::kGenPinsMask) >> detail::kGenPinsShift)
++      : 0;
++  if (pins > open) {
++    // Some of those reads were encoded by encoders that have ended (still
++    // in flight, or done): the backend must order this encoder after them.
++    detail::eval_context().inflight_donation = true;
++  }
++  return true;
++}
++
+ array::array(const std::complex<float>& val, Dtype dtype /* = complex64 */)
+     : array_desc_(std::make_shared<ArrayDesc>(Shape{}, dtype)) {
+   auto cval = static_cast<complex64_t>(val);
+diff --git a/mlx/array.h b/mlx/array.h
+index 8e14ca47..cc2773a1 100644
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -18,6 +19,40 @@ namespace mlx::core {
+ // Forward declaration
+ class Primitive;
+ 
++namespace detail {
++
++// The Metal backend's per-thread eval context: which stream the calling
++// thread is encoding on and which encoder generation is open there
++// (backend/metal/eval.cpp sets it around a primitive's eval_gpu).  `stream`
++// is -1 outside an eval, which makes `array::is_donatable(true)` the strict
++// test.  `inflight_donation` is set by a donation that saw through the pins
++// of encoders that have already ended; the backend reads it back to order
++// the encoder after them.
++struct EvalContext {
++  int stream = -1;
++  uint32_t gen = 0;
++  bool inflight_donation = false;
++};
++MLX_API EvalContext& eval_context();
++
++// How often a slice update wrote into its operand's buffer versus copying
++// it first (diagnostic; read by metal::dispatch_stats()).
++struct DonationCounters {
++  std::atomic<uint64_t> slice_update_donated{0};
++  std::atomic<uint64_t> slice_update_copied{0};
++};
++MLX_API DonationCounters& donation_counters();
++
++// Pin bookkeeping over `array::Data::pins` (backend/metal/device.cpp calls
++// these; here so the word's layout has one owner).  `pin_data` records one
++// more outstanding read of the buffer by encoder generation `gen` of
++// `stream`; `unpin_data` releases one.  Overflow and a second stream both
++// saturate into the "several streams" state, which is the strict one.
++MLX_API void pin_data(std::atomic<uint64_t>& pins, int stream, uint32_t gen);
++MLX_API void unpin_data(std::atomic<uint64_t>& pins);
++
++} // namespace detail
++
+ using Deleter = std::function<void(allocator::Buffer)>;
+ using ShapeElem = int32_t;
+ using Shape = SmallVector<ShapeElem>;
+@@ -231,6 +266,25 @@ class MLX_API array {
+   struct Data {
+     allocator::Buffer buffer;
+     Deleter d;
++    // Pins: the references the Metal backend's command buffers hold on this
++    // buffer until the GPU is done with it (backend/metal/eval.cpp pins every
++    // input of every primitive it encodes; the completion handler releases
++    // them).  A pin keeps the buffer ALIVE, but on the stream that encoded
++    // the read it is not an observer of the buffer's CONTENTS: a kernel
++    // encoded later on the same stream runs after the reads it pins (the
++    // encoder orders a write after the reads of the same buffer, and a
++    // later encoder waits on the fences of the ones still in flight).  So
++    // `is_donatable(/*through_stream_pins=*/true)` may see through them.
++    //
++    // One 64-bit word, changed only by compare-and-swap (the eval thread
++    // pins, a completion thread unpins):
++    //   bits  0..7   pins        pins outstanding (one per encoder that read it)
++    //   bits  8..15  gen_pins    ...of which from encoder generation `gen`
++    //   bits 16..47  gen         the encoder generation of the latest pin
++    //   bits 48..63  stream      int16: -1 none, -2 several streams, else
++    //                            the stream index every pin came from
++    static constexpr uint64_t kNoPins = 0xFFFF000000000000ull; // stream -1
++    std::atomic<uint64_t> pins{kNoPins};
+     Data(allocator::Buffer buffer, Deleter d = allocator::free)
+         : buffer(buffer), d(d) {}
+     // Not copyable
+@@ -295,6 +349,14 @@ class MLX_API array {
+     return array_desc_.use_count() == 1 && (array_desc_->data.use_count() == 1);
+   }
+ 
++  /** The same question, but a buffer whose only other holders are the pins
++   * of command buffers on the CALLING stream (see `Data::pins`) is still
++   * donatable.  Only meaningful inside a primitive's `eval_gpu` on the Metal
++   * backend, where the eval context names the stream; anywhere else it is
++   * the strict test above.  A primitive that donates through pins from
++   * encoders still in flight is ordered after them by the backend. */
++  bool is_donatable(bool through_stream_pins) const;
++
+   /** The array's siblings. */
+   const std::vector<array>& siblings() const {
+     return array_desc_->siblings;
+diff --git a/mlx/backend/gpu/primitives.cpp b/mlx/backend/gpu/primitives.cpp
+index 268d6290..9b542769 100644
+--- a/mlx/backend/gpu/primitives.cpp
++++ b/mlx/backend/gpu/primitives.cpp
+@@ -125,12 +125,28 @@ void DynamicSliceUpdate::eval_gpu(
+     return;
+   }
+ 
+-  // Copy or donate input to output
++  // Copy or donate input to output.  The donation looks through the pins
++  // of this stream's command buffers (array::is_donatable(true)): a loop
++  // carry that the previous iteration's kernels read is dead to everyone
++  // but those pins, and writing its window in place is the point of a
++  // slice update on a cache.  Row-contiguous only, so the shared buffer
++  // has exactly the strides `compute_dynamic_offset` and the window copy
++  // below read from `out`.
+   auto s = stream();
+-  auto ctype = in.flags().contiguous && in.size() == in.data_size()
+-      ? CopyType::Vector
+-      : CopyType::General;
+-  copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, s);
++  if (in.dtype() == out.dtype() && in.flags().row_contiguous &&
++      in.size() == in.data_size() &&
++      in.is_donatable(/* through_stream_pins = */ true)) {
++    out.copy_shared_buffer(in);
++    detail::donation_counters().slice_update_donated.fetch_add(
++        1, std::memory_order_relaxed);
++  } else {
++    auto ctype = in.flags().contiguous && in.size() == in.data_size()
++        ? CopyType::Vector
++        : CopyType::General;
++    copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, s);
++    detail::donation_counters().slice_update_copied.fetch_add(
++        1, std::memory_order_relaxed);
++  }
+ 
+   auto out_offset =
+       compute_dynamic_offset(start_indices, out.strides(), axes_, s);
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 846611c2..f4f716de 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -406,6 +406,11 @@ DispatchStats dispatch_stats() {
+   s.gpu_gap_ns = acct.gpu_gap_ns.load(std::memory_order_relaxed);
+   s.queue_ns = acct.queue_ns.load(std::memory_order_relaxed);
+   s.now_ns = dispatch_clock_ns();
++  auto& dc = detail::donation_counters();
++  s.slice_update_donated =
++      dc.slice_update_donated.load(std::memory_order_relaxed);
++  s.slice_update_copied =
++      dc.slice_update_copied.load(std::memory_order_relaxed);
+   return s;
+ }
+ 
+@@ -413,7 +418,7 @@ CommandEncoder::CommandEncoder(
+     Device& d,
+     int index,
+     ResidencySet& residency_set)
+-    : device_(d) {
++    : device_(d), index_(index) {
+   auto pool = new_scoped_memory_pool();
+   queue_ = NS::TransferPtr(device_.mtl_device()->newCommandQueue());
+   if (!queue_) {
+@@ -483,6 +488,12 @@ void CommandEncoder::register_output_array(const array& a) {
+   }
+ }
+ 
++void CommandEncoder::pin(const std::shared_ptr<array::Data>& data) {
++  if (data && pinned_.insert(data).second) {
++    detail::pin_data(data->pins, index_, generation_);
++  }
++}
++
+ void CommandEncoder::add_temporary(array arr) {
+   temporaries_.push_back(std::move(arr));
+ }
+@@ -551,6 +562,21 @@ void CommandEncoder::end_encoding() {
+   std::unordered_set<NS::SharedPtr<MTL::Fence>> waiting_on;
+   {
+     std::lock_guard lk(outputs_mtx_);
++    // A primitive in this encoder donated a buffer whose readers were
++    // encoded by encoders that have ended (array::is_donatable(true) saw
++    // through their pins): its write must not start before those reads
++    // are done.  Waiting on every fence still in flight is the conservative
++    // form -- fence waits apply to the whole compute pass, so this orders
++    // the pass after everything committed ahead of it -- and it is paid
++    // only by an encoder that actually donated that way.
++    if (needs_inflight_wait_) {
++      for (auto& f : inflight_fences_) {
++        if (waiting_on.find(f) == waiting_on.end()) {
++          encoder_->waitForFence(f.get());
++          waiting_on.insert(f);
++        }
++      }
++    }
+     // Remove temporaries from inputs and outputs.
+     //
+     // A temporary ARRAY does not cross command encoder boundaries, but its
+@@ -579,6 +605,9 @@ void CommandEncoder::end_encoding() {
+     for (auto& out : all_outputs_) {
+       prev_ce_outputs_[out] = fence_;
+     }
++    // This encoder is now in flight until its command buffer completes.
++    inflight_fences_.push_back(fence_);
++    ended_fences_.push_back(fence_);
+   }
+ 
+   encoder_->updateFence(fence_.get());
+@@ -601,6 +630,7 @@ void CommandEncoder::end_encoding() {
+   encoder_->endEncoding();
+   encoder_.reset();
+   needs_barrier_ = false;
++  needs_inflight_wait_ = false;
+   concurrent_ = false;
+   prev_inputs_.clear();
+   next_inputs_.clear();
+@@ -608,6 +638,14 @@ void CommandEncoder::end_encoding() {
+   next_outputs_.clear();
+   concurrent_outputs_.clear();
+   all_inputs_.clear();
++  // The pins this encoder took stay until the command buffer completes; a
++  // later encoder in the same buffer starts a new generation, so its
++  // donations treat them as in-flight reads (fenced above), never as its own.
++  generation_++;
++  if (!pinned_.empty()) {
++    ended_pins_.push_back(std::move(pinned_));
++    pinned_.clear();
++  }
+ }
+ 
+ void CommandEncoder::signal_event(
+@@ -643,14 +681,51 @@ void CommandEncoder::commit(std::function<void()> completion) {
+   if (ops == 0) {
+     acct.empty_command_buffers.fetch_add(1, std::memory_order_relaxed);
+   }
++  // Every pin the encoders of this command buffer took (gpu::eval's input
++  // retention) rides in its completion handler and is released there
++  // FIRST, ahead of the scheduler's task accounting and the dispatch
++  // accounting, so that whoever learns of the completion from either of
++  // those finds the buffers already donatable.
++  std::vector<std::unordered_set<std::shared_ptr<array::Data>>> pins =
++      std::move(ended_pins_);
++  ended_pins_.clear();
++  if (!pinned_.empty()) {
++    // An encoder still open at commit (a bare `commit()` without
++    // `end_encoding()`): its pins complete with this buffer too.
++    pins.push_back(std::move(pinned_));
++    pinned_.clear();
++    generation_++;
++  }
++  std::vector<NS::SharedPtr<MTL::Fence>> fences = std::move(ended_fences_);
++  ended_fences_.clear();
+   buffer_->addCompletedHandler(
+-      [&error_ = error_,
++      [this,
++       &error_ = error_,
+        wait_events = std::move(wait_events_),
+        signal_events = std::move(signal_events_),
+        completion = std::move(completion),
++       pins = std::move(pins),
++       fences = std::move(fences),
+        ops,
+        commit_ns,
+-       cb_index](MTL::CommandBuffer* cbuf) {
++       cb_index](MTL::CommandBuffer* cbuf) mutable {
++        for (auto& set : pins) {
++          for (auto& d : set) {
++            detail::unpin_data(d->pins);
++          }
++          set.clear();
++        }
++        pins.clear();
++        if (!fences.empty()) {
++          std::lock_guard lk(outputs_mtx_);
++          for (auto& f : fences) {
++            auto it = std::find(
++                inflight_fences_.begin(), inflight_fences_.end(), f);
++            if (it != inflight_fences_.end()) {
++              inflight_fences_.erase(it);
++            }
++          }
++        }
+         if (completion) {
+           completion();
+         }
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index 871e95cc..8c73b2b5 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -9,6 +9,7 @@
+ #include <string>
+ #include <unordered_map>
+ #include <unordered_set>
++#include <vector>
+ 
+ #include "mlx/array.h"
+ #include "mlx/backend/common/metal_kernel.h"
+@@ -98,6 +99,24 @@ class MLX_API CommandEncoder {
+   void commit(std::function<void()> completion = nullptr);
+   void synchronize();
+ 
++  // Keep `data` alive until the command buffer holding the current encoder
++  // has completed (gpu::eval pins every input of every primitive it
++  // encodes).  One pin per encoder per buffer, whatever the number of
++  // kernels reading it; released by the command buffer's completion
++  // handler, BEFORE the dispatch accounting books that buffer as complete.
++  void pin(const std::shared_ptr<array::Data>& data);
++  // The generation of the open encoder: what `array::Data::pins` tags a pin
++  // with, so `array::is_donatable(true)` can tell the pins of THIS encoder
++  // (ordered by its own barriers) from those of encoders that have ended.
++  uint32_t generation() const {
++    return generation_;
++  }
++  // A primitive donated a buffer that encoders which have already ended
++  // may still be reading: this encoder must wait on their fences.
++  void require_inflight_wait() {
++    needs_inflight_wait_ = true;
++  }
++
+   MTL::CommandBuffer* get_command_buffer() const {
+     return buffer_.get();
+   }
+@@ -140,6 +159,21 @@ class MLX_API CommandEncoder {
+   // A map of prior command encoder outputs to their corresponding fence.
+   std::unordered_map<const void*, NS::SharedPtr<MTL::Fence>> prev_ce_outputs_;
+   std::mutex outputs_mtx_;
++
++  // Stream index (the eval context's `stream`).
++  int index_{0};
++  // Encoders ended so far on this stream; the open one's generation.
++  uint32_t generation_{0};
++  // The buffers the open encoder has pinned, the pins of the encoders that
++  // ended in the open command buffer (released at its completion), and the
++  // fences of every encoder that has ended but whose command buffer has not
++  // completed -- what a donation through in-flight pins waits on.  The two
++  // fence lists are under `outputs_mtx_` (completion handlers prune them).
++  bool needs_inflight_wait_{false};
++  std::unordered_set<std::shared_ptr<array::Data>> pinned_;
++  std::vector<std::unordered_set<std::shared_ptr<array::Data>>> ended_pins_;
++  std::vector<NS::SharedPtr<MTL::Fence>> ended_fences_;
++  std::vector<NS::SharedPtr<MTL::Fence>> inflight_fences_;
+ };
+ 
+ class MLX_API Device {
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+index e6826253..43fed929 100644
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -41,30 +41,43 @@ void eval(array& arr) {
+       inputs = arr.inputs();
+     }
+ 
++    // The eval context is what lets a primitive donate an operand whose
++    // only other holders are this stream's pins (array::is_donatable(true)):
++    // it names the stream and the open encoder generation, and carries
++    // back whether such a donation saw through pins of encoders that have
++    // already ended -- reads this encoder must then be fenced after.
++    auto& ctx = detail::eval_context();
++    ctx.stream = s.index;
++    ctx.gen = encoder.generation();
++    ctx.inflight_donation = false;
+     debug_set_primitive_buffer_label(command_buffer, arr.primitive());
+     arr.primitive().eval_gpu(arr.inputs(), outputs);
++    ctx.stream = -1;
++    if (ctx.inflight_donation) {
++      encoder.require_inflight_wait();
++      ctx.inflight_donation = false;
++    }
+   }
+-  std::unordered_set<std::shared_ptr<array::Data>> buffers;
++  // Keep every input (and every sibling output) alive until the command
++  // buffer completes: the encoder holds the pins and hands them to the
++  // buffer's completion handler at commit.  An input the output was
++  // donated to is the output's own buffer now, not a read to protect.
++  const auto& out_data = arr.data_shared_ptr();
+   for (auto& in : arr.inputs()) {
+-    buffers.insert(in.data_shared_ptr());
+-  }
+-  for (auto& s : arr.siblings()) {
+-    buffers.insert(s.data_shared_ptr());
++    if (in.data_shared_ptr() != out_data) {
++      encoder.pin(in.data_shared_ptr());
++    }
+   }
+-  // Remove the output if it was donated to by an input
+-  if (auto it = buffers.find(arr.data_shared_ptr()); it != buffers.end()) {
+-    buffers.erase(it);
++  for (auto& sib : arr.siblings()) {
++    if (sib.data_shared_ptr() != out_data) {
++      encoder.pin(sib.data_shared_ptr());
++    }
+   }
+ 
+   if (encoder.needs_commit()) {
+     encoder.end_encoding();
+     scheduler::notify_new_task(s);
+-    encoder.commit([s, buffers = std::move(buffers)]() {
+-      scheduler::notify_task_completion(s);
+-    });
+-  } else {
+-    command_buffer->addCompletedHandler(
+-        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
++    encoder.commit([s]() { scheduler::notify_task_completion(s); });
+   }
+ }
+ 
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+index a3df0e6e..b47c82e3 100644
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -743,10 +743,23 @@ void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
+     return;
+   }
+ 
+-  auto ctype = in.flags().contiguous && in.size() == in.data_size()
+-      ? CopyType::Vector
+-      : CopyType::General;
+-  copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
++  // Copy or donate input to output (see DynamicSliceUpdate::eval_gpu for
++  // why the donation may look through this stream's pins).
++  if (in.dtype() == out.dtype() && in.flags().row_contiguous &&
++      in.size() == in.data_size() &&
++      in.is_donatable(/* through_stream_pins = */ true)) {
++    out.copy_shared_buffer(in);
++    detail::donation_counters().slice_update_donated.fetch_add(
++        1, std::memory_order_relaxed);
++  } else {
++    auto ctype = in.flags().contiguous && in.size() == in.data_size()
++        ? CopyType::Vector
++        : CopyType::General;
++    copy_gpu(
++        in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
++    detail::donation_counters().slice_update_copied.fetch_add(
++        1, std::memory_order_relaxed);
++  }
+   auto [data_offset, out_strides] =
+       prepare_slice(out, start_indices_, strides_);
+ 
+diff --git a/mlx/backend/metal/metal.h b/mlx/backend/metal/metal.h
+index ed2f79d3..2021c052 100644
+--- a/mlx/backend/metal/metal.h
++++ b/mlx/backend/metal/metal.h
+@@ -65,6 +65,10 @@ struct DispatchStats {
+   uint64_t gpu_gap_ns = 0; // idle between consecutive buffers on the GPU
+   uint64_t queue_ns = 0; // sum of GPU start - host commit time
+   uint64_t now_ns = 0; // host clock when the snapshot was taken
++  // Slice updates (static and dynamic) that wrote into their operand's
++  // buffer, and those that copied it first (array::is_donatable(true)).
++  uint64_t slice_update_donated = 0;
++  uint64_t slice_update_copied = 0;
+ };
+ MLX_API DispatchStats dispatch_stats();
+ 
+-- 
+2.50.1 (Apple Git-155)
+

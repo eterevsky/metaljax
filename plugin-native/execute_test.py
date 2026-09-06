@@ -599,6 +599,98 @@ def _dynamic_big_body(s):
     return (v, n + 1)
 
 
+# The KV in-place rewrite (metal_lowering.cc `kv::`): keras-hub's decode loop
+# carries ONE stacked cache [B, layers, 2, T, H, D] and rebuilds it every
+# token -- each layer slices its slab out, `dynamic_update_slice`s the new
+# row in, reads attention off the result, and the body re-stacks the slabs.
+# The rewrite turns that into a chain of window writes ON the carry.  These
+# bodies spell the pattern the way jax lowers keras-hub's (slice + reshape,
+# DUS, stack = broadcast_in_dim + concatenate), with the corners the rewrite
+# has to get right: a wrapping position (`i % T`, a cache that fills and
+# wraps), a layer that reads its slab BEFORE its own update (gemma4's
+# `where(mask, new, dynamic_slice(slab))`), a layer that keeps its slab as
+# it is (gemma4's KV-sharing layers), and a bf16 cache.
+_KV_L, _KV_T, _KV_H, _KV_D, _KV_B = 3, 8, 2, 4, 1
+
+
+def _kv_layer(cache, l, pos, x, wk, wv, pre_read, read_after=False):
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    B, T, H, D = _KV_B, _KV_T, _KV_H, _KV_D
+    slab = cache[:, l]                     # [B, 2, T, H, D]
+    k, v = slab[:, 0], slab[:, 1]          # [B, T, H, D]
+    new_k = (x @ wk).reshape(B, 1, H, D).astype(cache.dtype)
+    new_v = (x @ wv).reshape(B, 1, H, D).astype(cache.dtype)
+    if pre_read:
+        old = lax.dynamic_slice(k, (0, pos, 0, 0), (B, 1, H, D))
+        mask = (jnp.arange(D) % 2 == 0).reshape(1, 1, 1, D)
+        new_k = jnp.where(mask, new_k, old)
+    k2 = lax.dynamic_update_slice(k, new_k, (0, pos, 0, 0))
+    v2 = lax.dynamic_update_slice(v, new_v, (0, pos, 0, 0))
+    q = (x @ wk).reshape(B, 1, H, D)
+    scores = jnp.einsum("bqhd,bthd->bhqt", q, k2.astype(jnp.float32))
+    probs = jax.nn.softmax(scores, axis=-1)
+    out = jnp.einsum("bhqt,bthd->bqhd", probs,
+                     v2.astype(jnp.float32)).reshape(B, H * D)
+    if read_after:
+        # The slab BEFORE its update, read after it: an in-place write
+        # would change this value, so the rewrite must decline the carry.
+        out = out + jnp.sum(k.astype(jnp.float32)) * 1e-3
+    return jnp.stack([k2, v2], axis=1), out
+
+
+def _kv_body(s, wrap=True, identity_layer=True, read_after=False):
+    import jax.numpy as jnp
+    cache, x, i, acc, (wk, wv) = s
+    pos = (i % _KV_T) if wrap else i
+    parts = []
+    for l in range(_KV_L):
+        if identity_layer and l == _KV_L - 1:
+            parts.append(cache[:, l])
+            continue
+        slab, out = _kv_layer(cache, l, pos, x, wk[l], wv[l],
+                              pre_read=(l == 1), read_after=read_after)
+        parts.append(slab)
+        x = x + 0.5 * out
+    acc = acc + jnp.sum(x) * 1e-3 + 1.0
+    return (jnp.stack(parts, axis=1), x, i + 1, acc, (wk, wv))
+
+
+def _kv_args(dtype, seed):
+    import jax.numpy as jnp
+    B, L, T, H, D = _KV_B, _KV_L, _KV_T, _KV_H, _KV_D
+    return [np.zeros((B, L, 2, T, H, D), dtype),
+            _rand((B, H * D), seed),
+            np.int32(0), np.float32(0.0),
+            (_rand((L, H * D, H * D), seed + 1) * np.float32(0.3),
+             _rand((L, H * D, H * D), seed + 2) * np.float32(0.3))]
+
+
+def _kv_dynamic(steps, **kw):
+    """`steps` iterations behind a data-dependent stop (the pipelined
+    dynamic while), the cache wrapping at T=8."""
+    import jax
+    from jax import lax
+
+    def fn(cache, x, i, acc, ws):
+        return lax.while_loop(lambda s: s[3] < (steps - 0.5),
+                              lambda s: _kv_body(s, **kw),
+                              (cache, x, i, acc, ws))
+    return fn
+
+
+def _kv_counted(steps, **kw):
+    """The same body under fori_loop: the counted (chunked) path."""
+    from jax import lax
+
+    def fn(cache, x, i, acc, ws):
+        return lax.fori_loop(0, steps,
+                             lambda _t, s: _kv_body(s, **kw),
+                             (cache, x, i, acc, ws))
+    return fn
+
+
 def _cases():
     import jax
     import jax.numpy as jnp
@@ -1054,6 +1146,25 @@ def _cases():
          lambda x: jax.lax.while_loop(
              lambda s: s[0] < 5000.0, _dynamic_big_body, (x, jnp.int32(0))),
          [np.float32(1.0)], *EXACT),
+        # The KV in-place rewrite (see `_kv_body`): every case here must match
+        # the CPU AND -- the contract `_p39_kv_inplace` checks -- be
+        # bit-identical with METALJAX_KV_INPLACE=0, since only data movement
+        # changes.  The band is the attention's contractions', not the
+        # cache's: the cache holds matmul rows.
+        ("kv cache in place (dynamic loop, wraps)",
+         _kv_dynamic(12), _kv_args(np.float32, 700), *DOT),
+        # fori_loop: jax wraps the body in a `func.call @closed_call`, and the
+        # rewrite matches a rebuild INSIDE the while body's own block (keras-
+        # hub's generate loop is a while_loop with an inline body), so this
+        # case runs the literal tape -- a differential row for the counted
+        # path either way, and the contract pins that it is NOT rewritten.
+        ("kv cache in place (counted loop, fills)",
+         _kv_counted(8, wrap=False), _kv_args(np.float32, 710), *DOT),
+        ("kv cache in place (bf16, no identity layer)",
+         _kv_dynamic(10, identity_layer=False),
+         _kv_args(ml_dtypes.bfloat16, 720), *BF16DOT),
+        ("kv cache in place (slab read after update: declined)",
+         _kv_dynamic(6, read_after=True), _kv_args(np.float32, 730), *DOT),
         # A loop whose bound is CAPTURED rather than constant: the counted
         # encoding's bound_kind 2, indexing the cond's capture list.
         ("fori_loop (captured bound)",
@@ -9182,6 +9293,94 @@ def _p35_while_pipeline(subprocess, pathlib, re):
              the_layout_cannot_move_an_answer)]
 
 
+def _p39_kv_inplace(subprocess, pathlib, re):
+    """The KV in-place rewrite fires on the stacked-cache decode shape,
+    writes the cache in place (the vendored MLX's donation through the
+    stream's pins), declines the one shape it must, and cannot move an
+    answer: every case is BIT-identical with METALJAX_KV_INPLACE=0."""
+    here = str(pathlib.Path(__file__).resolve())
+
+    def arm(env_extra):
+        import json
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--kv-inplace"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("KV "):
+                label, payload = line[3:].split("\t", 1)
+                answers[label] = json.loads(payload)
+        text = proc.stdout + proc.stderr
+        return answers, text
+
+    def the_rewrite_fires():
+        answers, text = arm({})
+        rewrote = re.findall(r"kv inplace: rewrote carry (\d+): updates=(\d+)",
+                             text)
+        declined = re.findall(r"kv inplace declined carry \d+: (.*)", text)
+        # Every program is lowered twice (the plain and the fused lowering),
+        # so each case narrates twice.  The dynamic case rewrites (2 updated
+        # layers x k,v = 4 updates), the bf16 case rewrites all 3 layers (6),
+        # the read-after case DECLINES with the reason, and the fori_loop
+        # case narrates nothing: its rebuild sits inside jax's `closed_call`
+        # wrapper, which the analysis does not see through (documented).
+        updates = sorted(int(u) for _c, u in rewrote)
+        if updates != [4, 4, 6, 6]:
+            return False, f"rewrote updates {updates}, wanted [4, 4, 6, 6]"
+        if len(declined) != 2 or not all(
+                "read after an overlapping update" in d for d in declined):
+            return False, f"declines {declined}, wanted 2 x read-after"
+        return True, (f"rewrote {len(rewrote)} carries (updates {updates}), "
+                      f"declined {len(declined)} (read-after)")
+
+    def the_cache_is_written_in_place():
+        """On the dynamic loop (12 steps, 4 updates each) the chain donates
+        every time but the first iteration, whose carry the loop still
+        holds: the vendored MLX counts the slice updates that wrote into
+        their operand vs copied it first."""
+        _answers, text = arm({})
+        loops = re.findall(
+            r"while\(pipelined\): steps=(\d+).*?slice_update_donated=(\d+) "
+            r"slice_update_copied=(\d+)", text)
+        if not loops:
+            return False, "no pipelined-loop narration"
+        steps, donated, copied = max(((int(a), int(b), int(c))
+                                      for a, b, c in loops), key=lambda t: t[0])
+        if donated < 4 * (steps - 1) or copied > 4 + 2:
+            return False, (f"steps={steps} donated={donated} copied={copied}: "
+                           "the chain did not write in place")
+        return True, f"steps={steps} donated={donated} copied={copied}"
+
+    def the_knob_restores_the_literal_tape():
+        _answers, text = arm({"METALJAX_KV_INPLACE": "0"})
+        if "kv inplace" in text:
+            return False, "METALJAX_KV_INPLACE=0 still narrates the rewrite"
+        return True, "no rewrite under the knob"
+
+    def the_rewrite_cannot_move_an_answer():
+        base, _ = arm({})
+        other, _ = arm({"METALJAX_KV_INPLACE": "0"})
+        bad = []
+        for case in sorted(base):
+            if base[case] != other.get(case):
+                bad.append(case)
+        if bad:
+            return False, "differs under the knob: " + "; ".join(bad)
+        return True, f"{len(base)} cases bit-identical with the rewrite off"
+
+    return [("kv in-place rewrite fires", the_rewrite_fires),
+            ("kv cache is written in place", the_cache_is_written_in_place),
+            ("kv knob restores the literal tape",
+             the_knob_restores_the_literal_tape),
+            ("kv rewrite cannot move an answer",
+             the_rewrite_cannot_move_an_answer)]
+
+
 def _p36_tape_gate(subprocess, tempfile, pathlib, re):
     """The trace budget is asked of the post-pass TAPE, not only the MLIR.
 
@@ -9724,6 +9923,21 @@ def main():
         ws = [_rand((64, 64), 933 + i) * f32(0.1) for i in range(3)]
         jax.jit(_msl_gru)(h0, xs, *ws)
         return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--kv-inplace":
+        # The KV in-place rows alone: answers to stdout, the plugin's
+        # narration (what the rewrite did, what donated) to stderr/stdout.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        import json as _json
+        for name, fn, args, _rtol, _atol in _cases():
+            if not name.startswith("kv cache in place"):
+                continue
+            out = _flatten(jax.jit(fn)(*args))
+            print(f"KV {name}\t"
+                  f"{_json.dumps([_canonical(v)[1].ravel().tolist() for v in out])}",
+                  flush=True)
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--dynamic-while":
         # The two dynamic-trip while rows alone, so the parent can read one
         # serial/pipelined census per arm out of the narration, and compare
@@ -10018,6 +10232,8 @@ def main():
                          + _p36_tape_gate(subprocess, tempfile, pathlib,
                                           __import__("re"))
                          + _p38_chunk_plan(subprocess, pathlib,
+                                           __import__("re"))
+                         + _p39_kv_inplace(subprocess, pathlib,
                                            __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))

@@ -154,6 +154,13 @@ enum Op : int {
   // emit with TWO results: the output, and the new recurrent state, which
   // the layer writes back into its cache.
   kGdnStep,
+  // The KV in-place rewrite (metal_lowering.cc `KvInplace`): a while body
+  // that rebuilds a stacked cache carry from per-layer slices of it, each
+  // with a window replaced, becomes a chain of window writes ON the carry
+  // -- `kv_starts` builds every update's start vector in one small fused
+  // kernel, `kv_update` is one `mx::slice_update` on the chain, and
+  // `depends` orders the chain after the readers of its previous state.
+  kKvStarts, kKvUpdate, kDepends,
   // M5b: a counted loop msl_scan planned into one generated Metal kernel,
   // and a site where the handler computes on the HOST. Both were lowered by
   // src/metaljax/tape.py; the pseudo-names below are how it asked for them.
@@ -584,6 +591,16 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //   kQmm/kSdpa/kMoe*    documented beside their handlers — the M4 emits'
 //                       layouts are long enough to want reading in place,
 //                       and they are read with a Cursor, not by index
+//   kKvStarts           [D]; ins [const_m, bound_m, sel_m, raw_0..raw_D-1]
+//                       (three int32 [n, rank] payload constants); result
+//                       int32 [n, rank], row i = the start vector of the
+//                       i-th in-place cache update: const_m + sum_d
+//                       where(sel_m == d+1, clip(raw_d, 0, bound_m), 0)
+//   kKvUpdate           [row, rank, axes...]; ins [cache, update, starts]:
+//                       mx::slice_update(cache, update, starts[row], axes)
+//                       -- the update already has the cache's rank
+//   kDepends            []; ins [x, dep...]: x, ordered after every dep
+//                       (mx::depends) -- no data moves
 //
 // A region is a Program of its own, whose arguments are the region block's
 // arguments followed by its CAPTURES -- the values it reads from enclosing
