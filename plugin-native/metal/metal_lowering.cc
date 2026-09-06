@@ -807,6 +807,40 @@ const int64_t kTraceBudget = EnvInt("METALJAX_TRACE_BUDGET", 20000);
 const bool kBodyCompile = EnvOn("METALJAX_BODY_COMPILE");
 const int64_t kChunkMax = EnvInt("METALJAX_CHUNK_MAX", 16);
 const int64_t kChunkMaxCost = EnvInt("METALJAX_CHUNK_MAX_COST", 1500);
+// T4 (the row-10 chunk cadence): a byte bound on one chunked replay, so a
+// body that moves gigabytes per iteration replays in SMALL chunks.  Such a
+// body is device-bound for a millisecond or more per iteration, a compiled
+// call's fixed cost is nothing next to that, and a big chunk costs it twice:
+// nothing of the loop reaches the device until the first chunk's graph is
+// built and walked (~0.1 ms per unrolled iteration on the DeepSeek-V2-Lite
+// decode body), and the replay itself reads slower per iteration the longer
+// the chunk.  Measured on that 26-layer, 1.1 GB/iteration loop: K=2 22.5 ms
+// per token in-PJRT against 23.7-24.1 at K=16 (logs/t4-chunksubmit).
+//
+// The bound is on the body's bytes NET OF ITS WRITE-ONLY ACCUMULATORS, and
+// it is withheld altogether when those are big -- two facts from the same
+// measurement campaign (findings2.txt):
+//   * `BlockBytes` charges a `dynamic_update_slice` its whole result, so a
+//     loop that stacks one slab per iteration into a carried output (every
+//     jax scan `ys`, every remat residual stack, every stacked gradient)
+//     reads as gigabytes per iteration while the device does kilobytes of
+//     in-place work.  Those bytes say nothing about device time and must
+//     not shrink K: texmo's lstm.1024 loop is 427 MB by that count and 0.2
+//     ms per iteration, and K=4 there cost 2.2x (K=2 4.9x).
+//   * A chunk boundary COPIES those accumulators.  The submission pins the
+//     carries until the command buffer completes (runtime/control.cc
+//     `run_chunked`), so the next chunk's in-place update cannot donate and
+//     copies the stack: 0.35 ms per boundary per 64 MB.  More boundaries on
+//     such a loop is a pure loss whatever the rest of the body does (+18 %
+//     per step on the maxtext train row at K=2), so a loop whose write-only
+//     accumulators exceed `kChunkAccMb` keeps the `kChunkMax` chunk.
+// `AccumulatorBytes` finds the accumulators (a DUS/scatter chain from a
+// carry argument back to the same-position result, the argument read by
+// nothing else).  Never below 2: K=1 is not a chunked replay at all (the
+// single-step arm submits on `period`, not per iteration).  0 disables the
+// byte bound; a negative kChunkAccMb disables the veto.
+const int64_t kChunkBytesMb = EnvInt("METALJAX_CHUNK_BYTES_MB", 2048);
+const int64_t kChunkAccMb = EnvInt("METALJAX_CHUNK_ACC_MB", 64);
 // The runtime's bound on unrolling a counted loop INSIDE a trace
 // (runtime/control.cc run_while's in-trace arm, same number): past 64
 // iterations the trace holds more intermediates than Metal's buffer budget
@@ -1823,6 +1857,113 @@ int64_t PassthroughBytes(mlir::Block& block) {
 
 int64_t ProgramBytes(LowerContext& ctx, mlir::Block& block) {
   return BlockBytes(ctx, block) + PassthroughBytes(block);
+}
+
+// T4: the WRITE-ONLY ACCUMULATORS a loop body carries.  A carry whose result
+// is a chain of `dynamic_update_slice` / single-result `scatter` ops rooted,
+// through operand 0, at the same-position block argument -- and whose
+// argument no other op in the body reads -- is a stacked output written one
+// slab per iteration (jax's scan `ys`, remat residual stacks, stacked
+// gradients).  jax 0.11 spells the write as `func.call
+// @dynamic_update_index_in_dim(%stack, %slab, %i)`, so the walk follows a
+// call into its callee and maps the callee's root argument back to the call
+// operand; `BlockBytes` charges the call's result AND the update inside it,
+// each the full stack, and both are counted here so the chunk byte rule can
+// see the body net of the chain.  Returns the bytes of those carries: what
+// one chunk-boundary submission copies (`run_chunked`).  Cheap: one walk of
+// the terminator's operands.
+bool IsUpdateOp(mlir::Operation* op) {
+  const llvm::StringRef n = op->getName().getStringRef();
+  return (n == "stablehlo.dynamic_update_slice" || n == "stablehlo.scatter") &&
+         op->getNumResults() == 1 && op->getNumOperands() > 0;
+}
+
+mlir::func::FuncOp CalleeOf(LowerContext& ctx, mlir::Operation* op) {
+  const llvm::StringRef n = op->getName().getStringRef();
+  if (n != "func.call" && n != "stablehlo.composite") return nullptr;
+  auto sym = op->getAttrOfType<mlir::FlatSymbolRefAttr>(
+      n == "func.call" ? "callee" : "decomposition");
+  if (!sym) return nullptr;
+  auto fn = ctx.module.lookupSymbol<mlir::func::FuncOp>(sym.getValue());
+  if (!fn || fn.getBody().empty()) return nullptr;
+  return fn;
+}
+
+// Every use of `arg` is an in-place update reading it as operand 0, or a
+// call whose callee treats the corresponding argument the same way.
+bool WriteOnlyArg(LowerContext& ctx, mlir::BlockArgument arg, int depth) {
+  if (depth > 8) return false;
+  for (mlir::Operation* user : arg.getUsers()) {
+    if (IsUpdateOp(user) && user->getOperand(0) == arg) continue;
+    mlir::func::FuncOp fn = CalleeOf(ctx, user);
+    if (!fn) return false;
+    bool ok = true;
+    for (unsigned i = 0; i < user->getNumOperands(); i++) {
+      if (user->getOperand(i) != arg) continue;
+      if (i >= fn.getBody().front().getNumArguments() ||
+          !WriteOnlyArg(ctx, fn.getBody().front().getArgument(i), depth + 1)) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) return false;
+  }
+  return true;
+}
+
+// Follows an in-place update chain upward from `v` -- operand 0 of every
+// update op, and through a call into its callee's returned value -- to the
+// BLOCK ARGUMENT it is rooted at (null when it is not such a chain), adding
+// what BlockBytes charged along the way.
+mlir::BlockArgument UpdateChainRoot(LowerContext& ctx, mlir::Value v,
+                                    int64_t* bytes, int depth) {
+  if (depth > 8) return nullptr;
+  for (int guard = 0; guard < 4096; guard++) {
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(v)) return arg;
+    mlir::Operation* def = v.getDefiningOp();
+    if (def == nullptr) return nullptr;
+    if (IsUpdateOp(def)) {
+      *bytes += OpBytes(def);
+      v = def->getOperand(0);
+      continue;
+    }
+    mlir::func::FuncOp fn = CalleeOf(ctx, def);
+    if (!fn) return nullptr;
+    mlir::Block& body = fn.getBody().front();
+    mlir::Operation* term = body.getTerminator();
+    const unsigned ri = mlir::cast<mlir::OpResult>(v).getResultNumber();
+    if (term == nullptr || ri >= term->getNumOperands()) return nullptr;
+    *bytes += ValueBytes(v);   // the call's own result, as BlockBytes charged it
+    mlir::BlockArgument root =
+        UpdateChainRoot(ctx, term->getOperand(ri), bytes, depth + 1);
+    if (!root || root.getOwner() != &body ||
+        root.getArgNumber() >= def->getNumOperands() ||
+        !WriteOnlyArg(ctx, root, depth + 1))
+      return nullptr;
+    v = def->getOperand(root.getArgNumber());
+  }
+  return nullptr;
+}
+
+int64_t AccumulatorBytes(LowerContext& ctx, mlir::Block& block,
+                         int64_t* chain_bytes) {
+  *chain_bytes = 0;
+  int64_t acc = 0;
+  mlir::Operation* term = block.getTerminator();
+  if (term == nullptr) return 0;
+  const unsigned n = std::min<unsigned>(block.getNumArguments(),
+                                        term->getNumOperands());
+  for (unsigned i = 0; i < n; i++) {
+    mlir::BlockArgument arg = block.getArgument(i);
+    mlir::Value res = term->getOperand(i);
+    if (res == arg) continue;
+    int64_t bytes = 0;
+    mlir::BlockArgument root = UpdateChainRoot(ctx, res, &bytes, 0);
+    if (root != arg || !WriteOnlyArg(ctx, arg, 0)) continue;
+    acc += ValueBytes(res);
+    *chain_bytes += bytes;
+  }
+  return acc;
 }
 
 // ops/control.py `_bytes_ok`: whether tracing `mult` copies of this block fits
@@ -6399,9 +6540,22 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
   // both engines, which is what a tape diff compares.
   const int64_t chunkable =
       (kCompileEnabled && cost <= kChunkMaxCost && pure) ? 1 : 0;
+  // The byte bound on a chunk (kChunkBytesMb / kChunkAccMb above): the
+  // iterations whose traffic, net of the write-only accumulators, fits the
+  // budget, floored at 2 -- and withheld when the accumulators themselves
+  // are big, because every chunk boundary copies them.
+  int64_t chain_bytes = 0;
+  const int64_t acc_mb = AccumulatorBytes(*ctx_, body_block, &chain_bytes) >> 20;
+  const int64_t real_mb =
+      std::max<int64_t>(0, BlockBytes(*ctx_, body_block) - chain_bytes) >> 20;
+  const bool acc_veto = kChunkAccMb >= 0 && acc_mb > kChunkAccMb;
+  const int64_t by_chunk_bytes =
+      (kChunkBytesMb <= 0 || acc_veto)
+          ? kChunkMax
+          : std::max<int64_t>(2, kChunkBytesMb / std::max<int64_t>(real_mb, 1));
   const int64_t kmax = std::max<int64_t>(
       1, std::min<int64_t>({by_cost, kChunkMax,
-                            BytesChunks(*ctx_, body_block)}));
+                            BytesChunks(*ctx_, body_block), by_chunk_bytes}));
   // The single-step gate solved for `repeat`, on `gate_cost`.  For a body
   // the MLIR count admits this is >= `by_cost` >= `kmax`, so nothing the
   // executor asks for changes; for one it refused and the tape admits, it
@@ -6431,7 +6585,8 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
                  "[metaljax-native] while gate: cost=%lld tape=%lld "
                  "bytes=%lldMB "
                  "budget=%lld by_cost=%lld by_bytes=%lld pure=%d "
-                 "body_compile=%lld chunkable=%lld kmax=%lld period=%lld\n",
+                 "body_compile=%lld chunkable=%lld kmax=%lld period=%lld "
+                 "real=%lldMB acc=%lldMB%s\n",
                  static_cast<long long>(cost),
                  static_cast<long long>(have_regions ? body.tape_cost : cost),
                  static_cast<long long>(BlockBytes(*ctx_, body_block) >> 20),
@@ -6441,7 +6596,10 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
                  static_cast<long long>(body_compile_max),
                  static_cast<long long>(chunkable),
                  static_cast<long long>(kmax),
-                 static_cast<long long>(period));
+                 static_cast<long long>(period),
+                 static_cast<long long>(real_mb),
+                 static_cast<long long>(acc_mb),
+                 acc_veto ? " (accumulators veto the chunk byte bound)" : "");
     std::fflush(stderr);
   }
 

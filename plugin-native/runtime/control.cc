@@ -69,7 +69,63 @@ std::vector<mx::array> run_chunked(Program* body,
     for (int64_t r = 0; r < repeat; r++) out = run_body(body, out, caps, false);
     return out;
   };
-  for (int64_t i = 0; i < trip / K; i++) {
+  const int64_t nchunks = trip / K;
+  const int64_t rem = trip % K;
+  // The schedule, once per distinct (trip, K) per body under METALJAX_DEBUG:
+  // `nchunks` compiled K-chunks, each submitted as it is built (a blocking
+  // flush every `sync_every` of them), then `rem` single-step replays left
+  // LAZY for the final flush.  `submits` counts `loop_submit`s, `flushes`
+  // the blocking `loop_flush`es, the final one included.
+  //
+  // Why the singles trail lazily instead of being submitted one by one, and
+  // why every submission is a cost in itself (T4, findings2): a submission
+  // PINS every carry it is handed -- `mx::async_eval`'s Synchronizer node
+  // keeps the inputs' buffers in its command-buffer completion handler
+  // until the device is done -- so the NEXT replay's in-place update of a
+  // carried accumulator (a `dynamic_update_slice` chain writing one slab
+  // per iteration into a stacked output) finds its operand not donatable
+  // and copies the whole stack.  Measured 0.35 ms per boundary per 64 MB of
+  // accumulator; +80 ms per step on the maxtext 0.6B train row when its
+  // 28-layer loops went from one submission to thirteen, and 2-5x on texmo's
+  // lstm/gru.1024 rows at K=2-4 (logs/t4-chunksubmit/findings2.txt).  A
+  // lazy chain of singles is evaluated by ONE eval at the flush, in place
+  // all the way; the K-chunks stay submitted because a chunk is `K`
+  // iterations of device work per boundary, and the lowering sizes K so
+  // that boundary is cheap next to it (metal_lowering.cc kChunkBytesMb /
+  // kChunkAccMb).
+  // How far the host may run ahead of the device, in submitted chunks
+  // (`g_cfg.chunk_inflight`, METALJAX_CHUNK_INFLIGHT).  MLX's own
+  // back-pressure (transforms.cpp MAX_ACTIVE_TASKS) counts only the command
+  // buffers its 800-op / 512 MB rule commits in the MIDDLE of an eval, never
+  // the one `async_eval` commits at its end -- so a chunk that fits one
+  // command buffer is never counted, and a loop of such chunks lets the
+  // host submit every one of them before the device has finished the
+  // first.  Each chunk in flight holds its transients (the completion
+  // handlers pin them until the device is done), so the loop's whole
+  // working set is allocated at once, and in a process whose buffer pool
+  // already holds another program's leftovers every one of those
+  // allocations misses the pool: +350 ms per 64-step chunk on texmo's
+  // gru.256 row at K=2 inside the suite process, nothing standalone
+  // (findings2 section 2d).  Waiting on the carries of the chunk
+  // `inflight` behind keeps the host that many chunks ahead and no more:
+  // the device never idles (inflight-1 chunks stay queued) and a finished
+  // chunk's transients are back in the pool before the next one allocates.
+  // `array::wait` is a no-op on a carry that is already available or was
+  // never scheduled (a pass-through), so the wait costs nothing it should
+  // not.
+  const int64_t inflight = std::max<int64_t>(1, g_cfg.chunk_inflight);
+  if (body->narrate_chunk_plan(trip, K)) {
+    const int64_t blocking = nchunks / sync_every;
+    debug_print("chunked loop: trip=" + std::to_string(trip) +
+                " K=" + std::to_string(K) + " plan=" + std::to_string(nchunks) +
+                "x" + std::to_string(K) + "+" + std::to_string(rem) +
+                "x1 submits=" + std::to_string(nchunks - blocking) +
+                " flushes=" + std::to_string(blocking + 1) +
+                " inflight=" + std::to_string(inflight) +
+                " (singles trail lazily)");
+  }
+  std::vector<std::vector<mx::array>> ring(static_cast<size_t>(inflight));
+  for (int64_t i = 0; i < nchunks; i++) {
     vals = chunk(K, vals);
     // Async-flush each chunk (a blocking sync per chunk serializes CPU
     // and GPU); block only often enough to bound pending buffers.
@@ -78,8 +134,10 @@ std::vector<mx::array> run_chunked(Program* body,
     } else {
       loop_submit(vals);
     }
+    std::vector<mx::array>& slot = ring[static_cast<size_t>(i % inflight)];
+    for (mx::array& a : slot) a.wait();   // chunk i - inflight, if any
+    slot = vals;
   }
-  const int64_t rem = trip % K;
   for (int64_t i = 0; i < rem; i++) vals = chunk(1, vals);
   loop_flush(vals, (trip % std::max<int64_t>(sync_every * K, 1)) * cost);
   return vals;

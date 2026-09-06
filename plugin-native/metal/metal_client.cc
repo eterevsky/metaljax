@@ -249,6 +249,7 @@ void ConfigureFromEnv() {
       /*ingest_clear_bytes=*/EnvInt("METALJAX_INGEST_CLEAR_MB", 8192) *
           (int64_t{1} << 20),
       /*while_pipeline=*/EnvInt("METALJAX_WHILE_PIPELINE", 1),
+      /*chunk_inflight=*/EnvInt("METALJAX_CHUNK_INFLIGHT", 4),
       /*debug=*/EnvFlag("METALJAX_DEBUG"),
       /*memdbg=*/EnvFlag("METALJAX_MEMDBG"));
 

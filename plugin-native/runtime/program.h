@@ -259,6 +259,10 @@ struct Config {
   int64_t loop_clear_cost = 500000;           // METALJAX_LOOP_CLEAR_COST
   int64_t ingest_clear_bytes = 8LL << 30;     // METALJAX_INGEST_CLEAR_MB
   int64_t while_pipeline = 1;                 // METALJAX_WHILE_PIPELINE
+  // T4: how many submitted K-chunks of one counted loop may be in flight
+  // before the host waits for the oldest (control.cc `run_chunked`, where
+  // the reason is written out). 1 = one chunk at a time.
+  int64_t chunk_inflight = 4;                 // METALJAX_CHUNK_INFLIGHT
   bool debug = false;                         // METALJAX_DEBUG
   bool memdbg = false;                        // METALJAX_MEMDBG
 };
@@ -272,7 +276,8 @@ void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
                int64_t flush_floor_bytes, int64_t flush_main_flushes,
                int64_t flush_earn_mult,
                int64_t loop_clear_cost, int64_t ingest_clear_bytes,
-               int64_t while_pipeline, bool debug, bool memdbg);
+               int64_t while_pipeline, int64_t chunk_inflight, bool debug,
+               bool memdbg);
 
 struct Stats {
   int64_t flushes = 0;         // eager byte-denominated sync points
@@ -749,6 +754,18 @@ class Program {
   bool no_chunk() const { return no_chunk_; }
   void set_no_chunk() { no_chunk_ = true; }
 
+  // Should `run_chunked` narrate its schedule for this (trip, K)?  True the
+  // first time a body runs chunked with a given pair -- a decode loop
+  // replays the same plan once per token, and one line says it.  Debug
+  // only (control.cc `run_chunked`); the state moves whenever the plan does,
+  // so a loop whose trip count comes from a carry narrates each new one.
+  bool narrate_chunk_plan(int64_t trip, int64_t k) {
+    if (chunk_plan_trip_ == trip && chunk_plan_k_ == k) return false;
+    chunk_plan_trip_ = trip;
+    chunk_plan_k_ = k;
+    return true;
+  }
+
   size_t num_ops() const { return ops_.size(); }
   int num_slots() const { return nslots_; }
   int num_args() const { return nargs_; }
@@ -903,6 +920,8 @@ class Program {
   bool compile_disabled_ = false;
   bool compile_probe_ = true;   // settle the first compiled call (run_recovering)
   bool no_chunk_ = false;
+  int64_t chunk_plan_trip_ = -1;   // last narrated chunk plan (debug only)
+  int64_t chunk_plan_k_ = -1;
   // P27 + P28: what this program's own flush history has established about
   // it -- the hard-flush count and the live-set water marks `flush_bound`'s
   // three rules read. See FlushState.
