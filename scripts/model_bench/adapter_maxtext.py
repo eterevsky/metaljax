@@ -296,9 +296,28 @@ def run_maxtext(bench, backend, prompt, n_decode):
     rng, sub = jax.random.split(rng)
     state = engine.init_decode_state(sub)
     state = engine.insert(prefill_result, state, slot=0)
+    # MAXTEXT_RNG_PRESPLIT=1 (harness variant, reported as its own cell):
+    # draw the per-step keys BEFORE the timed loop -- the same chain of
+    # splits, so every `sub` is the value the loop below would have drawn.
+    # Greedy decode never reads them, and the per-step `jax.random.split` is
+    # a jitted `threefry_split` execute of its own: 0.35 ms/tok of harness
+    # overhead on DeepSeek-V2-Lite (row 10, TIMING), which mlx-lm's loop
+    # does not pay.  The original (per-step split inside the loop) stays the
+    # default so the recorded cells reproduce.
+    presplit = os.environ.get("MAXTEXT_RNG_PRESPLIT") == "1"
+    subs = []
+    if presplit:
+        for _ in range(n_decode - 1):
+            rng, sub = jax.random.split(rng)
+            subs.append(sub)
+        if subs:
+            _sync(subs[-1])
     t0 = time.monotonic()
-    for _ in range(n_decode - 1):
-        rng, sub = jax.random.split(rng)
+    for i in range(n_decode - 1):
+        if presplit:
+            sub = subs[i]
+        else:
+            rng, sub = jax.random.split(rng)
         state, sampled = engine.generate(params, state, rng=sub)
         ids.append(_first_token(sampled))
     decode_s = time.monotonic() - t0
@@ -309,7 +328,8 @@ def run_maxtext(bench, backend, prompt, n_decode):
     return dict(load_s=load_s, warmup_s=warmup_s, prefill_ms=prefill_ms,
                 decode_ms_tok=decode_ms, out_tokens=len(ids),
                 token_ids=[int(t) for t in ids[:64]],
-                prompt_tokens=true_length, text=text)
+                prompt_tokens=true_length, text=text,
+                rng_presplit=presplit)
 
 
 # -------------------------------------------------------------------- train

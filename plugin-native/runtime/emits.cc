@@ -12,6 +12,7 @@
 #include "program.h"
 
 #include "gdn.h"
+#include "mla.h"
 
 #include <algorithm>
 #include <optional>
@@ -348,61 +349,55 @@ bool Program::step_emit(const Entry& e,
     case kMlaSdpa: {
       // metal_mla.cc: maxtext's multi-span MLA/GQA decode attention.  The
       // per-span masked softmax partials joined by the flash renormalization
-      // ARE the softmax over the concatenated scores, so: concat the spans,
-      // build the additive mask from the segment ids (exactly the numbers
-      // the matched `_where` chain selects), and run ONE fused sdpa — whose
-      // vector kernel supports the MLA 192/128 head geometry.  The graph
-      // pre-scaled q, so scale = 1.
+      // ARE the softmax over the concatenated scores.  runtime/mla.cc runs
+      // it: as ONE generated kernel over both spans when the geometry's
+      // kernel was proven at lowering (B3 -- the spans, the values and the
+      // segment ids are read in place, nothing is concatenated), and
+      // otherwise on the concat path -- concat the spans, build the
+      // additive mask from the segment ids (exactly the numbers the matched
+      // `_where` chain selects), and call MLX's fused sdpa, whose vector
+      // kernel supports the MLA 192/128 head geometry.  The graph pre-scaled
+      // q, so scale = 1.
       // Grouped query attention needs nothing here: k and v simply carry
-      // Hkv < H heads, and MLX's sdpa reads both counts off the arrays and
-      // repeats the KV heads itself, in the same head order the matched
-      // reshape merged (query head h -> kv head h / (H/Hkv)).  The mask is
-      // per-key, so [B,1,1,T] broadcasts over heads either way.
+      // Hkv < H heads (query head h reads kv head h / (H/Hkv), the order
+      // the matched reshape merged), and the mask is per-key.
       // ins [q(B,1,H,D), then per span k(B,T,Hkv,D), v(B,T,Hkv,Dv),
       // seg(B,T)];
-      // attrs [B, H, D, Dv, nspans, T..., seg_val, dtype, out_dtype];
+      // attrs [B, H, Hkv, D, Dv, nspans, T..., seg_val, dtype, out_dtype];
       // fattrs [mask_true, mask_false].
       Cursor c(at);
-      const auto B = static_cast<mx::ShapeElem>(c.next());
-      const auto H = static_cast<mx::ShapeElem>(c.next());
-      c.next();  // D: carried for the record, read off the arrays
-      const auto Dv = static_cast<mx::ShapeElem>(c.next());
+      MlaSpec sp;
+      sp.B = c.next();
+      sp.H = c.next();
+      sp.Hkv = c.next();
+      sp.D = c.next();
+      sp.Dv = c.next();
       const int64_t nspans = c.next();
-      std::vector<int64_t> T(static_cast<size_t>(nspans));
-      for (int64_t i = 0; i < nspans; i++) T[static_cast<size_t>(i)] = c.next();
-      const int64_t seg_val = c.next();
-      mx::Dtype dt = dtype_of(c.next());
+      if (nspans != 2)
+        throw std::invalid_argument("tape: mla_sdpa wants two spans");
+      sp.T0 = c.next();
+      sp.T1 = c.next();
+      sp.seg_val = c.next();
+      sp.dt = dtype_of(c.next());
       mx::Dtype out_dt = dtype_of(c.next());
-      (void)Dv;
+      sp.mask_true = e.fattrs[0];
+      sp.mask_false = e.fattrs[1];
 
-      mx::array q = in(0);  // [B, 1, H, D] -> [B, H, 1, D]
-      q = mx::transpose(q, {0, 2, 1, 3});
-      if (q.dtype() != dt) q = mx::astype(q, dt);
-      std::vector<mx::array> ks, vs, masks;
+      mx::array q = in(0);
+      if (q.dtype() != sp.dt) q = mx::astype(q, sp.dt);
+      std::vector<mx::array> ks, vs, segs;
       for (int64_t i = 0; i < nspans; i++) {
         mx::array k = in(static_cast<size_t>(1 + 3 * i));
         mx::array v = in(static_cast<size_t>(2 + 3 * i));
-        mx::array seg = in(static_cast<size_t>(3 + 3 * i));
-        if (k.dtype() != dt) k = mx::astype(k, dt);
-        if (v.dtype() != dt) v = mx::astype(v, dt);
+        if (k.dtype() != sp.dt) k = mx::astype(k, sp.dt);
+        if (v.dtype() != sp.dt) v = mx::astype(v, sp.dt);
         ks.push_back(k);
         vs.push_back(v);
-        masks.push_back(mx::where(
-            mx::equal(seg, weak_int(seg_val, seg)),
-            mx::array(e.fattrs[0], dt), mx::array(e.fattrs[1], dt)));
+        segs.push_back(in(static_cast<size_t>(3 + 3 * i)));
       }
-      // [B, T, Hkv, D] concat on T, then to [B, Hkv, T, D].
-      mx::array k = mx::transpose(mx::concatenate(ks, 1), {0, 2, 1, 3});
-      mx::array v = mx::transpose(mx::concatenate(vs, 1), {0, 2, 1, 3});
-      mx::array mask =
-          mx::reshape(mx::concatenate(masks, 1),
-                      mx::Shape{B, 1, 1, static_cast<mx::ShapeElem>(
-                                             k.shape(2))});
-      mx::array out = mx::fast::scaled_dot_product_attention(
-          q, k, v, /*scale=*/1.0f, /*mask_mode=*/"", mask);
-      out = mx::transpose(out, {0, 2, 1, 3});  // [B, H, 1, Dv] -> [B, 1, H, Dv]
+      mx::array out =
+          MlaRun(sp, q, ks[0], vs[0], segs[0], ks[1], vs[1], segs[1]);
       if (out.dtype() != out_dt) out = mx::astype(out, out_dt);
-      (void)H;
       env[e.outs[0]] = out;
       break;
     }

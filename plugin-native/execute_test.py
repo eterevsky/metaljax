@@ -982,12 +982,15 @@ def _cases():
          [_rand((2, 128), 88), _rand((128, 4, 128), 89),
           np.array(9, np.int32)], *DOT),
         # Contracted axes that straddle the stack axis (maxtext's o-proj
-        # layout): the view cannot exist, the recognizer must DECLINE, and
-        # the slice chain runs.
-        ("stacked dot non-collapsible declines",
-         lambda x, W, i: jnp.einsum(
-             "bcd,cdk->bk", x, jax.lax.dynamic_index_in_dim(
-                 jnp.transpose(W, (1, 0, 2, 3)), i, 0, keepdims=False)),
+        # layout): no view of the ORIGINAL buffer exists.  At M = 3 the
+        # RELAYOUT form (B3) declines too -- it is decode-only, M = 1, where
+        # `_p41_stacked_relayout` pins it -- so the slice chain runs here
+        # and the answer is the CPU's either way.
+        ("stacked dot o-proj layout (M=3 declines)",
+         lambda x, W, i: jax.lax.dot_general(
+             x, jax.lax.dynamic_index_in_dim(
+                 jnp.transpose(W, (1, 0, 2, 3)), i, 0, keepdims=False),
+             (((1, 2), (0, 1)), ((), ()))),
          # Small magnitudes: the DECLINE is the point, and the fallback's
          # canonicalized pair order reduces K = 512 in a different order
          # than the CPU, which at unit variance exceeds DOT's per-element
@@ -3912,6 +3915,59 @@ module @dus_plan_all_zero {
 """
 
 
+def _stacked_relayout_forms():
+    """(label, jax function, inputs) for `_p41_stacked_relayout`.
+
+    Both spell maxtext's attention out-projection read: the ORIGINAL stack
+    is [heads, L, head_dim, model] (param_scan_axis = 1), the graph hoists a
+    [1, 0, 2, 3] transpose out of the loop, and the layer's dot contracts
+    (heads, head_dim) -- axes that straddle L in the buffer, so no [L, K, N]
+    view of it exists and the recognizer DECLINED until B3.  The inline form
+    slices in @main; the scanned form is the helper-call spelling inside a
+    while loop, the way maxtext's decode body reads it.
+
+    Both are M = 1 -- one decoded token, the row-10 geometry -- because that
+    is where the bit contract lives: at M = 1 the pack is read by the same
+    gemv `gather_mm` dispatches for every other stacked read.  (At M > 1
+    `gather_mm` and the slice chain's `matmul` pick different steel kernels
+    and accumulate K in different orders -- measured 9.6e-7 relative on
+    K = 512 -- which is the stacked recognizer's own, pre-B3 class; the
+    M = 3 differential case above covers it at DOT tolerance.)  The dots are
+    spelled with `dot_general` directly (`jnp.einsum` folds the head axes
+    through a reshape the matcher does not read through), and the inline
+    slice with `lax.dynamic_slice` (`dynamic_index_in_dim`'s helper carries
+    jax's negative-index wrap -- compare/add/select -- which the helper-call
+    matcher has never accepted; the scan lowering's helper is the bare
+    slice).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    dn = (((1, 2), (0, 1)), ((), ()))
+    # B3_RELAYOUT_M (test-only): the activation row count, so the same
+    # forms can show the decode-only rule at M > 1.
+    m = int(os.environ.get("B3_RELAYOUT_M", "1"))
+    x = _rand((m, 8, 64), 90) * 0.1
+    W = _rand((8, 4, 64, 64), 91) * 0.1
+    Ws = _rand((8, 4, 64, 512), 92) * 0.05
+    h0 = _rand((m, 8, 64), 93) * 0.1
+
+    def inline(x, W, i):
+        w = jax.lax.dynamic_slice(jnp.transpose(W, (1, 0, 2, 3)),
+                                  (i, 0, 0, 0), (1, 8, 64, 64))
+        return jax.lax.dot_general(x, w.reshape(8, 64, 64), dn)
+
+    def scanned(h, W):
+        def body(h, w):
+            return jax.lax.dot_general(h, w, dn).reshape(m, 8, 64), None
+        return jax.lax.scan(body, h, jnp.transpose(W, (1, 0, 2, 3)))[0]
+
+    return [
+        ("o-proj inline", inline, [x, W, np.array(3, np.int32)]),
+        ("o-proj scanned", scanned, [h0, Ws]),
+    ]
+
+
 def _start_plan_forms():
     """(label, module, inputs) for `_p34_start_plan`'s narration arm.
 
@@ -5049,7 +5105,7 @@ module @mla_two_span {
 """
 
 
-def _mla_gqa_two_span(dt, acc, d=4):
+def _mla_gqa_two_span(dt, acc, d=4, t=(4, 2)):
     """maxtext's GROUPED-QUERY decode attention, as row 11 spells it.
 
     Same two-span flash combine as `_MLA_TWO_SPAN`, with the one difference
@@ -5072,7 +5128,13 @@ def _mla_gqa_two_span(dt, acc, d=4):
     so d=4 keeps the module small and lands on MLX's unfused fallback --
     which tests the recognizer and the emit's plumbing -- while d=64 is the
     path row 11 actually takes, GQA head repeat inside the kernel included.
+
+    `t` is the pair of span lengths (prefill, autoregressive).  The B3
+    two-span kernel hands key i to simdgroup i % 32, so spans whose SUM
+    passes 32 (and is not a multiple of it) are what exercise more than one
+    key per simdgroup and a ragged last round.
     """
+    T0, T1 = t
     ninf = {"f32": "0xFF800000", "bf16": "0xFF80"}[dt]
     # Two spans, identical but for their key length; the callee names have
     # to differ because their shapes do.
@@ -5170,10 +5232,10 @@ def _mla_gqa_two_span(dt, acc, d=4):
     return f"""
 module @mla_gqa_two_span {{
   func.func public @main(%q: tensor<1x1x4x{d}x{dt}>,
-      %kp: tensor<1x4x2x{d}x{dt}>, %vp: tensor<1x4x2x{d}x{dt}>,
-      %sp: tensor<1x4xi32>,
-      %ka: tensor<1x2x2x{d}x{dt}>, %va: tensor<1x2x2x{d}x{dt}>,
-      %sa: tensor<1x2xi32>) -> tensor<1x1x4x{d}x{dt}> {{
+      %kp: tensor<1x{T0}x2x{d}x{dt}>, %vp: tensor<1x{T0}x2x{d}x{dt}>,
+      %sp: tensor<1x{T0}xi32>,
+      %ka: tensor<1x{T1}x2x{d}x{dt}>, %va: tensor<1x{T1}x2x{d}x{dt}>,
+      %sa: tensor<1x{T1}xi32>) -> tensor<1x1x4x{d}x{dt}> {{
     %one = stablehlo.constant dense<1> : tensor<i32>
     %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
     %zacc = stablehlo.constant dense<0.000000e+00> : tensor<{acc}>
@@ -5181,8 +5243,8 @@ module @mla_gqa_two_span {{
     %neg = stablehlo.constant dense<-2.38197633E+38> : tensor<f32>
     %half = stablehlo.constant dense<-1.19098816E+38> : tensor<f32>
     %ninf = stablehlo.constant dense<{ninf}> : tensor<{dt}>
-{span("p", 4, "%kp", "%vp", "%sp")}
-{span("a", 2, "%ka", "%va", "%sa")}
+{span("p", T0, "%kp", "%vp", "%sp")}
+{span("a", T1, "%ka", "%va", "%sa")}
     %m = stablehlo.maximum %mtp, %mta : tensor<1x1x4x1x{dt}>
     %dp = stablehlo.subtract %mtp, %m : tensor<1x1x4x1x{dt}>
     %e1p = stablehlo.exponential %dp : tensor<1x1x4x1x{dt}>
@@ -5212,7 +5274,7 @@ module @mla_gqa_two_span {{
     %root = stablehlo.add %acc, %wsa : tensor<1x1x4x{d}x{dt}>
     return %root : tensor<1x1x4x{d}x{dt}>
   }}
-{where_callees("p", 4)}{where_callees("a", 2)}}}
+{where_callees("p", T0)}{where_callees("a", T1)}}}
 """
 
 
@@ -5222,6 +5284,12 @@ _MLA_GQA_TWO_SPAN_BF16 = _mla_gqa_two_span("bf16", "f32")
 # repeat happens inside the kernel rather than in its fallback -- the path
 # row 11 runs (D = 128 there).
 _MLA_GQA_TWO_SPAN_BF16_D64 = _mla_gqa_two_span("bf16", "f32", d=64)
+# B3: the two-span KERNEL's own forms (runtime/mla.cc).  Spans past 32 keys
+# put several keys on one simdgroup with a ragged last round, at both dtypes
+# the kernel names; D = 32 is the smallest head dim the lane split takes.
+_MLA_KERNEL_BF16_D64_T40_27 = _mla_gqa_two_span("bf16", "f32", d=64,
+                                                t=(40, 27))
+_MLA_KERNEL_F32_D64_T33_5 = _mla_gqa_two_span("f32", "f32", d=64, t=(33, 5))
 
 
 # --------------------------------------------------------------------------
@@ -6104,6 +6172,24 @@ def _gqa_inputs(text):
         args.append(v.astype({"f32": np.float32,
                               "bf16": ml_dtypes.bfloat16}[dt]))
     return args
+
+
+def _mla_kernel_forms():
+    """(label, module, kernel key tag runtime/mla.cc must narrate, dtype).
+
+    The geometries the B3 two-span kernel takes -- MLX's own `sdpa_vector`
+    head-dim set, so the concat path it is compared against runs the fused
+    kernel it copies -- and `_p40_mla_kernel` pins that it BUILDS for each
+    and that its answer is the concat path's to the bit.
+    """
+    return [
+        ("kernel bf16 D=64 T4+2", _MLA_GQA_TWO_SPAN_BF16_D64,
+         "B1H4Hkv2D64Dv64T4+2_bfloat16_t", "bf16"),
+        ("kernel bf16 D=64 T40+27", _MLA_KERNEL_BF16_D64_T40_27,
+         "B1H4Hkv2D64Dv64T40+27_bfloat16_t", "bf16"),
+        ("kernel f32 D=64 T33+5", _MLA_KERNEL_F32_D64_T33_5,
+         "B1H4Hkv2D64Dv64T33+5_float", "f32"),
+    ]
 
 
 def _mla_inputs(text):
@@ -8747,6 +8833,245 @@ def _p31_norm(subprocess, pathlib, re):
             ("norm fused == jax-CPU", fused_agrees_with_cpu)]
 
 
+def _p40_mla_kernel(subprocess, pathlib, re):
+    """B3: the two-span decode attention KERNEL (runtime/mla.cc).
+
+    The concat path joins the spans for MLX's fused sdpa -- concat(K),
+    concat(V), a mask per span and their concat -- about eight copy kernels
+    per layer around the one that attends, 26 layers a token on row 10.  The
+    kernel reads both spans, the values and the segment ids in place, and it
+    is MLX's own `sdpa_vector` with two key pointers, so its answer is meant
+    to be the concat path's TO THE BIT (the contract: bit-identical, or
+    within the fused-attention ULP class the recognizer discloses -- the
+    detail line says which held).
+
+    Pinned: the kernel BUILDS for every eligible geometry (narration, with
+    the Spec key), the kill switch keeps the recognizer but runs the concat
+    path, the kernel's answer against the kill switch, and against jax-CPU.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+
+    def arm(env_extra, platform="metal"):
+        import json
+        child = dict(os.environ)
+        if platform == "cpu":
+            child.pop("METALJAX_PLUGIN_PATH", None)
+            child["JAX_PLATFORMS"] = "cpu"
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--mla-kernel-forms"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if not line.startswith("MLK "):
+                continue
+            label, payload = line[4:].split("\t", 1)
+            answers[label] = np.array(json.loads(payload))
+        built = re.findall(r"mla: kernel built mjn_mla2_\d+ for (\S+)",
+                           proc.stderr)
+        matched = re.findall(
+            r"mla: matched a multi-span attention \(([^,]*),", proc.stderr)
+        disabled = "kernel disabled (METALJAX_MLA_KERNEL=0)" in proc.stderr
+        return answers, built, matched, disabled
+
+    def worst(a, b):
+        scale = max(float(np.max(np.abs(b))), 1e-30)
+        return float(np.max(np.abs(a - b))) / scale
+
+    # The disclosed class (fused attention, f32 softmax inside the kernel):
+    # a couple of ULP of the model dtype -- `_p32_mla`'s bar.
+    BAR = {"bf16": 2 * 2.0**-7, "f32": 1e-6}
+
+    def the_kernel_builds():
+        _a, built, matched, _d = arm({})
+        want = [tag for _l, _t, tag, _d in _mla_kernel_forms()]
+        missing = [t for t in want if not any(b.startswith(t) for b in built)]
+        if missing:
+            return False, f"no kernel built for {missing} (built {built})"
+        if len(matched) != len(_mla_kernel_forms()):
+            return False, (f"{len(matched)} matches over "
+                           f"{len(_mla_kernel_forms())} modules")
+        return True, f"{len(built)} kernels built: {', '.join(built)}"
+
+    def the_kill_switch_keeps_the_match():
+        _a, built, matched, disabled = arm({"METALJAX_MLA_KERNEL": "0"})
+        if built:
+            return False, f"{len(built)} kernels built with the switch off"
+        if not disabled:
+            return False, "no `kernel disabled` narration"
+        if len(matched) != len(_mla_kernel_forms()):
+            return False, f"the recognizer stopped firing ({len(matched)})"
+        return True, "no kernel, the recognizer still fires, concat path runs"
+
+    def the_kernel_is_the_concat_paths_answer():
+        on, built, _m, _d = arm({})
+        off, built_off, _m2, _d2 = arm({"METALJAX_MLA_KERNEL": "0"})
+        if not built or built_off:
+            return False, "the arms did not split on the kernel"
+        exact, close, bad = [], [], []
+        for label, _text, _tag, dt in _mla_kernel_forms():
+            if on[label].shape == off[label].shape and \
+                    np.array_equal(on[label], off[label]):
+                exact.append(label)
+                continue
+            e = worst(on[label], off[label])
+            (close if e <= BAR[dt] else bad).append(f"{label} {e:.2e}")
+        if bad:
+            return False, "; ".join(bad)
+        if close:
+            return True, (f"{len(exact)} bit-identical; within the disclosed "
+                          f"ULP class: {'; '.join(close)}")
+        return True, f"{len(exact)} forms bit-identical with the concat path"
+
+    def the_kernel_agrees_with_cpu():
+        fused, built, _m, _d = arm({})
+        cpu, cbuilt, _m2, _d2 = arm({}, platform="cpu")
+        if not built:
+            return False, "the kernel did not build"
+        if cbuilt:
+            return False, "the CPU arm loaded the plugin"
+        bad = []
+        for label, _text, _tag, dt in _mla_kernel_forms():
+            e = worst(fused[label], cpu[label])
+            if e > BAR[dt]:
+                bad.append(f"{label} {e:.2e} > {BAR[dt]:.0e}")
+        if bad:
+            return False, "; ".join(bad)
+        e = max(worst(fused[l], cpu[l])
+                for l, _t, _g, _d in _mla_kernel_forms())
+        return True, (f"{len(_mla_kernel_forms())} forms agree with jax-CPU, "
+                      f"worst {e:.1e}")
+
+    return [("mla kernel builds", the_kernel_builds),
+            ("mla kernel kill switch", the_kill_switch_keeps_the_match),
+            ("mla kernel == concat path", the_kernel_is_the_concat_paths_answer),
+            ("mla kernel == jax-CPU", the_kernel_agrees_with_cpu)]
+
+
+def _p41_stacked_relayout(subprocess, pathlib, re):
+    """B3: the stacked dot's RELAYOUT form (metal_stacked.cc).
+
+    maxtext's attention out-projection stack is [heads, L, head_dim, model]:
+    the layer axis sits between the two contracted axes, no [L, K, N] view of
+    the buffer exists, and the recognizer declined -- so row 10 copied 8.4 MB
+    of weights per layer per token (218 MB/token, ~0.93 ms) through a dynamic
+    slice.  The relayout materializes the CARRIED (transposed) layout once
+    per executable as a pack, keyed by the argument's identity like a
+    quantized pack, and the emit gathers from it in place.
+
+    Pinned: the match FIRES with `relayout planned` and the pack wave
+    narrates `relaid` for both spellings; METALJAX_STACKED_RELAYOUT=0 keeps
+    the decline (the slice chain runs, no pack); and the answers against the
+    kill switch and against METALJAX_STACKED_DOT=0 -- the relayout is the
+    same gather_mm over the same matrix at another address, so against its
+    own kill switch it is bit-exact; against the slice chain the detail line
+    says whether the bits held (a different MLX matmul kernel may accumulate
+    K in another order at M > 1).
+    """
+    here = str(pathlib.Path(__file__).resolve())
+
+    def arm(env_extra, platform="metal"):
+        import json
+        child = dict(os.environ)
+        if platform == "cpu":
+            child.pop("METALJAX_PLUGIN_PATH", None)
+            child["JAX_PLATFORMS"] = "cpu"
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here,
+                               "--stacked-relayout-forms"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if not line.startswith("SRL "):
+                continue
+            label, payload = line[4:].split("\t", 1)
+            answers[label] = np.array(json.loads(payload))
+        planned = re.findall(
+            r"stacked: matched a stacked dot \(([^,]*), \d+ ops absorbed, "
+            r"relayout planned\)", proc.stderr)
+        relaid = re.findall(r"stacked: relaid (\S+) \(", proc.stderr)
+        matched = re.findall(
+            r"stacked: matched a stacked dot \(([^,]*),", proc.stderr)
+        return answers, planned, relaid, matched
+
+    def worst(a, b):
+        scale = max(float(np.max(np.abs(b))), 1e-30)
+        return float(np.max(np.abs(a - b))) / scale
+
+    def the_relayout_fires():
+        _a, planned, relaid, _m = arm({})
+        n = len(_stacked_relayout_forms())
+        if len(planned) < n:
+            return False, f"{len(planned)} relayouts planned over {n} forms"
+        if len(relaid) < n:
+            return False, f"{len(relaid)} stacks relaid over {n} forms"
+        return True, f"{len(relaid)} relaid: {', '.join(relaid)}"
+
+    def the_kill_switch_declines():
+        _a, planned, relaid, matched = arm({"METALJAX_STACKED_RELAYOUT": "0"})
+        if planned or relaid:
+            return False, f"{len(planned)}/{len(relaid)} with the switch off"
+        if matched:
+            return False, f"{len(matched)} matches: these stacks must decline"
+        return True, "declined, as before B3"
+
+    def multi_row_reads_stay_sliced():
+        """The form is decode-only: at M > 1 (a prefill program) the stack
+        keeps its slice chain, with the narration saying why."""
+        _a, planned, relaid, matched = arm({"B3_RELAYOUT_M": "3"})
+        if planned or relaid:
+            return False, f"{len(planned)}/{len(relaid)} relayouts at M=3"
+        if matched:
+            return False, f"{len(matched)} matches at M=3"
+        return True, "M=3 forms decline (decode-only form)"
+
+    def bit_exact_against_the_switch():
+        on, planned, _r, _m = arm({})
+        off, p2, _r2, _m2 = arm({"METALJAX_STACKED_RELAYOUT": "0"})
+        if not planned or p2:
+            return False, "the arms did not split on the relayout"
+        bad = [k for k in on if on[k].shape != off[k].shape
+               or not np.array_equal(on[k], off[k])]
+        if bad:
+            e = max(worst(on[k], off[k]) for k in bad)
+            return False, f"{len(bad)} form(s) differ, worst {e:.2e}: {bad}"
+        return True, f"{len(on)} forms bit-identical with the relayout off"
+
+    def against_the_slice_chain_and_cpu():
+        on, planned, _r, _m = arm({})
+        chain, _p, _r2, matched = arm({"METALJAX_STACKED_DOT": "0"})
+        cpu, _p3, _r3, _m3 = arm({}, platform="cpu")
+        if matched:
+            return False, "STACKED_DOT=0 still matched"
+        exact, close, bad = [], [], []
+        for k in on:
+            if np.array_equal(on[k], chain[k]):
+                exact.append(k)
+            else:
+                e = worst(on[k], chain[k])
+                (close if e <= 1e-5 else bad).append(f"{k} {e:.2e}")
+        ecpu = max(worst(on[k], cpu[k]) for k in on)
+        if bad or ecpu > 1e-5:
+            return False, f"chain: {'; '.join(bad)}; cpu worst {ecpu:.2e}"
+        how = (f"{len(exact)} bit-identical with the slice chain"
+               if not close else
+               f"{len(exact)} bit-identical, reordered: {'; '.join(close)}")
+        return True, f"{how}; vs jax-CPU worst {ecpu:.1e}"
+
+    return [("stacked relayout fires", the_relayout_fires),
+            ("stacked relayout kill switch", the_kill_switch_declines),
+            ("stacked relayout is decode-only", multi_row_reads_stay_sliced),
+            ("stacked relayout is bit-exact", bit_exact_against_the_switch),
+            ("stacked relayout vs chain/CPU", against_the_slice_chain_and_cpu)]
+
+
 def _p33_gdn(subprocess, pathlib, re):
     """The gated-delta-net decode step: it FIRES, it is the whole block, and
     it is on the literal chain's own values.
@@ -10037,6 +10362,34 @@ def main():
             print(f"GQA {label}\t"
                   f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
         return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--mla-kernel-forms":
+        # B3: the geometries the two-span kernel takes, through the plugin
+        # (or the CPU when the caller says so): answers to stdout, the
+        # kernel's build narration to stderr.
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        import json as _json
+        for label, text, _tag, _dt in _mla_kernel_forms():
+            out = _run_module(text, _mla_inputs(text))[0]
+            print(f"MLK {label}\t"
+                  f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--stacked-relayout-forms":
+        # B3: the stacked dots whose contracted axes straddle the layer axis
+        # (maxtext's attention out-projection), through jax on the plugin --
+        # or on the CPU when the caller says so.  Answers to stdout, the
+        # recognizer's and the pack wave's narration to stderr.
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        import json as _json
+        import jax
+        for label, fn, args in _stacked_relayout_forms():
+            outs = _flatten(jax.jit(fn)(*args))
+            print(f"SRL {label}\t"
+                  f"{_json.dumps(np.concatenate([np.asarray(o).astype(np.float64).ravel() for o in outs]).tolist())}")
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--start-plan-forms":
         # The START PLAN's modules, run through the plugin: answers to
         # stdout, the `ds plan:` tally to stderr.  The plan is a lowering
@@ -10225,6 +10578,10 @@ def main():
                          + _p32_mla(subprocess, pathlib, __import__("re"))
                          + _p37_gqa(subprocess, pathlib, __import__("re"))
                          + _p33_gdn(subprocess, pathlib, __import__("re"))
+                         + _p40_mla_kernel(subprocess, pathlib,
+                                           __import__("re"))
+                         + _p41_stacked_relayout(subprocess, pathlib,
+                                                 __import__("re"))
                          + _p34_start_plan(subprocess, pathlib,
                                            __import__("re"))
                          + _p35_while_pipeline(subprocess, pathlib,

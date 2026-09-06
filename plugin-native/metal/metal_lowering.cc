@@ -40,6 +40,7 @@ Licensed under the Apache License, Version 2.0.
 #include "metal/metal_names.h"
 #include "metal/metal_recognize.h"
 #include "gdn.h"
+#include "mla.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -1098,6 +1099,11 @@ bool UsesPacks(const RewritePlan* plan, mlir::ModuleOp module,
   for (mlir::Operation& op : block) {
     auto it = plan->qmm_roots.find(&op);
     if (it != plan->qmm_roots.end() && it->second->nvals > 0) return true;
+    // ...a stacked dot whose weights were RELAID into a pack (B3)...
+    auto sd = plan->stacked_roots.find(&op);
+    if (sd != plan->stacked_roots.end() && sd->second->relayout &&
+        sd->second->pack_slot >= 0)
+      return true;
     // ...and an expert gather whose dots read a pack of their own.
     auto moe = plan->moe_roots.find(&op);
     if (moe != plan->moe_roots.end()) {
@@ -8528,10 +8534,20 @@ absl::Status Lowering::LowerRagged(mlir::Operation* op, const RaggedMatch& m) {
 // out shape...].
 absl::Status Lowering::LowerStackedDot(mlir::Operation* op,
                                        const StackedDotMatch& m) {
-  for (mlir::Value v : {m.x, m.w_carry, m.layer})
-    RETURN_IF_ERROR(CheckValue(v));
+  for (mlir::Value v : {m.x, m.layer}) RETURN_IF_ERROR(CheckValue(v));
   ASSIGN_OR_RETURN(int x, Slot(m.x));
-  ASSIGN_OR_RETURN(int w, Slot(m.w_carry));
+  int w = -1;
+  if (m.relayout) {
+    // B3: the weights are the relaid PACK -- a trailing input of the tape,
+    // threaded into this frame as a capture (`UsesPacks`) -- not the carry.
+    if (m.pack_slot < 0 || pack_slots_.empty() ||
+        m.pack_slot >= static_cast<int>(pack_slots_.size()))
+      return Decline("a relaid stack whose pack is not in scope");
+    w = pack_slots_[static_cast<size_t>(m.pack_slot)];
+  } else {
+    RETURN_IF_ERROR(CheckValue(m.w_carry));
+    ASSIGN_OR_RETURN(w, Slot(m.w_carry));
+  }
   ASSIGN_OR_RETURN(int layer, Slot(m.layer));
   ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
   ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.stacked_dot"));
@@ -8554,10 +8570,17 @@ absl::Status Lowering::LowerStackedDot(mlir::Operation* op,
 }
 
 // The multi-span decode attention (metal_mla.cc).  ins [q, then per span
-// k, v, seg]; attrs [B, H, D, Dv, nspans, T..., seg_val, dtype, out_dtype];
-// fattrs [mask_true, mask_false].  `H` is the QUERY head count; a grouped
-// match's KV head count is not emitted because the emit reads it off k
-// (`MlaMatch::Hkv` exists for the shape checks and the narration).
+// k, v, seg]; attrs [B, H, Hkv, D, Dv, nspans, T..., seg_val, dtype,
+// out_dtype]; fattrs [mask_true, mask_false].  `H` is the QUERY head count,
+// `Hkv` the KV head count (H % Hkv == 0; MLA is Hkv == H).
+//
+// The two-span kernel (runtime/mla.cc) is BUILT AND PROVEN HERE,
+// synchronously, for gdn.h's reason: MLX generates the Metal library at
+// eval, a build error on an async worker aborts the process, and this entry
+// is traced into an enclosing `mx::compile` graph where nothing is
+// evaluated -- so the last safe moment is this one, on the first execute,
+// outside any trace.  A geometry the kernel does not take, or a source Metal
+// will not build, leaves the emit on the concat path.
 absl::Status Lowering::LowerMla(mlir::Operation* op, const MlaMatch& m) {
   RETURN_IF_ERROR(CheckValue(m.q));
   ASSIGN_OR_RETURN(int q, Slot(m.q));
@@ -8574,12 +8597,29 @@ absl::Status Lowering::LowerMla(mlir::Operation* op, const MlaMatch& m) {
   ASSIGN_OR_RETURN(int dtype, DtypeCode(m.q));
   ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
   ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.mla_sdpa"));
-  std::vector<int64_t> attrs{m.B, m.H, m.D, m.Dv,
+  if (m.spans.size() != 2)
+    return Decline("a multi-span attention without two spans");
+  std::vector<int64_t> attrs{m.B, m.H, m.Hkv, m.D, m.Dv,
                              static_cast<int64_t>(m.spans.size())};
   for (const MlaSpan& s : m.spans) attrs.push_back(s.T);
   attrs.push_back(m.seg_val);
   attrs.push_back(static_cast<int64_t>(dtype));
   attrs.push_back(static_cast<int64_t>(out_code));
+  {
+    MlaSpec spec;
+    spec.B = m.B;
+    spec.H = m.H;
+    spec.Hkv = m.Hkv;
+    spec.D = m.D;
+    spec.Dv = m.Dv;
+    spec.T0 = m.spans[0].T;
+    spec.T1 = m.spans[1].T;
+    spec.dt = dtype_of(dtype);
+    spec.seg_val = m.seg_val;
+    spec.mask_true = m.mask_true;
+    spec.mask_false = m.mask_false;
+    MlaProve(spec);
+  }
   EmitF(opcode, std::move(ins), {Bind(op->getResult(0))}, std::move(attrs),
         {m.mask_true, m.mask_false}, ResultBytes(op));
   return absl::OkStatus();
@@ -9721,6 +9761,9 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
   pctx.blocked_cone = blocked_cone;
   absl::Status packed = BuildQmmPacks(&plan, pctx);
   if (!packed.ok()) return packed;
+  // ...and the stacked dots' relaid layouts (B3), appended after them.
+  absl::Status relaid = BuildStackedPacks(&plan, pctx);
+  if (!relaid.ok()) return relaid;
   // ...and the router check, which is a value question too (moe.py's was in
   // the same eager prologue, for the same reason: it syncs with the host).
   absl::Status verified = VerifyMoe(&plan, eval);

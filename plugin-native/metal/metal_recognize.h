@@ -365,6 +365,28 @@ struct StackedDotMatch {
   int64_t M = 0;                    // product of the lhs free dims
   int out_dtype = 0;
   std::vector<int64_t> out_shape;   // the root's declared result shape
+  // The RELAYOUT form (B3: row 10's attention out-projection).  maxtext's
+  // param_scan_axis puts the LAYER axis between the two contracted axes of
+  // the original buffer -- [heads, L, head_dim, model] -- so no [L, K, N]
+  // view of THAT buffer exists, but one of the CARRIED (transposed) layout
+  // does.  The pack wave (`BuildStackedPacks`) materializes the carried
+  // layout ONCE per executable, keyed by the argument's identity exactly like
+  // a quantized pack (a different buffer repacks, `Tape`), and the emit
+  // gathers from the pack in place: the per-layer 8.4 MB dynamic-slice copy
+  // -- 218 MB/token on row 10 -- becomes one 218 MB copy per model load.
+  // Bit-exact: the same gather_mm over the same matrix, only its address
+  // changes.  DECODE-ONLY (M == 1): at M > 1 gather_mm and the slice chain's
+  // matmul take different steel paths, and on row 11's prefill (M = 64)
+  // that measured slower than the copy it saves -- a multi-row read keeps
+  // its slice chain.  Costs the stack's size in device memory for the
+  // executable's life (METALJAX_STACKED_RELAYOUT_MB caps the total; =0 /
+  // METALJAX_STACKED_RELAYOUT=0 declines the form, and the slice chain
+  // runs).
+  bool relayout = false;
+  int origin_arg = -1;                 // the @main argument the stack hoists to
+  std::vector<int64_t> relayout_perm;  // carried axis i = original axis perm[i]
+  int64_t relayout_bytes = 0;          // the pack's size
+  int pack_slot = -1;                  // index into plan->packs, once built
   std::vector<mlir::Operation*> ops;  // the ops this match absorbs
   std::string name;
 };
@@ -672,6 +694,15 @@ absl::Status VerifyMoe(RewritePlan* plan, const SubtreeEval& eval);
 // literally) rather than packed approximately; `plan->packs` comes back
 // holding the arrays the tape's trailing inputs take.
 absl::Status BuildQmmPacks(RewritePlan* plan, const PackContext& ctx);
+
+// The stacked-dot RELAYOUT packs (metal_stacked.cc), at the first execute,
+// after the quantized packs: every `relayout` match gets its carried layout
+// materialized from this execute's buffers and appended to `plan->packs`
+// (its argument joins `pack_args`, so a later call with different weights
+// repacks); a match whose pack cannot be built -- the governor refuses the
+// bytes, the budget is spent -- is DROPPED, and its slice chain lowers
+// literally.
+absl::Status BuildStackedPacks(RewritePlan* plan, const PackContext& ctx);
 
 // The cross-executable build cache's counters (P19), for the tests: a pack is
 // a pure function of the reconstruction and the buffers it reads, so two

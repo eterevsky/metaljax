@@ -37,9 +37,11 @@ Licensed under the Apache License, Version 2.0.
 #include <functional>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/strings/str_cat.h"
 #include "llvm/ADT/DenseSet.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -63,6 +65,37 @@ void Debug(const std::string& line) {
 bool EnvOff(const char* name) {
   const char* v = std::getenv(name);
   return v != nullptr && std::string(v) == "0";
+}
+
+int64_t RelayoutBudgetBytes();
+
+// METALJAX_STACKED_RELAYOUT=0 declines the relayout form (the slice chain
+// runs, as before B3); METALJAX_STACKED_RELAYOUT_MB caps what one
+// executable's relaid packs may hold in total (default 2048 MB, 0 = none).
+bool RelayoutEnabled() {
+  static const bool on = !EnvOff("METALJAX_STACKED_RELAYOUT") &&
+                         RelayoutBudgetBytes() > 0;
+  return on;
+}
+
+int64_t RelayoutBudgetBytes() {
+  static const int64_t bytes = [] {
+    const char* v = std::getenv("METALJAX_STACKED_RELAYOUT_MB");
+    if (v == nullptr || *v == '\0') return 2048LL << 20;
+    char* end = nullptr;
+    const long long mb = std::strtoll(v, &end, 10);
+    if (end == v || mb < 0) return 2048LL << 20;
+    return static_cast<int64_t>(mb) << 20;
+  }();
+  return bytes;
+}
+
+// Bytes per element of a float type the dot accepts (the match already
+// required a non-f64 float).
+int ElemBytes(mlir::Type t) {
+  if (auto f = mlir::dyn_cast<mlir::FloatType>(t))
+    return static_cast<int>((f.getWidth() + 7) / 8);
+  return 4;
 }
 
 // Not a stacked-weight read: run the chain as written.
@@ -308,65 +341,139 @@ std::unique_ptr<StackedDotMatch> MatchRoot(
     std::iota(perm.begin(), perm.end(), 0);
     origin = hoisted;
   }
+  int origin_arg = -1;
   {
     auto ba = mlir::dyn_cast<mlir::BlockArgument>(origin);
     if (!ba || ba.getOwner() != main_block)
       Bail("the stack does not hoist to a @main argument");
+    origin_arg = static_cast<int>(ba.getArgNumber());
   }
   sdims = ShapeOf(origin);
   if (perm.size() != sdims.size() || perm.size() != wdims.size())
     Bail("the stack rank disagrees with the slice");
 
-  // Row-major strides of the original buffer, in elements.
-  std::vector<int64_t> st(sdims.size());
-  {
-    int64_t acc = 1;
-    for (int i = static_cast<int>(sdims.size()) - 1; i >= 0; i--) {
-      st[i] = acc;
-      acc *= std::max<int64_t>(sdims[i], 1);
-    }
-  }
-  // The rhs's dims, as ORIGINAL stack axes: rhs dim j is stack axis
-  // (j < a ? j : j + 1) — the slice axis dropped — mapped through the
-  // transpose.  The contracted axes (K) are the first nc of them, the free
-  // axes (N) the rest; each group must collapse to a single stride in that
-  // order for the [L, K, N] view to exist.
-  std::vector<int64_t> in_order;
-  for (size_t j = 0; j + 1 < wdims.size(); j++) {
-    const int64_t wax = static_cast<int64_t>(j) < a
-                            ? static_cast<int64_t>(j)
-                            : static_cast<int64_t>(j) + 1;
-    in_order.push_back(perm[wax]);
-  }
-  auto collapse = [&](size_t lo, size_t hi,  // in_order indices [lo, hi)
-                      const char* what) -> std::pair<int64_t, int64_t> {
-    int64_t extent = 1;
-    for (size_t i = lo; i < hi; i++) {
-      const int64_t ax = in_order[i];
-      extent *= sdims[ax];
-      if (i + 1 < hi) {
-        const int64_t nx = in_order[i + 1];
-        if (st[ax] != sdims[nx] * st[nx])
-          Bail(absl::StrCat(what, " axes do not collapse in the stack"));
+  // One layout's proof: `dims` row-major with `p` mapping carried axes to
+  // its axes.  The rhs's dims, as axes of that layout: rhs dim j is carried
+  // axis (j < a ? j : j + 1) -- the slice axis dropped -- mapped through p.
+  // The contracted axes (K) are the first nc of them, the free axes (N) the
+  // rest; each group must collapse to a single stride in that order for the
+  // [L, K, N] view to exist.
+  struct Layout {
+    int64_t L = 0, K = 0, N = 0, sl = 0, sk = 0, sn = 0;
+  };
+  auto prove = [&](const std::vector<int64_t>& dims,
+                   const std::vector<int64_t>& p,
+                   std::string* why) -> std::optional<Layout> {
+    // Row-major strides of that layout, in elements.
+    std::vector<int64_t> st(dims.size());
+    {
+      int64_t acc = 1;
+      for (int i = static_cast<int>(dims.size()) - 1; i >= 0; i--) {
+        st[i] = acc;
+        acc *= std::max<int64_t>(dims[i], 1);
       }
     }
-    return {extent, st[in_order[hi - 1]]};
+    std::vector<int64_t> in_order;
+    for (size_t j = 0; j + 1 < wdims.size(); j++) {
+      const int64_t wax = static_cast<int64_t>(j) < a
+                              ? static_cast<int64_t>(j)
+                              : static_cast<int64_t>(j) + 1;
+      in_order.push_back(p[wax]);
+    }
+    auto collapse = [&](size_t lo, size_t hi,  // in_order indices [lo, hi)
+                        const char* what,
+                        std::pair<int64_t, int64_t>* out) -> bool {
+      int64_t extent = 1;
+      for (size_t i = lo; i < hi; i++) {
+        const int64_t ax = in_order[i];
+        extent *= dims[ax];
+        if (i + 1 < hi) {
+          const int64_t nx = in_order[i + 1];
+          if (st[ax] != dims[nx] * st[nx]) {
+            *why = absl::StrCat(what, " axes do not collapse in the stack");
+            return false;
+          }
+        }
+      }
+      *out = {extent, st[in_order[hi - 1]]};
+      return true;
+    };
+    std::pair<int64_t, int64_t> kk, nn;
+    if (!collapse(0, nc, "the contracted", &kk)) return std::nullopt;
+    if (!collapse(nc, in_order.size(), "the free", &nn)) return std::nullopt;
+    Layout l;
+    l.K = kk.first;
+    l.sk = kk.second;
+    l.N = nn.first;
+    l.sn = nn.second;
+    if (l.sn != 1) {
+      *why = "the free stride is not 1";
+      return std::nullopt;
+    }
+    l.L = wdims[a];
+    l.sl = st[p[a]];
+    if (l.L < 1 || l.K < 1 || l.N < 1) {
+      *why = "degenerate sizes";
+      return std::nullopt;
+    }
+    return l;
   };
-  auto [K, sk] = collapse(0, nc, "the contracted");
-  auto [N, sn] = collapse(nc, in_order.size(), "the free");
-  if (sn != 1) Bail("the free stride is not 1");
-  const int64_t L = wdims[a];
-  const int64_t sl = st[perm[a]];
-  if (L < 1 || K < 1 || N < 1) Bail("degenerate sizes");
+
+  std::string why;
+  std::optional<Layout> lay = prove(sdims, perm, &why);
+  bool relayout = false;
+  if (!lay.has_value()) {
+    // The RELAYOUT form: the ORIGINAL buffer has no [L, K, N] view (maxtext's
+    // attention out-projection: the layer axis sits between the two
+    // contracted axes), but the CARRIED layout -- the transpose the graph
+    // itself hoisted -- is row-major in `wdims`, and if THAT collapses the
+    // pack wave materializes it once per executable (BuildStackedPacks) and
+    // the emit reads the pack.  A stack that is not a transposed @main
+    // argument has no other layout to try.
+    std::vector<int64_t> ident(wdims.size());
+    std::iota(ident.begin(), ident.end(), 0);
+    const bool transposed = perm != ident;
+    std::string why2;
+    if (transposed && RelayoutEnabled()) {
+      lay = prove(wdims, ident, &why2);
+      if (lay.has_value()) relayout = true;
+    }
+    if (!lay.has_value()) Bail(why);
+  }
+  const int64_t K = lay->K, N = lay->N, L = lay->L;
+  const int64_t sk = lay->sk, sn = lay->sn, sl = lay->sl;
   if (K * N < 16384) Bail("the weight is too small to matter");
 
-  // The inverse permutation: transpose(w_carry, back_perm) is the original.
+  // The inverse permutation: transpose(w_carry, back_perm) is the original
+  // -- or the identity when the emit reads a relaid pack, which IS the
+  // carried layout, contiguous.
   match->back_perm.resize(perm.size());
-  for (size_t i = 0; i < perm.size(); i++) match->back_perm[perm[i]] = i;
+  if (relayout) {
+    std::iota(match->back_perm.begin(), match->back_perm.end(), 0);
+    match->relayout = true;
+    match->origin_arg = origin_arg;
+    match->relayout_perm = perm;
+    int64_t numel = 1;
+    for (int64_t d : wdims) numel *= std::max<int64_t>(d, 1);
+    match->relayout_bytes =
+        numel * static_cast<int64_t>(ElemBytes(ElemOf(dot.getRhs())));
+  } else {
+    for (size_t i = 0; i < perm.size(); i++) match->back_perm[perm[i]] = i;
+  }
 
   int64_t M = 1;
   for (size_t i = 0; i + nc < lshape.size(); i++) M *= lshape[i];
   if (M < 1) Bail("degenerate rows");
+  // The relayout pays only on the DECODE geometry.  At M == 1 the pack is
+  // read by the same gemv the other stacked reads dispatch, bit-identical
+  // to the slice chain and 0.7 ms/token faster on row 10; at M > 1
+  // gather_mm takes a different steel path from the slice chain's matmul,
+  // and on row 11's PREFILL program (M = 64, 28 layers) that measured
+  // +3 ms over a 25 ms prefill (b3-row10/findings.txt section 5).  So a
+  // multi-row read keeps its slice chain -- the form it always had.
+  if (relayout && M != 1)
+    Bail(absl::StrCat("the relayout form is decode-only (M=", M,
+                      "): the slice chain runs"));
 
   // Frame guard: the fused root lowers inside `frame`'s splice, so both
   // values must be resolvable there.
@@ -553,13 +660,81 @@ void AnalyzeStackedDot(mlir::func::FuncOp fn, RewritePlan* plan) {
           if (cand.contains(o)) absorbed.push_back(o);
         m->ops = std::move(absorbed);
         Debug(absl::StrCat("matched a stacked dot (", m->name, ", ",
-                           m->ops.size(), " ops absorbed)"));
+                           m->ops.size(), " ops absorbed",
+                           m->relayout ? ", relayout planned" : "", ")"));
         plan->stacked.push_back(std::move(m));
       }
       return;
     }
     if (kept.empty()) return;
   }
+}
+
+absl::Status BuildStackedPacks(RewritePlan* plan, const PackContext& ctx) {
+  bool any = false;
+  for (const auto& m : plan->stacked) any = any || m->relayout;
+  if (!any) return absl::OkStatus();
+  if (ctx.args == nullptr) return absl::OkStatus();
+  const int64_t budget = RelayoutBudgetBytes();
+  absl::flat_hash_set<int> args(plan->pack_args.begin(),
+                                plan->pack_args.end());
+  std::vector<std::unique_ptr<StackedDotMatch>> kept;
+  int64_t total = 0;
+  int64_t relaid = 0;
+  bool dropped = false;
+  for (auto& m : plan->stacked) {
+    if (!m->relayout) {
+      kept.push_back(std::move(m));
+      continue;
+    }
+    std::string why;
+    try {
+      if (m->origin_arg < 0 ||
+          m->origin_arg >= static_cast<int>(ctx.args->size()))
+        Bail("the stack's argument is out of range");
+      if (total + m->relayout_bytes > budget)
+        Bail(absl::StrCat("the relayout budget is spent (",
+                          (total + m->relayout_bytes) >> 20, " MB > ",
+                          budget >> 20, " MB, METALJAX_STACKED_RELAYOUT_MB)"));
+      const mx::array& src = (*ctx.args)[m->origin_arg];
+      std::vector<int> perm(m->relayout_perm.begin(), m->relayout_perm.end());
+      if (static_cast<size_t>(src.ndim()) != perm.size())
+        Bail("the argument's rank disagrees with the stack");
+      // The no-panic contract: the pack is device memory held for the
+      // executable's life, admitted like a transfer of its size.
+      governor_admit(m->relayout_bytes, MemWhere::kExecute);
+      mx::array pk = mx::contiguous(mx::transpose(src, perm));
+      mx::eval(pk);
+      m->pack_slot = static_cast<int>(plan->packs.size());
+      plan->packs.push_back(pk);
+      args.insert(m->origin_arg);
+      total += m->relayout_bytes;
+      relaid++;
+      Debug(absl::StrCat(
+          "relaid ", m->name, " (", m->relayout_bytes >> 20,
+          " MB once, in place of a ",
+          (m->relayout_bytes / std::max<int64_t>(m->L, 1)) >> 20,
+          " MB slice per layer)"));
+      kept.push_back(std::move(m));
+    } catch (const Reject& e) {
+      why = e.why;
+    } catch (const std::exception& e) {
+      why = e.what();
+    }
+    if (!why.empty()) {
+      Debug(absl::StrCat("weights stay sliced (", m->name,
+                         ": relayout declined, ", why, ")"));
+      dropped = true;
+    }
+  }
+  plan->stacked = std::move(kept);
+  plan->pack_args.assign(args.begin(), args.end());
+  std::sort(plan->pack_args.begin(), plan->pack_args.end());
+  if (dropped) plan->rebuild();
+  if (relaid > 0)
+    Debug(absl::StrCat(relaid, " stack(s) relaid, ", total >> 20,
+                       " MB held for the executable"));
+  return absl::OkStatus();
 }
 
 }  // namespace metaljax
