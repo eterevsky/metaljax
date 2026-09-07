@@ -8,9 +8,10 @@
 
 *One column per tracked run of the model suite (scripts/model_bench/).
 Cells: metaljax warm decode ms/token (or the row's noted metric);
-✗ = blocked, with the measured reason in STATUS.md footnotes at that
-version's commit. Full per-run tables live in STATUS.md; raw JSONL in
-notes/data/. Append a column per release / major optimization.*
+✗ = blocked (the measured reason is in that release's gate record,
+notes/release-gates-<version>.md). Comparators, footnotes and the current
+release's cells: STATUS.md. Append a column per release / major
+optimization.*
 
 | # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 | 0.11.6 | 0.11.7 | HEAD | goal |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -38,295 +39,43 @@ notes/data/. Append a column per release / major optimization.*
 
 Notes:
 
-- **goal** = the best non-metaljax cell for the row in STATUS.md's table,
-  at the same precision (STATUS.md's like-for-like rule, fn 10): ˣ mlx-lm,
-  ˡ llama.cpp, ᵗ torch-MPS. jax-CPU is never a goal (Oleg, 2026-09-03):
-  rows with no other framework stay empty. Copied from STATUS.md on
-  2026-09-03; STATUS.md stays the
-  source of truth and carries the caveats behind these cells: row 4's goal
-  is the dated 2026-08-03 mlx-lm git-main cell (fn 7); row 18 is torch with
-  the SDPA math fallback (fn 3); row 17's comparators are fn 9; and the
-  llama.cpp cells carry a 4 % two-pass band (fn 10), wider than their lead
-  over mlx-lm on rows 3 and 6, so ˡ vs ˣ there is a coin toss.
-  Like-for-like audit (2026-09-06, every comparator cell's provenance
-  checked): row 7's goal moved from llama.cpp 6.7 to mlx-lm 8.8 (the
-  GGUF quantizes attention/embeddings/head to Q8_0, STATUS fn 16);
-  row 12's goal is EMPTY until mlx-lm is re-measured on a bf16
-  checkpoint (the mirror is float16, fn 17); row 17's torch goal is an
-  upper bound (torch also runs the T5-XXL encoder, fn 18); row 4's
-  mlx-lm goal is a dated cell whose run record is lost (fn 7). Follow-ups
-  2026-09-06: row 11's mlx-lm goal re-measured at our 128-token window =
-  3.2; row 17's torch goal re-measured with T5 off = 553 / 3078 (no longer
-  an upper bound); row 4's pinned mlx-lm refuses the checkpoint, so 10.5
-  stays flagged.
+- **goal** = the best non-metaljax cell for the row in STATUS.md's table at
+  the same precision and workload (STATUS.md's like-for-like rule, fn 10):
+  ˣ mlx-lm, ˡ llama.cpp, ᵗ torch-MPS; jax-CPU is never a goal and rows with
+  no other framework stay empty. It sits last, beside HEAD, so a row's
+  current status is its last two cells. Standing caveats (STATUS.md has the
+  detail): row 4's goal is a dated mlx-lm cell whose run record is lost
+  (fn 7); row 12's goal is empty until mlx-lm is measured on a bf16
+  checkpoint (the mirror is float16, fn 17); row 7's goal is mlx-lm because
+  the llama.cpp GGUF quantizes attention/embeddings/head to Q8_0 (fn 16);
+  row 17's torch goal runs with the T5 encoder off, matching our context
+  (fn 18); the llama.cpp cells carry a 4 % two-pass band, wider than their
+  lead over mlx-lm on rows 3 and 6.
+- ʰ = HEAD-column cells: rerun-first medians of ≥ 2 runs on a frozen build
+  of main, token streams identical to the row's release record unless
+  stated. As of 2026-09-07: rows 1/2/3/5 are on the 2026-09-03 build
+  (commit 235a14a); rows 4/7/8/10/11/14/18 on the 2026-09-06 build (commit
+  f960503 and later); row 10 is on the ᵖ workload; rows 6/9/12/13/15/16/17/
+  19/20 have no HEAD cell since 0.11.7.
+- ᵐ **Row 11 changed benchmark implementation after 0.11.7** (the
+  best-available-implementation rule): every cell through the 0.11.7 column
+  is the maxtext decode harness and is NOT comparable to the keras-hub cells
+  that follow — the harness switch is worth ~1.36× by itself (same-session
+  control: maxtext 12.22 vs keras 9.0 on one binary), so no release-over-
+  release comparison may span it. The same applies to the row's jax-CPU
+  history (maxtext 89.7 → keras-hub 29.4).
 - ᵖ **Row 10 changed workload on 2026-09-06**: the cell now decodes the
   manifest prompt (50 tokens in a 64-slot prefill) for 128 tokens like the
   comparators (25.9 on the 0.11.7 release binary); every earlier cell used
   the adapter's 5-token default prompt for 8 tokens (24.8 on the same
-  binary) and is not comparable across the switch. HEAD on the new
-  workload (2026-09-06 merged binary): 23.7 (23.68 / 23.67, plus one 30.2
-  outlier in the same session that no knob reproduced); the release binary
-  re-read 25.95 on the same machine state; the harness-presplit variant
-  (MAXTEXT_RNG_PRESPLIT=1, the per-step RNG split hoisted out of the loop)
-  read 23.24. Per-knob attribution at this workload: chunk byte bound
-  −1.2, MLA kernel −0.5, relayout −0.7, in-flight window ~0.
-  It sits last, beside HEAD, so the current status of a row is the last two
-  cells.
-- **0.11.1** (2026-08-02): pre-buffer-fix era, mixed command-buffer
-  caps; raw data lost to the panic reboots — values from STATUS
-  history. Row 16 measured under machine contention.
-- **0.11.2** (2026-08-03): sequential release-gate run at shipped
-  defaults; token agreement audited.
-- **0.11.3** (2026-08-05 release gate, tree 0012813): steady-state
-  harness — prefill/decode absorb per-shape executable builds before
-  timing (one-time cost reported as build_s; materially this moved
-  only the quantized rows). What landed: qmm quantized-matmul
-  recognizer incl. native MXFP4 (rows 7/13/14), MoE expert gather
-  incl. the T=1 decode fix (rows 3/7), sdpa fused attention + the
-  eager memory stack (row 17 first-ever), streaming keras load +
-  the retry double-residency fix (row 9 first-ever). Rows 18/19
-  carried from 0.11.2 (not re-measured this gate). Rows 8/12 paused
-  after kernel panic #7 (machine-wedge class; size-ladder protocol in
-  TASKS.md); rows 10/15 blocked on the maxtext 8B class (MLX
-  command-buffer bug / phase-2 load transient); row 20 deferred.
-- **0.11.4** = the **fully native PJRT plugin** (`plugin-native/`; wheel
-  variant `METALJAX_WHEEL_PLUGIN=native` — C++ StableHLO parse + lowering,
-  no Python engine in the loop). Sourced entirely from
-  benchmarks/perf-2026-08-native-baseline.md's Table 3 and
-  notes/rc-gates-2026-08-16.md, no new numbers invented for this column.
-  Latest pass per row: P18 (rows 3, 6, 17), P19 (row 9, footnote 29 in
-  STATUS.md), P20 (rows 13, 14, 16, 19), the 2026-08-16 RC
-  spot-check (rows 5, 7, 18 — 58.1/22.0/394.7, each within ±1% of its
-  P18/P20 cell; `METALJAX_DEBUG=1` confirmed 0 msl_scan plans on all
-  three), and **P24, the same day** (rows 1, 2, 4, 11 — the four cells
-  that had been carried at their P16 value since 2026-08-12). P24
-  re-measured all four on the RC binary with a same-day Stage-1 control
-  each, since their Stage-1 numbers were P16-era too:
-  **301.6 / 98.6 / 27.0 / 16.63** against P16's 301.6 / 98.8 / 27.2 /
-  16.67 — every cell reproduced inside 0.7 %, so the ceiling caveat is
-  withdrawn and these are current numbers, not upper bounds.
-  Their same-day Stage-1 controls read 242.4 / 93.8 / 27.0 / 16.39, so
-  the native/Stage-1 ratios are 1.24 / 1.05 / 1.00 / 1.02 — unchanged
-  from P16, and the row-1 gap is *not* an sdpa miss: on the 31B row the
-  recognizer never fires (0 sdpa emits, 0 msl plans), while on the 12B
-  row it does (8 fused attentions) and the timing is P16's to 0.2 %.
-  Data: `notes/data/p24-stale-rows-2026-08-16.{json,csv}`.
-  Rows 8/10/12/15 stay
-  ✗ under the same embargoes as the metaljax column (kernel-panic /
-  MLX command-buffer classes); row 20 is mlx-only and has never run on
-  either metaljax stack. **Row 19 = P25 (2026-08-16), 1006.2 → 833.9**:
-  the eager flush now TRIMS MLX's buffer pool back to
-  `METALJAX_FLUSH_CLEAR_MB` instead of dumping the whole pool to the OS
-  (`runtime.cc::trim_cache`; notes/cpp-p25-cache-limit.md). Measured in
-  one hold beside a same-day control on the RC binary, which reads
-  **975.4** — so the mechanism is worth 1.17× and the cell's remaining
-  1.9× of the 440 anchor is the WATERMARK, not the dumping: the same row
-  reads 685.6 at an 8 GB watermark and 464.1 at 32 GB, and 32 GB is where
-  the LoRA row (18) blows through its 70 GB guard. The default is left at
-  2048 MB, which is strictly better than the shipped dump at the same
-  peak (20-21 GB here); raising it is Oleg's call off that table.
-  **Rows 2/13/18/19 = P27 (2026-08-16), and they retire that table**
-  (notes/cpp-p27-flush-pressure.md): the watermark is no longer one number
-  for every program, because the LoRA row's blowout turned out not to be a
-  pool. Measured with a footprint meter inside the dylib, its live set goes
-  19.6 → 46.5 GB in about a second during the keras build/convert phase —
-  identically on both binaries — and the watermark decides only how much
-  DEAD pool is standing beside that spike (1.5 GB at 2048, 16.2 at 32768,
-  which is the whole difference between 48.5 and 63.2 GB of footprint).
-  So the cap moves to 32768 and two rules spend it: a program must have
-  taken 8 hard flushes to count as an eager main, and even then the pool may
-  claim only what a 48 GB (3/8 of RAM) footprint target has left after its
-  own live set. P25's 2048 is the FLOOR under both, so nothing is trimmed
-  harder than it was. **Row 19 833.9 → 469.7** (five runs 460-478, peak
-  25 GB under a 48 GB budget, against 811.6 for the same binary with the
-  policy off) and **row 18 394.7 → 360.2** (five runs, peak unchanged: its
-  meter reads 56.7-57.5 GB either way). Rows 13 and 2 are the controls —
-  80.3 vs 80.2 and 92.9 vs 93.2 with the policy off, peaks unmoved — and
-  row 2's distance from its 98.6 P24 cell is the tree, not this policy.
-  Suite-106 same-binary policy-on/off geomean **0.9983** over 106,
-  `texmo_gate` 106/106 three times, 0 buffer-limit recoveries in a
-  106-config sweep on either policy.
-  **Stage 1 still dumps** — its copies of the flush are frozen, so the
-  backport is a separate decision and any same-day native/Stage-1 ratio
-  on an eager-main row now has this in it. Rows 5 and 7's timings are
-  reproducible to ±1%, but their greedy-token streams are not: the
-  fused-attention recognizer emits are run-to-run nondeterministic
-  (RC gate 1 finding, `METALJAX_RECOGNIZE=0` restores determinism) —
-  the numbers above are timing only, not a token-identity claim.
-  That nondeterminism does **not** extend to the four P24 rows: rows 2
-  and 4 are token-identical to Stage 1 *and* to their P16 runs (64/64),
-  and rows 1 and 11, which diverge from Stage 1 (at token 34 and token
-  ~3), reproduce their own P16 native stream exactly — four days apart
-  for row 1, and twice in a row for row 11. Row 1 takes no sdpa emit at
-  all, so its divergence is the plain lowering's arithmetic order, not
-  the fused path.
-- Comparison stacks — a DATED 2026-08-03 snapshot (versions in
-  scripts/model_bench/versions.lock.md); the current comparators are the
-  goal column and STATUS.md (e.g. mlx-lm 31B re-measured 133.1 on
-  2026-08-31, V2-Lite 10.5): mlx-lm 12B 58.3 / 31B 137 / MoE 17.0 / gpt-oss
-  8.8 / V2-Lite 10.6 / Mixtral 52.8 / R1-32B 131.8; torch-MPS 12B
-  67.6 / 31B 148.7 / SigLIP 29.8 / LoRA 135.6 / SD3.5 654 @512²,
-  2998 @1024²; llama.cpp 12B-bf16 44.2 / 31B-bf16 111.2 (the
-  bandwidth roofline, 439–555 GB/s effective on every dense row).
-
-- ᴳ (0.11.5 column; first attested in the rc-era governor campaign) = measured under the memory governor (2026-08-17, frozen-gov7 ebe56e71): ORIGINAL jax implementations, no benchmark-code modifications; the rows that previously panicked (#7) or guard-killed (122 GB) now run under the no-panic contract. Row 10's per-token number is the governor campaign's own (1865 ms/tok, 88 GB peak, exit 0).
-
-- **Every unmarked 0.11.5rc cell** was measured by the release gate on
-  2026-08-17 on the frozen release dylib `ebe56e71…` — the SAME binary the ᴳ
-  cells were measured on (the release build reproduces `frozen-gov7` byte for
-  byte), one guarded process per row, machine lock held, `METALJAX_DEBUG=1`.
-  Details and per-row ratios: `notes/release-gates-0.11.5.md` gate 5.
-
-- ᶜ (rc-era note, column since overwritten by the 0.11.5 re-gate) **Row 7 was a bracketed cell.** Its first two samples of the evening read
-  24.2 / 23.9 ms/tok; a governor-off arm read 22.1 and a fourth arm with the
-  governor back ON read **21.9**, so the pair was the suite-context trap
-  (CLAUDE.md item 12), not a governor cost. The cell is the bracketed value;
-  the spread (21.9–24.2) is recorded in the gate document.
-
-- ᶠ (rc-era note, column since overwritten by the 0.11.5 re-gate) **Rows 11, 14 and 19 were the P28 re-measure, at the HISTORICAL budgets.**
-  The release gate found both decode rows guard-killing at the budgets every
-  previous campaign used (22 > 20 GB, 26 > 25 GB) and attributed it, one
-  variable at a time, to **P27's flush watermark** rather than the governor —
-  their checkpoint load takes 134 hard flushes in one call, so P27 reads it as
-  an eager main and lets the 14 GB it frees at its last flush stand in the
-  pool for the rest of the process. **P28's benefit gate**
-  (`METALJAX_FLUSH_EARN_MULT`, default 2, `notes/cpp-p28-benefit-gate.md`)
-  bounds a program's pool by the live set it has demonstrated it CYCLES: that
-  load earns 3.6 GB, the decode step earns the floor, and row 19's training
-  step — which genuinely swings 13.6 GB a flush — keeps everything P27 gave
-  it. All three cells above are **shipped defaults at the rows' own historical
-  budgets** (20 / 25 / 48 GB), medians of three or more guarded runs:
-
-  | row | budget | P27 (0.11.5 as gated) | **P28** | P25 semantics (the control) |
-  |---|---:|---|---|---|
-  | 11 | 20 GB | **0 of 6 complete**, 21–25 GB | **9 of 9**, 16.61–16.83 ms/tok, 9.6–19 GB | 9 of 9, 16.52–17.07, 7.6–17 GB |
-  | 14 | 25 GB | guard kill at 26 GB | **4 of 4**, 31.82–32.13 ms/tok, 9.1–17 GB | completes, 32.14, 7.7–15 GB |
-  | 19 | 48 GB | 456.1 ms/step, 25 GB | **459.2 / 458.4 / 462.5**, 25 GB | 811–834 ms/step |
-
-  Row 11's peak is a sub-second LIVE transient in the orbax restore (~17 GB
-  under *every* policy, P25 included) with whatever the pool holds standing
-  beside it, and `mem_guard.sh` samples at 2 Hz — so single peak readings
-  scatter and the completion counts, not the peaks, are the statement. Row
-  19's `loss` / `loss_first` are identical to P27's to thirteen digits in all
-  three runs.
-
-  **Re-spotted on the combined build** (2026-08-18, `frozen-vendor-d651add3` —
-  the same plugin linked against the vendored patched `libmlx_metaljax.dylib`),
-  same historical budgets, one guarded process per row: **16.60** ms/tok
-  (16 GB), **31.94** ms/tok (9.2 GB), **463.5** ms/step (25 GB), all exit 0 —
-  single runs against the three-run spreads above and inside their noise (row
-  14 inside, row 11 0.01 ms under, row 19 1.0 ms over its trio and inside the
-  456–470 class), with row 19's loss bit-identical across all eight runs of the
-  campaign. The cells stand on either library.
-
-- ʷ **Row 15 is a WRONG-OUTPUT row, not a timing row.** Its memory blocker is
-  gone (it completes, 79 GB peak, 0 governor refusals) and it decodes at
-  369.7 ms/tok, but the text is `" fragment!!!!!!!"` = token ids
-  `[12289, 0, 0, 0, 0, 0, 0, 0]`, and `!` is Qwen3's token 0 — i.e. the logits
-  have collapsed to a constant and greedy `argmax` returns index 0. The number
-  is therefore **not published as a cell**: timing a program that computes the
-  wrong answer measures nothing. Row 14 is the same adapter, the same qwix
-  int8 overrides and the same emits at 0.6B and is coherent (31.995 ms/tok,
-  the gate-5 run of the same day); the two differ by ~10× in traffic per
-  compiled unit and by tied-vs-untied logits. The "known MLX-quantization bug"
-  label the governor campaign gave it does not exist and has been withdrawn
-  (2026-08-03 exonerated the quantized dots, `7932b4d`).
-
-  **Mechanism established 2026-08-17 evening** (`notes/row15-wrong-output-2026-08-17.md`
-  §8, STATUS fn 34): **nondeterministic MLX command-buffer corruption at 8B
-  traffic, on BOTH engines**, amplified into the collapse by qwix's per-tensor
-  `absmax` scale — which clamps a zero scale but not a NaN one, so one bad
-  element turns a whole tensor NaN. Ten prefills of the same loaded parameters
-  in one process, on identical inputs, return **8 distinct first tokens and 2
-  full collapses** on the native engine and **10 distinct** on Stage 1, while
-  **row 14 returns the same token 10/10**. It is not our compiled path
-  (`METALJAX_COMPILE=0` is worse), not the recognizer, not the chunked replay,
-  and not the int8 arithmetic (every row-14/row-15 s8×s8→s32 contraction is
-  bit-exact vs numpy on both stacks). The committed 8B **bf16** canary
-  `notes/data/qwen3_8b_prefill_36layer.mlir` — no quantization, no checkpoint —
-  still corrupts at today's shipped budgets, bit-identically on both engines.
-  No fix at our level: this is the upstream MLX report. **The cell stays
-  unpublished and the row stays ✗.** *(Superseded 2026-08-18 — the level
-  became ours; see footnote ᵛ.)*
-
-- ᵛ **Row 15 is FIXED as of 2026-08-18 — the level became ours.** Footnote ʷ
-  above is the history. The wrong output was MLX's own command-buffer fence
-  drop (`slicing.cpp:62`), fixed in our vendored patched MLX inside the
-  native wheel; 10/10 deterministic first tokens and a coherent decode on
-  the release binary, and the 401.4 ms/tok cell is the row's first honest
-  timing. Mechanism + attestation: `notes/mlx-patch-diagnosis.md`.
-
-- **0.11.5** (2026-08-18 consolidated re-gate): every cell measured in one
-  campaign on the release binary `frozen-vendor-d651add3` (native plugin +
-  vendored patched `libmlx_metaljax`, tree `29bb8eb`), one guarded process
-  per cell, historical budgets, token agreement PASS. Named items (row 1
-  variance disposition, rows 3/8 suite-context brackets, row 10 spread,
-  row 18 drift, row 15 first timing) in notes/release-gates-0.11.5.md; full report
-  `~/.cache/metaljax-bench/logs/regate-0.11.5/models/`.
-- **0.11.6** (2026-08-27 release gate): every cell from the release binary
-  `frozen-0.11.6-dde2d668` (tree `83ff94f`), one guarded process per cell.
-  ALL 20 rows now produce numbers — rows 12 and 20 for the first time
-  (run at documented raised memory envelopes; shipped defaults unchanged).
-  Zero regressions standing; token agreement under the greedy contract
-  (Qwen3-8B and Llama-8B now EXACT vs CPU). Named items in
-  notes/release-gates-0.11.6.md; full report `~/.cache/metaljax-bench/logs/gate-0.11.6/`.
-
-- **0.11.7** (2026-08-31/09-01, the dense-band release): every cell from
-  the release binary `frozen-0117-combined-c0ed1a10` (tree `e9c0728`; the
-  only change after the binary was frozen is the version string, and the
-  tree reproduces the binary byte for byte). What landed: batched
-  middle-contracted dots + the MLX gemv occupancy floor (rows 1/2/5/6 —
-  the dense-band campaign, row 1 now 0.95× mlx-lm), the cache-append
-  scatter→slice_update, and the rms_norm recognizer's gemma/keras
-  coverage; the row-10 decode-floor work (ragged_dot 6590c05,
-  stacked-dot/K=1 ff569eb, P30 op-count 37b0cee) ships here too, hence
-  1948.2 → 24.8. Vendored MLX carries fork `fix/gemv-occupancy`
-  (vendor/0.32.0 @ d4967fa9). 17 of 20 rows improved, 3 flat within
-  noise (15/17 dispositioned standalone — suite-context), zero
-  regressions; jax pinned suite failure-set id-identical to 0.11.6;
-  texmo 106/106 + topconfs within ~1% of the 0.11.6 gate. Token
-  streams: rows 1/2/3 carry accepted 1-bf16-ULP tie-flips (logit
-  evidence archived), row 20 identical, rows 5/6 CPU-exact 64/64.
-  Named items in notes/release-gates-0.11.7.md; full report
-  `~/.cache/metaljax-bench/logs/gate-0.11.7/`.
-- ʰ HEAD-column cells (the rightmost-tracks-HEAD convention): row 11 =
-  9.0 on the keras-hub harness (see ᵐ; measured on the 0.11.7 release
-  binary, band 8.5–9.0); row 14 = 27.64 after the GQA attention
-  recognizer (43d4ad6); row 7 = 16.45 after the keras attention
-  recognizer (f1fbe30); row 3 = 31.4 on the merged main binary (keras
-  norm coverage + attention; 31.6 / 31.4 / 31.4, 127 tokens emitted, prefill
-  123.7 → 16.0 ms); rows 10 / 14 / 11 on the merged binary with the
-  dynamic-slice start plan (49f3ab9): row 10 = 24.27 (24.27 / 24.27 / 24.36,
-  stream unchanged), row 14 = 27.2 (27.22 / 27.19), row 11 keras 9.0 / 8.9
-  (unchanged; its maxtext arm 10.14 / 10.04 against the 11.0 record), row 8 =
-  24.8 (24.6 / 24.8 / 24.8, was 25.8 before the start plan; streams unchanged);
-  with the structural while-pipeline gate (235a14a; command-buffer cadence
-  still 800): row 11 keras = 8.3 (8.3 / 8.3 / 8.3, was 9.0), row 5 = 40.8
-  (40.7 / 40.8), row 2 = 56.4 (56.4 / 56.4), row 1 = 123.9 (one run), row 19
-  452 ms/step (one run, flat within its 445–450 band, not recorded); streams
-  identical to the records on every row. A cadence of 100 would take row 11
-  to 6.6 but costs texmo suite-106 1.0 % geomean (one config −7 %) — Oleg's
-  call, pending; on the 2026-09-06 merged binary (GQA absorb a943227,
-  chunk cadence 5bcf71a, KV in place + fork donation ec29278, MLA kernel +
-  relayout f960503; frozen-b3main-021b39a1): row 11 keras = 7.5 (7.5 / 7.6 /
-  7.5; its maxtext arm 9.5), row 14 = 26.9 (26.87 / 26.96), row 4 = 19.6 (x2),
-  row 7 = 14.2 (14.3 / 14.2), row 10 = 22.6 (22.50 / 22.62), row 8 = 23.4;
-  rows 5 / 2 read 41.5 / 56.6 once (cells unchanged); streams identical to
-  the records on every row; row 18 = 258.8 on main with the post-pass-tape compile
-  gate (4de653c; 258.9 / 258.7, was 338.8 on the same machine state, step-0
-  loss 2.9247 → 2.9195 = the compiled path's class); rows 4 / 7 re-measured on the
-  235a14a main binary during the gap-rows profiling: row 4 = 20.0 (six
-  runs, stream identical to the gate's), row 7 = 15.9 (four runs, stream
-  identical); row 8 = 25.8 on the merged main binary with the
-  fused GDN step + keras norm coverage; row 21 = 148.4 on the merged main binary (fused GDN step + keras norm
-  coverage; 148.4 / 155.3 / 147.4, median). The previous ʰ
-  cells (rows 4/10/11/14) became frozen 0.11.7 cells.
-- ᵐ **Row 11 changed benchmark implementation after 0.11.7** (the
-  best-available-implementation rule): every cell through the 0.11.7
-  column is the maxtext decode harness and is NOT comparable to the
-  keras-hub cells that follow — the harness switch is worth ~1.36× by
-  itself (same-session control: maxtext 12.22 vs keras 9.0 on the same
-  binary), so no release-over-release comparison may span the switch.
-  The same applies to the row's jax-CPU history (maxtext 89.7 →
-  keras-hub 29.4). The maxtext bench id stays measured beside rows
-  14/19.
+  binary) and is not comparable across the switch. The harness's per-step
+  RNG split is worth ~0.5 ms/token on this row; the cell keeps the original
+  harness (MAXTEXT_RNG_PRESPLIT=1 is the reported variant).
+- ᴳ = measured under the memory governor (from 2026-08-17): the original jax
+  implementation with no benchmark-code changes; rows that previously
+  panicked or were guard-killed run under the no-panic contract.
+- ᴾ²⁷ (0.11.4 column) = re-measured on the 2026-08-16 flush-pressure build
+  (notes/cpp-p27-flush-pressure.md) rather than the release-gate run.
+- ᵛ (row 15) = a timing cell; before 2026-08-18 the row produced wrong
+  output (MLX's dropped command-buffer fence, fixed in the vendored MLX,
+  notes/mlx-patch-diagnosis.md) and its earlier cells were not timings.
