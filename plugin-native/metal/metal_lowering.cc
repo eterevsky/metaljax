@@ -1104,6 +1104,10 @@ bool UsesPacks(const RewritePlan* plan, mlir::ModuleOp module,
     if (sd != plan->stacked_roots.end() && sd->second->relayout &&
         sd->second->pack_slot >= 0)
       return true;
+    // ...a projection pack (B6), read where its root dot is...
+    auto pj = plan->proj_roots.find(&op);
+    if (pj != plan->proj_roots.end() && pj->second->pack_slot >= 0)
+      return true;
     // ...and an expert gather whose dots read a pack of their own.
     auto moe = plan->moe_roots.find(&op);
     if (moe != plan->moe_roots.end()) {
@@ -3046,6 +3050,7 @@ class Lowering {
   absl::Status LowerGdn(mlir::Operation* op, const GdnMatch& m);
   absl::Status LowerRmsNorm(mlir::Operation* op, const RmsNormMatch& m);
   absl::Status LowerRopeView(mlir::Operation* op, const RopeMatch& m);
+  absl::Status LowerProjPack(mlir::Operation* op, const ProjPackMatch& m);
   // One node of the pair-space plan, as one tape entry; `slots` holds the
   // slot each earlier node landed in.
   absl::StatusOr<int> LowerMoeNode(const MoeMatch& m, const MoeNode& node,
@@ -3722,86 +3727,20 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerPad(mlir::Operation* op) {
   return attrs;
 }
 
-// Would `reshape(transpose(x, perm), target)` hand back a VIEW, for a
-// row-contiguous `x` of shape `src`?  When it would not, MLX materializes a
-// full copy of the operand -- `reshape_gpu` (mlx/backend/metal/copy.cpp) asks
-// `prepare_reshape` (mlx/backend/common/common.cpp) and falls through to
-// `copy_gpu_inplace` on a `true`.  This mirrors that decision: collapse the
-// input's contiguous runs, then try to factor the target's dims out of them.
-//
-// It is used to price the dot's own lowering, so a divergence from MLX can
-// only cost or save an optimization -- never a result.
-bool ReshapeIsView(const std::vector<int64_t>& src,
-                   const std::vector<int64_t>& perm,
-                   const std::vector<int64_t>& target) {
-  const size_t r = src.size();
-  if (perm.size() != r) return false;
-  std::vector<int64_t> stride(r, 1);
-  for (size_t i = r; i-- > 1;) stride[i - 1] = stride[i] * src[i];
-  std::vector<int64_t> pshape(r), pstride(r);
-  for (size_t i = 0; i < r; i++) {
-    pshape[i] = src[perm[i]];
-    pstride[i] = stride[perm[i]];
-  }
+// `ReshapeIsView` (the dot's merge-is-a-view question) lives in
+// metal_proj.cc, shared with the projection-pack analysis.
 
-  int64_t numel = 1;
-  for (int64_t d : src) numel *= d;
-  if (numel == 0) return true;  // prepare_reshape's empty early-out
-
-  // `collapse_contiguous_dims`: drop unit axes, merge a run when the outer
-  // stride is exactly the inner stride times the inner extent.  MLX keeps
-  // unit axes IN the contiguity test (a unit axis whose stride differs from
-  // its neighbour's breaks the run there); dropping them is the permissive
-  // side, and permissive here only ever declines an optimization.
-  std::vector<int64_t> cshape, cstride;
-  for (size_t i = 0; i < r; i++) {
-    if (pshape[i] == 1) continue;
-    if (!cshape.empty() && pstride[i] * pshape[i] == cstride.back()) {
-      cshape.back() *= pshape[i];
-      cstride.back() = pstride[i];
-    } else {
-      cshape.push_back(pshape[i]);
-      cstride.push_back(pstride[i]);
-    }
-  }
-  if (cshape.empty()) return true;  // a scalar after collapsing
-  // Row-contiguous input is prepare_reshape's other early-out: one run left
-  // whose stride is 1.
-  if (cshape.size() == 1 && cstride[0] == 1) return true;
-
-  // The factoring loop, verbatim in effect: peel each target extent off the
-  // front of the current run; a run that does not divide forces the copy.
-  size_t j = 0;
-  for (size_t i = 0; i < target.size(); i++) {
-    const int64_t want = target[i];
-    if (j < cshape.size() && cshape[j] % want == 0) {
-      cshape[j] /= want;
-      if (cshape[j] == 1) j++;
-    } else if (want == 1) {
-      continue;
-    } else {
-      return false;
-    }
-  }
-  return true;
-}
-
-absl::StatusOr<std::vector<int64_t>> Lowering::LowerDotGeneral(
-    mlir::Operation* op) {
-  auto dot = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op);
-  if (!dot) return Decline("stablehlo.dot_general in an unexpected form");
-  mlir::stablehlo::DotDimensionNumbersAttr dn = dot.getDotDimensionNumbers();
-  std::vector<int64_t> lb(dn.getLhsBatchingDimensions().begin(),
-                          dn.getLhsBatchingDimensions().end());
-  std::vector<int64_t> rb(dn.getRhsBatchingDimensions().begin(),
-                          dn.getRhsBatchingDimensions().end());
-  std::vector<int64_t> lc(dn.getLhsContractingDimensions().begin(),
-                          dn.getLhsContractingDimensions().end());
-  std::vector<int64_t> rc(dn.getRhsContractingDimensions().begin(),
-                          dn.getRhsContractingDimensions().end());
-  ASSIGN_OR_RETURN(std::vector<int64_t> lhs, Dims(op->getOperand(0)));
-  ASSIGN_OR_RETURN(std::vector<int64_t> rhs, Dims(op->getOperand(1)));
-
+// The dot_general attribute vector from SHAPES alone (the layout
+// runtime/program.h documents: `[lrank, lperm..., rrank, rperm..., B, M, K,
+// N, out_dtype, out_rank, out_shape..., kind, chunk, batch side, batch
+// groups, batch tail]`).  `LowerDotGeneral` calls it with the op's own
+// dims; `LowerProjPack` (B6) calls it with the packed weight's, so the pack
+// dot's attrs come from the same code as every ordinary dot's.
+absl::StatusOr<std::vector<int64_t>> DotAttrsFor(
+    const std::vector<int64_t>& lhs, const std::vector<int64_t>& rhs,
+    std::vector<int64_t> lb, std::vector<int64_t> rb, std::vector<int64_t> lc,
+    std::vector<int64_t> rc, int l_code, int r_code, int out_code,
+    const std::vector<int64_t>& declared) {
   // The contraction PAIRS may be jointly reordered without changing the
   // result: both operands flatten their K axes in pair order, so any one
   // permutation applied to both is the same sum.  Order them so the BIGGER
@@ -3863,15 +3802,10 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDotGeneral(
   std::vector<int64_t> out_shape = batch;
   out_shape.insert(out_shape.end(), m.begin(), m.end());
   out_shape.insert(out_shape.end(), n.begin(), n.end());
-  ASSIGN_OR_RETURN(std::vector<int64_t> declared,
-                          Dims(op->getResult(0)));
   if (declared != out_shape)
     return Decline("dot_general result shape does not follow from its dims");
 
-  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
   const mx::Dtype out_dt = dtype_of(out_code);
-  ASSIGN_OR_RETURN(int l_code, DtypeCode(op->getOperand(0)));
-  ASSIGN_OR_RETURN(int r_code, DtypeCode(op->getOperand(1)));
 
   // Which of ops/linalg._dot_general's arms runs is a static property of the
   // dtypes: 0 float matmul, 1 exact-f32 K-chunks, 2 int64 outer product, 3
@@ -4031,6 +3965,29 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerDotGeneral(
   attrs.push_back(batch_groups);
   attrs.push_back(batch_tail);
   return attrs;
+}
+
+absl::StatusOr<std::vector<int64_t>> Lowering::LowerDotGeneral(
+    mlir::Operation* op) {
+  auto dot = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(op);
+  if (!dot) return Decline("stablehlo.dot_general in an unexpected form");
+  mlir::stablehlo::DotDimensionNumbersAttr dn = dot.getDotDimensionNumbers();
+  std::vector<int64_t> lb(dn.getLhsBatchingDimensions().begin(),
+                          dn.getLhsBatchingDimensions().end());
+  std::vector<int64_t> rb(dn.getRhsBatchingDimensions().begin(),
+                          dn.getRhsBatchingDimensions().end());
+  std::vector<int64_t> lc(dn.getLhsContractingDimensions().begin(),
+                          dn.getLhsContractingDimensions().end());
+  std::vector<int64_t> rc(dn.getRhsContractingDimensions().begin(),
+                          dn.getRhsContractingDimensions().end());
+  ASSIGN_OR_RETURN(std::vector<int64_t> lhs, Dims(op->getOperand(0)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> rhs, Dims(op->getOperand(1)));
+  ASSIGN_OR_RETURN(std::vector<int64_t> declared, Dims(op->getResult(0)));
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
+  ASSIGN_OR_RETURN(int l_code, DtypeCode(op->getOperand(0)));
+  ASSIGN_OR_RETURN(int r_code, DtypeCode(op->getOperand(1)));
+  return DotAttrsFor(lhs, rhs, std::move(lb), std::move(rb), std::move(lc),
+                     std::move(rc), l_code, r_code, out_code, declared);
 }
 
 // The START PLAN, appended to both dynamic-slice attribute layouts.
@@ -7755,8 +7712,12 @@ absl::Status Lowering::Inline(mlir::Operation* op, llvm::StringRef attr) {
     // arguments are the same mlir::Values at every call site — so a reader
     // the proof missed fails its own Slot() loudly instead of silently
     // reading another call's array.
+    // ...unless the absorbed op's result IS bound: a projection pack's
+    // roots[1..] (and GDN's state root) are absorbed yet written by the
+    // root's emit, and a callee may read them like any other value.
     if (ctx_->plan != nullptr &&
-        ctx_->plan->absorbed(op->getOperand(i).getDefiningOp())) {
+        ctx_->plan->absorbed(op->getOperand(i).getDefiningOp()) &&
+        !slots_.contains(op->getOperand(i))) {
       slots_.erase(block.getArgument(i));
       continue;
     }
@@ -8079,6 +8040,13 @@ absl::Status Lowering::LowerOpImpl(mlir::Operation* op) {
         return Decline("a recognizer root with several results");
       RETURN_IF_ERROR(CheckValue(op->getResult(0)));
       return LowerRopeView(op, *rope->second);
+    }
+    auto proj = ctx_->plan->proj_roots.find(op);
+    if (proj != ctx_->plan->proj_roots.end()) {
+      if (op->getNumResults() != 1)
+        return Decline("a recognizer root with several results");
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      return LowerProjPack(op, *proj->second);
     }
   }
 
@@ -8852,6 +8820,133 @@ absl::Status Lowering::LowerRopeView(mlir::Operation* op,
     back.insert(back.end(), xd.begin(), xd.end());
     Emit(op_reshape, {o5}, {Bind(op->getResult(0))}, std::move(back),
          std::nullopt, ResultBytes(op));
+  }
+  return absl::OkStatus();
+}
+
+// The projection pack's emit (metal_proj.cc; B6).  Plain opcodes only, no
+// runtime change: ONE `dot_general` of the shared activation against the
+// pack (a trailing input of the tape, threaded into this frame as a capture
+// when the block reads it, `UsesPacks`), then per member a last-axis `slice`
+// of the packed output and -- where the member's declared result is
+// [.., H, h] rather than [.., n_i] -- a `reshape`; the last slot of each
+// chain binds that member's own result, so every consumer (bias add, rope,
+// norm, kv_update) resolves through `Slot` unchanged.  At M == 1 the slices
+// are shared-buffer views of a row-contiguous [.., n_total] and the
+// reshapes are views of those.  `roots[1..]` are absorbed: `LowerOp`
+// returns before reaching them, their results already bound here.
+//
+// This emit never Declines on a matched shape (a Decline discards every
+// recognizer for the executable): a pack that is not in scope -- which the
+// analysis and `UsesPacks` rule out -- lowers the members as the literal
+// dots they were, in place.
+absl::Status Lowering::LowerProjPack(mlir::Operation* op,
+                                     const ProjPackMatch& m) {
+  if (m.roots.empty() || m.roots[0] != op)
+    return Decline("proj: a pack rooted elsewhere");
+  RETURN_IF_ERROR(CheckValue(m.lhs));
+  for (mlir::Operation* r : m.roots) {
+    if (r->getNumResults() != 1) return Decline("proj: a member with several results");
+    RETURN_IF_ERROR(CheckValue(r->getResult(0)));
+  }
+  ASSIGN_OR_RETURN(int x, Slot(m.lhs));
+  ASSIGN_OR_RETURN(std::vector<int64_t> xd, Dims(m.lhs));
+  ASSIGN_OR_RETURN(int l_code, DtypeCode(m.lhs));
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
+  ASSIGN_OR_RETURN(int op_dot, Opcode("stablehlo.dot_general"));
+  ASSIGN_OR_RETURN(int op_slice, Opcode("stablehlo.slice"));
+  ASSIGN_OR_RETURN(int op_reshape, Opcode("stablehlo.reshape"));
+
+  const bool in_scope = m.pack_slot >= 0 && !pack_slots_.empty() &&
+                        m.pack_slot < static_cast<int>(pack_slots_.size());
+  if (!in_scope) {
+    if (kDebug)
+      std::fprintf(stderr,
+                   "[metaljax-native] proj: %s has no pack in scope: the "
+                   "dots run as written\n", m.name.c_str());
+    for (size_t i = 0; i < m.roots.size(); i++) {
+      mlir::Operation* r = m.roots[i];
+      RETURN_IF_ERROR(CheckValue(r->getOperand(1)));
+      ASSIGN_OR_RETURN(int w, Slot(r->getOperand(1)));
+      ASSIGN_OR_RETURN(int r_code, DtypeCode(r->getOperand(1)));
+      ASSIGN_OR_RETURN(std::vector<int64_t> attrs,
+                       DotAttrsFor(xd, m.rhs_dims[i], m.lb, m.rb, m.lc, m.rc,
+                                   l_code, r_code, out_code,
+                                   m.out_shapes[i]));
+      Emit(op_dot, {x, w}, {Bind(r->getResult(0))}, std::move(attrs),
+           std::nullopt, ResultBytes(r));
+    }
+    return absl::OkStatus();
+  }
+  const int pack = pack_slots_[static_cast<size_t>(m.pack_slot)];
+
+  // The packed weight: [k_1, .., k_nc, n_total] contracted on its leading
+  // dims (a view of the contiguous [K, n_total] pack), or under `nk`
+  // [n_total, k_1, .., k_nc] contracted on its trailing ones.  The pack
+  // ARRAY has exactly this shape (BuildProjPacks reshapes it), so the
+  // runtime's `transpose(in(1), rperm)` sees the rank it was told.
+  std::vector<int64_t> kdims;
+  for (int64_t d : m.lc) {
+    if (d < 0 || d >= static_cast<int64_t>(xd.size()))
+      return Decline("proj: a contracting dim out of range");
+    kdims.push_back(xd[static_cast<size_t>(d)]);
+  }
+  std::vector<int64_t> pdims, prc;
+  if (m.nk) {
+    pdims.push_back(m.n_total);
+    pdims.insert(pdims.end(), kdims.begin(), kdims.end());
+    for (size_t j = 0; j < kdims.size(); j++)
+      prc.push_back(static_cast<int64_t>(j + 1));
+  } else {
+    pdims = kdims;
+    pdims.push_back(m.n_total);
+    for (size_t j = 0; j < kdims.size(); j++)
+      prc.push_back(static_cast<int64_t>(j));
+  }
+  std::vector<int64_t> pout;  // lhs free dims ++ [n_total]
+  for (int64_t d = 0; d < static_cast<int64_t>(xd.size()); d++) {
+    bool contracted = false;
+    for (int64_t c : m.lc) contracted = contracted || c == d;
+    if (!contracted) pout.push_back(xd[static_cast<size_t>(d)]);
+  }
+  pout.push_back(m.n_total);
+  ASSIGN_OR_RETURN(std::vector<int64_t> attrs,
+                   DotAttrsFor(xd, pdims, m.lb, {}, m.lc, prc, l_code, l_code,
+                               out_code, pout));
+  const int64_t elem = m.elem_bytes > 0 ? m.elem_bytes : 4;
+  const int d_slot = nslots_++;
+  Emit(op_dot, {x, pack}, {d_slot}, std::move(attrs), std::nullopt,
+       Product(pout) * elem);
+
+  const int64_t rank = static_cast<int64_t>(pout.size());
+  int64_t off = 0;
+  for (size_t i = 0; i < m.roots.size(); i++) {
+    mlir::Operation* r = m.roots[i];
+    const int64_t n_i = m.n[i];
+    std::vector<int64_t> starts(static_cast<size_t>(rank), 0);
+    std::vector<int64_t> limits = pout;
+    std::vector<int64_t> strides(static_cast<size_t>(rank), 1);
+    starts.back() = off;
+    limits.back() = off + n_i;
+    std::vector<int64_t> band(pout.begin(), pout.end() - 1);
+    band.push_back(n_i);
+    const bool reshape = m.out_shapes[i] != band;
+    std::vector<int64_t> sattrs{rank};
+    sattrs.insert(sattrs.end(), starts.begin(), starts.end());
+    sattrs.insert(sattrs.end(), limits.begin(), limits.end());
+    sattrs.insert(sattrs.end(), strides.begin(), strides.end());
+    const int s_slot = reshape ? nslots_++ : Bind(r->getResult(0));
+    Emit(op_slice, {d_slot}, {s_slot}, std::move(sattrs), std::nullopt,
+         ResultBytes(r));
+    if (reshape) {
+      std::vector<int64_t> rattrs{
+          static_cast<int64_t>(m.out_shapes[i].size())};
+      rattrs.insert(rattrs.end(), m.out_shapes[i].begin(),
+                    m.out_shapes[i].end());
+      Emit(op_reshape, {s_slot}, {Bind(r->getResult(0))}, std::move(rattrs),
+           std::nullopt, ResultBytes(r));
+    }
+    off += n_i;
   }
   return absl::OkStatus();
 }
@@ -9802,7 +9897,8 @@ absl::StatusOr<LoweredProgram> LowerModule(mlir::ModuleOp module) {
 }
 
 absl::StatusOr<LoweredProgram> LowerModuleFused(
-    mlir::ModuleOp module, const std::vector<mx::array>& args) {
+    mlir::ModuleOp module, const std::vector<mx::array>& args,
+    bool proj_packs) {
   if (!module) return absl::NotFoundError("no module");
   if (!RecognizeEnabled()) return absl::NotFoundError("recognizers are off");
   mlir::func::FuncOp main = module.lookupSymbol<mlir::func::FuncOp>("main");
@@ -9827,6 +9923,17 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
     AnalyzeRagged(main, &plan);
     // ...and the stacked-weight dots, deferring to all four.
     AnalyzeStackedDot(main, &plan);
+    // ...and the projection packs (B6): sibling decode projections over one
+    // activation, deferring to every dot-rooted recognizer above.  The
+    // weights must be non-donated arguments, hence the donation set.  Left
+    // out when the executable found their weights changing every call.
+    if (proj_packs) {
+      AnalyzeProjPack(main, DonatedArgs(main), &plan);
+    } else if (kDebug) {
+      std::fprintf(stderr, "[metaljax-native] proj: left out of this tape "
+                           "(the weights changed too often to pack)\n");
+      std::fflush(stderr);
+    }
     // ...and the multi-span decode attentions: rooted at the combine
     // ADD, which no dot-rooted recognizer claims.
     AnalyzeMla(main, &plan);
@@ -9892,6 +9999,10 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
   // ...and the stacked dots' relaid layouts (B3), appended after them.
   absl::Status relaid = BuildStackedPacks(&plan, pctx);
   if (!relaid.ok()) return relaid;
+  // ...and the projection packs (B6), after both -- BuildQmmPacks clears
+  // `plan.packs`, and the slot indices are positions in that vector.
+  absl::Status projected = BuildProjPacks(&plan, pctx);
+  if (!projected.ok()) return projected;
   // ...and the router check, which is a value question too (moe.py's was in
   // the same eager prologue, for the same reason: it syncs with the host).
   absl::Status verified = VerifyMoe(&plan, eval);
@@ -9911,8 +10022,13 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
   if (!lowered.ok()) return lowered;
   lowered->packs = plan.packs;
   lowered->pack_args = plan.pack_args;
-  for (int i : plan.pack_args)
-    lowered->pack_arg_ids.push_back(args[i].id());
+  lowered->proj_only_args = plan.proj_only_args;
+  for (int i : plan.pack_args) {
+    const mx::array& a = args[static_cast<size_t>(i)];
+    lowered->pack_arg_ids.push_back(a.id());
+    lowered->pack_arg_data.push_back(a.data_shared_ptr());
+    lowered->pack_arg_raw.push_back(a.data_shared_ptr().get());
+  }
   for (const auto& m : plan.qmm)
     if (!m->disabled && !m->absorbed) lowered->num_qmm++;
   lowered->num_moe = static_cast<int64_t>(plan.moe.size());
@@ -9921,6 +10037,7 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
   lowered->num_stacked = static_cast<int64_t>(plan.stacked.size());
   lowered->num_gdn = static_cast<int64_t>(plan.gdn.size());
   lowered->num_rope = static_cast<int64_t>(plan.rope.size());
+  lowered->num_proj = static_cast<int64_t>(plan.proj.size());
   return lowered;
 }
 

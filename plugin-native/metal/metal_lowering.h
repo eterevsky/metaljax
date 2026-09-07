@@ -90,6 +90,23 @@ struct LoweredProgram {
   std::vector<mlx::core::array> packs;
   std::vector<int> pack_args;
   std::vector<std::uintptr_t> pack_arg_ids;
+  // ...and a weak handle on each of those arrays' buffers with its raw
+  // address.  `id()` is the address of a refcounted descriptor, and address
+  // recycling applies to it exactly as it does to a CPython object: a caller
+  // that hands over FRESH weights each call (training; a donated weight the
+  // executable freed) can land the new array on the old descriptor's
+  // address, and an id-only check then reused a stale pack -- measured on
+  // the B6 contract's donated pair (calls 2 and 3 off by 4.5, silently).
+  // The weak handle proves the buffer is still alive and the raw pointer
+  // that it is the SAME buffer (qmm's BuiltCache `LeafMatches`, which this
+  // repeats at the executable's own boundary).
+  std::vector<std::weak_ptr<mlx::core::array::Data>> pack_arg_data;
+  std::vector<const void*> pack_arg_raw;
+  // The `pack_args` ONLY the projection packs (B6) key on, sorted: when a
+  // call changes one of these and nothing else, the executable repacks a
+  // bounded number of times and then re-lowers WITHOUT the projection
+  // packs, keeping every other recognizer (`Tape`, `kMaxProjRepacks`).
+  std::vector<int> proj_only_args;
   // How many fused entries the tape holds, per family (diagnostics, and what
   // the tests assert on).
   int64_t num_qmm = 0;
@@ -99,6 +116,7 @@ struct LoweredProgram {
   int64_t num_stacked = 0;
   int64_t num_gdn = 0;
   int64_t num_rope = 0;
+  int64_t num_proj = 0;
   // The StableHLO this tape was built from, as MLIR bytecode -- the program
   // `GetHloModules` (PJRT's `OptimizedProgram`) hands back, converted to HLO
   // on demand.  Kept serialized rather than as a live module because the
@@ -115,9 +133,12 @@ absl::StatusOr<LoweredProgram> LowerModule(mlir::ModuleOp module);
 // the FIRST call rather than at compile: the executable keeps the plain tape
 // `LowerModule` built, asks for this one once, and keeps whichever it got --
 // a module that recognizes nothing, or a pack that fails an exactness check,
-// comes back `NotFound` and the plain tape stays.
+// comes back `NotFound` and the plain tape stays.  `proj_packs` = false
+// leaves the projection packs (B6) out: the executable asks for that after
+// their weights changed too often (`kMaxProjRepacks`).
 absl::StatusOr<LoweredProgram> LowerModuleFused(
-    mlir::ModuleOp module, const std::vector<mlx::core::array>& args);
+    mlir::ModuleOp module, const std::vector<mlx::core::array>& args,
+    bool proj_packs = true);
 
 }  // namespace metaljax
 

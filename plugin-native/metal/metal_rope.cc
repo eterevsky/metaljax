@@ -372,6 +372,18 @@ void AnalyzeRope(mlir::func::FuncOp fn, RewritePlan* plan) {
   for (const auto& m : plan->mla) take(m->root, m->ops);
   for (const auto& m : plan->gdn) take(m->root, m->ops);
   for (const auto& m : plan->norm) take(m->root, m->ops);
+  // A projection pack's roots[1..] are absorbed but BOUND (the root's emit
+  // writes them), so an apply may read one like any root's result; the
+  // group's ops are still taken.
+  for (const auto& m : plan->proj) {
+    if (m->roots.empty()) continue;
+    taken.insert(m->roots[0]);
+    llvm::DenseSet<mlir::Operation*> bound(m->roots.begin(), m->roots.end());
+    for (mlir::Operation* o : m->ops) {
+      taken.insert(o);
+      if (!bound.contains(o)) absorbed_elsewhere.insert(o);
+    }
+  }
 
   std::vector<std::unique_ptr<RopeMatch>> found;
   llvm::DenseSet<mlir::Operation*> visited_fns;

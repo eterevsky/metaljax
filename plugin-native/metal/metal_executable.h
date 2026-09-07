@@ -177,6 +177,11 @@ class MetalLoadedExecutable final : public xla::PjRtLoadedExecutable {
 
   // How many times the packs have been rebuilt, and whether to stop trying.
   static constexpr int kMaxRepacks = 8;
+  // ...and, separately, how many times ONLY the projection packs' weights
+  // (B6) changed: past this the tape is re-lowered without them and keeps
+  // every other recognizer, instead of retiring the whole fused tape for a
+  // family whose pack is a copy of arguments that were fresh anyway.
+  static constexpr int kMaxProjRepacks = 2;
 
   xla::PjRtClient* client_;
   xla::PjRtDevice* device_;
@@ -194,6 +199,8 @@ class MetalLoadedExecutable final : public xla::PjRtLoadedExecutable {
   mutable std::shared_ptr<const LoweredProgram> fused_;
   mutable bool fuse_done_ = false;   // tried and got nothing: do not retry
   mutable int repacks_ = 0;
+  mutable int proj_repacks_ = 0;
+  mutable bool proj_off_ = false;    // re-lowered without projection packs
 };
 
 }  // namespace metaljax

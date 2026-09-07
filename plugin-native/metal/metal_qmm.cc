@@ -2458,6 +2458,7 @@ void RewritePlan::rebuild() {
   gdn_roots.clear();
   norm_roots.clear();
   rope_roots.clear();
+  proj_roots.clear();
   for (const auto& m : qmm) {
     if (m->disabled) continue;
     // An ABSORBED match still owns its absorbed ops -- its weight is packed
@@ -2500,6 +2501,13 @@ void RewritePlan::rebuild() {
   }
   for (const auto& m : rope) {
     rope_roots[m->root] = m.get();
+    for (mlir::Operation* o : m->ops) skip.insert(o);
+  }
+  for (const auto& m : proj) {
+    // roots[0] is dispatched; roots[1..] are absorbed (in `ops`) and bound
+    // by the root's emit, the GDN precedent.
+    if (m->roots.empty()) continue;
+    proj_roots[m->roots[0]] = m.get();
     for (mlir::Operation* o : m->ops) skip.insert(o);
   }
 }

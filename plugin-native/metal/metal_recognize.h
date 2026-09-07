@@ -573,6 +573,60 @@ struct RopeMatch {
 };
 
 // --------------------------------------------------------------------------
+// the projection pack (metal_proj.cc): sibling decode projections, one dot
+// --------------------------------------------------------------------------
+
+// N `dot_general`s in one block that read the SAME activation against
+// distinct, loop-invariant weights -- a transformer's q/k/v (or k/v, or a
+// gate/up pair) at decode -- become ONE dot over the weights concatenated
+// along the output axis, materialized once per executable exactly like the
+// stacked dot's relayout pack (`BuildProjPacks` after `BuildStackedPacks`),
+// and per-consumer `slice`s of the packed output that are VIEWS at M == 1.
+// Every member's [2880 -> 512] bf16 gemv is latency-bound (b5-row7
+// findings §9: 41 us alone, 66 us for the overlapped pair); the packed
+// [2880 -> 1024] gemv has no partner to overlap and runs in about one
+// member's time.  Row-major [K, n_total] is consumed in place by MLX's
+// `check_transpose`, so the pack runs the SAME `gemv_t` kernel the members
+// ran; at K < 8192 the per-output K reduction order depends only on
+// (BM, SM, TM), so the default layout is bit-identical to the literal dots
+// (design section 4).  DECODE-ONLY (M == 1, mirroring the relayout's rule):
+// at M > 1 the slices are strided and MLX's split-K partition count changes
+// with N.  `roots[0]` is the plan root (earliest in block order); `roots[1..]`
+// are ABSORBED but their results are BOUND by `Lowering::LowerProjPack`, the
+// GDN precedent.  Costs the pack's size in device memory for the
+// executable's life (METALJAX_PROJ_PACK_MB caps the total; METALJAX_PROJ_PACK
+// =0 declines every group).
+struct ProjPackMatch {
+  std::vector<mlir::Operation*> roots;   // block order; roots[0] = plan root
+  mlir::Value lhs;                       // the shared activation (peeled)
+  std::vector<mlir::Value> rhs;          // each weight, behind its aliases
+  std::vector<int> origin_args;          // @main arg per weight, -1 = constant
+  // The dot's dimension numbers, identical across the group, in the pair
+  // order the lowering canonicalizes them to (`DotAttrsFor`).
+  std::vector<int64_t> lb, rb, lc, rc;
+  std::vector<int64_t> lhs_dims;
+  std::vector<int64_t> kdims;            // contracted extents, pair order
+  int64_t K = 0, M = 1;
+  std::vector<int64_t> n;                // per member: product of rhs free
+  int64_t n_total = 0;
+  std::vector<std::vector<int64_t>> rhs_dims;   // each rhs's declared shape
+  std::vector<std::vector<int64_t>> out_shapes; // each root's declared result
+  int64_t elem_bytes = 0;
+  int64_t pack_bytes = 0;
+  // The pack's layout, from the weights' STORAGE order (part of the group
+  // key, so every member agrees): false = row-major [K, n_total], the
+  // `gemv_t` a [K, N] weight runs; true = row-major [n_total, K] contracted
+  // on its dim 1, which MLX reads as transposed -- the non-T `gemv` an
+  // [N, K] weight (`x @ W.T`) runs.  Either way the packed dot is the
+  // members' own kernel.  METALJAX_PROJ_PACK_LAYOUT=kn|nk forces one on
+  // every group (the A/B arm for the other kernel; not bit-identical).
+  bool nk = false;
+  int pack_slot = -1;                    // index into plan->packs, once built
+  std::vector<mlir::Operation*> ops;     // absorbed: roots[1..] + aliases
+  std::string name;
+};
+
+// --------------------------------------------------------------------------
 // the plan
 // --------------------------------------------------------------------------
 
@@ -586,6 +640,7 @@ struct RewritePlan {
   std::vector<std::unique_ptr<GdnMatch>> gdn;
   std::vector<std::unique_ptr<RmsNormMatch>> norm;
   std::vector<std::unique_ptr<RopeMatch>> rope;
+  std::vector<std::unique_ptr<ProjPackMatch>> proj;
 
   // Ops a recognizer absorbed: no entry, no slot, never executed.
   llvm::DenseSet<mlir::Operation*> skip;
@@ -599,6 +654,7 @@ struct RewritePlan {
   llvm::DenseMap<mlir::Operation*, GdnMatch*> gdn_roots;
   llvm::DenseMap<mlir::Operation*, RmsNormMatch*> norm_roots;
   llvm::DenseMap<mlir::Operation*, RopeMatch*> rope_roots;
+  llvm::DenseMap<mlir::Operation*, ProjPackMatch*> proj_roots;  // roots[0]
 
   // The packed arrays, in the order the tape's trailing inputs take them.
   std::vector<mx::array> packs;
@@ -607,12 +663,16 @@ struct RewritePlan {
   // different buffers has to repack (qmm.py `_Pack.matches`).
   std::vector<int> pack_args;
   std::vector<std::uintptr_t> pack_arg_ids;
+  // ...and the subset of `pack_args` ONLY the projection packs (B6) read: a
+  // change on one of these costs the executable its projection packs and
+  // nothing else (metal_executable.cc `Tape`, `kMaxProjRepacks`).
+  std::vector<int> proj_only_args;
 
   bool empty() const {
     return qmm_roots.empty() && sdpa_roots.empty() && moe_roots.empty() &&
            ragged_roots.empty() && stacked_roots.empty() &&
            mla_roots.empty() && gdn_roots.empty() && norm_roots.empty() &&
-           rope_roots.empty();
+           rope_roots.empty() && proj_roots.empty();
   }
   // Recompute `skip` and the root maps from the matches that are still live.
   void rebuild();
@@ -693,6 +753,17 @@ void AnalyzeRagged(mlir::func::FuncOp fn, RewritePlan* plan);
 // AnalyzeRagged.  METALJAX_STACKED_DOT=0 disables it.
 void AnalyzeStackedDot(mlir::func::FuncOp fn, RewritePlan* plan);
 
+// The projection packs (metal_proj.cc).  Runs after AnalyzeStackedDot and
+// claims only dots no other recognizer did.  Structural, except that the
+// weights must be @main arguments (or constants) that are neither donated
+// nor updated by the program (a result of the weight's type derived from
+// it) -- a pack is keyed by their identity, and such a weight repacks every
+// call.  METALJAX_PROJ_PACK=0 disables it; `all` packs every eligible
+// member (the default policy `kv` leaves the wide q alone).
+void AnalyzeProjPack(mlir::func::FuncOp fn,
+                     const absl::flat_hash_set<int>& donated,
+                     RewritePlan* plan);
+
 // The multi-span decode attentions (metal_mla.cc).  Roots at the combine
 // ADD, which no dot-rooted recognizer claims.  Purely structural.
 // METALJAX_MLA=0 disables it.
@@ -734,6 +805,26 @@ absl::Status BuildQmmPacks(RewritePlan* plan, const PackContext& ctx);
 // bytes, the budget is spent -- is DROPPED, and its slice chain lowers
 // literally.
 absl::Status BuildStackedPacks(RewritePlan* plan, const PackContext& ctx);
+
+// The projection packs (metal_proj.cc), at the first execute, AFTER the
+// stacked relayouts (and so after `BuildQmmPacks`, which clears
+// `plan->packs`): smallest pack first, each weight viewed as [K, n_i] and
+// concatenated along n, governor-admitted; a pack that cannot be built --
+// the budget, a governor refusal, any exception -- DROPS its match and every
+// member lowers literally (the no-panic contract prefers a slower program
+// to a RESOURCE_EXHAUSTED from a pack).
+absl::Status BuildProjPacks(RewritePlan* plan, const PackContext& ctx);
+
+// Would `reshape(transpose(x, perm), target)` hand back a VIEW, for a
+// row-contiguous `x` of shape `src`?  Mirrors MLX's `prepare_reshape`
+// (mlx/backend/common/common.cpp): collapse the input's contiguous runs, then
+// factor the target's dims out of them.  Used by the dot lowering to price
+// its own merge (a divergence from MLX costs or saves an optimization, never
+// a result) and by the projection-pack analysis to prove a weight reads in
+// place.  Defined in metal_proj.cc.
+bool ReshapeIsView(const std::vector<int64_t>& src,
+                   const std::vector<int64_t>& perm,
+                   const std::vector<int64_t>& target);
 
 // The cross-executable build cache's counters (P19), for the tests: a pack is
 // a pure function of the reconstruction and the buffers it reads, so two

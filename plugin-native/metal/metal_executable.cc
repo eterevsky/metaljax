@@ -5,6 +5,7 @@ Licensed under the Apache License, Version 2.0.
 
 #include "metal/metal_executable.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -159,16 +160,67 @@ const std::shared_ptr<const LoweredProgram>& MetalLoadedExecutable::Tape(
     // The pack is a pure function of the buffers its reconstruction read: a
     // call that hands over the same arrays reuses it, and one that does not
     // has to repack (Stage 1 qmm.py `_Pack.matches`).
+    // Identity is the descriptor's address AND the buffer behind it: the
+    // address alone is recyclable (metal_lowering.h `pack_arg_data`), so
+    // the buffer the pack was built from must still be alive and must be
+    // the buffer this call hands over.
+    // Every key is checked (not just the first miss) so a miss can be
+    // attributed: one confined to the projection packs' own weights costs
+    // those packs, not the tape.
     bool same = true;
-    for (size_t i = 0; i < fused_->pack_args.size() && same; i++) {
+    bool proj_only = true;
+    int missed = -1;
+    for (size_t i = 0; i < fused_->pack_args.size(); i++) {
       const int a = fused_->pack_args[i];
-      same = a < static_cast<int>(inputs.size()) &&
-             inputs[a].id() == fused_->pack_arg_ids[i];
+      bool ok = a < static_cast<int>(inputs.size()) &&
+                inputs[a].id() == fused_->pack_arg_ids[i];
+      if (ok && i < fused_->pack_arg_raw.size() &&
+          fused_->pack_arg_raw[i] != nullptr) {
+        std::shared_ptr<mx::array::Data> live = fused_->pack_arg_data[i].lock();
+        const std::shared_ptr<mx::array::Data>& now =
+            inputs[a].data_shared_ptr();
+        ok = live != nullptr && live.get() == fused_->pack_arg_raw[i] &&
+             now != nullptr && now.get() == fused_->pack_arg_raw[i];
+      }
+      if (ok) continue;
+      same = false;
+      if (missed < 0) missed = a;
+      if (!std::binary_search(fused_->proj_only_args.begin(),
+                              fused_->proj_only_args.end(), a))
+        proj_only = false;
     }
     if (same) return fused_;
     fused_ = nullptr;
-    if (++repacks_ > kMaxRepacks) {
+    if (proj_only && !proj_off_) {
+      // Only projection-pack weights changed (B6).  A bounded number of
+      // repacks, then the tape is re-lowered WITHOUT the projection packs:
+      // every other recognizer stays, and there is no key left to miss.
+      if (++proj_repacks_ > kMaxProjRepacks) {
+        proj_off_ = true;
+        if (kDebug) {
+          std::fprintf(stderr,
+                       "[metaljax-native] %s: the projection packs' weights "
+                       "changed %d times (argument %d): re-lowering without "
+                       "them, the other recognizers stay\n",
+                       name_.c_str(), proj_repacks_, missed);
+          std::fflush(stderr);
+        }
+      } else if (kDebug) {
+        std::fprintf(stderr,
+                     "[metaljax-native] %s: the projection packs' weights "
+                     "changed (argument %d): repacking (%d of %d)\n",
+                     name_.c_str(), missed, proj_repacks_, kMaxProjRepacks);
+        std::fflush(stderr);
+      }
+    } else if (++repacks_ > kMaxRepacks) {
       // Weights being trained, or a "scale" that is really per-call data.
+      if (kDebug) {
+        std::fprintf(stderr,
+                     "[metaljax-native] %s: the packed weights changed %d "
+                     "times (argument %d): the fused tape is retired\n",
+                     name_.c_str(), repacks_, missed);
+        std::fflush(stderr);
+      }
       fuse_done_ = true;
       return lowered_;
     }
@@ -186,7 +238,7 @@ const std::shared_ptr<const LoweredProgram>& MetalLoadedExecutable::Tape(
   if (!module.ok()) return lowered_;
   absl::StatusOr<LoweredProgram> fused;
   try {
-    fused = LowerModuleFused(**module, inputs);
+    fused = LowerModuleFused(**module, inputs, /*proj_packs=*/!proj_off_);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "[metaljax-native] %s: recognizers failed (%s)\n",
                  name_.c_str(), e.what());
@@ -216,14 +268,15 @@ const std::shared_ptr<const LoweredProgram>& MetalLoadedExecutable::Tape(
                  "%lld gathered expert dispatch(es), %lld ragged "
                  "dispatch(es), %lld stacked dot(s), %lld fused "
                  "attention(s), %lld gated delta step(s), %lld rope "
-                 "view(s), %zu packed arrays\n",
+                 "view(s), %lld projection pack(s), %zu packed arrays\n",
                  name_.c_str(), static_cast<long long>(fused->num_qmm),
                  static_cast<long long>(fused->num_moe),
                  static_cast<long long>(fused->num_ragged),
                  static_cast<long long>(fused->num_stacked),
                  static_cast<long long>(fused->num_sdpa),
                  static_cast<long long>(fused->num_gdn),
-                 static_cast<long long>(fused->num_rope), fused->packs.size());
+                 static_cast<long long>(fused->num_rope),
+                 static_cast<long long>(fused->num_proj), fused->packs.size());
     std::fflush(stderr);
   }
   fused_ = std::make_shared<const LoweredProgram>(std::move(*fused));

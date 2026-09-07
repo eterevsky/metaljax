@@ -4077,6 +4077,300 @@ def _stacked_relayout_forms():
     ]
 
 
+def _proj_pack_forms():
+    """(label, jax function, inputs, calls) for `_p43_proj_pack`.
+
+    B6: the projection PACK (metal_proj.cc).  Sibling decode projections over
+    one activation become one dot over the concatenated weights.  The forms
+    are the shapes the model table runs, cut down to what a contract needs:
+
+      F1  keras-shaped gpt-oss decode (row 7): x[1,1,2880] against
+          W_q[2880,64,64] / W_k[2880,8,64] / W_v[2880,8,64], biases, the
+          rotate-half rope on q and k, the K/V cache updates -- inside a
+          counted while whose bound is an ARGUMENT (so the body is a region,
+          never unrolled) with the weights as carries, the way the real
+          decode program reads them.  Policy `kv` packs K+V and leaves q.
+      F2  row 11's shape at the top level, no bias, q/k norms over the head
+          dim: x[1,1,1024] . W[1024,16,128] / [1024,8,128] / [1024,8,128].
+          Called FOUR times with fresh weights (the repack contract: two
+          repacks, then the executable re-lowers without the projection
+          packs and keeps its norms).
+      F3  F1's projections at prefill (M = 59): declines, decode-only.
+      F4  mismatched head widths (row 8's gated q): [2048,4,512] + [2048,2,256]
+          pack on the merged [K, n] view.
+      F5  two tiny f32 members (GDN's b/a): [2048,32] + [2048,32].
+      F6  two CONSTANT weights (no pack argument, never repacks).
+      F7  two affine-quantized members: the qmm recognizer owns the dots.
+      F8  DONATED weights, returned updated in place: declines (a pack would
+          repack every call), called three times with fresh weights.
+      F9  K = 8192 with the packed N crossing 2048: a different gemv_t
+          summation tree, tolerance-level.
+      F10 weights stored [N, K] (`x @ W.T`, an Equinox/PyTorch port) in
+          f32: the members run MLX's non-T `gemv`, so the pack is laid out
+          [n_total, K] BY STORAGE and stays bit-identical (f32 exposes a
+          reorder bf16 rounding would hide).
+      F11 the weights behind ONE tuple `optimization_barrier` (jax's usual
+          way to pin a pytree), one of them returned as is: looked
+          through, packed, the pass-through is not an update.
+      F12 weights the program UPDATES (`w - lr * g`, not donated: texmo's
+          training-step shape): declines at analysis, no repack storm.
+    `calls` is how many times the child runs the form (each with fresh
+    inputs); a label with a call suffix is one answer.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    bf16 = jnp.bfloat16
+
+    def rnd(shape, seed, scale=1.0, dtype=ml_dtypes.bfloat16):
+        return (np.random.RandomState(seed).standard_normal(shape)
+                * scale).astype(dtype)
+
+    # --- F1 -----------------------------------------------------------
+    D, HQ, HKV, HD, T = 2880, 64, 8, 64, 4
+
+    def f1_step(s):
+        i, n, x, ck, cv, wq, wk, wv, wo, bq, bk, bv = s
+        pos = i % T
+        ang = (pos.astype(jnp.float32)
+               * jnp.arange(HD // 2, dtype=jnp.float32) * 0.01)
+        ang = jnp.concatenate([ang, ang])[None, None, None, :]
+        cos = jnp.cos(ang).astype(bf16)
+        sin = jnp.sin(ang).astype(bf16)
+        q = jnp.einsum("bqm,muh->bquh", x, wq) + bq
+        k = jnp.einsum("bqm,muh->bquh", x, wk) + bk
+        v = jnp.einsum("bqm,muh->bquh", x, wv) + bv
+        q = _rope_keras(q, cos, sin)
+        k = _rope_keras(k, cos, sin)
+        ck = lax.dynamic_update_slice(ck, k, (0, pos, 0, 0))
+        cv = lax.dynamic_update_slice(cv, v, (0, pos, 0, 0))
+        qg = q.reshape(1, 1, HKV, HQ // HKV, HD).sum(3)
+        sc = jnp.einsum("bqhd,bthd->bqht", qg, ck)
+        o = jnp.einsum("bqht,bthd->bqhd", sc, cv).reshape(1, 1, HKV * HD)
+        x = (x.astype(jnp.float32)
+             + 0.01 * jnp.einsum("bqn,nm->bqm", o, wo).astype(jnp.float32)
+             ).astype(bf16)
+        return (i + 1, n, x, ck, cv, wq, wk, wv, wo, bq, bk, bv)
+
+    def proj_f1(n, x, ck, cv, wq, wk, wv, wo, bq, bk, bv):
+        s = lax.while_loop(lambda s: s[0] < s[1], f1_step,
+                           (jnp.int32(0), n, x, ck, cv, wq, wk, wv, wo,
+                            bq, bk, bv))
+        return s[2], s[3], s[4]
+
+    def f1_args(seed):
+        zeros = np.zeros((1, T, HKV, HD), ml_dtypes.bfloat16)
+        return [np.int32(3), rnd((1, 1, D), seed), zeros, zeros.copy(),
+                rnd((D, HQ, HD), seed + 1, 0.02),
+                rnd((D, HKV, HD), seed + 2, 0.02),
+                rnd((D, HKV, HD), seed + 3, 0.02),
+                rnd((HKV * HD, D), seed + 4, 0.02),
+                rnd((HQ, HD), seed + 5, 0.1), rnd((HKV, HD), seed + 6, 0.1),
+                rnd((HKV, HD), seed + 7, 0.1)]
+
+    # --- F2 -----------------------------------------------------------
+    def head_norm(x, w):
+        xf = x.astype(jnp.float32)
+        var = jnp.mean(xf * xf, axis=-1, keepdims=True)
+        return (xf * lax.rsqrt(var + 1e-6)).astype(bf16) * w
+
+    def proj_f2(x, wq, wk, wv, nq, nk):
+        q = jnp.einsum("bqm,muh->bquh", x, wq)
+        k = jnp.einsum("bqm,muh->bquh", x, wk)
+        v = jnp.einsum("bqm,muh->bquh", x, wv)
+        return head_norm(q, nq), head_norm(k, nk), v
+
+    def f2_args(seed):
+        return [rnd((1, 1, 1024), seed), rnd((1024, 16, 128), seed + 1, 0.03),
+                rnd((1024, 8, 128), seed + 2, 0.03),
+                rnd((1024, 8, 128), seed + 3, 0.03),
+                (1.0 + np.random.RandomState(seed + 4).standard_normal((128,))
+                 * 0.1).astype(ml_dtypes.bfloat16),
+                (1.0 + np.random.RandomState(seed + 5).standard_normal((128,))
+                 * 0.1).astype(ml_dtypes.bfloat16)]
+
+    # --- F3 -----------------------------------------------------------
+    def proj_f3(x, wq, wk, wv, bq, bk, bv):
+        q = jnp.einsum("bqm,muh->bquh", x, wq) + bq
+        k = jnp.einsum("bqm,muh->bquh", x, wk) + bk
+        v = jnp.einsum("bqm,muh->bquh", x, wv) + bv
+        return q[:, :, :2], k, v
+
+    def f3_args(seed):
+        return [rnd((1, 59, D), seed, 0.5), rnd((D, HQ, HD), seed + 1, 0.02),
+                rnd((D, HKV, HD), seed + 2, 0.02),
+                rnd((D, HKV, HD), seed + 3, 0.02),
+                rnd((HQ, HD), seed + 5, 0.1), rnd((HKV, HD), seed + 6, 0.1),
+                rnd((HKV, HD), seed + 7, 0.1)]
+
+    # --- F4 -----------------------------------------------------------
+    def proj_f4(x, w1, w2):
+        return (jnp.einsum("bqm,muh->bquh", x, w1),
+                jnp.einsum("bqm,muh->bquh", x, w2))
+
+    def f4_args(seed):
+        return [rnd((1, 1, 2048), seed), rnd((2048, 4, 512), seed + 1, 0.02),
+                rnd((2048, 2, 256), seed + 2, 0.02)]
+
+    # --- F5 -----------------------------------------------------------
+    def proj_f5(x, wb, wa):
+        return x @ wb, x @ wa
+
+    def f5_args(seed):
+        return [rnd((1, 2048), seed, 1.0, np.float32),
+                rnd((2048, 32), seed + 1, 0.02, np.float32),
+                rnd((2048, 32), seed + 2, 0.02, np.float32)]
+
+    # --- F6 -----------------------------------------------------------
+    c1 = rnd((256, 128), 601, 0.05, np.float32)
+    c2 = rnd((256, 128), 602, 0.05, np.float32)
+
+    def proj_f6(x):
+        return x @ jnp.asarray(c1), x @ jnp.asarray(c2)
+
+    def f6_args(seed):
+        return [rnd((1, 256), seed, 1.0, np.float32)]
+
+    # --- F7 -----------------------------------------------------------
+    def unpack(packed, columns):
+        lo = jnp.bitwise_and(packed, jnp.int8(0x0F))
+        lo = jnp.where(lo > 7, lo - 16, lo)
+        hi = jnp.right_shift(packed, jnp.int8(4))
+        return jnp.reshape(jnp.stack([lo, hi], axis=-1),
+                           packed.shape[:-1] + (columns,))
+
+    def dense_sub(packed, scale, zero, g_idx, x, columns):
+        w = unpack(packed, columns)
+        g = g_idx.astype(jnp.int32)
+        s_ = jnp.take(scale, g, axis=0)
+        z = jnp.take(zero, g, axis=0)
+        return x @ ((w.astype(x.dtype) - z.astype(x.dtype)) * s_)
+
+    def proj_f7(x, p1, s1, z1, g1, p2, s2, z2, g2):
+        return (dense_sub(p1, s1, z1, g1, x, 64),
+                dense_sub(p2, s2, z2, g2, x, 64))
+
+    def f7_args(seed):
+        _q1, p1, s1, z1, g1 = _quantize(512, 64, 128, "float32", seed=seed)
+        _q2, p2, s2, z2, g2 = _quantize(512, 64, 128, "float32",
+                                        seed=seed + 1)
+        return [rnd((1, 512), seed, 0.5, np.float32), p1, s1, z1, g1,
+                p2, s2, z2, g2]
+
+    # --- F8 -----------------------------------------------------------
+    def proj_f8(x, w1, w2):
+        # The donated weights come back updated in place (the training
+        # shape): jax aliases each to its output, and only a USABLE donation
+        # reaches the plugin -- an unusable one is dropped from the module.
+        return x @ w1, x @ w2, w1 * 0.5, w2 * 0.5
+
+    def f8_args(seed):
+        return [rnd((1, 512), seed), rnd((512, 256), seed + 1, 0.05),
+                rnd((512, 256), seed + 2, 0.05)]
+
+    # --- F9 -----------------------------------------------------------
+    def proj_f9(x, w1, w2):
+        return x @ w1, x @ w2
+
+    def f9_args(seed):
+        return [rnd((1, 8192), seed), rnd((8192, 1536), seed + 1, 0.01),
+                rnd((8192, 1024), seed + 2, 0.01)]
+
+    # --- F10 ----------------------------------------------------------
+    def proj_f10(x, w1, w2):
+        return (jnp.einsum("bqm,hm->bqh", x, w1),
+                jnp.einsum("bqm,hm->bqh", x, w2))
+
+    def f10_args(seed):
+        return [rnd((1, 1, 2560), seed, 1.0, np.float32),
+                rnd((384, 2560), seed + 1, 0.02, np.float32),
+                rnd((384, 2560), seed + 2, 0.02, np.float32)]
+
+    # --- F11 ----------------------------------------------------------
+    def proj_f11(x, w1, w2):
+        w1b, w2b = lax.optimization_barrier((w1, w2))
+        return x @ w1b, x @ w2b, w1b
+
+    def f11_args(seed):
+        return [rnd((1, 640), seed), rnd((640, 192), seed + 1, 0.05),
+                rnd((640, 192), seed + 2, 0.05)]
+
+    # --- F12 ----------------------------------------------------------
+    def proj_f12(x, w1, w2, g1, g2):
+        return x @ w1, x @ w2, w1 - 0.1 * g1, w2 - 0.1 * g2
+
+    def f12_args(seed):
+        return [rnd((1, 512), seed), rnd((512, 320), seed + 1, 0.05),
+                rnd((512, 320), seed + 2, 0.05),
+                rnd((512, 320), seed + 3, 0.05),
+                rnd((512, 320), seed + 4, 0.05)]
+
+    # The executables are named jit_<function name>: the parent reads each
+    # program's narration by that name.
+    f8 = jax.jit(proj_f8, donate_argnums=(1, 2))
+    return [
+        ("F1 keras decode loop", jax.jit(proj_f1), f1_args, 1),
+        ("F2 row11 norms", jax.jit(proj_f2), f2_args, 4),
+        ("F3 prefill M59", jax.jit(proj_f3), f3_args, 1),
+        ("F4 mismatched heads", jax.jit(proj_f4), f4_args, 1),
+        ("F5 tiny f32 pair", jax.jit(proj_f5), f5_args, 1),
+        ("F6 constant pair", jax.jit(proj_f6), f6_args, 1),
+        ("F7 quantized pair", jax.jit(proj_f7), f7_args, 1),
+        ("F8 donated pair", f8, f8_args, 3),
+        ("F9 K8192 crossing 2048", jax.jit(proj_f9), f9_args, 1),
+        ("F10 NK-stored f32 pair", jax.jit(proj_f10), f10_args, 1),
+        ("F11 tuple barrier pair", jax.jit(proj_f11), f11_args, 1),
+        ("F12 updated pair", jax.jit(proj_f12), f12_args, 1),
+    ]
+
+
+def _gemv_band(K, N, nk):
+    """The tile MLX's M = 1 dispatch picks for a [K -> N] dot, reduced to
+    what fixes the per-output K summation order (mlx-src/mlx/backend/metal/
+    matmul.cpp 1085-1153, gemv.h): `gemv_t` for a [K, N] weight orders by
+    (BM, SM, TM) with the fork's occupancy floor on (sm, sn); the non-T
+    `gemv` for an [N, K] weight by (BN, SN, TN).  Two dots with equal bands
+    run the same instruction sequence per output; a different band is a
+    different PSO (expected identical, compiler-dependent) or, past the
+    floor, a different tree."""
+    if not nk:
+        sm, sn = (4, 8) if (K >= 8192 and N >= 2048) else (8, 4)
+        bn = 16 if N >= 2048 else 4 if N >= 512 else 2
+        tn = 1 if N < 4 else 4
+        while sn > 4 and (N + bn * sn * tn - 1) // (bn * sn * tn) < 32:
+            sn //= 2
+            sm *= 2
+        return ("gemv_t", 1, sm, 4, bn, sn, tn)
+    bn, sm, sn = 1, 1, 32
+    if K <= 64:
+        sm, sn = 8, 4
+    elif K >= 16 * N:
+        bn = 8
+    tn = 4
+    return ("gemv", bn, sn, tn, sm)
+
+
+# Per form: K, the members' n_i under the `kv` policy, the storage class;
+# `all` adds the q member the policy leaves alone.  From these the contract
+# decides which forms must be BIT-identical to the literal dots (every
+# member in the pack's band) and which report their bits and hold a ULP.
+_PROJ_FORM_BANDS = {
+    "F1": (2880, [512, 512], False), "F2": (1024, [2048, 1024, 1024], False),
+    "F4": (2048, [2048, 512], False), "F5": (2048, [32, 32], False),
+    "F6": (256, [128, 128], False), "F9": (8192, [1536, 1024], False),
+    "F10": (2560, [384, 384], True), "F11": (640, [192, 192], False),
+}
+_PROJ_FORM_BANDS_ALL = dict(_PROJ_FORM_BANDS)
+_PROJ_FORM_BANDS_ALL["F1"] = (2880, [4096, 512, 512], False)
+_PROJ_FORM_BANDS_ALL["F2"] = (1024, [2048, 1024, 1024], False)
+
+
+def _proj_same_band(form, bands=_PROJ_FORM_BANDS):
+    K, ns, nk = bands[form]
+    pack = _gemv_band(K, sum(ns), nk)
+    return all(_gemv_band(K, n, nk) == pack for n in ns)
+
+
 def _start_plan_forms():
     """(label, module, inputs) for `_p34_start_plan`'s narration arm.
 
@@ -9995,6 +10289,442 @@ def _p42_rope_view(subprocess, pathlib, re):
              the_rewrite_cannot_move_an_answer)]
 
 
+def _p43_proj_pack(subprocess, pathlib, re):
+    """B6: the projection PACK (metal_proj.cc).
+
+    Row 7's K and V projections are two latency-bound [2880 -> 512] bf16
+    gemvs; the rope view shortened q's chain and the pair stopped landing in
+    one concurrent dispatch group (+41 us per layer).  The pack makes them
+    ONE dot over the concatenated weights, materialized once per executable
+    (governor-admitted, budgeted, keyed by the weights' identity), with
+    per-consumer slice views.
+
+    Pinned, on the forms of `_proj_pack_forms`: the match FIRES and PACKS
+    (narration and the executable's count); both kill switches restore the
+    literal tape; fewer dispatches; every answer whose members share the
+    pack's gemv band (`_gemv_band`) is BIT-identical with
+    METALJAX_PROJ_PACK=0 -- the same kernel, the same K order -- and a
+    band-crossing one (F2, F4, F9) holds a ULP with its bits REPORTED, not
+    failed (design section 4: a PSO change is compiler-dependent); prefill
+    declines; the consumers (bias, rope, kv_update, norms) match jax-CPU;
+    the `kv`/`all` policies; the qmm recognizer keeps its dots; the byte
+    cap and a donated weight decline; the pack's layout follows the
+    weights' storage ([N, K] weights pack [n_total, K] and stay
+    bit-identical); a tuple barrier is looked through; a weight the
+    program updates declines; fresh weights repack a bounded number of
+    times and then the executable re-lowers WITHOUT the projection packs,
+    keeping its other recognizers.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+    memo = {}
+
+    def arm(env_extra, platform="metal"):
+        import json
+        key = (platform, tuple(sorted(env_extra.items())))
+        if key in memo:
+            return memo[key]
+        child = dict(os.environ)
+        if platform == "cpu":
+            child.pop("METALJAX_PLUGIN_PATH", None)
+            child["JAX_PLATFORMS"] = "cpu"
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--proj-pack"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("PPK "):
+                label, payload = line[4:].split("\t", 1)
+                answers[label] = [np.array(a) for a in json.loads(payload)]
+        text = proc.stdout + proc.stderr
+        memo[key] = (answers, text)
+        return memo[key]
+
+    def proj_lines(text):
+        return [ln for ln in text.splitlines() if "[metaljax-native] proj:" in ln]
+
+    def matched(text):
+        return re.findall(r"proj: matched a projection pack \((\S+), (\d+) dots, ([\d.]+) MB", text)
+
+    def packed(text):
+        return re.findall(r"proj: packed (\S+) \(([\d.]+) MB once, (\d+) weights", text)
+
+    def exe_pack_counts(text):
+        """Every fused-tape narration per program, in order: {jit name:
+        [pack count, ...]} -- one entry per (re)lowering."""
+        out = {}
+        for m in re.finditer(r"\[metaljax-native\] (jit_proj_\w+): .*?(\d+) projection pack\(s\)", text):
+            out.setdefault(m.group(1), []).append(int(m.group(2)))
+        return out
+
+    def exe_packs(text):
+        """First fused-tape narration per program: {jit name: pack count}."""
+        return {k: v[0] for k, v in exe_pack_counts(text).items()}
+
+    def dispatches(text):
+        out = {}
+        for m in re.finditer(r"\[metaljax-native\] (jit_proj_\w+): flushes=.*?dispatches=(\d+)", text):
+            out.setdefault(m.group(1), int(m.group(2)))
+        return out
+
+    def same(a, b):
+        return len(a) == len(b) and all(
+            x.shape == y.shape and np.array_equal(x, y) for x, y in zip(a, b))
+
+    def worst(a, b):
+        e = 0.0
+        for x, y in zip(a, b):
+            scale = max(float(np.max(np.abs(y))), 1e-30)
+            e = max(e, float(np.max(np.abs(x - y))) / scale)
+        return e
+
+    def form_of(label):
+        return label.split()[0]
+
+    # A band-crossing pack accumulates in f32 and rounds once: at most one
+    # ULP of the output dtype (bf16 forms), or an f32 reorder's few ULP.
+    F32_FORMS = {"F5", "F6", "F10"}
+
+    def ulp_band(form):
+        return 1e-5 if form in F32_FORMS else 2 ** -7
+
+    def compare_arms(on, off, bands=_PROJ_FORM_BANDS, skip=()):
+        """Every label of `on` against `off`: same-band forms must be
+        bit-identical, band-crossing ones within a ULP.  Returns
+        (failures, exact labels, reported labels, worst error)."""
+        bad, exact, reported, e_max = [], [], [], 0.0
+        for k in sorted(on):
+            f = form_of(k)
+            if f in skip or k not in off:
+                continue
+            if same(on[k], off[k]):
+                exact.append(k)
+                continue
+            e = worst(on[k], off[k])
+            if f in bands and _proj_same_band(f, bands):
+                bad.append(f"{k} differs by {e:.2e} (same gemv band: must be bit-identical)")
+            elif e > ulp_band(f):
+                bad.append(f"{k} differs by {e:.2e} (> 1 ULP)")
+            else:
+                reported.append(k)
+                e_max = max(e_max, e)
+        return bad, exact, reported, e_max
+
+    # The pack each form builds under the DEFAULT policy (`auto`: F1 K+V,
+    # F2 Q+K+V by the tile rule).
+    KV_NAMES = {"F1": "m1k2880n512+512", "F2": "m1k1024n2048+1024+1024",
+                "F4": "m1k2048n2048+512", "F5": "m1k2048n32+32",
+                "F6": "m1k256n128+128", "F9": "m1k8192n1536+1024",
+                "F10": "m1k2560n384+384", "F11": "m1k640n192+192"}
+
+    def the_pack_fires():
+        _a, text = arm({})
+        names = {n for n, _d, _mb in matched(text)}
+        built = {n for n, _mb, _w in packed(text)}
+        missing = [f"{f} {n}" for f, n in KV_NAMES.items()
+                   if n not in names or n not in built]
+        if missing:
+            return False, f"not matched+packed: {missing}; lines: {proj_lines(text)[:8]}"
+        exe = exe_packs(text)
+        want = {"jit_proj_f1": 1, "jit_proj_f2": 1, "jit_proj_f4": 1,
+                "jit_proj_f5": 1, "jit_proj_f6": 1, "jit_proj_f9": 1,
+                "jit_proj_f10": 1, "jit_proj_f11": 1}
+        bad = {k: exe.get(k) for k in want if exe.get(k) != want[k]}
+        if bad:
+            return False, f"executable pack counts {bad} (want 1 each); have {exe}"
+        return True, (f"{len(KV_NAMES)} forms matched and packed: "
+                      + ", ".join(sorted(built)))
+
+    def the_kill_switches_decline():
+        for env in ({"METALJAX_PROJ_PACK": "0"}, {"METALJAX_PROJ_PACK_MB": "0"}):
+            _a, text = arm(env)
+            if proj_lines(text):
+                return False, f"{env} still narrates: {proj_lines(text)[:3]}"
+            if re.search(r"[1-9]\d* projection pack\(s\)", text):
+                return False, f"{env} still counts packs"
+        return True, "PROJ_PACK=0 and PROJ_PACK_MB=0 narrate nothing, count zero"
+
+    def the_pack_removes_dispatches():
+        _a, on = arm({})
+        _b, off = arm({"METALJAX_PROJ_PACK": "0"})
+        d_on, d_off = dispatches(on), dispatches(off)
+        progs = ["jit_proj_f1", "jit_proj_f2", "jit_proj_f4", "jit_proj_f5",
+                 "jit_proj_f6", "jit_proj_f10", "jit_proj_f11"]
+        if any(p not in d_on or p not in d_off for p in progs):
+            return False, f"dispatch narration on={d_on} off={d_off}"
+        worse = [p for p in progs if d_on[p] >= d_off[p]]
+        if worse:
+            return False, f"no fewer dispatches on {worse}: on={d_on} off={d_off}"
+        return True, ", ".join(f"{p[9:]} {d_off[p]}->{d_on[p]}" for p in progs)
+
+    def the_pack_cannot_move_an_answer():
+        on, _t = arm({})
+        off, _u = arm({"METALJAX_PROJ_PACK": "0"})
+        if set(on) != set(off):
+            return False, f"labels differ: {sorted(set(on) ^ set(off))}"
+        strict = sorted(f for f in _PROJ_FORM_BANDS if _proj_same_band(f))
+        crossing = sorted(f for f in _PROJ_FORM_BANDS if not _proj_same_band(f))
+        # The forms the contract was designed around must fall where the
+        # design says: K/V-shaped packs in one band, F2/F4 (bn4 -> bn16)
+        # and F9 (K = 8192, N crossing 2048) across one.
+        if not {"F1", "F5", "F6", "F10", "F11"} <= set(strict):
+            return False, f"band table: strict={strict}"
+        if not {"F2", "F4", "F9"} <= set(crossing):
+            return False, f"band table: crossing={crossing}"
+        bad, exact, reported, e = compare_arms(on, off)
+        if bad:
+            return False, "differs under the knob: " + "; ".join(bad)
+        held = [k for k in exact if form_of(k) in crossing]
+        n_cross = sum(1 for k in on if form_of(k) in crossing)
+        return True, (f"{len(exact)} cases bit-identical with the pack off "
+                      f"(same-band forms {strict} all held); band-crossing "
+                      f"{crossing}: bits held on {len(held)} of {n_cross}, "
+                      f"worst {e:.1e}")
+
+    def prefill_declines():
+        _a, text = arm({})
+        decl = [ln for ln in proj_lines(text) if "multi-row (M=59)" in ln]
+        if not decl:
+            return False, f"no multi-row decline: {proj_lines(text)[:6]}"
+        if any(n.startswith("m59") for n, _d, _mb in matched(text)):
+            return False, "an M=59 group matched"
+        if exe_packs(text).get("jit_proj_f3", 0) != 0:
+            return False, "the prefill executable counts packs"
+        return True, f"{len(decl)} M=59 dots declined (decode-only), no pack"
+
+    def consumers_match_cpu():
+        on, _t = arm({})
+        cpu, _u = arm({}, platform="cpu")
+        report, bad = [], []
+        # bf16 forms: the plugin rounds each op where XLA:CPU keeps f32
+        # across fusions, and F1 loops three steps; the band is the bf16
+        # differential's (HALF) widened for the loop.
+        bands = {"F1 keras decode loop": 2.5e-2, "F2 row11 norms call1": 8e-3,
+                 "F2 row11 norms call2": 8e-3, "F2 row11 norms call3": 8e-3,
+                 "F2 row11 norms call4": 8e-3, "F4 mismatched heads": 8e-3,
+                 "F5 tiny f32 pair": 1e-5, "F6 constant pair": 1e-5,
+                 "F7 quantized pair": 1e-5, "F9 K8192 crossing 2048": 8e-3,
+                 "F10 NK-stored f32 pair": 1e-5, "F11 tuple barrier pair": 8e-3,
+                 "F12 updated pair": 8e-3}
+        for k, band in bands.items():
+            if k not in on or k not in cpu:
+                return False, f"missing {k}: metal={sorted(on)} cpu={sorted(cpu)}"
+            e = worst(on[k], cpu[k])
+            report.append(f"{k.split()[0]} {e:.1e}")
+            if e > band:
+                bad.append(f"{k} {e:.2e} > {band:.0e}")
+        if bad:
+            return False, "; ".join(bad)
+        return True, "vs jax-CPU worst: " + ", ".join(report)
+
+    def the_policy():
+        # `auto` (the default): F1's K+V (512 + 512 = 1024) stays in the
+        # members' gemv_t bn4 tile, so q is left alone; F2's K+V (1024 +
+        # 1024 = 2048) would cross into bn16 for nothing, so q is packed too
+        # (Q+K+V = 4096 shares q's own tile).  `kv` leaves q alone on both,
+        # `all` packs everything.
+        _a, au = arm({})
+        _b, kv = arm({"METALJAX_PROJ_PACK": "kv"})
+        _c, al = arm({"METALJAX_PROJ_PACK": "all"})
+        au_left = [ln for ln in proj_lines(au) if "policy auto leaves the widest" in ln]
+        au_took = [ln for ln in proj_lines(au) if "policy auto packs the widest" in ln]
+        if len(au_left) < 1 or len(au_took) < 1:
+            return False, (f"auto narrated leave x{len(au_left)}, pack x"
+                           f"{len(au_took)} (want F1 left, F2 packed)")
+        kv_left = [ln for ln in proj_lines(kv) if "policy kv leaves the widest" in ln]
+        if len(kv_left) < 2:
+            return False, f"kv policy narrated {len(kv_left)} times (want F1, F2)"
+        au_names = {n for n, _mb, _w in packed(au)}
+        kv_names = {n for n, _mb, _w in packed(kv)}
+        al_names = {n for n, _mb, _w in packed(al)}
+        want_au = {"m1k2880n512+512", "m1k1024n2048+1024+1024", "m1k2048n32+32"}
+        want_kv = {"m1k2880n512+512", "m1k1024n1024+1024", "m1k2048n32+32"}
+        want_all = {"m1k2880n4096+512+512", "m1k1024n2048+1024+1024",
+                    "m1k2048n32+32"}
+        if not want_au <= au_names:
+            return False, f"auto packed {sorted(au_names)}"
+        if not want_kv <= kv_names:
+            return False, f"kv packed {sorted(kv_names)}"
+        if not want_all <= al_names:
+            return False, f"all packed {sorted(al_names)}"
+        if "policy kv" in al or "policy auto" in al:
+            return False, "the all policy still narrates a policy"
+        on, _t = arm({"METALJAX_PROJ_PACK": "all"})
+        off, _u = arm({"METALJAX_PROJ_PACK": "0"})
+        # Under `all` k/v cross into q's bn16 band (F1, F2): reported.
+        bad, exact, reported, e = compare_arms(on, off, _PROJ_FORM_BANDS_ALL)
+        if bad:
+            return False, "all differs from the literal dots: " + "; ".join(bad)
+        return True, (f"auto packs K+V on F1 and Q+K+V on F2 (the tile rule), "
+                      f"kv packs K+V on both, all packs Q+K+V; F5 under all "
+                      f"three; all vs off: bits held on {len(exact)} of "
+                      f"{len(on)}, worst {e:.1e}")
+
+    def quantized_dots_stay_qmm():
+        _a, text = arm({})
+        q = re.findall(r"qmm: packed (\S+)", text)
+        if len(q) < 2:
+            return False, f"qmm packed {q}"
+        stray = [ln for ln in proj_lines(text)
+                 if "k512n64" in ln or "[1,512] x [512,64]" in ln]
+        if stray:
+            return False, f"proj touched the quantized dots: {stray}"
+        return True, f"{len(q)} qmm packs, no proj line on their dots"
+
+    def the_byte_cap_declines():
+        cap, text = arm({"METALJAX_PROJ_PACK_MB": "1"})
+        decl = [ln for ln in proj_lines(text)
+                if "declined over budget" in ln and "m1k2880n512+512" in ln]
+        if not decl:
+            return False, f"no over-budget decline: {proj_lines(text)[-6:]}"
+        if "m1k2880n512+512" in {n for n, _mb, _w in packed(text)}:
+            return False, "F1 packed over the cap"
+        off, _u = arm({"METALJAX_PROJ_PACK": "0"})
+        k = "F1 keras decode loop"
+        if not same(cap[k], off[k]):
+            return False, f"F1 under the cap differs from the literal dots by {worst(cap[k], off[k]):.2e}"
+        small = {n for n, _mb, _w in packed(text)}
+        return True, (f"F1 declined over a 1 MB cap and lowered literally "
+                      f"(bit-identical); under the cap: {sorted(small)}")
+
+    def a_donated_weight_declines():
+        on, text = arm({})
+        decl = [ln for ln in proj_lines(text) if "the weight is donated" in ln]
+        if not decl:
+            return False, f"no donation decline: {proj_lines(text)[:6]}"
+        if "m1k512n256+256" in {n for n, _mb, _w in packed(text)}:
+            return False, "the donated pair packed"
+        if exe_packs(text).get("jit_proj_f8", 0) != 0:
+            return False, "the donated executable counts packs"
+        off, _u = arm({"METALJAX_PROJ_PACK": "0"})
+        calls = [k for k in on if k.startswith("F8")]
+        if len(calls) != 3 or any(not same(on[k], off[k]) for k in calls):
+            return False, f"F8 calls {calls} differ from the literal dots"
+        return True, f"declined ({len(decl)} narrations), 3 calls literal and identical"
+
+    def fresh_weights_repack():
+        # F2 runs four times with fresh weights: the pack is keyed by their
+        # identity, so calls 2 and 3 repack (narrated, 1 of 2 / 2 of 2) and
+        # call 4 re-lowers WITHOUT the projection packs -- the executable's
+        # fourth fused narration counts 0 packs but exists (its head norms
+        # keep the fused tape), where the old rule would have retired every
+        # recognizer after eight misses or re-lowered forever.
+        on, text = arm({})
+        n = sum(1 for nm, _mb, _w in packed(text)
+                if nm == "m1k1024n2048+1024+1024")
+        if n != 3:
+            return False, f"F2 packed {n} times over 4 calls with fresh weights (want 3)"
+        rep = re.findall(r"jit_proj_f2: the projection packs' weights changed \(argument (\d+)\): repacking \((\d) of 2\)", text)
+        if [r[1] for r in rep] != ["1", "2"]:
+            return False, f"repack narration {rep} (want 1 of 2, 2 of 2)"
+        off_line = re.search(r"jit_proj_f2: the projection packs' weights changed 3 times \(argument \d+\): re-lowering without them", text)
+        if off_line is None:
+            return False, "no 're-lowering without them' narration for F2"
+        if "proj: left out of this tape" not in text:
+            return False, "the fourth lowering did not narrate the packs left out"
+        counts = exe_pack_counts(text).get("jit_proj_f2")
+        if counts != [1, 1, 1, 0]:
+            return False, f"F2's fused narrations count {counts} packs (want [1, 1, 1, 0]: the fourth tape keeps the norms, drops the pack)"
+        if "jit_proj_f2: the packed weights changed" in text:
+            return False, "F2 counted against the whole-tape repack bound"
+        off, _u = arm({"METALJAX_PROJ_PACK": "0"})
+        calls = {k: on[k] for k in on if k.startswith("F2 ")}
+        bad, exact, reported, e = compare_arms(calls, off)
+        if bad or len(calls) != 4:
+            return False, f"F2 calls {sorted(calls)}: {bad}"
+        return True, (f"calls 2-3 repacked, call 4 re-lowered with 0 packs and "
+                      f"the norms kept; 4 calls vs the pack off: bits held on "
+                      f"{len(exact)} of 4 (band-crossing form), worst {e:.1e}")
+
+    def the_layout_follows_storage():
+        on, text = arm({})
+        by = re.findall(r"proj: matched a projection pack \((\S+), \d+ dots, [\d.]+ MB, layout (\w+) by storage\)", text)
+        lay = dict(by)
+        if lay.get("m1k2560n384+384") != "nk" or lay.get("m1k2880n512+512") != "kn":
+            return False, f"layouts by storage: {lay}"
+        built = {n: l for n, l in re.findall(r"proj: packed (\S+) \([\d.]+ MB once, \d+ weights, layout (\w+)\)", text)}
+        if built.get("m1k2560n384+384") != "nk":
+            return False, f"F10 built as {built.get('m1k2560n384+384')}"
+        off, _u = arm({"METALJAX_PROJ_PACK": "0"})
+        k = "F10 NK-stored f32 pair"
+        if not same(on[k], off[k]):
+            return False, f"F10 differs from its literal dots by {worst(on[k], off[k]):.2e} under the storage layout"
+        # The forced layout is the A/B arm: F10 then runs the OTHER kernel
+        # (gemv_t on an [N, K] weight), not bit-identical, within a few ULP.
+        forced, ftext = arm({"METALJAX_PROJ_PACK_LAYOUT": "kn"})
+        fl = re.findall(r"proj: matched a projection pack \((\S+), \d+ dots, [\d.]+ MB, layout (\w+) forced\)", ftext)
+        if dict(fl).get("m1k2560n384+384") != "kn":
+            return False, f"forced layouts: {fl}"
+        e = worst(forced[k], off[k])
+        if e > 1e-5:
+            return False, f"F10 under the forced kn layout differs by {e:.2e}"
+        held = same(forced[k], off[k])
+        return True, (f"F10 ([N,K] f32) packs nk by storage, bit-identical; F1 "
+                      f"packs kn; forced kn on F10 within {e:.1e} (bits "
+                      f"{'held' if held else 'not held'}, the A/B arm)")
+
+    def a_tuple_barrier_is_looked_through():
+        on, text = arm({})
+        if "m1k640n192+192" not in {n for n, _mb, _w in packed(text)}:
+            return False, f"F11 not packed: {[ln for ln in proj_lines(text) if 'barrier' in ln or '640' in ln][:4]}"
+        if "computed by stablehlo.optimization_barrier" in text:
+            return False, "a barrier result was declined as computed"
+        if exe_packs(text).get("jit_proj_f11") != 1:
+            return False, "F11's executable does not count its pack"
+        off, _u = arm({"METALJAX_PROJ_PACK": "0"})
+        k = "F11 tuple barrier pair"
+        if not same(on[k], off[k]):
+            return False, f"F11 differs from the literal dots by {worst(on[k], off[k]):.2e}"
+        return True, "F11 packed through the tuple barrier (w1 returned as is: a pass-through, not an update), bit-identical"
+
+    def an_updated_weight_declines():
+        on, text = arm({})
+        decl = [ln for ln in proj_lines(text) if "the weight is updated by the program" in ln]
+        if len(decl) < 2:
+            return False, f"updated-weight declines: {decl}; lines: {[ln for ln in proj_lines(text) if '512' in ln][:4]}"
+        if "m1k512n320+320" in {n for n, _d, _mb in matched(text)}:
+            return False, "the updated pair matched"
+        if exe_packs(text).get("jit_proj_f12", 0) != 0:
+            return False, "the updated executable counts packs"
+        if "jit_proj_f12: the projection packs' weights changed" in text:
+            return False, "F12 repacked"
+        off, _u = arm({"METALJAX_PROJ_PACK": "0"})
+        k = "F12 updated pair"
+        if not same(on[k], off[k]):
+            return False, "F12 differs from the literal dots"
+        return True, f"declined ({len(decl)} narrations: a result of the weight's type derives from it), F1/F2/F11 unaffected, answer literal"
+
+    def the_pack_is_read_inside_the_loop():
+        _a, text = arm({})
+        if "has no pack in scope" in text:
+            return False, "the emit fell back: the pack was not in scope"
+        if exe_packs(text).get("jit_proj_f1") != 1:
+            return False, "F1's executable does not narrate the fused tape"
+        m = re.search(r"\[metaljax-native\] jit_proj_f1: flushes=.*?unrolls=(\d+)", text)
+        if m is None or int(m.group(1)) != 0:
+            return False, f"F1's loop unrolled ({m and m.group(1)}): not a region"
+        return True, "F1's while body reads the pack as a region capture"
+
+    return [("proj pack fires", the_pack_fires),
+            ("proj pack kill switches", the_kill_switches_decline),
+            ("proj pack removes dispatches", the_pack_removes_dispatches),
+            ("proj pack cannot move an answer", the_pack_cannot_move_an_answer),
+            ("proj pack is decode-only", prefill_declines),
+            ("proj pack consumers vs CPU", consumers_match_cpu),
+            ("proj pack policy kv/all", the_policy),
+            ("proj pack leaves qmm dots", quantized_dots_stay_qmm),
+            ("proj pack byte cap declines", the_byte_cap_declines),
+            ("proj pack donation declines", a_donated_weight_declines),
+            ("proj pack repacks fresh weights", fresh_weights_repack),
+            ("proj pack in the loop body", the_pack_is_read_inside_the_loop),
+            ("proj pack layout follows storage", the_layout_follows_storage),
+            ("proj pack tuple barrier", a_tuple_barrier_is_looked_through),
+            ("proj pack updated weight declines", an_updated_weight_declines)]
+
+
 def _p36_tape_gate(subprocess, tempfile, pathlib, re):
     """The trace budget is asked of the post-pass TAPE, not only the MLIR.
 
@@ -10679,6 +11409,23 @@ def main():
             print(f"MLK {label}\t"
                   f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
         return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--proj-pack":
+        # B6: the projection-pack forms, through jax on the plugin -- or on
+        # the CPU when the caller says so.  Answers to stdout (one line per
+        # call, fresh inputs per call), the recognizer's, the pack wave's
+        # and the executable's narration to stderr.
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        import json as _json
+        for label, fn, make_args, calls in _proj_pack_forms():
+            for c in range(calls):
+                outs = _flatten(fn(*make_args(1000 + 10 * c)))
+                tag = label if calls == 1 else f"{label} call{c + 1}"
+                print(f"PPK {tag}\t"
+                      f"{_json.dumps([np.asarray(o).astype(np.float64).ravel().tolist() for o in outs])}",
+                      flush=True)
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--stacked-relayout-forms":
         # B3: the stacked dots whose contracted axes straddle the layer axis
         # (maxtext's attention out-projection), through jax on the plugin --
@@ -10897,6 +11644,8 @@ def main():
                          + _p39_kv_inplace(subprocess, pathlib,
                                            __import__("re"))
                          + _p42_rope_view(subprocess, pathlib,
+                                          __import__("re"))
+                         + _p43_proj_pack(subprocess, pathlib,
                                           __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))

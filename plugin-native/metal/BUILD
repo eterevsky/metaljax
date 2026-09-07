@@ -74,6 +74,7 @@ cc_library(
         "metal_mla.cc",
         "metal_moe.cc",
         "metal_norm.cc",
+        "metal_proj.cc",
         "metal_qmm.cc",
         "metal_ragged.cc",
         "metal_rope.cc",
