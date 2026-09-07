@@ -23,7 +23,7 @@ notes/data/. Append a column per release / major optimization.*
 | 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 14.2 ʰ | 8.8 ˣ |
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 23.4 ʰ | 13.7 ˣ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | | 114.9 ˡ |
-| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **25.9** ᵖ | 22.6 ʰ | 10.5 ˣ |
+| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **25.9** ᵖ | 23.7 ʰ | 10.5 ˣ |
 | 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 7.5 ʰ | 3.2 ˣ |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | | |
 | 13 | E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | | |
@@ -63,8 +63,13 @@ Notes:
   manifest prompt (50 tokens in a 64-slot prefill) for 128 tokens like the
   comparators (25.9 on the 0.11.7 release binary); every earlier cell used
   the adapter's 5-token default prompt for 8 tokens (24.8 on the same
-  binary) and is not comparable across the switch. The HEAD cell 22.6 is
-  still on the old workload until re-measured.
+  binary) and is not comparable across the switch. HEAD on the new
+  workload (2026-09-06 merged binary): 23.7 (23.68 / 23.67, plus one 30.2
+  outlier in the same session that no knob reproduced); the release binary
+  re-read 25.95 on the same machine state; the harness-presplit variant
+  (MAXTEXT_RNG_PRESPLIT=1, the per-step RNG split hoisted out of the loop)
+  read 23.24. Per-knob attribution at this workload: chunk byte bound
+  −1.2, MLA kernel −0.5, relayout −0.7, in-flight window ~0.
   It sits last, beside HEAD, so the current status of a row is the last two
   cells.
 - **0.11.1** (2026-08-02): pre-buffer-fix era, mixed command-buffer
