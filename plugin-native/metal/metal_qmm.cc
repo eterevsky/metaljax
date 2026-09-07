@@ -2457,6 +2457,7 @@ void RewritePlan::rebuild() {
   mla_roots.clear();
   gdn_roots.clear();
   norm_roots.clear();
+  rope_roots.clear();
   for (const auto& m : qmm) {
     if (m->disabled) continue;
     // An ABSORBED match still owns its absorbed ops -- its weight is packed
@@ -2495,6 +2496,10 @@ void RewritePlan::rebuild() {
   }
   for (const auto& m : norm) {
     norm_roots[m->root] = m.get();
+    for (mlir::Operation* o : m->ops) skip.insert(o);
+  }
+  for (const auto& m : rope) {
+    rope_roots[m->root] = m.get();
     for (mlir::Operation* o : m->ops) skip.insert(o);
   }
 }

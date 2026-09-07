@@ -3045,6 +3045,7 @@ class Lowering {
   absl::Status LowerMla(mlir::Operation* op, const MlaMatch& m);
   absl::Status LowerGdn(mlir::Operation* op, const GdnMatch& m);
   absl::Status LowerRmsNorm(mlir::Operation* op, const RmsNormMatch& m);
+  absl::Status LowerRopeView(mlir::Operation* op, const RopeMatch& m);
   // One node of the pair-space plan, as one tape entry; `slots` holds the
   // slot each earlier node landed in.
   absl::StatusOr<int> LowerMoeNode(const MoeMatch& m, const MoeNode& node,
@@ -3326,6 +3327,9 @@ class Lowering {
   // view whatever its shape, so the pair lowers as ONE payload entry (the
   // splat-broadcast fold in LowerOp's broadcast branch).
   absl::flat_hash_map<std::string, int> splat_bcast_slots_;
+  // The rope-view rewrite's [-1, +1] sign constant, one slot per (dtype,
+  // rank) per frame: 56 applies share one payload instead of carrying 56.
+  absl::flat_hash_map<std::string, int> rope_sgn_slots_;
   // The payload behind every constant slot of this frame (refcounted views,
   // not copies), for the splat-broadcast fold to build its view from.
   absl::flat_hash_map<int, mx::array> const_payloads_;
@@ -8069,6 +8073,13 @@ absl::Status Lowering::LowerOpImpl(mlir::Operation* op) {
       RETURN_IF_ERROR(CheckValue(op->getResult(0)));
       return LowerRmsNorm(op, *norm->second);
     }
+    auto rope = ctx_->plan->rope_roots.find(op);
+    if (rope != ctx_->plan->rope_roots.end()) {
+      if (op->getNumResults() != 1)
+        return Decline("a recognizer root with several results");
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      return LowerRopeView(op, *rope->second);
+    }
   }
 
   // Symbol-carrying calls are spliced in rather than lowered: both run the
@@ -8729,6 +8740,119 @@ absl::Status Lowering::LowerRmsNorm(mlir::Operation* op,
         {static_cast<int64_t>(out_code), m.w ? 1 : 0, m.b ? 1 : 0,
          m.offset_f32 ? 1 : 0},
         {m.eps, m.offset}, ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// metal_rope.cc: the rotate-half rope apply as ONE fused elementwise kernel.
+//
+//   x5   = reshape(x, [.., 2, h])                         view
+//   r5   = slice(x5, pair axis reversed)                  view (stride -1)
+//   c5   = reshape(cos, [.., 2, h]);  s5 = reshape(sin, [.., 2, h])
+//   sgn  = [-1, +1] along the pair axis                   constant
+//   out  = reshape(x5 * c5 + r5 * (s5 * sgn), x.shape)    view
+//
+// The literal chain is `x * cos + concat(-x2, x1) * sin`: the same two
+// products and the same sum on the same values -- `(-x2) * sin1` and
+// `x2 * (-sin1)` are one IEEE multiplication with the sign on the other
+// operand -- so the answer is bit-identical; only the negate kernel and the
+// concatenate's two copies are gone.  The five inputs and four ops sit in
+// MLX's fusable set, so a compiled body runs them as one kernel; eagerly
+// they are the same ops the literal tape ran, minus the three.
+//
+// The reversed slice: MLX's `slice` takes a negative stride and normalizes
+// a stop of -(n+1) to "past the front" (mlx/ops.cpp normalize_slice), which
+// on the pair axis of extent 2 is start 1, stop -3, stride -1.
+absl::Status Lowering::LowerRopeView(mlir::Operation* op,
+                                     const RopeMatch& m) {
+  RETURN_IF_ERROR(CheckValue(m.x));
+  RETURN_IF_ERROR(CheckValue(m.cos));
+  RETURN_IF_ERROR(CheckValue(m.sin));
+  ASSIGN_OR_RETURN(int x, Slot(m.x));
+  ASSIGN_OR_RETURN(int c, Slot(m.cos));
+  ASSIGN_OR_RETURN(int s, Slot(m.sin));
+  ASSIGN_OR_RETURN(std::vector<int64_t> xd, Dims(m.x));
+  ASSIGN_OR_RETURN(std::vector<int64_t> cd, Dims(m.cos));
+  ASSIGN_OR_RETURN(std::vector<int64_t> sd, Dims(m.sin));
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(m.x.getType());
+  if (!t) return Decline("rope: x is not a ranked tensor");
+  std::optional<mx::Dtype> dt = MxDtypeOf(t.getElementType());
+  if (!dt.has_value()) return Decline("rope: x has no MLX dtype");
+  if (xd.empty() || xd.back() != 2 * m.h) return Decline("rope: x width");
+  const int64_t rank = static_cast<int64_t>(xd.size());
+  const int64_t bytes = ValueBytes(m.x);
+
+  ASSIGN_OR_RETURN(int op_reshape, Opcode("stablehlo.reshape"));
+  ASSIGN_OR_RETURN(int op_slice, Opcode("stablehlo.slice"));
+  ASSIGN_OR_RETURN(int op_mul, Opcode("stablehlo.multiply"));
+  ASSIGN_OR_RETURN(int op_add, Opcode("stablehlo.add"));
+  ASSIGN_OR_RETURN(int op_const, Opcode("stablehlo.constant"));
+
+  // [.., 2, h] of a [.., 2h] value: the pair axis split off the last.
+  auto split = [&](const std::vector<int64_t>& d) {
+    std::vector<int64_t> out{static_cast<int64_t>(d.size()) + 1};
+    out.insert(out.end(), d.begin(), d.end() - 1);
+    out.push_back(2);
+    out.push_back(m.h);
+    return out;
+  };
+  const int x5 = nslots_++;
+  Emit(op_reshape, {x}, {x5}, split(xd), std::nullopt, bytes);
+  const int c5 = nslots_++;
+  Emit(op_reshape, {c}, {c5}, split(cd), std::nullopt, ValueBytes(m.cos));
+  const int s5 = nslots_++;
+  Emit(op_reshape, {s}, {s5}, split(sd), std::nullopt, ValueBytes(m.sin));
+
+  // The rotated half: the pair axis reversed.
+  {
+    std::vector<int64_t> attrs{rank + 1};
+    std::vector<int64_t> start(static_cast<size_t>(rank + 1), 0);
+    std::vector<int64_t> stop(xd.begin(), xd.end() - 1);
+    stop.push_back(2);
+    stop.push_back(m.h);
+    std::vector<int64_t> strides(static_cast<size_t>(rank + 1), 1);
+    start[static_cast<size_t>(rank - 1)] = 1;
+    stop[static_cast<size_t>(rank - 1)] = -3;
+    strides[static_cast<size_t>(rank - 1)] = -1;
+    attrs.insert(attrs.end(), start.begin(), start.end());
+    attrs.insert(attrs.end(), stop.begin(), stop.end());
+    attrs.insert(attrs.end(), strides.begin(), strides.end());
+    const int r5 = nslots_++;
+    Emit(op_slice, {x5}, {r5}, std::move(attrs), std::nullopt, bytes);
+
+    // The sign, on the pair axis: [-1, +1] as [1, .., 1, 2, 1] in x's dtype.
+    // A rank >= 2 payload, so MLX never bakes it into kernel source as a
+    // literal (that is the rank-0 rule).  Settled to a leaf like every
+    // stored payload (pending_payload_evals_).
+    const std::string key = absl::StrCat(static_cast<int>(dt->val()), ":", rank);
+    int sg;
+    auto hit = rope_sgn_slots_.find(key);
+    if (hit != rope_sgn_slots_.end()) {
+      sg = hit->second;
+    } else {
+      const float vals[2] = {-1.0f, 1.0f};
+      mx::Shape sshape(static_cast<size_t>(rank + 1), 1);
+      sshape[static_cast<size_t>(rank - 1)] = 2;
+      mx::array sgn = mx::astype(mx::array(vals, sshape, mx::float32), *dt);
+      pending_payload_evals_.push_back(sgn);
+      sg = nslots_++;
+      const_view_.insert(sg);
+      Emit(op_const, {}, {sg}, {}, sgn, 8);
+      rope_sgn_slots_.emplace(key, sg);
+    }
+
+    const int ss = nslots_++;
+    Emit(op_mul, {s5, sg}, {ss}, {}, std::nullopt, ValueBytes(m.sin));
+    const int m1 = nslots_++;
+    Emit(op_mul, {x5, c5}, {m1}, {}, std::nullopt, bytes);
+    const int m2 = nslots_++;
+    Emit(op_mul, {r5, ss}, {m2}, {}, std::nullopt, bytes);
+    const int o5 = nslots_++;
+    Emit(op_add, {m1, m2}, {o5}, {}, std::nullopt, bytes);
+    std::vector<int64_t> back{rank};
+    back.insert(back.end(), xd.begin(), xd.end());
+    Emit(op_reshape, {o5}, {Bind(op->getResult(0))}, std::move(back),
+         std::nullopt, ResultBytes(op));
+  }
   return absl::OkStatus();
 }
 
@@ -9710,8 +9834,12 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
     // `_l2norm`s inside the block are norms the fused kernel computes
     // itself, and whichever recognizer runs first owns them.
     AnalyzeGdn(main, &plan);
-    // ...and the RMS norms, LAST.
+    // ...and the RMS norms, LAST among the fused kernels.
     AnalyzeNorm(main, &plan);
+    // ...and the rotate-half rope applies, which read only what is left
+    // (metal_rope.cc): a view rewrite, not a kernel, so it goes after every
+    // recognizer that could have claimed an operand of one.
+    AnalyzeRope(main, &plan);
     plan.rebuild();
   } catch (const std::exception& e) {
     // Analysis must never break a program (qmm.py `analyze`).
@@ -9792,6 +9920,7 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
   lowered->num_ragged = static_cast<int64_t>(plan.ragged.size());
   lowered->num_stacked = static_cast<int64_t>(plan.stacked.size());
   lowered->num_gdn = static_cast<int64_t>(plan.gdn.size());
+  lowered->num_rope = static_cast<int64_t>(plan.rope.size());
   return lowered;
 }
 

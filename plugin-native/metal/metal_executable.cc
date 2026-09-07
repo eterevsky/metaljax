@@ -215,13 +215,15 @@ const std::shared_ptr<const LoweredProgram>& MetalLoadedExecutable::Tape(
                  "[metaljax-native] %s: %lld fused quantized matmul(s), "
                  "%lld gathered expert dispatch(es), %lld ragged "
                  "dispatch(es), %lld stacked dot(s), %lld fused "
-                 "attention(s), %lld gated delta step(s), %zu packed arrays\n",
+                 "attention(s), %lld gated delta step(s), %lld rope "
+                 "view(s), %zu packed arrays\n",
                  name_.c_str(), static_cast<long long>(fused->num_qmm),
                  static_cast<long long>(fused->num_moe),
                  static_cast<long long>(fused->num_ragged),
                  static_cast<long long>(fused->num_stacked),
                  static_cast<long long>(fused->num_sdpa),
-                 static_cast<long long>(fused->num_gdn), fused->packs.size());
+                 static_cast<long long>(fused->num_gdn),
+                 static_cast<long long>(fused->num_rope), fused->packs.size());
     std::fflush(stderr);
   }
   fused_ = std::make_shared<const LoweredProgram>(std::move(*fused));

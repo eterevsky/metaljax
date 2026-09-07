@@ -691,6 +691,86 @@ def _kv_counted(steps, **kw):
     return fn
 
 
+# The rotate-half rope apply as a view (metal_rope.cc): every spelling the
+# model table applies its table with, at decode's [1, 1, H, D] and prefill's
+# [1, L, H, D], eager at the top level and inside a scan body (the compiled
+# path, the table computed from the position carry as keras does).  The
+# contract `_p42_rope_view` pins that the rewrite FIRES, that it removes
+# dispatches, and that every answer is bit-identical with
+# METALJAX_ROPE_VIEW=0: only data movement changes.
+_ROPE_H, _ROPE_D = 4, 32
+
+
+def _rope_keras(x, cos, sin):
+    """keras-hub `RotaryEmbedding._apply_rotary_pos_emb`: the pair stack."""
+    import jax.numpy as jnp
+    x1, x2 = jnp.split(x, 2, axis=-1)
+    rot = jnp.stack((-x2, x1), axis=-2).reshape(x.shape)
+    return x * cos + rot * sin
+
+
+def _rope_concat(x, cos, sin):
+    """maxtext / mlx-style `rotate_half`: the last-axis concatenate."""
+    import jax.numpy as jnp
+    x1, x2 = jnp.split(x, 2, axis=-1)
+    rot = jnp.concatenate((-x2, x1), axis=-1)
+    return x * cos + rot * sin
+
+
+# Every fixture applies ONE table to two arrays (q and k), as every
+# transformer does: with a single consumer MLX fuses the whole cos/sin table
+# into the literal apply's kernel and the rewrite is count-neutral (its
+# tables sit behind a reshape, which MLX does not fuse through); with two,
+# the table is materialized on both arms and each apply's negate and two
+# concatenate copies are the whole difference.
+def _rope_top(name, form, dtype):
+    import jax.numpy as jnp
+
+    def fn(x, theta):
+        cos = jnp.cos(theta).astype(dtype)
+        sin = jnp.sin(theta).astype(dtype)
+        q = x.astype(dtype)
+        k = (x * 0.5).astype(dtype)
+        return form(q, cos, sin), form(k, cos, sin)
+    fn.__name__ = name
+    return fn
+
+
+def _rope_scan(name, form, dtype):
+    import jax.numpy as jnp
+    from jax import lax
+
+    def fn(xs, theta):
+        def body(carry, xt):
+            p, acc = carry
+            ang = theta * (1.0 + p.astype(jnp.float32))
+            cos = jnp.cos(ang).astype(dtype)
+            sin = jnp.sin(ang).astype(dtype)
+            yq = form(xt.astype(dtype), cos, sin)
+            yk = form((xt * 0.5).astype(dtype), cos, sin)
+            # The carry keeps the loop honest (the position feeds the next
+            # step's table; the trip count comes back exactly); the compared
+            # outputs are the per-step applies themselves.  An f32 sum of
+            # the bf16 applies is NOT compared: XLA:CPU keeps excess f32
+            # precision across the fused multiply-add where the tape rounds
+            # each op, and twelve such terms drift past the half band while
+            # both arms of the plugin agree with each other bit for bit.
+            return (p + 1, acc + 1.0), (yq, yk)
+        init = (jnp.int32(0), jnp.float32(0.0))
+        (p, acc), (yq, yk) = lax.scan(body, init, xs)
+        return p, acc, yq, yk
+    fn.__name__ = name
+    return fn
+
+
+def _rope_args(seed, steps=None, L=1):
+    shape = (1, L, _ROPE_H, _ROPE_D)
+    if steps is not None:
+        shape = (steps,) + shape
+    return [_rand(shape, seed) * np.float32(3.0),
+            _rand((1, L, 1, _ROPE_D), seed + 1) * np.float32(2.0)]
+
+
 def _cases():
     import jax
     import jax.numpy as jnp
@@ -1163,6 +1243,24 @@ def _cases():
         # path either way, and the contract pins that it is NOT rewritten.
         ("kv cache in place (counted loop, fills)",
          _kv_counted(8, wrap=False), _kv_args(np.float32, 710), *DOT),
+        # The rotate-half rope apply as a view (see `_rope_keras`): each row
+        # must match the CPU AND -- the contract `_p42_rope_view` checks --
+        # be bit-identical with METALJAX_ROPE_VIEW=0.  bf16 rows carry the
+        # half band because XLA:CPU keeps excess f32 precision across the
+        # fused multiply-add where the tape rounds each op (both arms of the
+        # plugin agree with each other exactly).
+        ("rope view (keras pair-stack, bf16)",
+         _rope_top("rope_keras_bf16", _rope_keras, jnp.bfloat16),
+         _rope_args(800), *HALF),
+        ("rope view (last-axis concat, f32)",
+         _rope_top("rope_concat_f32", _rope_concat, jnp.float32),
+         _rope_args(810), *F32),
+        ("rope view (prefill shape, bf16)",
+         _rope_top("rope_prefill_bf16", _rope_keras, jnp.bfloat16),
+         _rope_args(820, L=5), *HALF),
+        ("rope view (scan body, bf16)",
+         _rope_scan("rope_scan_bf16", _rope_keras, jnp.bfloat16),
+         _rope_args(830, steps=6), *HALF),
         ("kv cache in place (bf16, no identity layer)",
          _kv_dynamic(10, identity_layer=False),
          _kv_args(ml_dtypes.bfloat16, 720), *BF16DOT),
@@ -9815,6 +9913,88 @@ def _p39_kv_inplace(subprocess, pathlib, re):
              the_rewrite_cannot_move_an_answer)]
 
 
+def _p42_rope_view(subprocess, pathlib, re):
+    """The rotate-half rope apply lowers as a view (metal_rope.cc): the
+    rewrite fires on both spellings and at both shapes, removes dispatches,
+    is switched off by METALJAX_ROPE_VIEW=0, and cannot move an answer --
+    every case is BIT-identical with the knob off."""
+    here = str(pathlib.Path(__file__).resolve())
+
+    def arm(env_extra):
+        import json
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--rope-view"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("ROPE "):
+                label, payload = line[5:].split("\t", 1)
+                answers[label] = json.loads(payload)
+        return answers, proc.stdout + proc.stderr
+
+    def dispatches(text):
+        return {m.group(1): int(m.group(2)) for m in re.finditer(
+            r"\[metaljax-native\] (jit_rope_\w+): flushes=.*?dispatches=(\d+)",
+            text)}
+
+    def the_rewrite_fires():
+        _answers, text = arm({})
+        matched = re.findall(
+            r"rope: matched (\d+) rotate-half apply\(ies\) as views "
+            r"\((\d+) pair-stacked, (\d+) last-axis\)", text)
+        views = re.findall(r"(\d+) rope view\(s\)", text)
+        # Four programs, two applies each (q and k): three pair-stacked
+        # (keras decode, keras prefill, the scan body) and one last-axis
+        # concatenate.
+        counts = sorted(int(n) for n, _s, _c in matched)
+        forms = (sum(int(s) for _n, s, _c in matched),
+                 sum(int(c) for _n, _s, c in matched))
+        if counts != [2, 2, 2, 2] or forms != (6, 2):
+            return False, f"matched {matched}"
+        if sorted(int(v) for v in views) != [2, 2, 2, 2]:
+            return False, f"rope view(s) narrated {views}"
+        return True, f"4 programs, {forms[0]} pair-stacked + {forms[1]} last-axis"
+
+    def the_rewrite_removes_dispatches():
+        _a, on = arm({})
+        _b, off = arm({"METALJAX_ROPE_VIEW": "0"})
+        d_on, d_off = dispatches(on), dispatches(off)
+        if not d_on or set(d_on) != set(d_off):
+            return False, f"dispatch narration on={d_on} off={d_off}"
+        worse = [k for k in d_on if d_on[k] >= d_off[k]]
+        if worse:
+            return False, f"no fewer dispatches on {worse}: on={d_on} off={d_off}"
+        return True, ", ".join(f"{k[4:]} {d_off[k]}->{d_on[k]}" for k in sorted(d_on))
+
+    def the_knob_restores_the_literal_tape():
+        _answers, text = arm({"METALJAX_ROPE_VIEW": "0"})
+        if "rope: matched" in text:
+            return False, "METALJAX_ROPE_VIEW=0 still narrates the rewrite"
+        if re.search(r"[1-9]\d* rope view\(s\)", text):
+            return False, "METALJAX_ROPE_VIEW=0 still counts rope views"
+        return True, "no rewrite under the knob"
+
+    def the_rewrite_cannot_move_an_answer():
+        base, _ = arm({})
+        other, _ = arm({"METALJAX_ROPE_VIEW": "0"})
+        bad = [c for c in sorted(base) if base[c] != other.get(c)]
+        if bad:
+            return False, "differs under the knob: " + "; ".join(bad)
+        return True, f"{len(base)} cases bit-identical with the rewrite off"
+
+    return [("rope view rewrite fires", the_rewrite_fires),
+            ("rope view removes dispatches", the_rewrite_removes_dispatches),
+            ("rope view knob restores the literal tape",
+             the_knob_restores_the_literal_tape),
+            ("rope view cannot move an answer",
+             the_rewrite_cannot_move_an_answer)]
+
+
 def _p36_tape_gate(subprocess, tempfile, pathlib, re):
     """The trace budget is asked of the post-pass TAPE, not only the MLIR.
 
@@ -10372,6 +10552,21 @@ def main():
                   f"{_json.dumps([_canonical(v)[1].ravel().tolist() for v in out])}",
                   flush=True)
         return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--rope-view":
+        # The rope-view rows alone: answers to stdout, the plugin's
+        # narration (what matched, the dispatch counts) to stderr.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        import json as _json
+        for name, fn, args, _rtol, _atol in _cases():
+            if not name.startswith("rope view"):
+                continue
+            out = _flatten(jax.jit(fn)(*args))
+            print(f"ROPE {name}\t"
+                  f"{_json.dumps([_canonical(v)[1].ravel().tolist() for v in out])}",
+                  flush=True)
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--dynamic-while":
         # The two dynamic-trip while rows alone, so the parent can read one
         # serial/pipelined census per arm out of the narration, and compare
@@ -10701,6 +10896,8 @@ def main():
                                            __import__("re"))
                          + _p39_kv_inplace(subprocess, pathlib,
                                            __import__("re"))
+                         + _p42_rope_view(subprocess, pathlib,
+                                          __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,

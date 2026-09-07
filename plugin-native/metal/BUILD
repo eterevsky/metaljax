@@ -76,6 +76,7 @@ cc_library(
         "metal_norm.cc",
         "metal_qmm.cc",
         "metal_ragged.cc",
+        "metal_rope.cc",
         "metal_sdpa.cc",
         "metal_stacked.cc",
     ],

@@ -55,6 +55,7 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 | `METALJAX_QMM` | `1` | debug-bisect | =0 disables the quantized-matmul rewrite (Stage 1 and plugin-native) |
 | `METALJAX_QMM_BATCH` | `1` | debug-bisect | =0 rejects dots that carry batching dims (a stack of per-expert weights) |
 | `METALJAX_QMM_SCALES` | `auto` | user knob | pack scale/bias width: auto keeps the source when lossless, `source` always narrows, `f32` never does |
+| `METALJAX_ROPE_VIEW` | `1` | debug-bisect | plugin-native only: =0 turns off the rotate-half rope rewrite (`metal_rope.cc`: `x*cos + concat(-x2, x1)*sin` lowered as one fused kernel over a stride -1 view of x, the sign folded onto the table -- bit-exact, three dispatches fewer per apply); the literal tape is the A/B arm |
 | `METALJAX_RECOGNIZE` | `1` | debug-bisect | plugin-native only: =0 turns off ALL THREE recognizer emits, i.e. the second (fused) lowering is never built -- the control for what an emit is worth |
 | `METALJAX_SDPA` | `1` | debug-bisect | =0 disables the fused-attention rewrite (Stage 1 and plugin-native) |
 | `METALJAX_SYNC` | `0` | debug-bisect | (see src/metaljax/engine.py) |

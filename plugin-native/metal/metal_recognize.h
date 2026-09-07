@@ -551,6 +551,28 @@ struct GdnMatch {
 };
 
 // --------------------------------------------------------------------------
+// the rotate-half rope apply as a view (metal_rope.cc)
+// --------------------------------------------------------------------------
+
+// `x * cos + rotate_half(x) * sin`, rooted at the add.  The emit
+// (`Lowering::LowerRopeView`) reads x, cos and sin and writes the root:
+// x seen as [.., 2, h], the rotated half as that view with its pair axis
+// reversed (a stride -1 slice, no kernel), the sign folded onto the sin
+// table through a [-1, +1] constant -- one fused elementwise kernel in
+// place of a negate, two concatenate copies and the fused multiply-add.
+// Bit-exact: the same products and the same sum on the same values.
+struct RopeMatch {
+  mlir::Operation* root = nullptr;  // the add
+  mlir::Value x;                    // [.., 2h]
+  mlir::Value cos;                  // [.., 2h], right-aligned broadcastable
+  mlir::Value sin;                  // likewise
+  int64_t h = 0;                    // half the rotary width
+  const char* form = "";            // "stacked" (keras) or "concat"
+  std::vector<mlir::Operation*> ops;  // the ops this match absorbs
+  std::string name;
+};
+
+// --------------------------------------------------------------------------
 // the plan
 // --------------------------------------------------------------------------
 
@@ -563,6 +585,7 @@ struct RewritePlan {
   std::vector<std::unique_ptr<MlaMatch>> mla;
   std::vector<std::unique_ptr<GdnMatch>> gdn;
   std::vector<std::unique_ptr<RmsNormMatch>> norm;
+  std::vector<std::unique_ptr<RopeMatch>> rope;
 
   // Ops a recognizer absorbed: no entry, no slot, never executed.
   llvm::DenseSet<mlir::Operation*> skip;
@@ -575,6 +598,7 @@ struct RewritePlan {
   llvm::DenseMap<mlir::Operation*, MlaMatch*> mla_roots;
   llvm::DenseMap<mlir::Operation*, GdnMatch*> gdn_roots;
   llvm::DenseMap<mlir::Operation*, RmsNormMatch*> norm_roots;
+  llvm::DenseMap<mlir::Operation*, RopeMatch*> rope_roots;
 
   // The packed arrays, in the order the tape's trailing inputs take them.
   std::vector<mx::array> packs;
@@ -587,7 +611,8 @@ struct RewritePlan {
   bool empty() const {
     return qmm_roots.empty() && sdpa_roots.empty() && moe_roots.empty() &&
            ragged_roots.empty() && stacked_roots.empty() &&
-           mla_roots.empty() && gdn_roots.empty() && norm_roots.empty();
+           mla_roots.empty() && gdn_roots.empty() && norm_roots.empty() &&
+           rope_roots.empty();
   }
   // Recompute `skip` and the root maps from the matches that are still live.
   void rebuild();
@@ -682,6 +707,12 @@ void AnalyzeGdn(mlir::func::FuncOp fn, RewritePlan* plan);
 // The RMS norms (metal_norm.cc).  Runs LAST; roots at the weight-apply
 // transpose.  Purely structural.  METALJAX_NORM=0 disables it.
 void AnalyzeNorm(mlir::func::FuncOp fn, RewritePlan* plan);
+
+// The rotate-half rope applies (metal_rope.cc).  Runs AFTER the norms, and
+// reads only what the others left: its root is an add no other recognizer
+// claims, and it declines an apply whose x, cos or sin another match
+// absorbed.  Purely structural.  METALJAX_ROPE_VIEW=0 disables it.
+void AnalyzeRope(mlir::func::FuncOp fn, RewritePlan* plan);
 
 // The first-execute check of a match's router, on the buffers of this
 // execute: the scores must BE the top-k weights scattered at the matched
