@@ -518,6 +518,19 @@ bool is_oom(const std::exception& e) {
          std::string::npos;
 }
 
+bool governor_fits(int64_t want) {
+  if (!g_gov.on) return true;
+  const MemSample s = governor_sample(/*force=*/false);
+  if (over_hard_line(s, want, nullptr)) return false;
+  // The squeeze line with `want` applied, not the soft line: a warm page
+  // cache keeps the free list under the floor on a machine that is not in
+  // trouble (see `being_squeezed`), and a decode step must not lose its
+  // speculation to that.
+  if (g_gov.free_floor > 0 && s.free - want < g_gov.free_floor / 4)
+    return false;
+  return s.pressure <= 1;
+}
+
 bool governor_pressured() { return g_gov.on && g_pressured; }
 bool governor_squeezed() { return g_gov.on && g_squeezed; }
 

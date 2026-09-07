@@ -187,7 +187,8 @@ void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
                int64_t flush_floor_bytes, int64_t flush_main_flushes,
                int64_t flush_earn_mult, int64_t loop_clear_cost,
                int64_t ingest_clear_bytes, int64_t while_pipeline,
-               int64_t chunk_inflight, bool debug, bool memdbg) {
+               int64_t chunk_inflight, int64_t while_submit_ahead,
+               int64_t while_ahead_copy_bytes, bool debug, bool memdbg) {
   g_cfg.eager_flush_bytes = eager_flush_bytes;
   g_cfg.flush_sync_every = flush_sync_every;
   g_cfg.flush_clear_bytes = flush_clear_bytes;
@@ -199,6 +200,8 @@ void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
   g_cfg.ingest_clear_bytes = ingest_clear_bytes;
   g_cfg.while_pipeline = while_pipeline;
   g_cfg.chunk_inflight = chunk_inflight;
+  g_cfg.while_submit_ahead = while_submit_ahead;
+  g_cfg.while_ahead_copy_bytes = while_ahead_copy_bytes;
   g_cfg.debug = debug;
   g_cfg.memdbg = memdbg;
 

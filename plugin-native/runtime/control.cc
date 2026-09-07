@@ -16,14 +16,27 @@
 #include "program.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <exception>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace metaljax {
 
 namespace {
+
+// The allocation failures MLX's Metal allocator raises from inside an eval
+// walk (backend/metal/allocator.cpp): a request past the device's maximum
+// buffer, the live-buffer resource limit (`is_resource_limit`), or a plain
+// refusal. A speculative submission that meets one of these is dropped, not
+// propagated (run_while's submit-ahead step).
+bool is_alloc_failure(const std::exception& e) {
+  const std::string what = e.what();
+  return what.find("[metal::malloc]") != std::string::npos ||
+         what.find("[malloc] Unable to allocate") != std::string::npos;
+}
 
 // One uncompiled application of a loop body.
 std::vector<mx::array> run_body(Program* body,
@@ -393,7 +406,15 @@ void Program::run_while(const Entry& e,
     std::vector<mx::array> pred = cond->interpret(cargs, false);
     if (pred.size() != 1)
       throw std::runtime_error("tape: while cond must return one value");
-    return pred[0];
+    // A bool, as part of the graph that is submitted with the carry: the
+    // host read of an evaluated bool array is then a WAIT on the event
+    // that submission attached and nothing else (MLX's `eval` of an
+    // evaluated array is `wait`, `astype` to an array's own dtype is the
+    // identity) -- which is what lets the submit-ahead step below read
+    // t's condition without queueing behind the iteration it has already
+    // submitted after it. A cond is `tensor<i1>` and this is a no-op; the
+    // line is here so that stays a fact the loop does not depend on.
+    return mx::astype(pred[0], mx::bool_);
   };
 
   // Can the body be BUILT before its condition is known? Building an MLX
@@ -440,10 +461,10 @@ void Program::run_while(const Entry& e,
   const mx::metal::DispatchStats loop_ds0 =
       g_cfg.debug ? mx::metal::dispatch_stats() : mx::metal::DispatchStats{};
   int64_t loop_steps = 0;
-  auto narrate_loop = [&](const char* mode) {
+  auto narrate_loop = [&](const char* mode, const std::string& extra) {
     if (!g_cfg.debug) return;
     debug_line(std::string("[metaljax-native] while(") + mode +
-               "): steps=" + std::to_string(loop_steps) + " " +
+               "): steps=" + std::to_string(loop_steps) + " " + extra +
                DispatchDelta(loop_ds0, DispatchSnapshotSettled(), loop_steps));
   };
   if (!pipeline) {
@@ -458,7 +479,7 @@ void Program::run_while(const Entry& e,
       // unevaluated graph across iterations.
       loop_flush(vals, cost);
     }
-    narrate_loop("serial");
+    narrate_loop("serial", "");
     write_results(e, env, vals);
     return;
   }
@@ -467,11 +488,12 @@ void Program::run_while(const Entry& e,
   // made LLM decode stall (M4's verdict): the old shape submitted the
   // condition and waited, then submitted the body and waited, so the GPU
   // was idle for both decisions. Here the body and the NEXT condition are
-  // built and submitted before the current condition is read back, so by
+  // built before the current condition is read back -- and, from the third
+  // iteration on, SUBMITTED before it too (submit-ahead, below) -- so by
   // the time the host wakes up the device is already a token ahead.
   //
   // The order of what happens once the condition says "keep going" is
-  // load-bearing:
+  // load-bearing on the read-first step:
   //   1. drop this iteration's carry, so the update ops in the body it
   //      feeds can donate their buffers (see cond_of);
   //   2. THEN submit -- the WHOLE carry, since the condition only forces
@@ -479,13 +501,68 @@ void Program::run_while(const Entry& e,
   //      unevaluated graph;
   //   3. charge the iteration against the op-unit budget, exactly as the
   //      serial path's loop_flush does.
-  // Speculation never touches the carry a loop may return: the body of
-  // iteration t is only ever SUBMITTED once t's condition has said true.
-  // The one place it is EVALUATED earlier is BodyRunner's probe after a
-  // compiled body has been rebound mid-loop -- and that is still safe,
-  // because `vals` is held across the build, which is precisely what
-  // stops MLX donating (and therefore mutating) anything in it.
+  // Speculation never touches the carry a loop may return. On a read-first
+  // step the body of iteration t is only ever SUBMITTED once t's condition
+  // has said true; on a submit-ahead step it is submitted earlier, and
+  // what keeps it off the carry is that `vals` is HELD across the
+  // submission -- MLX donates only to a use_count of one (mx::array::
+  // is_donatable; the vendored fork's through-pins variant keeps that
+  // test), so nothing the speculation builds can write in place into
+  // anything in `vals`. The one other place a body is EVALUATED early is
+  // BodyRunner's probe after a compiled body has been rebound mid-loop,
+  // and that is safe for the same reason: `vals` is held across it.
   g_stats.pipelined_loops++;
+
+  // Submit-ahead (gap-rows item 8; METALJAX_WHILE_SUBMIT_AHEAD). The
+  // condition read is the loop's one blocking point, and submitting t+1
+  // only AFTER it leaves the device idle from the last kernel of t through
+  // the host's wake-up, the encode of t+1's first command buffer and
+  // Metal's commit-to-start latency: 1.1 ms of a 14 ms token on row 7,
+  // 1.9-2.4 of 19.6 on row 4 (`gpu_idle_ms` in the narration). Submitting
+  // t+1 first closes that gap; if t's condition then says stop, the work
+  // is simply dropped. What it costs, and what keeps it inside the
+  // no-panic contract:
+  //
+  //   * The held carry means the body's in-place chain (metaljax.kv_update
+  //     / a slice_update on the carry) copies the cache ROOT into a fresh
+  //     buffer once per speculative step and donates down the chain from
+  //     there: cache bytes per token, `slice_update_copied` +1 per step.
+  //     The carries that are not pass-throughs bound that copy, and
+  //     METALJAX_WHILE_AHEAD_COPY_MB caps it -- past the cap the bubble
+  //     hidden is worth less than the copy, and the loop reads first.
+  //   * One more iteration's pinned transients are in flight. The first
+  //     pipelined step measures them (active memory after its submission
+  //     minus before its build) and every ahead step asks the governor --
+  //     without stalling, reclaiming or refusing -- whether that much plus
+  //     the copy still fits under its lines; when it does not, the step
+  //     reads first, as before (`ahead_declined`).
+  //   * A speculative submission that fails to allocate (the governor's
+  //     OOM, Metal's buffer limit, MLX's malloc) is swallowed: the device
+  //     is drained so the abandoned walk's encoded kernels retire before
+  //     their buffers can be recycled, the speculation is dropped, the
+  //     step is rebuilt and read first, and the loop stays read-first.
+  //   * The condition read queues nothing behind the speculation: see
+  //     cond_of. The host wakes when t is done, not when t+1 is.
+  //   * Engaging from the THIRD iteration keeps a loop that stops after
+  //     one or two from running a body for nothing: keras-hub's 1-token
+  //     generate is a 1-step loop whose body is the whole prompt forward.
+  //
+  // What remains: when the loop stops, the dropped iteration's device time
+  // runs ahead of whatever the program does after the loop -- one token
+  // per generate call.
+  const bool ahead_enabled = g_cfg.while_submit_ahead > 0;
+  bool ahead = false;              // engaged for this loop
+  bool ahead_decided = false;      // ...after the first pipelined step
+  int64_t ahead_want = 0;          // bytes one more in-flight step adds
+  int64_t ahead_copy = 0;          // bytes a speculation copies (a bound)
+  int64_t ahead_inflight = 0;      // the measured in-flight set of a step
+  int64_t ahead_steps = 0, ahead_declined = 0, ahead_failures = 0;
+  auto mb = [](int64_t bytes) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.1f", static_cast<double>(bytes) / 1048576.0);
+    return std::string(buf);
+  };
+
   // The first iteration stays unpipelined. BodyRunner probes a freshly
   // bound compiled body with a SYNCHRONOUS eval (a Metal build error
   // raised on an async worker aborts the process), and that probe should
@@ -503,28 +580,104 @@ void Program::run_while(const Entry& e,
   loop_flush(vals, cost);
   mx::array pred = cond_of(vals);
   for (;;) {
+    // What this process holds before the step is built: the baseline the
+    // first pipelined step's in-flight measurement is taken against
+    // (nothing of the loop's is in flight here -- the first iteration was
+    // flushed).
+    const int64_t active_before =
+        (ahead_enabled && !ahead_decided)
+            ? static_cast<int64_t>(mx::get_active_memory()) : 0;
     // Built, not run: `next` is a lazy graph until something asks for its
-    // values, and nothing does until `pred` says this iteration happens.
-    // Pure host work, and it overlaps whatever the device is still doing
-    // for the carry and condition submitted last time round.
+    // values, and nothing does until `pred` says this iteration happens
+    // (or, on an ahead step, until the submission below). Pure host work,
+    // and it overlaps whatever the device is still doing for the carry
+    // and condition submitted last time round.
     std::vector<mx::array> next = runner.run_one(vals);
     mx::array npred = cond_of(next);
+    bool submitted = false;
+    if (ahead) {
+      if (!governor_fits(ahead_want)) {
+        ahead_declined++;
+        g_stats.ahead_declines++;
+      } else {
+        std::vector<mx::array> pending(next);
+        pending.push_back(npred);
+        bool failed = false;
+        try {
+          loop_submit(pending);            // `vals` held: nothing donates
+          submitted = true;
+        } catch (const std::exception& ex) {
+          if (!is_oom(ex) && !is_alloc_failure(ex)) throw;
+          debug_print(std::string("submit-ahead failed (") + ex.what() +
+                      "); reading first for the rest of this loop");
+          failed = true;
+        }
+        if (failed) {
+          // Recovery OUTSIDE the handler, in this order: retire what the
+          // abandoned walk had already encoded while its buffers are still
+          // held (`pending`, `next`), THEN drop them, THEN allocate again.
+          ahead = false;
+          ahead_failures++;
+          g_stats.ahead_declines++;
+          mx::synchronize();
+          pending.clear();
+          next.clear();
+          gc_collect();
+          mx::clear_cache();
+          next = runner.run_one(vals);
+          npred = cond_of(next);
+        }
+      }
+    }
     const bool go = loop_item_bool(pred);    // the one blocking point
     // An evaluated condition is detached from the carry it was computed
     // from -- but only once MLX has actually walked it, and only if the
     // host read did not have to build a converted copy first. Dropping it
     // outright is one move and needs neither to be true.
     pred = npred;
-    if (!go) break;                          // `vals` is intact: see above
+    if (!go) break;   // `vals` intact (see above); a speculation in flight
+                      // runs to completion into buffers nothing reads
+    if (ahead_enabled && !ahead_decided) {
+      // The bytes a speculation would have to copy: every carry the body
+      // does not pass through unchanged (a pass-through comes back as the
+      // same array), which bounds the ones it updates in place.
+      for (size_t i = 0; i < vals.size() && i < next.size(); i++)
+        if (next[i].id() != vals[i].id())
+          ahead_copy += static_cast<int64_t>(vals[i].nbytes());
+    }
     vals = std::move(next);                  // (1) release the old carry
-    std::vector<mx::array> pending(vals);
-    pending.push_back(pred);
-    loop_submit(pending);                    // (2) submit, do not wait
+    if (!submitted) {
+      std::vector<mx::array> pending(vals);
+      pending.push_back(pred);
+      loop_submit(pending);                  // (2) submit, do not wait
+      if (ahead_enabled && !ahead_decided) {
+        ahead_decided = true;
+        ahead_inflight = std::max<int64_t>(
+            0, static_cast<int64_t>(mx::get_active_memory()) - active_before);
+        ahead_want = ahead_inflight + ahead_copy;
+        ahead = ahead_copy <= g_cfg.while_ahead_copy_bytes;
+        if (g_cfg.debug)
+          debug_print(std::string("submit-ahead ") + (ahead ? "on" : "off") +
+                      ": copy=" + mb(ahead_copy) + "MB (cap " +
+                      mb(g_cfg.while_ahead_copy_bytes) + "MB) inflight=" +
+                      mb(ahead_inflight) + "MB");
+      }
+    } else {
+      ahead_steps++;
+      g_stats.ahead_steps++;
+    }
     g_stats.pipelined_steps++;
     loop_steps++;
     loop_account(cost);                      // (3) same cadence, same clears
   }
-  narrate_loop("pipelined");
+  narrate_loop(ahead_steps > 0 ? "pipelined+ahead" : "pipelined",
+               ahead_enabled
+                   ? "ahead_steps=" + std::to_string(ahead_steps) +
+                         " ahead_declined=" + std::to_string(ahead_declined) +
+                         " ahead_failures=" + std::to_string(ahead_failures) +
+                         " ahead_copy_mb=" + mb(ahead_copy) +
+                         " ahead_inflight_mb=" + mb(ahead_inflight) + " "
+                   : std::string());
   write_results(e, env, vals);
 }
 

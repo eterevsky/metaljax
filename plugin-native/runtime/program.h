@@ -270,6 +270,15 @@ struct Config {
   // before the host waits for the oldest (control.cc `run_chunked`, where
   // the reason is written out). 1 = one chunk at a time.
   int64_t chunk_inflight = 4;                 // METALJAX_CHUNK_INFLIGHT
+  // B4: a pipelined dynamic while submits iteration t+1 BEFORE it reads
+  // t's condition back, and drops the work if the loop stops (control.cc
+  // `run_while`, where the contract is written out). 0 = read first.
+  int64_t while_submit_ahead = 1;             // METALJAX_WHILE_SUBMIT_AHEAD
+  // ...and the most a speculative iteration may have to COPY per step: the
+  // bytes of the carries it cannot update in place because the loop still
+  // holds them (a KV cache root). Past this cap the bubble it hides is
+  // worth less than the copy, and the loop reads first.
+  int64_t while_ahead_copy_bytes = 128LL << 20;  // METALJAX_WHILE_AHEAD_COPY_MB
   bool debug = false;                         // METALJAX_DEBUG
   bool memdbg = false;                        // METALJAX_MEMDBG
 };
@@ -283,8 +292,9 @@ void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
                int64_t flush_floor_bytes, int64_t flush_main_flushes,
                int64_t flush_earn_mult,
                int64_t loop_clear_cost, int64_t ingest_clear_bytes,
-               int64_t while_pipeline, int64_t chunk_inflight, bool debug,
-               bool memdbg);
+               int64_t while_pipeline, int64_t chunk_inflight,
+               int64_t while_submit_ahead, int64_t while_ahead_copy_bytes,
+               bool debug, bool memdbg);
 
 struct Stats {
   int64_t flushes = 0;         // eager byte-denominated sync points
@@ -303,6 +313,10 @@ struct Stats {
   int64_t unrolls = 0;         // counted loops unrolled into a trace
   int64_t pipelined_loops = 0;  // dynamic whiles that ran pipelined
   int64_t pipelined_steps = 0;  // ...iterations they retired that way
+  int64_t ahead_steps = 0;      // ...of which were SUBMITTED before their
+                                // predecessor's condition was read (B4)
+  int64_t ahead_declines = 0;   // ahead steps withheld: no headroom, or a
+                                // submission that failed to allocate
   int64_t serial_loops = 0;     // dynamic whiles that could not pipeline
   int64_t msl_launches = 0;     // generated persistent kernels launched
   int64_t msl_failures = 0;     // ...plans retired to their loops
@@ -469,6 +483,11 @@ MemSample governor_sample(bool force);   // ...the cached one
 bool governor_pressured();         // the cached verdict (the ingest pacer)
 bool governor_squeezed();          // ...the harder one (the flush's veto)
 void governor_admit(int64_t want, MemWhere where);
+// The question without the ladder: would `want` more resident bytes stay
+// under both hard lines and off the squeeze line RIGHT NOW? Reads the cached
+// sample; never reclaims, stalls or refuses -- for an OPTIMIZATION that has
+// a cheaper shape to fall back to (the submit-ahead step, control.cc).
+bool governor_fits(int64_t want);
 int64_t release_page_cache(const void* data, int64_t bytes);
 // ...and the same for every large read-only file mapping THIS PROCESS holds,
 // which is what a loader that copies before `device_put` needs.

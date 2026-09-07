@@ -168,8 +168,9 @@ int main() {
                       /*flush_earn_mult=*/2,
                       /*loop_clear_cost=*/500000,
                       /*ingest_clear_bytes=*/8LL << 30, /*while_pipeline=*/1,
-                      /*chunk_inflight=*/4, /*debug=*/false,
-                      /*memdbg=*/false);
+                      /*chunk_inflight=*/4, /*while_submit_ahead=*/1,
+                      /*while_ahead_copy_bytes=*/128LL << 20,
+                      /*debug=*/false, /*memdbg=*/false);
 
   const std::vector<float> a = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
   const std::vector<float> b = {0.5f, 1.0f, 1.5f, 2.0f, 2.5f, 3.0f};

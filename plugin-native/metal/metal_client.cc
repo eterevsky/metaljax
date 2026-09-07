@@ -250,6 +250,12 @@ void ConfigureFromEnv() {
           (int64_t{1} << 20),
       /*while_pipeline=*/EnvInt("METALJAX_WHILE_PIPELINE", 1),
       /*chunk_inflight=*/EnvInt("METALJAX_CHUNK_INFLIGHT", 4),
+      // B4 (gap-rows item 8): submit iteration t+1 of a pipelined dynamic
+      // while before t's condition is read; the copy cap is per step, in
+      // MB of carries the speculation cannot write in place.
+      /*while_submit_ahead=*/EnvInt("METALJAX_WHILE_SUBMIT_AHEAD", 1),
+      /*while_ahead_copy_bytes=*/EnvInt("METALJAX_WHILE_AHEAD_COPY_MB", 128) *
+          (int64_t{1} << 20),
       /*debug=*/EnvFlag("METALJAX_DEBUG"),
       /*memdbg=*/EnvFlag("METALJAX_MEMDBG"));
 

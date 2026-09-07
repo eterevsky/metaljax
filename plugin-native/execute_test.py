@@ -1168,6 +1168,17 @@ def _cases():
          _kv_args(ml_dtypes.bfloat16, 720), *BF16DOT),
         ("kv cache in place (slab read after update: declined)",
          _kv_dynamic(6, read_after=True), _kv_args(np.float32, 730), *DOT),
+        # B4 (submit-ahead): the loop stops after 6 steps with T=8 rows and
+        # no wrap, so rows 6 and 7 of every slab must come back ZERO.  The
+        # pipelined loop builds -- and, from the third step on, SUBMITS --
+        # iteration 7 before it reads iteration 6's condition; that
+        # iteration's update writes row 6.  It runs on the device and is
+        # dropped, and the only thing that keeps its write out of the
+        # returned cache is that the loop holds the carry across the
+        # submission (a held array is never donated, so the chain's root
+        # copies).  A speculation that donated would return row 6 filled.
+        ("kv cache in place (dynamic loop, no wrap: rows past the stop stay zero)",
+         _kv_dynamic(6, wrap=False), _kv_args(np.float32, 740), *DOT),
         # A loop whose bound is CAPTURED rather than constant: the counted
         # encoding's bound_kind 2, indexing the cond's capture list.
         ("fori_loop (captured bound)",
@@ -9594,6 +9605,54 @@ def _p35_while_pipeline(subprocess, pathlib, re):
                            "wanted 2/0")
         return True, "METALJAX_WHILE_PIPELINE=0 serialized both"
 
+    def ahead_lines(text):
+        """(steps, ahead_steps, ahead_declined) per `while(pipelined...)`
+        narration line, in order."""
+        return [(int(a), int(b), int(c)) for a, b, c in re.findall(
+            r"while\(pipelined(?:\+ahead)?\): steps=(\d+) ahead_steps=(\d+) "
+            r"ahead_declined=(\d+)", text)]
+
+    def arm_text(env_extra):
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--dynamic-while"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        return proc.stdout + proc.stderr
+
+    def a_pipelined_loop_submits_ahead():
+        """B4: from the third iteration on, iteration t+1 is SUBMITTED
+        before t's condition is read (`ahead_steps`), and the step count
+        is what the serial arm says it is -- the speculation that runs
+        past the stop is dropped, never committed."""
+        loops = ahead_lines(arm_text({}))
+        if not loops:
+            return False, "no pipelined-loop narration with ahead counters"
+        # Both dynamic loops run many steps; each must have submitted
+        # every step but its first two ahead (the first is serial, the
+        # second measures) -- or declined it for headroom, which the
+        # governor may do on a loaded machine and which still reads first.
+        bad = [f"steps={st} ahead={ah} declined={de}"
+               for st, ah, de in loops if st >= 3 and ah + de != st - 2]
+        if bad:
+            return False, "; ".join(bad)
+        if not any(ah > 0 for _st, ah, _de in loops):
+            return False, f"nothing submitted ahead: {loops}"
+        return True, ", ".join(f"steps={st} ahead={ah} declined={de}"
+                               for st, ah, de in loops)
+
+    def the_ahead_knob_reads_first():
+        loops = ahead_lines(arm_text({"METALJAX_WHILE_SUBMIT_AHEAD": "0"}))
+        if loops:
+            return False, f"METALJAX_WHILE_SUBMIT_AHEAD=0 still narrates ahead counters: {loops}"
+        _answers, census = arm({"METALJAX_WHILE_SUBMIT_AHEAD": "0"})
+        if totals(census) != (0, 2):
+            return False, f"knob off: census {totals(census)}, wanted 0/2 (still pipelined)"
+        return True, "knob off: both loops still pipeline, read-first"
+
     def the_layout_cannot_move_an_answer():
         """Same ops, same order, only the sync points move -- so the answers
         must be BIT-identical, trip count included.  This is the check that a
@@ -9601,7 +9660,8 @@ def _p35_while_pipeline(subprocess, pathlib, re):
         base, _ = arm({})
         bad = []
         for label, extra in (("serial", {"METALJAX_WHILE_PIPELINE": "0"}),
-                             ("eager body", {"METALJAX_BODY_COMPILE": "0"})):
+                             ("eager body", {"METALJAX_BODY_COMPILE": "0"}),
+                             ("read-first", {"METALJAX_WHILE_SUBMIT_AHEAD": "0"})):
             other, _ = arm(extra)
             for case in (BIG, SMALL):
                 if base.get(case) != other.get(case):
@@ -9609,11 +9669,13 @@ def _p35_while_pipeline(subprocess, pathlib, re):
                                f"{base.get(case)} vs {other.get(case)}")
         if bad:
             return False, "; ".join(bad)
-        return True, f"3 layouts agree exactly, {BIG} = {base[BIG]}"
+        return True, f"4 layouts agree exactly, {BIG} = {base[BIG]}"
 
     return [("a compiled while body pipelines", a_compiled_body_pipelines),
             ("an eager big body stays serial", an_eager_big_body_stays_serial),
             ("while-pipeline knob still disables", the_knob_still_disables),
+            ("a pipelined loop submits ahead", a_pipelined_loop_submits_ahead),
+            ("submit-ahead knob reads first", the_ahead_knob_reads_first),
             ("loop layout cannot move an answer",
              the_layout_cannot_move_an_answer)]
 
@@ -9649,37 +9711,78 @@ def _p39_kv_inplace(subprocess, pathlib, re):
                              text)
         declined = re.findall(r"kv inplace declined carry \d+: (.*)", text)
         # Every program is lowered twice (the plain and the fused lowering),
-        # so each case narrates twice.  The dynamic case rewrites (2 updated
-        # layers x k,v = 4 updates), the bf16 case rewrites all 3 layers (6),
-        # the read-after case DECLINES with the reason, and the fori_loop
-        # case narrates nothing: its rebuild sits inside jax's `closed_call`
+        # so each case narrates twice.  The two dynamic f32 cases (wrapping,
+        # and B4's no-wrap tail-rows case) rewrite (2 updated layers x k,v =
+        # 4 updates each), the bf16 case rewrites all 3 layers (6), the
+        # read-after case DECLINES with the reason, and the fori_loop case
+        # narrates nothing: its rebuild sits inside jax's `closed_call`
         # wrapper, which the analysis does not see through (documented).
         updates = sorted(int(u) for _c, u in rewrote)
-        if updates != [4, 4, 6, 6]:
-            return False, f"rewrote updates {updates}, wanted [4, 4, 6, 6]"
+        if updates != [4, 4, 4, 4, 6, 6]:
+            return False, f"rewrote updates {updates}, wanted [4, 4, 4, 4, 6, 6]"
         if len(declined) != 2 or not all(
                 "read after an overlapping update" in d for d in declined):
             return False, f"declines {declined}, wanted 2 x read-after"
         return True, (f"rewrote {len(rewrote)} carries (updates {updates}), "
                       f"declined {len(declined)} (read-after)")
 
-    def the_cache_is_written_in_place():
-        """On the dynamic loop (12 steps, 4 updates each) the chain donates
-        every time but the first iteration, whose carry the loop still
-        holds: the vendored MLX counts the slice updates that wrote into
-        their operand vs copied it first."""
-        _answers, text = arm({})
+    def loop_counts(text):
+        """(steps, ahead_steps, donated, copied) of the longest dynamic loop."""
         loops = re.findall(
-            r"while\(pipelined\): steps=(\d+).*?slice_update_donated=(\d+) "
-            r"slice_update_copied=(\d+)", text)
+            r"while\(pipelined(?:\+ahead)?\): steps=(\d+)(?: ahead_steps=(\d+))?"
+            r".*?slice_update_donated=(\d+) slice_update_copied=(\d+)", text)
         if not loops:
+            return None
+        return max(((int(a), int(b or 0), int(c), int(d))
+                    for a, b, c, d in loops), key=lambda t: t[0])
+
+    def the_cache_is_written_in_place():
+        """On the dynamic loop (12 steps, 4 updates each), read-first
+        (METALJAX_WHILE_SUBMIT_AHEAD=0), the chain donates every time but
+        the first iteration, whose carry the loop still holds: the
+        vendored MLX counts the slice updates that wrote into their
+        operand vs copied it first."""
+        _answers, text = arm({"METALJAX_WHILE_SUBMIT_AHEAD": "0"})
+        got = loop_counts(text)
+        if got is None:
             return False, "no pipelined-loop narration"
-        steps, donated, copied = max(((int(a), int(b), int(c))
-                                      for a, b, c in loops), key=lambda t: t[0])
+        steps, _ahead, donated, copied = got
         if donated < 4 * (steps - 1) or copied > 4 + 2:
             return False, (f"steps={steps} donated={donated} copied={copied}: "
                            "the chain did not write in place")
         return True, f"steps={steps} donated={donated} copied={copied}"
+
+    def a_speculation_copies_the_root_and_nothing_else():
+        """B4 (submit-ahead): a step submitted before its predecessor's
+        condition is read must NOT write into the carry the loop still
+        holds -- so its chain copies the cache ROOT into a fresh buffer,
+        exactly one copy per ahead step, and donates the rest of the
+        chain.  Pinned from both sides: fewer copies would mean a
+        speculation wrote in place into a carry the loop might return;
+        more would mean the chain stopped donating."""
+        _answers, text = arm({})
+        got = loop_counts(text)
+        if got is None:
+            return False, "no pipelined-loop narration"
+        steps, ahead, donated, copied = got
+        if ahead == 0:
+            return False, f"steps={steps} ahead_steps=0: not submitting ahead"
+        # Exactly: the first iteration copies once (the loop's own hold),
+        # every ahead step copies once (the held carry), and so does the
+        # speculation built past the stop -- which RUNS, into buffers
+        # nothing reads, and is dropped (steps+1 iterations of 4 updates
+        # reach the device).  Every other update in every chain donates.
+        want_copied = 2 + ahead
+        if copied != want_copied:
+            return False, (f"steps={steps} ahead={ahead} copied={copied}, "
+                           f"wanted {want_copied} (one root copy per "
+                           "speculative iteration, one for the first)")
+        if donated != 4 * (steps + 1) - copied:
+            return False, (f"steps={steps} donated={donated} copied={copied}: "
+                           f"wanted {4 * (steps + 1) - copied} donations "
+                           "(the rest of every chain, the dropped one included)")
+        return True, (f"steps={steps} ahead={ahead} donated={donated} "
+                      f"copied={copied} (= steps+1 iterations x 4 updates)")
 
     def the_knob_restores_the_literal_tape():
         _answers, text = arm({"METALJAX_KV_INPLACE": "0"})
@@ -9689,17 +9792,23 @@ def _p39_kv_inplace(subprocess, pathlib, re):
 
     def the_rewrite_cannot_move_an_answer():
         base, _ = arm({})
-        other, _ = arm({"METALJAX_KV_INPLACE": "0"})
         bad = []
-        for case in sorted(base):
-            if base[case] != other.get(case):
-                bad.append(case)
+        for label, extra in (("the rewrite off", {"METALJAX_KV_INPLACE": "0"}),
+                             ("read-first", {"METALJAX_WHILE_SUBMIT_AHEAD": "0"}),
+                             ("serial", {"METALJAX_WHILE_PIPELINE": "0"})):
+            other, _ = arm(extra)
+            for case in sorted(base):
+                if base[case] != other.get(case):
+                    bad.append(f"{case} under {label}")
         if bad:
-            return False, "differs under the knob: " + "; ".join(bad)
-        return True, f"{len(base)} cases bit-identical with the rewrite off"
+            return False, "differs: " + "; ".join(bad)
+        return True, (f"{len(base)} cases bit-identical with the rewrite off, "
+                      "read-first and serial")
 
     return [("kv in-place rewrite fires", the_rewrite_fires),
             ("kv cache is written in place", the_cache_is_written_in_place),
+            ("a speculation copies the root and nothing else",
+             a_speculation_copies_the_root_and_nothing_else),
             ("kv knob restores the literal tape",
              the_knob_restores_the_literal_tape),
             ("kv rewrite cannot move an answer",

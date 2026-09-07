@@ -94,7 +94,8 @@ std::string StatsDelta(const Stats& before, const Stats& after) {
       // read `clear` and dump the whole pool (P25).
       "flushes=%d(+trim %d) loop_flushes=%d(+clear %d) ingest=%dMB(+clear %d) "
       "limit_retries=%d "
-      "serial_loops=%d pipelined_loops=%d pipelined_steps=%d "
+      "serial_loops=%d pipelined_loops=%d pipelined_steps=%d"
+      "(+ahead %d, declined %d) "
       "compiles=%d compiled_calls=%d unrolls=%d drops=%d/%d",
       after.flushes - before.flushes,
       after.cache_trims - before.cache_trims,
@@ -109,6 +110,11 @@ std::string StatsDelta(const Stats& before, const Stats& after) {
       after.serial_loops - before.serial_loops,
       after.pipelined_loops - before.pipelined_loops,
       after.pipelined_steps - before.pipelined_steps,
+      // B4: how many of those steps were submitted before the previous
+      // condition was read, and how many the governor (or a failed
+      // submission) held back.
+      after.ahead_steps - before.ahead_steps,
+      after.ahead_declines - before.ahead_declines,
       // P5: the compiled path is otherwise invisible in a process with no
       // interpreter -- `compiles` counts traces BUILT, `compiled_calls`
       // replays (main, a while body, one chunk), and `drops` the two ways a
