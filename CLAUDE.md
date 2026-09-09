@@ -533,21 +533,28 @@ executes on the Metal device through plain `jax.numpy`.
   sees the module. The MLIR context must know **sdy** (+ mpmd) — jax 0.11
   emits sdy attrs and `sdy.sharding_constraint` ops even single-device
   (identity for us).
-- **M5 GPU (applegpu_g17s) MLX f32 matmul is low-precision** (~4e-3, neural
-  accelerators). metaljax defaults to accuracy: `MLX_METAL_GPU_ARCH=`
-  `applegpu_g16g` before MLX builds its device; opt out with
-  METALJAX_MATMUL_PRECISION=default. Owned by
-  `plugin-native/metal/metal_client.cc` (a static initializer that also
-  pins MLX_MAX_OPS_PER_BUFFER=800 / MLX_MAX_MB_PER_BUFFER=512); the loader
-  repeats the GPU_ARCH default before dlopen. `src/metaljax/__init__.py`
-  sets nothing. The kernel budget is no longer a correctness pin: the
-  vendored fork's fence fix retired the command-buffer-split corruption
-  (re-swept 2026-09-03, no budget corrupts; canary battery in
-  `~/.cache/metaljax-bench/logs/row11-overlap/`). Lowering it to 100
-  measured −1.9 ms/token on row 11 but −1.0 % geomean on texmo suite-106
-  (one config −7 %) — Oleg's call under release rule 2, pending; 800 stays
-  meanwhile. The byte budget stays 512: its upper bound is the no-panic
-  one (unpageable transients).
+- **M5 GPU (applegpu_g17s) f32 GEMM/attention through the neural
+  accelerators (NAX) is low-precision** (~8e-4 vs f64; torch-MPS f32 measures
+  2.1e-6, the exact class).  metaljax keeps f32 exact by setting
+  `MLX_ENABLE_TF32=0` (MLX gates f32-on-NAX behind it) while bf16/f16 and
+  quantized matmuls use NAX like mlx-lm's own default
+  (`METALJAX_MATMUL_PRECISION=high`, the default; row 16 86.8 -> 42 ms, row 18
+  338 -> 189 ms/step).  `highest` restores the pre-T1 whole-arch pin
+  `MLX_METAL_GPU_ARCH=applegpu_g16g` (no NAX for any dtype, small-device GEMM
+  tiles); `default` is MLX's own default (f32 on NAX).  Rule (Oleg,
+  2026-09-09): f32 is never silently degraded; a models.md cell may use the
+  fast f32 path only when its goal's implementation measurably does, and says
+  so.  Owned by `plugin-native/metal/metal_client.cc` (static initializer,
+  which also pins MLX_MAX_OPS_PER_BUFFER=800 / MLX_MAX_MB_PER_BUFFER=512);
+  the loader repeats the rule before dlopen.  bf16 outputs move by ~1 ULP vs
+  the pinned kernels (accumulation order); the bf16 fused-attention kernel's
+  error is absolute (row-scale), not relative.  The kernel budget is no
+  longer a correctness pin: the vendored fork's fence fix retired the
+  command-buffer-split corruption (re-swept 2026-09-03; canary battery in
+  `~/.cache/metaljax-bench/logs/row11-overlap/`).  Cadence 800 -> 200 is held
+  (Oleg, 2026-09-09: only if >= 5 % on several big models; row 11 alone gains).
+  The byte budget stays 512: its upper bound is the no-panic one (unpageable
+  transients).
 - All PJRT events are born ready — `jax.block_until_ready` is a **no-op** on
   this backend, so time through `np.asarray` (or `mx::eval`), never through
   block_until_ready.

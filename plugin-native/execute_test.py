@@ -782,10 +782,11 @@ def _cases():
     # Contractions accumulate in a different order from the CPU's, so they get
     # a band of their own.  Not a WIDE one: the M5's low-precision matmul path
     # (CLAUDE.md's "M5 GPU MLX f32 matmul is low-precision", ~4e-3) is off
-    # here, because src/jax_plugins/metal/__init__.py pins
-    # MLX_METAL_GPU_ARCH before dlopening the plugin -- on the native branch
-    # too.  Measured on 512x512: 7.6e-7 relative against an f64 reference,
-    # where jax-CPU itself is 1.3e-6.
+    # here, because the plugin (metal_client.cc) and the loader
+    # (src/jax_plugins/metal/__init__.py) set MLX_ENABLE_TF32=0 before MLX
+    # builds its device -- f32 GEMMs stay off the neural accelerators, the
+    # bf16/f16 ones use them.  Measured on 512x512: 7.6e-7 relative against
+    # an f64 reference, where jax-CPU itself is 1.3e-6.
     DOT = (1e-5, 1e-5)
     HALF = (5e-3, 5e-3)
     # bf16 contractions/backward passes: reordered accumulation at 2^-8 ULP.

@@ -150,9 +150,28 @@ bool EnvFlag(const char* name) {
 //    (max_abs_err 9.277e-03, the known benign bf16-vs-CPU residual) at
 //    800/512, 100/512, 25/512 and 800/40 alike.  So the cadence is a
 //    tuning knob again, and `tests/test_command_buffer.py` keeps watching.
-//  * `MLX_METAL_GPU_ARCH`: the M5's f32 GEMM goes through the neural
-//    accelerators at ~4e-3 unless the kernel arch is pinned back a
-//    generation.  `src/jax_plugins/metal/__init__.py` also sets this before
+//  * `MLX_ENABLE_TF32` = 0 (the METALJAX_MATMUL_PRECISION default, "high"):
+//    the M5's f32 GEMM goes through the neural accelerators (NAX,
+//    `mpp::tensor_ops`) at ~4e-3 relative error, and MLX gates exactly that
+//    -- f32 on NAX -- behind `MLX_ENABLE_TF32` (matmul.cpp `use_nax`,
+//    quantized.cpp, scaled_dot_product_attention.cpp: `enable_tf32() ||
+//    dtype != float32`).  With it off, f32 stays on the simdgroup kernels
+//    (the pinned arch's ~1e-6 class, measured over a shape sweep in
+//    `notes/env-flags.md`) while bf16/f16 GEMM, attention and quantized
+//    matmul keep the NAX kernels and the native arch's Max-class tile
+//    parameters.
+//    HISTORY: through the 0.11.7 gate this was a whole-arch pin,
+//    `MLX_METAL_GPU_ARCH=applegpu_g16g` -- one generation back, which turns
+//    NAX off for EVERY dtype and picks the "small device" GEMM tiles
+//    (`GEMM_TPARAM_MACRO` keys on the arch string's last letter).  Rows
+//    16 (SigLIP2 forward, bf16) and 18 (LoRA E2B train, bf16) paid 2x for
+//    it: 86.8 -> 42.2 ms and 338 -> 194 ms/step on the native arch
+//    (`~/.cache/metaljax-bench/logs/gap-rows/{row16,row18}/report.md`,
+//    the 3-arm A/B in `logs/t1-archpin/findings.txt`).
+//    `METALJAX_MATMUL_PRECISION=highest` restores that pin verbatim (for
+//    an A/B, or if a NAX kernel ever misbehaves); `=default` is MLX's own
+//    default (native arch, TF32 on: f32 GEMM at ~4e-3, the fast path).
+//    `src/jax_plugins/metal/__init__.py` applies the same rule before
 //    dlopening us (earlier, and visible from Python); setting it here too
 //    keeps a C++ embedder (`//metal:runtime_gil_free_test`, anything linking
 //    this dylib directly) from silently getting the fast, inaccurate path.
@@ -180,9 +199,18 @@ bool EnvFlag(const char* name) {
   }
   ::setenv("MLX_MAX_OPS_PER_BUFFER", "800", /*overwrite=*/0);
   ::setenv("MLX_MAX_MB_PER_BUFFER", "512", /*overwrite=*/0);
-  const char* precision = std::getenv("METALJAX_MATMUL_PRECISION");
-  if (precision == nullptr || std::string(precision) == "highest")
+  // METALJAX_MATMUL_PRECISION: "high" (the default; anything unrecognised
+  // is treated as it), "highest" (the historical whole-arch pin), "default"
+  // (MLX's own default: TF32 on).  See the comment block above.
+  const char* precision_env = std::getenv("METALJAX_MATMUL_PRECISION");
+  const std::string precision = precision_env ? precision_env : "high";
+  if (precision == "highest") {
     ::setenv("MLX_METAL_GPU_ARCH", "applegpu_g16g", /*overwrite=*/0);
+  } else if (precision == "default") {
+    ::setenv("MLX_ENABLE_TF32", "1", /*overwrite=*/0);
+  } else {
+    ::setenv("MLX_ENABLE_TF32", "0", /*overwrite=*/0);
+  }
   return true;
 }();
 

@@ -36,7 +36,7 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 | `METALJAX_MEM_SYS_MB` | `3/4 of RAM` | user knob | plugin-native only: the governor's hard line on the MACHINE's unreclaimable memory (wired+anonymous+compressor) |
 | `METALJAX_MEM_THROTTLE_KBPS` | `1048576` | user knob | plugin-native only: cumulative transfer rate a load is paced to while the free list is below the floor (1 GB/s) |
 | `METALJAX_LOOP_CLEAR_COST` | `500000` | user knob | cache-clear cadence in loop op-units (default 500000) |
-| `METALJAX_MATMUL_PRECISION` | `highest` | user knob | default=MLX default arch; unset picks the accurate g16g matmul path |
+| `METALJAX_MATMUL_PRECISION` | `high` | user knob | plugin-native: which MLX kernels the M5's f32 GEMM/attention/quantized matmul may use. `high` (unset) = native arch with `MLX_ENABLE_TF32=0` -- f32 stays off the neural accelerators (~1e-6 vs f64, the pinned class; bit-identical to `highest` on 9 of 10 swept shapes, 3.01e-6 vs 3.11e-6 on the tenth), bf16/f16 and quantized matmuls use them (row 16 86.8→42 ms, row 18 338→194 ms/step); `highest` = the pre-T1 whole-arch pin `MLX_METAL_GPU_ARCH=applegpu_g16g` (no accelerator kernels for ANY dtype, small-device GEMM tiles); `default` = MLX's own default (accelerator f32 at ~8e-4). Any other value is treated as `high`. |
 | `METALJAX_MEMDBG` | `` | debug-bisect | =1 logs active/cache memory at loop clears and execute end |
 | `METALJAX_MOE` | `1` | debug-bisect | =0 disables the expert-gather rewrite (Stage 1 and plugin-native) |
 | `METALJAX_MOE_VERIFY` | `1` | debug-bisect | =0 skips the router check the expert gather rests on -- a misread axis is then SILENT |
@@ -73,6 +73,9 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 | `METALJAX_VERIFY_COMPILE` | `None` | debug-bisect | plugin-native only: =1 runs every executable a second time op by op and reports outputs that differ from the compiled path; =dump also prints the arguments and both answers |
 | `MJDBG_VERIFY_MSL` | `None` | debug-bisect | verify every msl plan against the raw loop; dumps mismatches |
 
-metaljax also sets `MLX_METAL_GPU_ARCH` (accurate-matmul arch pin,
-see METALJAX_MATMUL_PRECISION) and `MLX_MAX_OPS_PER_BUFFER` before
-importing mlx.
+metaljax also sets `MLX_ENABLE_TF32=0` (or, under
+`METALJAX_MATMUL_PRECISION=highest`, the historical `MLX_METAL_GPU_ARCH=applegpu_g16g`
+arch pin -- see METALJAX_MATMUL_PRECISION), `MLX_MAX_OPS_PER_BUFFER` and
+`MLX_MAX_MB_PER_BUFFER` before MLX builds its Metal device (`setenv` with
+overwrite=0 in `plugin-native/metal/metal_client.cc`, `os.environ.setdefault`
+in the loader `src/jax_plugins/metal/__init__.py`): an exported value wins.

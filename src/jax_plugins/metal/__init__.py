@@ -52,11 +52,22 @@ def initialize():
         return
     # The MLX precision default, repeated from the plugin's own static
     # initializer (plugin-native/metal/metal_client.cc, which owns the
-    # numbers): MLX reads it when it initializes its Metal device, and
-    # setting it before jax dlopens the dylib below keeps the ordering
-    # obvious from the Python side too.
-    if os.environ.get("METALJAX_MATMUL_PRECISION", "highest") == "highest":
+    # numbers and the rationale): MLX reads these when it initializes its
+    # Metal device, and setting them before jax dlopens the dylib below
+    # keeps the ordering obvious from the Python side too.  The rule:
+    #   METALJAX_MATMUL_PRECISION unset / "high"  -> native arch, f32 GEMM
+    #       kept OFF the neural accelerators (MLX_ENABLE_TF32=0; bf16/f16
+    #       and quantized matmuls use them);
+    #   "highest" -> the historical whole-arch pin (applegpu_g16g: no
+    #       accelerator kernels for any dtype, small-device GEMM tiles);
+    #   "default" -> MLX's own default (accelerator f32 GEMM, ~4e-3).
+    precision = os.environ.get("METALJAX_MATMUL_PRECISION", "high")
+    if precision == "highest":
         os.environ.setdefault("MLX_METAL_GPU_ARCH", "applegpu_g16g")
+    elif precision == "default":
+        os.environ.setdefault("MLX_ENABLE_TF32", "1")
+    else:
+        os.environ.setdefault("MLX_ENABLE_TF32", "0")
     import jax._src.xla_bridge as xb
 
     # Keep CPU (priority 0) as the default backend; select metal explicitly
