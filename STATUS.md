@@ -28,7 +28,7 @@ parentheses is peak footprint where measured.
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | **388.4** (73 GB) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **86.68** | — | 29.8 (b32: 591) | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ⁴ | **1249.3** @512², **4961.6** @1024² | ✗ ⁹ | 553 @512², 3078 @1024² ⁹ ¹⁸ | — |
-| 18 | LoRA E2B train (ms/step) | 2048 | **362.1** | — | 135.6 ³ | — |
+| 18 | LoRA gemma4-E2B train (ms/step) | 2048 | **362.1** | — | 135.6 ³ | — |
 | 19 | maxtext train 0.6B (ms/step) | 1402 | **444.6** | — | — | — |
 | 20 | *aspirational* 235B-A22B 3-bit | ✗ | **56.2** (101 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
 | 21 | Qwen3.8-27B bf16 (dense hybrid) | ✗ ¹⁴ | **154.9** (56 GB) | **106.4** ¹⁵ | — | 98.2 ¹⁰ |
