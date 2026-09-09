@@ -266,12 +266,13 @@ const std::shared_ptr<const LoweredProgram>& MetalLoadedExecutable::Tape(
     std::fprintf(stderr,
                  "[metaljax-native] %s: %lld fused quantized matmul(s), "
                  "%lld gathered expert dispatch(es), %lld ragged "
-                 "dispatch(es), %lld stacked dot(s), %lld fused "
-                 "attention(s), %lld gated delta step(s), %lld rope "
+                 "dispatch(es) (%lld decode), %lld stacked dot(s), %lld "
+                 "fused attention(s), %lld gated delta step(s), %lld rope "
                  "view(s), %lld projection pack(s), %zu packed arrays\n",
                  name_.c_str(), static_cast<long long>(fused->num_qmm),
                  static_cast<long long>(fused->num_moe),
                  static_cast<long long>(fused->num_ragged),
+                 static_cast<long long>(fused->num_ragged_decode),
                  static_cast<long long>(fused->num_stacked),
                  static_cast<long long>(fused->num_sdpa),
                  static_cast<long long>(fused->num_gdn),

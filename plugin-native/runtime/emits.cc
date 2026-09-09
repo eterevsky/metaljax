@@ -700,12 +700,23 @@ bool Program::step_emit(const Entry& e,
       // assumption about the data.  A row at or past ends[g-1] is in no
       // group (the dense mask zeroes it everywhere), so its gather — clamped
       // to the last group — is discarded by `valid`.
+      //
+      // The DECODE form (metal_ragged.cc, "the decode form"): trailing
+      // attrs [form, nopad]; ins [x0 | x, w, rhs_idx] with `rhs_idx` the
+      // kRaggedIdx vector (matrix index per sorted row, already `* L +
+      // layer` when stacked).  form 1: every row is `x0` (one activation;
+      // the lhs index is a stride-0 zero, no kernel); form 2: real rows.
+      // No prefix, no `where` (every row is in a group by proof), and with
+      // `nopad` no pad either -- the same gather_mm kernel over the same
+      // rows and matrices as the base form, bit for bit.
       Cursor c(at);
       int64_t g = c.next(), m = c.next(), M = c.next();
       int64_t k = c.next(), n = c.next();
       mx::Dtype out_dt = dtype_of(c.next());
       const bool stacked = c.flag();
       int64_t L = c.next();
+      const int64_t form = c.done() ? 0 : c.next();
+      const bool nopad = c.done() ? false : c.flag();
       mx::Shape out_shape{static_cast<mx::ShapeElem>(M),
                           static_cast<mx::ShapeElem>(n)};
       if (m == 0 || k == 0 || n == 0) {
@@ -714,6 +725,33 @@ bool Program::step_emit(const Entry& e,
       }
       const mx::array& x = in(0);
       const mx::array& w = in(1);
+      if (form != 0) {
+        mx::array wg = w;
+        if (stacked)
+          wg = mx::reshape(mx::transpose(w, {1, 0, 2, 3}),
+                           mx::Shape{static_cast<mx::ShapeElem>(g * L),
+                                     static_cast<mx::ShapeElem>(k),
+                                     static_cast<mx::ShapeElem>(n)});
+        mx::array a = form == 1
+            ? mx::reshape(x, mx::Shape{1, 1, static_cast<mx::ShapeElem>(k)})
+            : mx::reshape(x, mx::Shape{static_cast<mx::ShapeElem>(m), 1,
+                                       static_cast<mx::ShapeElem>(k)});
+        mx::array lhs_idx = form == 1
+            ? mx::broadcast_to(mx::array(uint32_t{0}, mx::uint32),
+                               mx::Shape{static_cast<mx::ShapeElem>(m)})
+            : mx::arange(static_cast<double>(m), mx::uint32);
+        mx::array y = mx::gather_mm(a, wg, lhs_idx, in(2),
+                                    /*sorted_indices=*/false);
+        y = mx::reshape(y, mx::Shape{static_cast<mx::ShapeElem>(m),
+                                     static_cast<mx::ShapeElem>(n)});
+        if (!nopad && M > m)
+          y = mx::pad(y, {0}, mx::Shape{0},
+                      mx::Shape{static_cast<mx::ShapeElem>(M - m)},
+                      mx::array(0.0f, y.dtype()));
+        if (y.dtype() != out_dt) y = mx::astype(y, out_dt);
+        env[e.outs[0]] = y;
+        break;
+      }
       mx::array ends =
           mx::reshape(mx::astype(in(2), mx::int32),
                       mx::Shape{1, static_cast<mx::ShapeElem>(g)});
@@ -767,6 +805,34 @@ bool Program::step_emit(const Entry& e,
                     mx::array(0.0f, y.dtype()));
       if (y.dtype() != out_dt) y = mx::astype(y, out_dt);
       env[e.outs[0]] = y;
+      break;
+    }
+
+    case kRaggedIdx: {
+      // The decode ragged form's matrix index per SORTED row (metal_ragged.cc):
+      // `take(ids, perm)` -- the ids in the order the rows were permuted
+      // into, i.e. ascending -- times L plus the (clamped) layer when the
+      // weights are a stacked carry.  ins [ids [m], perm [m], (layer)];
+      // attrs [m, L, stacked].  One tiny gather and one fused elementwise
+      // kernel, shared by every expert dot of the layer.
+      Cursor c(at);
+      const int64_t m = c.next();
+      const int64_t L = c.next();
+      const bool stacked = c.flag();
+      mx::Shape vec{static_cast<mx::ShapeElem>(m)};
+      mx::array ids = mx::reshape(mx::astype(in(0), mx::int32), vec);
+      mx::array perm = mx::reshape(mx::astype(in(1), mx::int32), vec);
+      mx::array sorted = mx::take(ids, perm, 0);
+      if (stacked) {
+        mx::array l = mx::minimum(
+            mx::maximum(mx::reshape(mx::astype(in(2), mx::int32), mx::Shape{}),
+                        mx::array(0, mx::int32)),
+            mx::array(static_cast<int32_t>(L - 1), mx::int32));
+        sorted = mx::add(
+            mx::multiply(sorted, mx::array(static_cast<int32_t>(L), mx::int32)),
+            l);
+      }
+      env[e.outs[0]] = mx::astype(sorted, mx::uint32);
       break;
     }
 

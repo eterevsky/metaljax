@@ -4077,6 +4077,224 @@ def _stacked_relayout_forms():
     ]
 
 
+def _ragged_decode_forms():
+    """(label, jax function, args) for `_p44_ragged_decode`.
+
+    Row 10 rewrite 1: the ragged DECODE form (metal_ragged.cc, "the decode
+    form").  One MoE layer stack spelled the way maxtext's tape has it --
+    softmax router, `lax.top_k`, ids flattened, `jnp.argsort` (jax's
+    `@argsort` callee), rows = `repeat(x, topk)[perm]` (a clamping gather),
+    `jnp.bincount` (`@clip` callee + scatter-add), rows padded to the
+    tiling, three `lax.ragged_dot` (jax's dense fallback, whose cumsum is
+    the `@cumsum` callee) + swiglu, `[:m]` slices, unpermute by
+    `argsort(perm)`, the f32 weighted combine, two shared experts and the
+    residual add -- inside a `lax.scan` over transposed [g, L, k, n]
+    weight stacks (the stacked-weights extension) unless said otherwise.
+    Small: g = 8, top-k 2, k = 32, n = 16, tile 16, L = 3.
+
+      D1   decode (T = 1), bf16: fires, `decode nopad` on the gate/up dots
+           (one replicated activation) and `decode-rows nopad` on the down
+           dot (real rows).
+      D1f  D1 in f32.
+      D2   prefill (T = 4, m = 8 of a 16-row tile): declines -- the ids
+           come from a top-k over 4 tokens -- and keeps the pad.
+      D3   decode over PLAIN [g, k, n] weights (no scan): fires with L = 1.
+      D4   decode whose ids are a program INPUT: declines, range unproven.
+      D5   decode whose gate root has a SECOND reader (a sum over the whole
+           tile added to the output): fires, but that dot keeps its pad
+           (`decode` without `nopad`).
+      D6   decode with `argsort(descending=True)`: declines, the sort is not
+           ascending (the rows then sit in descending expert order and the
+           dense form computes what it computes; both arms agree with it).
+      D7   decode with top-k 1 (m = 1).
+      D8   decode (top-k 4) whose rows come off a broadcast RESHAPED to
+           [4, 48] instead of flattened to [m, k] -- rows 1 and 3 are x0
+           rotated by 16, not x0 (a hand-written gather; jax's `repeat`
+           never spells it).  The replicated-activation proof declines on
+           the reshape width and the dots run as `decode-rows` over the
+           real rows: still fewer dispatches, still bit-identical.
+      D9   decode whose "argsort" is `sort((V, [1, 0]))` -- an in-range
+           constant payload that is NOT the iota: declines, the payload is
+           not the iota (`take(V, perm)` would name the wrong expert; the
+           unfixed recognizer accepted any in-range constant and swapped
+           the rows).
+    Each function's answer is [final activation, the down dot's rows before
+    the unpermute (per layer), the shared-expert output (per layer)].
+
+    `_ragged_shared_ends_module` adds the SHARED raw module: two dots over
+    ONE `ends` value (jax spells one `@cumsum` call per `ragged_dot`; the
+    module is jax's own text with the second call removed) where the
+    second root has an extra real row and declines the decode form on its
+    bincount -- the base root reads the cumsum the decode root absorbed,
+    which the joint fixpoint must keep lowered (before the fix the whole
+    executable fell back to the plain tape).
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+
+    G, K, N, TILE, L = 8, 32, 16, 16, 3
+
+    def rnd(shape, seed, scale=1.0, dtype=ml_dtypes.bfloat16):
+        return (np.random.RandomState(seed).standard_normal(shape)
+                * scale).astype(dtype)
+
+    def make(tag, T=1, topk=2, dtype=jnp.bfloat16, stacked=True,
+             ids_input=False, second_reader=False, descending=False,
+             rows_rotated=False, perm_const=False):
+        m = T * topk
+        M = -(-m // TILE) * TILE
+
+        def layer(h, wr, wg, wu, wd, s1, s2, s3, ids_in=None):
+            x2d = h.reshape(-1, K)
+            probs = jax.nn.softmax((x2d @ wr).astype(jnp.float32), axis=-1)
+            if ids_in is None:
+                vals, ids = lax.top_k(probs, topk)
+            else:
+                ids = ids_in
+                vals = jnp.take_along_axis(probs, ids.reshape(T, topk), -1)
+            V = ids.reshape(-1)
+            if perm_const:
+                # An in-range payload that is not the iota: result 1 is
+                # the payload sorted along with V, not V's argsort.
+                payload = jnp.asarray(np.arange(m)[::-1].astype(np.int32))
+                perm = lax.sort((V, payload), num_keys=1)[1]
+            else:
+                perm = jnp.argsort(V, descending=descending)
+            if rows_rotated:
+                # [1, 6, K] -> [4, 48]: a k-wide row of it is x0 only for
+                # rows 0 and 2; the gather geometry is repeat's exactly.
+                assert m == 4 and T == 1
+                R = lax.broadcast_in_dim(x2d, (1, 6, K), (0, 2)).reshape(4, 48)
+                rows = lax.gather(
+                    R, perm[:, None],
+                    lax.GatherDimensionNumbers(offset_dims=(1,),
+                                               collapsed_slice_dims=(0,),
+                                               start_index_map=(0,)),
+                    slice_sizes=(1, K), mode="clip")
+            else:
+                rows = jnp.repeat(x2d, topk, axis=0)[perm]
+            gs = jnp.bincount(V, length=G)
+            zero = jnp.zeros((), dtype)
+            rp = lax.pad(rows, zero, ((0, M - m, 0), (0, 0, 0)))
+            a_full = lax.ragged_dot(rp, wg, gs, preferred_element_type=dtype)
+            a = a_full[:m]
+            b = lax.ragged_dot(rp, wu, gs, preferred_element_type=dtype)[:m]
+            hm = (a * jax.nn.sigmoid(a)) * b
+            hp = lax.pad(hm, zero, ((0, M - m, 0), (0, 0, 0)))
+            o = lax.ragged_dot(hp, wd, gs, preferred_element_type=dtype)[:m]
+            ou = o[jnp.argsort(perm)]
+            comb = (ou.astype(jnp.float32).reshape(-1, topk, K)
+                    * vals.reshape(-1, topk)[..., None]).sum(1)
+            sg = x2d @ s1
+            sh = ((sg * jax.nn.sigmoid(sg)) * (x2d @ s2)) @ s3
+            out = (h.astype(jnp.float32) + comb.reshape(h.shape)
+                   + sh.astype(jnp.float32).reshape(h.shape))
+            if second_reader:
+                out = out + a_full.astype(jnp.float32).sum() * 1e-3
+            return out.astype(dtype), (o, sh)
+
+        if stacked:
+            def fn(x, Wr, Wg, Wu, Wd, S1, S2, S3, *rest):
+                def body(h, ws):
+                    return layer(h, *ws, *rest)
+                return lax.scan(body, x, (Wr, jnp.transpose(Wg, (1, 0, 2, 3)),
+                                          jnp.transpose(Wu, (1, 0, 2, 3)),
+                                          jnp.transpose(Wd, (1, 0, 2, 3)),
+                                          S1, S2, S3))
+        else:
+            def fn(x, wr, wg, wu, wd, s1, s2, s3, *rest):
+                out, (o, sh) = layer(x, wr, wg, wu, wd, s1, s2, s3, *rest)
+                return out, (o[None], sh[None])
+        fn.__name__ = f"rgd_{tag}"
+        npdt = np.float32 if dtype == jnp.float32 else ml_dtypes.bfloat16
+        seed = sum(map(ord, tag))
+        if stacked:
+            args = [rnd((1, T, K), seed, 1.0, npdt),
+                    rnd((L, K, G), seed + 1, 0.3, npdt),
+                    rnd((G, L, K, N), seed + 2, 0.2, npdt),
+                    rnd((G, L, K, N), seed + 3, 0.2, npdt),
+                    rnd((G, L, N, K), seed + 4, 0.2, npdt),
+                    rnd((L, K, N), seed + 5, 0.2, npdt),
+                    rnd((L, K, N), seed + 6, 0.2, npdt),
+                    rnd((L, N, K), seed + 7, 0.2, npdt)]
+        else:
+            args = [rnd((1, T, K), seed, 1.0, npdt),
+                    rnd((K, G), seed + 1, 0.3, npdt),
+                    rnd((G, K, N), seed + 2, 0.2, npdt),
+                    rnd((G, K, N), seed + 3, 0.2, npdt),
+                    rnd((G, N, K), seed + 4, 0.2, npdt),
+                    rnd((K, N), seed + 5, 0.2, npdt),
+                    rnd((K, N), seed + 6, 0.2, npdt),
+                    rnd((N, K), seed + 7, 0.2, npdt)]
+        if ids_input:
+            args.append(np.array([5, 1], np.int32)[:m].reshape(T, topk))
+        return (tag.upper(), fn, args)
+
+    return [make("d1"),
+            make("d1f", dtype=jnp.float32),
+            make("d2", T=4),
+            make("d3", stacked=False),
+            make("d4", ids_input=True),
+            make("d5", second_reader=True),
+            make("d6", descending=True),
+            make("d7", topk=1),
+            make("d8", topk=4, rows_rotated=True),
+            make("d9", perm_const=True)]
+
+
+def _ragged_shared_ends_module():
+    """(module text, args) for the SHARED case of `_p44_ragged_decode`.
+
+    Two `lax.ragged_dot`s over one `gs`: the first over the two routed
+    rows, the second over those rows plus one extra real row (m = 3 against
+    a bincount of 2, so its decode proof declines on the row count).  jax
+    spells a separate `call @cumsum(counts)` per dot; the second call is
+    removed from jax's own text and its result replaced by the first's, so
+    both roots read ONE `ends`.  Built at run time so the spelling is the
+    installed jax's; an unexpected spelling raises instead of testing
+    nothing.
+    """
+    import re
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    G, K, N, TILE = 8, 32, 16, 16
+
+    def rgd_shared(x2d, wr, wg, wg2, extra):
+        probs = jax.nn.softmax((x2d @ wr).astype(jnp.float32), axis=-1)
+        _vals, ids = lax.top_k(probs, 2)
+        V = ids.reshape(-1)
+        perm = jnp.argsort(V)
+        rows = jnp.repeat(x2d, 2, axis=0)[perm]
+        gs = jnp.bincount(V, length=G)
+        zero = jnp.zeros((), jnp.bfloat16)
+        rp = lax.pad(rows, zero, ((0, TILE - 2, 0), (0, 0, 0)))
+        a = lax.ragged_dot(rp, wg, gs, preferred_element_type=jnp.bfloat16)[:2]
+        rp3 = lax.pad(jnp.concatenate([rows, extra], 0), zero,
+                      ((0, TILE - 3, 0), (0, 0, 0)))
+        b = lax.ragged_dot(rp3, wg2, gs, preferred_element_type=jnp.bfloat16)[:3]
+        return a, b
+
+    def rnd(shape, seed, scale=1.0):
+        return (np.random.RandomState(seed).standard_normal(shape)
+                * scale).astype(ml_dtypes.bfloat16)
+
+    args = [rnd((1, K), 901), rnd((K, G), 902, 0.3), rnd((G, K, N), 903, 0.2),
+            rnd((G, K, N), 904, 0.2), rnd((1, K), 905)]
+    lines = jax.jit(rgd_shared).lower(*args).as_text().splitlines()
+    calls = [i for i, ln in enumerate(lines) if "call @cumsum(" in ln]
+    if len(calls) != 2:
+        raise RuntimeError(f"expected two @cumsum calls, found {len(calls)}")
+    first = re.match(r"\s*(%\d+) = call @cumsum", lines[calls[0]]).group(1)
+    second = re.match(r"\s*(%\d+) = call @cumsum", lines[calls[1]]).group(1)
+    del lines[calls[1]]
+    text = re.sub(re.escape(second) + r"\b", first, "\n".join(lines) + "\n")
+    if text.count("call @cumsum(") != 1:
+        raise RuntimeError("the shared-ends rewrite did not take")
+    return text, args
+
+
 def _proj_pack_forms():
     """(label, jax function, inputs, calls) for `_p43_proj_pack`.
 
@@ -10725,6 +10943,288 @@ def _p43_proj_pack(subprocess, pathlib, re):
             ("proj pack updated weight declines", an_updated_weight_declines)]
 
 
+def _p44_ragged_decode(subprocess, pathlib, re):
+    """Row 10 rewrite 1: the ragged DECODE form (metal_ragged.cc).
+
+    At one-token decode the base emit spends ~8 non-gemv kernels per expert
+    dot recovering the group index from `ends` and padding the result to
+    the tiling its only readers slice straight back.  The decode form
+    proves the ids' range (a top-k over ONE row) and reads the group index
+    off the row permutation the graph already computes (`take(ids, perm)`,
+    one kRaggedIdx shared by the layer's dots), reads the one replicated
+    activation instead of the gathered rows, and skips the pad when every
+    reader is `slice[0:m]`.
+
+    Pinned, on the forms of `_ragged_decode_forms`: the match FIRES
+    (narration per dot and the executable's `(N decode)` count) on the
+    decode forms; prefill, unproven ids and a descending sort DECLINE with
+    the stated reasons; the kill switch `METALJAX_RAGGED_DECODE=0` restores
+    the base form; fewer dispatches; every answer is BIT-identical with the
+    knob-off arm (the same gather_mm kernel over the same rows and
+    matrices -- no tolerance anywhere); the unchanged consumers (combine,
+    shared experts) agree across arms; and the first layer -- identical
+    inputs on both backends -- matches jax-CPU's dense chain within the dot
+    tolerances (the bf16 residual chain is pinned by bit-identity, not by
+    a CPU tolerance it amplifies past).
+    """
+    here = str(pathlib.Path(__file__).resolve())
+    memo = {}
+
+    def arm(env_extra, platform="metal"):
+        import json
+        key = (platform, tuple(sorted(env_extra.items())))
+        if key in memo:
+            return memo[key]
+        child = dict(os.environ)
+        if platform == "cpu":
+            child.pop("METALJAX_PLUGIN_PATH", None)
+            child["JAX_PLATFORMS"] = "cpu"
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--ragged-decode"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("RGD ") or line.startswith("RGS "):
+                label, payload = line[4:].split("\t", 1)
+                answers[label] = [np.array(a) for a in json.loads(payload)]
+        text = proc.stdout + proc.stderr
+        memo[key] = (answers, text)
+        return memo[key]
+
+    def per_program(text):
+        """The ragged narration lines that precede each program's fused-tape
+        line, keyed by jit name (the forms run one after another)."""
+        out, pending = {}, []
+        for ln in text.splitlines():
+            if "[metaljax-native] ragged:" in ln:
+                pending.append(ln)
+            m = re.search(r"\[metaljax-native\] (jit_rgd_\w+): .*?(\d+) ragged dispatch\(es\) \((\d+) decode\)", ln)
+            if m:
+                d = out.setdefault(m.group(1), {"ragged": 0, "decode": 0, "lines": []})
+                d["ragged"] = int(m.group(2))
+                d["decode"] = int(m.group(3))
+                d["lines"].extend(pending)
+                pending = []
+        return out
+
+    def dispatches(text):
+        out = {}
+        for m in re.finditer(r"\[metaljax-native\] (jit_rgd_\w+): flushes=.*?dispatches=(\d+)", text):
+            out.setdefault(m.group(1), int(m.group(2)))
+        return out
+
+    def same(a, b):
+        return len(a) == len(b) and all(
+            x.shape == y.shape and np.array_equal(x, y) for x, y in zip(a, b))
+
+    def worst(a, b):
+        e = 0.0
+        for x, y in zip(a, b):
+            scale = max(float(np.max(np.abs(y))), 1e-30)
+            e = max(e, float(np.max(np.abs(x - y))) / scale)
+        return e
+
+    FIRING = {"jit_rgd_d1": 3, "jit_rgd_d1f": 3, "jit_rgd_d3": 3,
+              "jit_rgd_d5": 3, "jit_rgd_d7": 3, "jit_rgd_d8": 3}
+    DECLINING = {"jit_rgd_d2": "rows are not one replicated activation (4 tokens)",
+                 "jit_rgd_d4": "ids of unproven range",
+                 "jit_rgd_d6": "the sort is not ascending",
+                 "jit_rgd_d9": "the sort's payload is not the iota"}
+    JAX_FORMS = 10  # D1 .. D9 with D1f; SHARED is the raw module on top.
+
+    def the_form_fires():
+        _a, text = arm({})
+        progs = per_program(text)
+        bad = []
+        for prog, want in FIRING.items():
+            d = progs.get(prog)
+            if d is None:
+                bad.append(f"{prog}: no fused-tape line")
+                continue
+            if d["ragged"] != 3 or d["decode"] != want:
+                bad.append(f"{prog}: {d['ragged']} ragged, {d['decode']} decode (want 3/{want})")
+            matched = [ln for ln in d["lines"] if "matched a ragged dispatch" in ln]
+            x0 = [ln for ln in matched if " decode nopad" in ln]
+            rows = [ln for ln in matched if " decode-rows" in ln]
+            if prog == "jit_rgd_d5":
+                # The gate root has a second reader: decode WITHOUT nopad,
+                # and the narration names the reader that kept the pad.
+                kept = [ln for ln in matched if " decode," in ln]
+                if len(kept) != 1 or len(x0) != 1 or len(rows) != 1:
+                    bad.append(f"{prog}: expected one padded decode, one nopad, one rows; got {matched}")
+                # (One line: the up and down roots' readers are slices.)
+                pad = [ln for ln in d["lines"] if "pad kept (" in ln]
+                if pad != ["[metaljax-native] ragged: pad kept (stablehlo.convert reads the root)"]:
+                    bad.append(f"{prog}: expected one 'pad kept (stablehlo.convert reads the root)', got {pad}")
+            elif prog == "jit_rgd_d8":
+                # The [4, 48] reshape: the x0 substitution declines on the
+                # reshape width for the gate and up dots (the down dot's
+                # rows are the swiglu output, no gather at all) and every
+                # dot runs over the REAL rows.
+                why = sorted(ln.split("stay real (", 1)[1] for ln in d["lines"]
+                             if "decode rows stay real" in ln)
+                want = sorted(["rows are not one replicated activation (the reshape width))"] * 2
+                              + ["rows are not one replicated activation (no row gather))"])
+                if (len(rows) != 3 or x0 or why != want
+                        or not all(" nopad" in ln for ln in rows)):
+                    bad.append(f"{prog}: expected 3 decode-rows nopad, 2 on the reshape width + 1 no gather; got {matched} / {why}")
+            elif len(x0) != 2 or len(rows) != 1 or " nopad" not in rows[0]:
+                bad.append(f"{prog}: expected 2 x0-decode + 1 rows-decode, all nopad; got {matched}")
+        if bad:
+            return False, "; ".join(bad)[:600]
+        names = sorted({re.search(r"\((\S+ decode[^,]*)", ln).group(1)
+                        for p in FIRING for ln in progs[p]["lines"]
+                        if "matched a ragged dispatch" in ln and " decode" in ln})
+        return True, f"{len(FIRING)} programs, 3 decode dispatches each: {names}"
+
+    def the_declines():
+        _a, text = arm({})
+        progs = per_program(text)
+        bad = []
+        for prog, why in DECLINING.items():
+            d = progs.get(prog)
+            if d is None:
+                bad.append(f"{prog}: no fused-tape line")
+                continue
+            if d["ragged"] != 3 or d["decode"] != 0:
+                bad.append(f"{prog}: {d['ragged']} ragged, {d['decode']} decode (want 3/0)")
+            reasons = [ln for ln in d["lines"] if "decode form declined" in ln]
+            if not reasons or not all(why in ln for ln in reasons):
+                bad.append(f"{prog}: reasons {reasons[:3]} (want '{why}')")
+            if any(" decode" in ln for ln in d["lines"] if "matched" in ln):
+                bad.append(f"{prog}: a decode match narrated")
+        if bad:
+            return False, "; ".join(bad)[:600]
+        return True, "; ".join(f"{p[8:]}: {w}" for p, w in DECLINING.items())
+
+    def the_kill_switch():
+        _a, text = arm({"METALJAX_RAGGED_DECODE": "0"})
+        progs = per_program(text)
+        if any("decode form declined" in ln or (" decode" in ln and "matched" in ln)
+               for d in progs.values() for ln in d["lines"]):
+            return False, "RAGGED_DECODE=0 still narrates a decode form"
+        counts = {p: (d["ragged"], d["decode"]) for p, d in progs.items()}
+        want = {p: (3, 0) for p in counts if p != "jit_rgd_shared"}
+        want["jit_rgd_shared"] = (2, 0)
+        if counts != want or len(counts) != JAX_FORMS + 1:
+            return False, f"counts {counts} (want (3, 0) x{JAX_FORMS} + shared (2, 0))"
+        return True, (f"RAGGED_DECODE=0: {JAX_FORMS} programs, 3 base ragged "
+                      "dispatches each + the shared module's 2, 0 decode")
+
+    def fewer_dispatches():
+        _a, on = arm({})
+        _b, off = arm({"METALJAX_RAGGED_DECODE": "0"})
+        d_on, d_off = dispatches(on), dispatches(off)
+        progs = sorted(FIRING)
+        if any(p not in d_on or p not in d_off for p in progs):
+            return False, f"dispatch narration on={d_on} off={d_off}"
+        worse = [p for p in progs if d_on[p] >= d_off[p]]
+        if worse:
+            return False, f"no fewer dispatches on {worse}: on={d_on} off={d_off}"
+        return True, ", ".join(f"{p[8:]} {d_off[p]}->{d_on[p]}" for p in progs)
+
+    def bit_identical():
+        on, _t = arm({})
+        off, _u = arm({"METALJAX_RAGGED_DECODE": "0"})
+        if set(on) != set(off) or len(on) != JAX_FORMS + 1:
+            return False, f"labels differ: on={sorted(on)} off={sorted(off)}"
+        bad = [f"{k} differs by {worst(on[k], off[k]):.2e}" for k in sorted(on)
+               if not same(on[k], off[k])]
+        if bad:
+            return False, "; ".join(bad)
+        return True, (f"{JAX_FORMS} forms x 3 arrays + the shared module's 2 "
+                      "bit-identical (final, expert rows, shared)")
+
+    def consumers_unchanged():
+        on, _t = arm({})
+        off, _u = arm({"METALJAX_RAGGED_DECODE": "0"})
+        bad = [k for k in sorted(on) if k in off and k != "SHARED" and not (
+            np.array_equal(on[k][0], off[k][0]) and np.array_equal(on[k][2], off[k][2]))]
+        if bad:
+            return False, f"final/shared differ on {bad}"
+        return True, "final activation and shared-expert output identical across arms on every form"
+
+    def matches_cpu():
+        # The suite's own rule (`_compare`): |got - want| <= rtol |want| +
+        # atol, at BF16DOT for the bf16 forms and DOT for the f32 one --
+        # on the FIRST layer's expert rows and shared output, which both
+        # backends compute from identical inputs (the emit against the CPU
+        # dense chain), and on the whole 3-layer chain of the f32 form.
+        # The bf16 chain is NOT gated end to end: the residual stream
+        # amplifies the router's bf16 rounding differences layer by layer
+        # (D4, the BASE form with input ids, reaches 2.4x the tolerance at
+        # layer 3); the whole chain is pinned by `bit_identical` instead,
+        # and reported here.
+        on, _t = arm({})
+        cpu, _c = arm({}, platform="cpu")
+        if set(on) != set(cpu):
+            return False, f"labels differ: {sorted(set(on) ^ set(cpu))}"
+
+        def frac(a, c, rtol, atol):
+            return float(np.max(np.abs(a - c) / (rtol * np.abs(c) + atol)))
+
+        first, whole, bad = {}, {}, []
+        for k in sorted(on):
+            rtol, atol = (1e-5, 1e-5) if k == "D1F" else (2e-2, 2e-2)
+            if k == "SHARED":
+                # One layer, two dots straight off identical inputs: the
+                # whole answer is gated.
+                f = max(frac(a, c, rtol, atol) for a, c in zip(on[k], cpu[k]))
+                first[k] = whole[k] = f
+                if f > 1.0:
+                    bad.append(f"{k} at {f:.2f}x")
+                continue
+            layers = 1 if k == "D3" else 3
+            f = 0.0
+            for a, c in zip(on[k][1:], cpu[k][1:]):
+                per = a.size // layers
+                f = max(f, frac(a[:per], c[:per], rtol, atol))
+            first[k] = f
+            whole[k] = max(frac(a, c, rtol, atol) for a, c in zip(on[k], cpu[k]))
+            if f > 1.0 or (k == "D1F" and whole[k] > 1.0):
+                bad.append(f"{k} at {f:.2f}x (first layer) / {whole[k]:.2f}x (chain)")
+        if bad:
+            return False, "; ".join(bad)
+        return True, ("tolerance used vs CPU, first layer: "
+                      + ", ".join(f"{k} {e:.2f}" for k, e in first.items())
+                      + "; whole bf16 chain (reported): "
+                      + ", ".join(f"{k} {e:.2f}" for k, e in whole.items()))
+
+    def shared_ends():
+        # Two roots over ONE `ends`, one of them base: the decode root's
+        # absorption must not take the cumsum the base root's emit reads.
+        # Before the fix the executable narrated `no fused tape (a value
+        # defined outside the entry block)` and lost every fusion.
+        on, text = arm({})
+        d = per_program(text).get("jit_rgd_shared")
+        if d is None:
+            return False, "no fused-tape line for jit_rgd_shared"
+        if (d["ragged"], d["decode"]) != (2, 1):
+            return False, f"{d['ragged']} ragged, {d['decode']} decode (want 2/1)"
+        if "jit_rgd_shared: no fused tape" in text:
+            return False, "the executable fell back to the plain tape"
+        why = [ln for ln in d["lines"] if "decode form declined" in ln]
+        if len(why) != 1 or "does not count every row once" not in why[0]:
+            return False, f"decline narration {why}"
+        if "SHARED" not in on or len(on["SHARED"]) != 2:
+            return False, "no SHARED answer"
+        return True, ("one ends, 2 ragged dispatches (1 decode), fused tape kept; "
+                      "the base root declined on its row count")
+
+    return [("ragged decode fires", the_form_fires),
+            ("ragged decode declines", the_declines),
+            ("ragged decode kill switch", the_kill_switch),
+            ("ragged decode removes dispatches", fewer_dispatches),
+            ("ragged decode bit-identical", bit_identical),
+            ("ragged decode consumers unchanged", consumers_unchanged),
+            ("ragged decode vs CPU", matches_cpu),
+            ("ragged decode shared ends", shared_ends)]
+
+
 def _p36_tape_gate(subprocess, tempfile, pathlib, re):
     """The trace budget is asked of the post-pass TAPE, not only the MLIR.
 
@@ -11409,6 +11909,27 @@ def main():
             print(f"MLK {label}\t"
                   f"{_json.dumps(out.astype(np.float64).ravel().tolist())}")
         return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--ragged-decode":
+        # Row 10 rewrite 1: the ragged decode forms, through jax on the
+        # plugin -- or on the CPU when the caller says so.  Answers to
+        # stdout, the recognizer's and the executable's narration to stderr.
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        import json as _json
+        import jax
+        for label, fn, args in _ragged_decode_forms():
+            out = jax.jit(fn)(*args)
+            outs = [out[0], out[1][0], out[1][1]]
+            print(f"RGD {label}\t"
+                  f"{_json.dumps([np.asarray(o).astype(np.float64).ravel().tolist() for o in outs])}",
+                  flush=True)
+        text, args = _ragged_shared_ends_module()
+        outs = _run_module(text, args)
+        print(f"RGS SHARED\t"
+              f"{_json.dumps([np.asarray(o).astype(np.float64).ravel().tolist() for o in outs])}",
+              flush=True)
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--proj-pack":
         # B6: the projection-pack forms, through jax on the plugin -- or on
         # the CPU when the caller says so.  Answers to stdout (one line per
@@ -11647,6 +12168,8 @@ def main():
                                           __import__("re"))
                          + _p43_proj_pack(subprocess, pathlib,
                                           __import__("re"))
+                         + _p44_ragged_decode(subprocess, pathlib,
+                                              __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,

@@ -331,6 +331,27 @@ struct RaggedMatch {
   // (the slice would then run anyway, and the fused op must read its
   // result rather than gather a second copy of the same weights).
   mlir::Operation* helper_call = nullptr;
+  // The DECODE form (row 10 rewrite 1): the dispatch is proven to be ONE
+  // token's, the rows' expert ids are proven in range, and the group index
+  // per sorted row is then `take(ids, perm)` -- the ascending argsort of the
+  // ids the graph already computes for the row permutation -- instead of
+  // the `#(ends <= i)` prefix recomputed per dot (arange, compare, sum,
+  // minimum, where, and a pad to the tiling that its readers slice
+  // straight back).  `decode` 1: the rows are ONE replicated activation
+  // (`x0`; jax's `repeat` + gather-by-perm at T = 1), and the gather chain
+  // is absorbed -- the emit reads row 0 of `x0` for every dispatched row.
+  // `decode` 2: real rows (the down projection reads the swiglu output).
+  // `nopad`: every reader of the root is a `slice[0:m, 0:n]`, absorbed
+  // (`row_slices`, aliased to the [m, n] output) -- the pad is never made.
+  // Bit-identical to the base form by construction: the same gather_mm
+  // kernel over the same rows against the same matrices in the same order
+  // (see metal_ragged.cc, "the decode form").
+  int decode = 0;
+  mlir::Value x0;
+  mlir::Value ids;    // [m] int: the expert id per (unsorted) routed row
+  mlir::Value perm;   // [m] int: the stable ascending argsort of `ids`
+  bool nopad = false;
+  std::vector<mlir::Operation*> row_slices;
   std::vector<mlir::Operation*> ops;  // the ops this match absorbs
   std::string name;
 };

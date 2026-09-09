@@ -128,6 +128,10 @@ enum Op : int {
   // by the cumsum(group_sizes) intervals, contract over (group, k) — becomes
   // one `gather_mm` over the rows' own groups.
   kRaggedDot,
+  // Its decode form's shared index vector (metal_ragged.cc, "the decode
+  // form"): `take(ids, perm) * L + layer` as uint32 -- the matrix index per
+  // sorted row, computed once per layer and read by every ragged dot of it.
+  kRaggedIdx,
   // The stacked-weight dot (metal_stacked.cc): a dot whose weight is
   // `dynamic_index_in_dim(stack, layer)` over a loop-invariant layer stack —
   // jax's scanned-layer form — becomes one `gather_mm` reading matrix

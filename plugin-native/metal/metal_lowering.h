@@ -113,6 +113,7 @@ struct LoweredProgram {
   int64_t num_moe = 0;
   int64_t num_sdpa = 0;
   int64_t num_ragged = 0;
+  int64_t num_ragged_decode = 0;
   int64_t num_stacked = 0;
   int64_t num_gdn = 0;
   int64_t num_rope = 0;

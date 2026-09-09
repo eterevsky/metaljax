@@ -156,6 +156,7 @@ const NamedOp kOpNames[] = {
     {"metaljax.moe.dot", kMoeDot},
     {"metaljax.moe.tail", kMoeTail},
     {"metaljax.ragged_dot", kRaggedDot},
+    {"metaljax.ragged_idx", kRaggedIdx},
     {"metaljax.stacked_dot", kStackedDot},
     {"metaljax.mla_sdpa", kMlaSdpa},
     {"metaljax.rms_norm", kRmsNorm},

@@ -31,6 +31,9 @@ Licensed under the Apache License, Version 2.0.
 #include "host_lapack.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
+#include <map>
+#include <tuple>
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
@@ -931,6 +934,7 @@ bool FoldableOp(int op) {
     case kMoeDot:
     case kMoeTail:
     case kRaggedDot:
+    case kRaggedIdx:
     case kStackedDot:
     // The gated delta step holds recurrent state and launches a generated
     // kernel: never evaluated at lower time.
@@ -3335,6 +3339,11 @@ class Lowering {
   // The rope-view rewrite's [-1, +1] sign constant, one slot per (dtype,
   // rank) per frame: 56 applies share one payload instead of carrying 56.
   absl::flat_hash_map<std::string, int> rope_sgn_slots_;
+  // The decode ragged form's index vector (kRaggedIdx), one per
+  // (ids, perm, layer) in this frame: the three expert dots of a layer
+  // share it.  Keyed by the input SLOTS, not the mlir::Values: `Inline`
+  // rebinds a callee's values at every splice, and a slot names one array.
+  std::map<std::tuple<int, int, int, int64_t, int64_t>, int> ragged_idx_slots_;
   // The payload behind every constant slot of this frame (refcounted views,
   // not copies), for the splat-broadcast fold to build its view from.
   absl::flat_hash_map<int, mx::array> const_payloads_;
@@ -8482,25 +8491,66 @@ absl::Status Lowering::LowerSdpa(mlir::Operation* op, const SdpaMatch& m) {
 
 // metal_ragged.cc's emit: the whole masked-broadcast chain and the dense
 // [g, M, k] x [g, k, n] contraction become one gather_mm over the real rows
-// (runtime/emits.cc kRaggedDot).  ins [x, w, ends]; attrs
-// [g, m, M, k, n, out dtype].
+// (runtime/emits.cc kRaggedDot).  ins [x, w, ends, (layer)]; attrs
+// [g, m, M, k, n, out dtype, stacked, L] -- and, in the decode form,
+// ins [x0 | x, w, rhs_idx] with attrs + [form, nopad].
 absl::Status Lowering::LowerRagged(mlir::Operation* op, const RaggedMatch& m) {
   const mlir::Value wv = m.stacked ? m.w_stack : m.w;
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.ragged_dot"));
+  std::vector<int64_t> attrs{m.g,     m.m, m.M, m.k, m.n,
+                             static_cast<int64_t>(out_code),
+                             m.stacked ? 1 : 0, m.L};
+  int layer = -1;
+  if (m.stacked) {
+    RETURN_IF_ERROR(CheckValue(m.layer));
+    ASSIGN_OR_RETURN(layer, Slot(m.layer));
+  }
+  if (m.decode != 0) {
+    // The decode form (metal_ragged.cc): ins [x0 | x, w, rhs_idx]; attrs
+    // gain [form, nopad].  The index vector -- `take(ids, perm) * L +
+    // layer` -- is ONE kRaggedIdx per (ids, perm, layer) in this frame,
+    // shared by every dot of the layer.
+    const mlir::Value rows = m.decode == 1 ? m.x0 : m.x;
+    for (mlir::Value v : {rows, wv, m.ids, m.perm})
+      RETURN_IF_ERROR(CheckValue(v));
+    ASSIGN_OR_RETURN(int x, Slot(rows));
+    ASSIGN_OR_RETURN(int w, Slot(wv));
+    ASSIGN_OR_RETURN(int ids, Slot(m.ids));
+    ASSIGN_OR_RETURN(int perm, Slot(m.perm));
+    // L and m are part of the key: the vector is `sorted * L + layer`, so
+    // two roots over stacks of different depth (or different row counts)
+    // must not share one.
+    const auto key = std::make_tuple(ids, perm, m.stacked ? layer : -1, m.L,
+                                     m.m);
+    int idx;
+    auto it = ragged_idx_slots_.find(key);
+    if (it != ragged_idx_slots_.end()) {
+      idx = it->second;
+    } else {
+      ASSIGN_OR_RETURN(int idx_op, Opcode("metaljax.ragged_idx"));
+      std::vector<int> idx_ins{ids, perm};
+      if (m.stacked) idx_ins.push_back(layer);
+      idx = nslots_++;
+      Emit(idx_op, std::move(idx_ins), {idx},
+           {m.m, m.L, m.stacked ? 1 : 0}, std::nullopt, m.m * 4);
+      ragged_idx_slots_[key] = idx;
+    }
+    attrs.push_back(m.decode);
+    attrs.push_back(m.nopad ? 1 : 0);
+    const int out = Bind(op->getResult(0));
+    Emit(opcode, {x, w, idx}, {out}, std::move(attrs), std::nullopt,
+         ResultBytes(op));
+    // The absorbed `slice[0:m, 0:n]` readers ARE the un-padded output.
+    for (mlir::Operation* sl : m.row_slices) Alias(sl->getResult(0), out);
+    return absl::OkStatus();
+  }
   for (mlir::Value v : {m.x, wv, m.ends}) RETURN_IF_ERROR(CheckValue(v));
   ASSIGN_OR_RETURN(int x, Slot(m.x));
   ASSIGN_OR_RETURN(int w, Slot(wv));
   ASSIGN_OR_RETURN(int ends, Slot(m.ends));
-  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
-  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.ragged_dot"));
   std::vector<int> ins{x, w, ends};
-  std::vector<int64_t> attrs{m.g,     m.m, m.M, m.k, m.n,
-                             static_cast<int64_t>(out_code),
-                             m.stacked ? 1 : 0, m.L};
-  if (m.stacked) {
-    RETURN_IF_ERROR(CheckValue(m.layer));
-    ASSIGN_OR_RETURN(int layer, Slot(m.layer));
-    ins.push_back(layer);
-  }
+  if (m.stacked) ins.push_back(layer);
   Emit(opcode, std::move(ins), {Bind(op->getResult(0))}, std::move(attrs),
        std::nullopt, ResultBytes(op));
   return absl::OkStatus();
@@ -10034,6 +10084,8 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
   lowered->num_moe = static_cast<int64_t>(plan.moe.size());
   lowered->num_sdpa = static_cast<int64_t>(plan.sdpa.size());
   lowered->num_ragged = static_cast<int64_t>(plan.ragged.size());
+  for (const auto& m : plan.ragged)
+    if (m->decode != 0) lowered->num_ragged_decode++;
   lowered->num_stacked = static_cast<int64_t>(plan.stacked.size());
   lowered->num_gdn = static_cast<int64_t>(plan.gdn.size());
   lowered->num_rope = static_cast<int64_t>(plan.rope.size());
