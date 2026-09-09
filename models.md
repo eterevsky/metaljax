@@ -15,27 +15,27 @@ optimization.*
 
 | # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 | 0.11.6 | 0.11.7 | HEAD | goal |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | **126.1** | 123.9 ʰ | 111.2 ˡ |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | **57.3** | 56.4 ʰ | 44.2 ˡ |
-| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | **33.4** | 28.5 ʰ | 16.9 ˡ |
+| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | **126.1** | 125.5 ʰ | 111.2 ˡ |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | **57.3** | 56.9 ʰ | 44.2 ˡ |
+| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | **33.4** | 28.9 ʰ | 16.9 ˡ |
 | 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | **24.0** | 17.0 ʰ | 10.5 ˣ |
-| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | 40.8 ʰ | 29.6 ˡ |
-| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | **42.2** | | 29.2 ˡ |
+| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | **42.0** | 40.3 ʰ | 29.6 ˡ |
+| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | **42.2** | 37.6 ʰ | 29.2 ˡ |
 | 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 13.2 ʰ | 8.8 ˣ |
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 21.3 ʰ | 13.7 ˣ |
-| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | | 114.9 ˡ |
-| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **25.9** ᵖ | 23.7 ʰ | 10.5 ˣ |
+| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | 188.0 ʰ | 114.9 ˡ |
+| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **25.9** ᵖ | 23.9 ʰ | 10.5 ˣ |
 | 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 5.2 ʰ | 3.2 ˣ |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | | |
 | 13 | gemma4-E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | | |
-| 14 | Qwen3-0.6B qwix-int8 | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | 26.9 ʰ | |
+| 14 | Qwen3-0.6B qwix-int8 | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | 26.7 ʰ | |
 | 15 | Qwen3-8B qwix-int8 | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | **388.4** ᵛ | | |
 | 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | **86.68** | | 29.8 ᵗ |
 | 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | **1249.3 / 4961.6** | | 553 / 3078 ᵗ |
-| 18 | LoRA gemma4-E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | 258.8 ʰ | 135.6 ᵗ |
-| 19 | Qwen3-0.6B maxtext train (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | | |
+| 18 | LoRA gemma4-E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | 259.7 ʰ | 135.6 ᵗ |
+| 19 | Qwen3-0.6B maxtext train (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | 452.3 ʰ | |
 | 20 | Qwen3-235B-A22B 3-bit (mlx quant) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | **56.2** ᴳ | | 28.0 ˣ |
-| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | **154.9** | 148.4 ʰ | 98.2 ˡ |
+| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | **154.9** | 145.5 ʰ | 98.2 ˡ |
 
 Notes:
 
@@ -53,11 +53,15 @@ Notes:
   lead over mlx-lm on rows 3 and 6.
 - ʰ = HEAD-column cells: rerun-first medians of ≥ 2 runs on a frozen build
   of main, token streams identical to the row's release record unless
-  stated. As of 2026-09-08: rows 4/7/8/11 are on the projection-pack build
-  (commit ad9507e, the K/V and Q+K+V projections as one dot; row 7 is
-  back below its pre-rope-view cell); row 3 on the submit-ahead build
-  (fcb57a7); rows 10/14/18 on the 2026-09-06 build (f960503); rows 1/2/5
-  on the 2026-09-03 build (235a14a) and re-read flat since.
+  stated. As of 2026-09-09: every HEAD cell is on the projection-pack build
+  (commit ad9507e; rows 1/2/3/5/6/9/10/14/18/19/21 re-measured that evening,
+  rows 4/7/8/11 the day before), with a 60 s cool-down before each row.
+  Rows 1/2/3/19 read 0.5-1.7 % above their previous cells (which predate
+  B1-B6); an attribution pass with the rope-view, submit-ahead and
+  projection-pack knobs off is running. Row 12 has no cell: the governor
+  refused cleanly at 106.4 GB of claimed memory against its 105 GB ceiling
+  (the desktop held 18 GB); it needs a lighter machine or a raised
+  ceiling with a matching guard.
 - ᵐ **Row 11 changed benchmark implementation after 0.11.7** (the
   best-available-implementation rule): every cell through the 0.11.7 column
   is the maxtext decode harness and is NOT comparable to the keras-hub cells
