@@ -22,14 +22,14 @@ parentheses is peak footprint where measured.
 | 9 | R1-Distill-32B | ✗ 131 GB | **190.8** (67 GB) | 131.8 | — | 114.9 ¹⁰ |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ² | **25.9** ¹¹ (86 GB) | 10.5 | — | 10.7 ¹⁰ |
 | 11 | Qwen3-0.6B (keras-hub decode) | 29.4 | **9.0** ¹³ | 3.2 ¹³ | — | 3.4 ¹⁰ |
-| 12 | Mixtral 8×7B bf16 | ✗ | **85.6** (90 GB) | 52.8 ¹⁷ (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ⁸ | **77.0** | — | — | — |
+| 12 | Mixtral 8×7B bf16 | ✗ | **85.6** (90 GB) | 53.5 ¹⁷ (93.4 GB) | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ⁸ | **77.0** | 4.5 ¹⁹ | — | — |
 | 14 | Qwen3-0.6B maxtext qwix-int8 | 143.4 | **29.88** | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | **388.4** (73 GB) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **86.68** | — | 29.8 (b32: 591) | — |
 | 17 | SD 3.5 Large (ms/diff-step) | ✗ ⁴ | **1249.3** @512², **4961.6** @1024² | ✗ ⁹ | 553 @512², 3078 @1024² ⁹ ¹⁸ | — |
 | 18 | LoRA gemma4-E2B train (ms/step) | 2048 | **362.1** | — | 135.6 ³ | — |
-| 19 | Qwen3-0.6B maxtext train (ms/step) | 1402 | **444.6** | — | — | — |
+| 19 | Qwen3-0.6B maxtext train (ms/step) | 1402 | **444.6** | — | 818 ²⁰ | — |
 | 20 | *aspirational* Qwen3-235B-A22B 3-bit (mlx quant) | ✗ | **56.2** (101 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
 | 21 | Qwen3.8-27B bf16 (dense hybrid) | ✗ ¹⁴ | **154.9** (56 GB) | **106.4** ¹⁵ | — | 98.2 ¹⁰ |
 
@@ -134,10 +134,11 @@ load ~20–30×.
     3.70 GB/token of the bf16 attention/head metaljax and mlx-lm run):
     not like-for-like under fn 10, kept for reference only; the row's
     goal is mlx-lm.
-17. Row 12 mlx-lm: the mlx-community mirror stores float16 tensors
-    (its config says bf16); the metaljax cell is bf16. Same byte width
-    and kernel path, different 16-bit format: provisional until
-    re-measured on the upstream bf16 checkpoint.
+17. Row 12 mlx-lm: on a local bf16 conversion of the mlx-community
+    mirror (its tensors are float16 though its config says bf16; f16
+    holds every bf16 value exactly, and all 323 converted tensors read
+    BF16), so the same bf16 computation as the metaljax cell: 53.4 /
+    53.6, 2026-09-10 (the f16 mirror itself read 52.8).
 18. Row 17 torch: diffusers run with the T5-XXL encoder OFF
     (text_encoder_3=None, max_sequence_length 77 → the same 154-token
     MMDiT context as the keras preset's t5=None), 2026-09-06; both sides
@@ -145,3 +146,15 @@ load ~20–30×.
     Same-session T5-on controls reproduced the previous cells (648.8 /
     3155.3 vs 654 / 2998; the 1024² session ran ~5 % slower than the
     2026-08-03 one, so the 3078 carries that offset).
+19. Row 13 mlx-lm: mlx-lm's own affine 4-bit, group-64 quantization
+    (`mlx_lm convert -q --q-bits 4 --q-group-size 64`, 4.5 bits/weight,
+    2.6 GB; mlx-lm git main 0.32 -- 0.31.3 rejects the checkpoint) of the
+    same bf16 google/gemma-4-E2B-it that keras quantizes to int4 (group
+    64 on q, 128 on k/v): median of 4 cells 4.9 / 4.5 / 4.0 / 4.5 on a
+    31-token generation, 2026-09-10.
+20. Row 19 torch-MPS: a full-parameter AdamW step at MaxText's defaults
+    (f32 master weights under bf16 autocast, lr 3e-5, betas 0.9/0.95,
+    eps 1e-8, weight decay 0.1, clip 1.0, batch 1, seq 256, synthetic
+    tokens, loss over the whole window; mean of 4 warm steps as the
+    MaxText adapter reports it): 817.9 / 817.7, 2026-09-10.  The
+    backward runs MPS's math SDPA decomposition (fn 3).

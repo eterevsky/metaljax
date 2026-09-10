@@ -26,14 +26,14 @@ optimization.*
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | 188.0 ʰ | 114.9 ˡ |
 | 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **25.9** ᵖ | 22.8 ʰ | 10.5 ˣ |
 | 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 5.2 ʰ | 3.2 ˣ |
-| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | | |
-| 13 | gemma4-E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | | |
+| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | | 53.5 ˣ |
+| 13 | gemma4-E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | 69.4 ʰ | 4.5 ˣ |
 | 14 | Qwen3-0.6B qwix-int8 | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | 26.7 ʰ | |
 | 15 | Qwen3-8B qwix-int8 | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | **388.4** ᵛ | | |
 | 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | **86.68** | 42.0 ʰ | 29.8 ᵗ |
-| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | **1249.3 / 4961.6** | | 553 / 3078 ᵗ |
+| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | **1249.3 / 4961.6** | 460 / 2056 ʰ | 553 / 3078 ᵗ |
 | 18 | LoRA gemma4-E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | **362.1** | 113.2 ʰ | 135.6 ᵗ |
-| 19 | Qwen3-0.6B maxtext train (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | 376.1 ʰ | |
+| 19 | Qwen3-0.6B maxtext train (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | **444.6** | 376.1 ʰ | 818 ᵗ |
 | 20 | Qwen3-235B-A22B 3-bit (mlx quant) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | **56.2** ᴳ | | 28.0 ˣ |
 | 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | **154.9** | 145.5 ʰ | 98.2 ˡ |
 
@@ -45,20 +45,24 @@ Notes:
   no other framework stay empty. It sits last, beside HEAD, so a row's
   current status is its last two cells. Standing caveats (STATUS.md has the
   detail): row 4's goal is a dated mlx-lm cell whose run record is lost
-  (fn 7); row 12's goal is empty until mlx-lm is measured on a bf16
-  checkpoint (the mirror is float16, fn 17); row 7's goal is mlx-lm because
+  (fn 7); row 12's goal is mlx-lm on a local bf16 conversion of the
+  float16 mirror (fn 17); row 13's goal is mlx-lm's own 4-bit quantization
+  of the same checkpoint (fn 19); row 19's goal is a torch-MPS full train
+  step at MaxText's defaults (fn 20); row 7's goal is mlx-lm because
   the llama.cpp GGUF quantizes attention/embeddings/head to Q8_0 (fn 16);
   row 17's torch goal runs with the T5 encoder off, matching our context
   (fn 18); the llama.cpp cells carry a 4 % two-pass band, wider than their
   lead over mlx-lm on rows 3 and 6.
 - ʰ = HEAD-column cells: rerun-first medians of ≥ 2 runs on a frozen build
   of main, token streams identical to the row's release record unless
-  stated. As of 2026-09-09 (late): rows 16/18/19 and the sentinels 4/7/11 are on
-  the precision-default build (METALJAX_MATMUL_PRECISION=high: f32 stays
-  exact, bf16/f16 and quantized matmuls use the M5 accelerators, as mlx-lm
-  and torch-MPS do); row 10 on the ragged-decode build; every other row on
-  the projection-pack build ad9507e, all with a 60 s cool-down before each
-  row.  Decode sentinels on the precision build read in band (row 11 5.1,
+  stated. As of 2026-09-10: rows 13/16/17/18/19 and the sentinels 4/7/11
+  are on the precision-default build 44fa042 (METALJAX_MATMUL_PRECISION=high:
+  f32 stays exact, bf16/f16 and quantized matmuls use the M5 accelerators,
+  as mlx-lm and torch-MPS do); row 10 on the ragged-decode build; every
+  other row on the projection-pack build ad9507e, all with a 60 s cool-down
+  before each row.  Row 17 has no token stream and its image statistics
+  vary run to run on every binary, so no identity is claimed there; each of
+  its resolutions is a median of 2.  Decode sentinels on the precision build read in band (row 11 5.1,
   row 4 16.7, row 7 13.2) with the first 64 token ids identical; rows 4 and
   7 end generation a few tokens earlier past that window (a bf16
   accumulation-order tie).  Rows 1/2/3 read within run spread of their
