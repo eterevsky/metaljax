@@ -1,0 +1,157 @@
+From 03309193c70ebf57cd5e15ca3069a02817629b74 Mon Sep 17 00:00:00 2001
+From: Oleg Eterevsky <oleg@eterevsky.com>
+Date: Wed, 9 Sep 2026 23:57:49 +0200
+Subject: [PATCH] Charge the command-buffer size budget for what a buffer
+ allocates, not what it reads
+
+`CommandEncoder::set_input_array` adds each distinct input's whole
+`data_size()` to `buffer_sizes_`, and `needs_commit()` ends the command
+buffer when that crosses `MLX_MAX_MB_PER_BUFFER`.  So the budget is charged
+for READING a buffer, not for holding one.
+
+On a program whose weights are resident and large this splits command
+buffers at every weight read.  Measured on a DeepSeek-V2-Lite decode step
+(bf16, one token, 26 MoE layers): the routed-expert slab is
+[26, 64, 2048, 1408] bf16, and every routed `gather_mm` that touches it
+trips the budget on its own.  52 of the 149 command buffers per token are
+these splits -- two of them per layer holding a single dot and nothing
+else -- costing ~0.59 ms/token of device idle plus per-buffer overhead, for
+a slab that was resident before the buffer opened and is still resident
+after it completes.  Nothing about reading it is transient.
+
+What the budget is for is the other quantity: how much unpageable memory
+one in-flight command buffer is responsible for -- the intermediates it
+ALLOCATES and holds until it completes.  This adds that accounting.
+`buffer_out_sizes_` sums the `data_size()` of the distinct buffers the
+command buffer WRITES (`register_output_array`, so outputs and written
+temporaries), deduplicated per command buffer rather than per encoder, and
+`MLX_MAX_MB_TRANSIENT_ONLY=1` applies the same numeric budget to it.
+
+The bound on transients is unchanged: a command buffer still commits after
+`max_mb` of intermediates.  What goes away is the splitting on inputs that
+the buffer did not allocate and cannot free.
+
+Off by default -- a caller who sized `MLX_MAX_MB_PER_BUFFER` against the
+old meaning should opt in rather than have the bound they chose loosened
+underneath them.
+
+Not changed here, but worth knowing before tuning either mode:
+`data_size()` is in ELEMENTS, so `(buffer_sizes_ >> 20) > max_mb` compares
+mega-ELEMENTS against a number named MB.  The effective byte budget is
+`max_mb` times the itemsize.
+---
+ mlx/backend/metal/device.cpp | 44 +++++++++++++++++++++++++++++++++++-
+ mlx/backend/metal/device.h   |  6 +++++
+ mlx/utils.h                  | 10 ++++++++
+ 3 files changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index f4f716de..05697265 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -477,6 +477,16 @@ void CommandEncoder::set_output_array(
+ 
+ void CommandEncoder::register_output_array(const array& a) {
+   all_outputs_.insert(a.buffer().ptr());
++  // The transient side of the size budget: this buffer WRITES `a`, so `a`'s
++  // storage is memory this command buffer is responsible for while it is in
++  // flight.  Deduplicated per COMMAND BUFFER (`buffer_out_bufs_` is reset in
++  // commit(), not in end_encoding()), so a buffer written by two encoders of
++  // the same command buffer is charged once.  An output that donated its
++  // operand's storage is charged even though nothing new was allocated --
++  // over-counting is the safe direction for a budget.
++  if (buffer_out_bufs_.insert(a.buffer().ptr()).second) {
++    buffer_out_sizes_ += a.data_size();
++  }
+ 
+   auto buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
+   if (concurrent_) {
+@@ -666,7 +676,37 @@ void CommandEncoder::wait_event(
+ 
+ bool CommandEncoder::needs_commit() const {
+   auto [max_ops, max_mb] = device_.get_max_ops_mb_per_buffer();
+-  return (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb);
++  // WHICH BYTES THE SIZE BUDGET COUNTS.
++  //
++  // `buffer_sizes_` is every DISTINCT INPUT's whole `data_size()`
++  // (`set_input_array`), so the budget is charged for reading a buffer, not
++  // for holding one.  On a program whose weights are resident and large --
++  // a mixture-of-experts decode step, where one routed `gather_mm` reads a
++  // 9.6 GB expert slab -- that ends a command buffer at EVERY such read: 52
++  // of 149 command buffers per token on the row that motivated this, each
++  // boundary costing device idle and per-buffer overhead, for a slab that
++  // was resident before the buffer opened and stays resident after it
++  // completes.  Nothing about reading it is transient.
++  //
++  // What the budget exists to bound is the other quantity: how much
++  // UNPAGEABLE memory one in-flight command buffer is responsible for --
++  // the intermediates it allocates and holds until it completes.  That is
++  // `buffer_out_sizes_`, the arrays it WRITES.  Under
++  // MLX_MAX_MB_TRANSIENT_ONLY the same numeric budget is applied to that
++  // quantity instead, which leaves the bound on transients exactly where it
++  // was (a buffer still commits after `max_mb` of them) and stops resident
++  // inputs from splitting command buffers they do not grow.
++  //
++  // Default off: for a caller who sized `MLX_MAX_MB_PER_BUFFER` against the
++  // old meaning, flipping it silently would loosen a bound they chose.
++  //
++  // NOTE (unchanged by this patch, and worth knowing before tuning either
++  // mode): `data_size()` is in ELEMENTS, not bytes, so `>> 20` compares
++  // mega-ELEMENTS against a number named MB.  The effective byte budget is
++  // therefore `max_mb` * itemsize -- 1 GB at 512 for bf16, 2 GB for f32.
++  const size_t sizes =
++      env::max_mb_transient_only() ? buffer_out_sizes_ : buffer_sizes_;
++  return (buffer_ops_ > max_ops) || ((sizes >> 20) > max_mb);
+ }
+ 
+ void CommandEncoder::commit(std::function<void()> completion) {
+@@ -762,6 +802,8 @@ void CommandEncoder::commit(std::function<void()> completion) {
+   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
+   buffer_ops_ = 0;
+   buffer_sizes_ = 0;
++  buffer_out_sizes_ = 0;
++  buffer_out_bufs_.clear();
+ }
+ 
+ void CommandEncoder::synchronize() {
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index 8c73b2b5..698cd2f4 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -132,6 +132,12 @@ class MLX_API CommandEncoder {
+   NS::SharedPtr<MTL::CommandBuffer> buffer_;
+   int buffer_ops_{0};
+   size_t buffer_sizes_{0};
++  // What this command buffer ALLOCATES: the summed `data_size()` of the
++  // distinct buffers it writes (outputs and temporaries), deduplicated over
++  // the whole command buffer rather than per encoder.  `needs_commit` uses
++  // it instead of `buffer_sizes_` under MLX_MAX_MB_TRANSIENT_ONLY.
++  size_t buffer_out_sizes_{0};
++  std::unordered_set<const void*> buffer_out_bufs_;
+ 
+   // The events hooked to current command buffer.
+   std::vector<std::shared_ptr<EventImpl>> wait_events_;
+diff --git a/mlx/utils.h b/mlx/utils.h
+index 9fa332fd..4e53aace 100644
+--- a/mlx/utils.h
++++ b/mlx/utils.h
+@@ -187,6 +187,16 @@ inline int max_mb_per_buffer(int default_value) {
+   return max_mb_per_buffer_;
+ }
+ 
++// MLX_MAX_MB_TRANSIENT_ONLY: charge the per-command-buffer size budget for
++// what the buffer ALLOCATES (the arrays it writes) instead of everything it
++// reads.  See `CommandEncoder::needs_commit`.  Off by default: the budget
++// keeps its historical meaning until a user opts in.
++inline bool max_mb_transient_only() {
++  static bool max_mb_transient_only_ =
++      get_var("MLX_MAX_MB_TRANSIENT_ONLY", 0) != 0;
++  return max_mb_transient_only_;
++}
++
+ inline bool metal_fast_synch() {
+   static bool metal_fast_synch = get_var("MLX_METAL_FAST_SYNCH", 0);
+   return metal_fast_synch;
+-- 
+2.50.1 (Apple Git-155)
+

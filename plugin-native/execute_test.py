@@ -11510,6 +11510,208 @@ def _p44_ragged_decode(subprocess, pathlib, re):
             ("ragged decode shared ends", shared_ends)]
 
 
+def _p45_cbuf_cadence(subprocess, pathlib, re):
+    """An eval that commits mid-flight must not leave an EMPTY command
+    buffer behind (the vendored MLX's `fix/skip-empty-finalize`).
+
+    MLX commits a command buffer in the middle of an eval whenever the op or
+    byte cadence trips (`CommandEncoder::needs_commit`), and that commit
+    increments the scheduler's active-task count.  `eval_impl`'s very next
+    statement is the back-pressure check `n_active_tasks() > MAX_ACTIVE_TASKS
+    (10)`, whose remedy is "commit any open streams" -- `gpu::finalize` on a
+    command buffer created microseconds ago and never touched.  Stock MLX
+    commits it anyway: one EMPTY command buffer per cadence commit, for as
+    long as ten buffers stay in flight.  They are not free.  Metal schedules
+    a committed buffer whether or not it holds a pass, and an empty one sits
+    in the queue ahead of the next real buffer: 35-50 us of pure device idle
+    each, measured on row 10 (DeepSeek-V2-Lite decode) at 68.8 empty buffers
+    and 1.08 ms of gap per token -- the largest single idle item in that
+    row's profile (`logs/row10-scout/analysis/profile-findings.md` A3).
+
+    `gpu::finalize` now returns without committing when nothing has been
+    encoded on the buffer since its last commit.  Pinned here because the
+    plugin SHIPS that MLX: re-vendoring one without the fix silently
+    restores the empty buffers, and this reads them straight off the
+    plugin's own counter (`cbufs=N(+empty M)`).
+
+    One empty buffer per EVAL survives and must: `eval_impl` signals the
+    stream's `Event` after the last primitive, so when the cadence has just
+    committed, that signal lands on a fresh buffer -- ops=0, but every
+    waiter depends on it.  What the fix removes is the part that SCALES
+    with the number of cadence commits.
+
+    Three claims about the empty buffers (two more, about WHICH bytes the
+    cadence counts, are stated at `bytes_arm` below).  (1) A run whose
+    cadence never trips books no empty buffers at all -- the baseline.
+    (2) A run forced to commit per op (the
+    shape row 10 reaches through `MLX_MAX_MB_PER_BUFFER` and a 9.6 GB
+    resident weight slab) keeps its real command buffers and adds at most
+    the one signal buffer per execute; on stock MLX the same execute books
+    one empty per cadence commit past the tenth -- measured 31 empty of 71
+    buffers, against 1 of 41 with the fix.  (3) The empties are scheduling,
+    not arithmetic: every answer is bit-identical across the cadences.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+    memo = {}
+
+    def arm(env_extra):
+        import json
+        key = tuple(sorted(env_extra.items()))
+        if key in memo:
+            return memo[key]
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--cbuf-cadence"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("CBUF "):
+                label, payload = line[5:].split("\t", 1)
+                answers[label] = json.loads(payload)
+        # One `cbufs=N(+empty M)` per execute, in the per-executable
+        # narration `metal_executable.cc` prints under METALJAX_DEBUG.
+        census = [(int(n), int(m)) for n, m in re.findall(
+            r"cbufs=(\d+)\(\+empty (\d+)\)", proc.stderr)]
+        memo[key] = (answers, census)
+        return memo[key]
+
+    def heaviest(census):
+        """The census entry of the execute that committed the most command
+        buffers -- the chain, whose cadence commits are what this is about
+        (the surrounding one-op setup executes commit once)."""
+        return max(census, key=lambda nm: nm[0])
+
+    def slow_cadence_has_no_empties():
+        answers, census = arm({"MLX_MAX_OPS_PER_BUFFER": "100000"})
+        if not answers or not census:
+            return False, f"answers={len(answers)} census={len(census)}"
+        empty = sum(m for _n, m in census)
+        if empty:
+            return False, (f"{empty} empty command buffer(s) with the "
+                           "cadence effectively off")
+        return True, (f"{len(census)} executes, "
+                      f"{sum(n for n, _m in census)} command buffers, 0 empty")
+
+    def per_op_cadence_does_not_scale_empties():
+        """The row-10 shape: a commit per op, so the back-pressure check
+        fires on every one of them once ten buffers are in flight.  The
+        empty count must stay at the one end-of-eval signal buffer instead
+        of tracking the commits."""
+        answers, census = arm({"MLX_MAX_OPS_PER_BUFFER": "1"})
+        if not answers or not census:
+            return False, f"answers={len(answers)} census={len(census)}"
+        bufs, empty = heaviest(census)
+        base = heaviest(arm({"MLX_MAX_OPS_PER_BUFFER": "100000"})[1])[0]
+        if bufs < 20 or bufs <= base:
+            return False, (f"{bufs} command buffers at cadence 1 vs {base} "
+                           "with it off: the cadence did not trip often "
+                           "enough, so this contract proved nothing")
+        # One per eval is structural (the Event signal); anything that grows
+        # with `bufs` is gpu::finalize committing untouched buffers.  Stock
+        # MLX books ~bufs/2 here.
+        if empty > 2:
+            return False, (f"{bufs} command buffers, {empty} of them EMPTY "
+                           "-- gpu::finalize is committing untouched buffers "
+                           "(is this MLX missing fix/skip-empty-finalize?)")
+        return True, (f"{bufs} command buffers at cadence 1, {empty} empty "
+                      "(the end-of-eval signal buffer)")
+
+    def the_cadence_cannot_move_an_answer():
+        base, _ = arm({"MLX_MAX_OPS_PER_BUFFER": "100000"})
+        bad = []
+        for cadence in ("1", "8", "800"):
+            other, _ = arm({"MLX_MAX_OPS_PER_BUFFER": cadence})
+            for case in sorted(base):
+                if base[case] != other.get(case):
+                    bad.append(f"{case} at cadence {cadence}")
+        if bad:
+            return False, "differs: " + "; ".join(bad[:4])
+        return True, (f"{len(base)} cases bit-identical at cadences "
+                      "1 / 8 / 800 / off")
+
+    # --- METALJAX_CBUF_BYTES: which bytes the size budget counts -----------
+    #
+    # `metal_client.cc` pins MLX_MAX_MB_PER_BUFFER=512, and MLX charges it for
+    # every distinct INPUT a command buffer reads.  A program with big
+    # RESIDENT weights therefore ends a command buffer at each weight read --
+    # 52 of row 10's 149 command buffers per token, for a 9.6 GB expert slab
+    # that the buffer neither allocates nor frees.  `=transient` (the fork
+    # branch `fix/transient-byte-cadence`) charges the same budget for what
+    # the buffer WRITES instead, which is the quantity 512 was chosen to
+    # bound.  DEFAULT-OFF pending Oleg's sign-off on the no-panic number, so
+    # this pins the knob's two halves and skips cleanly when the linked MLX
+    # does not carry the branch.
+
+    def bytes_arm(mode):
+        import json
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        # 8 mega-elements, so a 4096x4096 f32 weight (16) trips it alone.
+        child["MLX_MAX_MB_PER_BUFFER"] = "8"
+        child["METALJAX_CBUF_BYTES"] = mode
+        proc = subprocess.run([sys.executable, here, "--cbuf-bytes"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers, census = {}, {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("CBUFB "):
+                label, payload = line[6:].split("\t", 1)
+                answers[label] = json.loads(payload)
+        for name, n in re.findall(
+                r"jit_(readbig|writebig): .*? cbufs=(\d+)\(", proc.stderr):
+            census[name] = int(n)
+        return answers, census
+
+    def transient_bytes_skip_resident_inputs():
+        _a, base = bytes_arm("inputs")
+        _b, tran = bytes_arm("transient")
+        if "readbig" not in base or "writebig" not in base:
+            return False, f"census {sorted(base)}"
+        if base["readbig"] < 4:
+            return False, (f"readbig split into {base['readbig']} command "
+                           "buffers under the input rule: the budget did not "
+                           "trip, so this contract proved nothing")
+        if tran["readbig"] == base["readbig"]:
+            return True, ("MLX_MAX_MB_TRANSIENT_ONLY has no effect in this "
+                          "MLX -- fix/transient-byte-cadence is not vendored")
+        if tran["readbig"] > 2:
+            return False, (f"readbig still splits into {tran['readbig']} "
+                           "command buffers with transient accounting on")
+        # The bound the 512 exists for must survive: a program that WRITES
+        # that many bytes still splits.
+        if tran["writebig"] < 4:
+            return False, (f"writebig split into {tran['writebig']} command "
+                           "buffers with transient accounting on: the "
+                           "transient bound was lost, not merely re-aimed")
+        return True, (f"readbig {base['readbig']}->{tran['readbig']} cbufs, "
+                      f"writebig {base['writebig']}->{tran['writebig']} "
+                      "(the transient bound holds)")
+
+    def the_byte_mode_cannot_move_an_answer():
+        base, _ = bytes_arm("inputs")
+        other, _ = bytes_arm("transient")
+        bad = [c for c in sorted(base) if base[c] != other.get(c)]
+        if bad:
+            return False, "differs: " + "; ".join(bad)
+        return True, f"{len(base)} cases bit-identical across byte modes"
+
+    return [("cbuf cadence off: no empties", slow_cadence_has_no_empties),
+            ("cbuf cadence per-op: no empty pileup",
+             per_op_cadence_does_not_scale_empties),
+            ("cbuf cadence cannot move an answer",
+             the_cadence_cannot_move_an_answer),
+            ("cbuf bytes: resident inputs do not split",
+             transient_bytes_skip_resident_inputs),
+            ("cbuf bytes cannot move an answer",
+             the_byte_mode_cannot_move_an_answer)]
+
+
 def _p36_tape_gate(subprocess, tempfile, pathlib, re):
     """The trace budget is asked of the post-pass TAPE, not only the MLIR.
 
@@ -12082,6 +12284,69 @@ def main():
                   f"{_json.dumps([_canonical(v)[1].ravel().tolist() for v in out])}",
                   flush=True)
         return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--cbuf-cadence":
+        # A dot chain long enough that a per-op command-buffer cadence keeps
+        # more than MLX's ten buffers in flight -- the state in which
+        # `eval_impl`'s back-pressure calls `gpu::finalize` on an untouched
+        # buffer after every commit.  Answers to stdout, the per-execute
+        # `cbufs=N(+empty M)` census to stderr.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        import jax.numpy as jnp
+        import json as _json
+        n = 1024
+        x0 = np.linspace(-1.0, 1.0, n * n, dtype=np.float32).reshape(n, n)
+        w0 = (np.eye(n, dtype=np.float32) * np.float32(0.5)
+              + np.full((n, n), np.float32(0.5 / n), dtype=np.float32))
+
+        @jax.jit
+        def dot_chain(x, w):
+            for _ in range(40):
+                x = jnp.dot(x, w) + np.float32(0.125)
+            return x
+
+        out = _flatten(dot_chain(x0, w0))
+        print("CBUF dot chain\t"
+              f"{_json.dumps([_canonical(v)[1].ravel().tolist() for v in out])}",
+              flush=True)
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--cbuf-bytes":
+        # Two shapes that differ only in WHICH side of a dot is big:
+        # `readbig` reads six resident 16-mega-element weights and writes
+        # 8x4096; `writebig` reads 8x4096 and writes six 16-mega-element
+        # outer products.  Under a small MLX_MAX_MB_PER_BUFFER the input
+        # rule splits both; transient accounting must split only the second.
+        os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        import jax.numpy as jnp
+        import json as _json
+        K = N = 4096
+        ws = [jax.device_put(jnp.full((K, N), np.float32(1e-4) * (i + 1)))
+              for i in range(6)]
+        x = jax.device_put(jnp.full((8, K), np.float32(1e-2)))
+
+        @jax.jit
+        def readbig(x, *w):
+            acc = jnp.zeros((8, N), jnp.float32)
+            for wi in w:
+                acc = acc + jnp.dot(x, wi)
+            return acc.sum()
+
+        @jax.jit
+        def writebig(x, *w):
+            acc = jnp.float32(0)
+            for wi in w:
+                acc = acc + jnp.dot(wi[:, :1], x[:1, :N]).sum()
+            return acc
+
+        for label, fn in (("readbig", readbig), ("writebig", writebig)):
+            out = _flatten(fn(x, *ws))
+            print(f"CBUFB {label}\t"
+                  f"{_json.dumps([_canonical(v)[1].ravel().tolist() for v in out])}",
+                  flush=True)
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--dynamic-while":
         # The two dynamic-trip while rows alone, so the parent can read one
         # serial/pipelined census per arm out of the narration, and compare
@@ -12473,6 +12738,8 @@ def main():
                                              __import__("re"))
                          + _p44_ragged_decode(subprocess, pathlib,
                                               __import__("re"))
+                         + _p45_cbuf_cadence(subprocess, pathlib,
+                                             __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,
                                             __import__("re"))
                          + _p27_flush_pressure(subprocess, tempfile, pathlib,

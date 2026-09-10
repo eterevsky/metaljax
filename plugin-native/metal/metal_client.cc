@@ -199,6 +199,40 @@ bool EnvFlag(const char* name) {
   }
   ::setenv("MLX_MAX_OPS_PER_BUFFER", "800", /*overwrite=*/0);
   ::setenv("MLX_MAX_MB_PER_BUFFER", "512", /*overwrite=*/0);
+  // METALJAX_CBUF_BYTES=transient|inputs (default `inputs`): WHICH bytes the
+  // 512 MB budget above counts.
+  //
+  // MLX charges the budget for each distinct INPUT a command buffer reads
+  // (`CommandEncoder::set_input_array` adds the whole `data_size()`), so a
+  // program with big RESIDENT weights ends a command buffer at every weight
+  // read.  Row 10 (DeepSeek-V2-Lite decode) spends 52 of its 149 command
+  // buffers per token on exactly that: the routed-expert slab is 9.6 GB, so
+  // each routed `gather_mm` trips the budget on its own and two of the 149
+  // buffers per layer hold a single dot (~0.59 ms/token of device idle plus
+  // per-buffer overhead) -- for memory that was resident before the buffer
+  // opened and is still resident after it completes.
+  //
+  // `transient` switches the vendored MLX (fork branch
+  // `fix/transient-byte-cadence`) to charging the budget for what a command
+  // buffer ALLOCATES -- the arrays it writes -- which is the quantity the
+  // 512 was chosen to bound: how much UNPAGEABLE transient intermediate one
+  // in-flight command buffer is responsible for.  The bound on transients is
+  // identical under both modes; what goes away is splitting on inputs the
+  // buffer neither allocates nor frees.
+  //
+  // WHY THE DEFAULT IS STILL `inputs`.  512 is a NO-PANIC number (a 2048
+  // budget kernel-panicked the machine at an LLM checkpoint load, the
+  // wired-memory class: notes/mlx-command-buffer-split.md, panic #4), and
+  // moving what it counts changes which programs it stops --
+  // upward for anything that reads more than it writes.  That is Oleg's
+  // call, not this file's, and it wants the cadence canary battery
+  // (~/.cache/metaljax-bench/logs/row11-overlap/) plus the big-model rows
+  // re-run before it flips.  Until then this is an A/B knob.
+  if (const char* b = std::getenv("METALJAX_CBUF_BYTES")) {
+    if (std::string(b) == "transient") {
+      ::setenv("MLX_MAX_MB_TRANSIENT_ONLY", "1", /*overwrite=*/0);
+    }
+  }
   // METALJAX_MATMUL_PRECISION: "high" (the default; anything unrecognised
   // is treated as it), "highest" (the historical whole-arch pin), "default"
   // (MLX's own default: TF32 on).  See the comment block above.

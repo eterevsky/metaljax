@@ -1,0 +1,127 @@
+From 53659d2a1715247358a274cd64734aa5ce3e5a7c Mon Sep 17 00:00:00 2001
+From: Oleg Eterevsky <oleg@eterevsky.com>
+Date: Wed, 9 Sep 2026 23:45:08 +0200
+Subject: [PATCH] Do not commit an empty command buffer from gpu::finalize
+
+`eval_impl`'s back-pressure path submits an empty command buffer on every
+mid-eval commit, once ten buffers are in flight.
+
+`gpu::eval` commits when `CommandEncoder::needs_commit()` trips (the
+`MLX_MAX_OPS_PER_BUFFER` / `MLX_MAX_MB_PER_BUFFER` cadence) and calls
+`scheduler::notify_new_task`.  The very next statement in `eval_impl` is
+
+    if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS || ...) {
+      for (auto& s : open_streams) if (gpu) gpu::finalize(s);
+      scheduler::wait_for_one();
+
+so once ten command buffers are in flight -- routine for any eval whose
+cadence trips more often than the GPU drains it -- every cadence commit is
+immediately followed by `gpu::finalize` on the command buffer that commit
+just created: nothing has been encoded on it, and it is committed anyway.
+
+That is not free.  Metal schedules a committed command buffer whether or
+not it holds a compute pass, and an empty one sits in the queue in front of
+the next real buffer.  Measured on an M5 Max with a per-buffer GPU trace,
+about 40 % of these empty buffers are given GPU start/end timestamps and
+each costs 35-50 us of device idle between the buffers around it; the rest
+cost a host commit.  A decode step of a 16B MoE model whose resident expert
+weights trip the byte cadence once per layer paid 69 empty command buffers
+and 1.08 ms of device idle per token -- the largest single idle item in
+that model's profile, and about 5 % of its step time.
+
+A minimal reproduction, no model needed:
+
+    MLX_MAX_OPS_PER_BUFFER=1 on a 40-matmul chain (2048x2048 f32)
+      -> 80 dispatches, 71 command buffers, 31 of them empty.
+
+The fix is to notice there is nothing to submit.  `CommandEncoder::is_empty()`
+asks whether anything has been encoded on the current buffer since it was
+created -- no dispatches, no open compute encoder, no encoder that has
+already ended into it, and no signal or wait event -- and `gpu::finalize`
+returns without committing when that holds.
+
+Nothing waits on such a buffer.  `finalize` passes no completion handler, so
+it books no scheduler task; `wait_for_one()` is reached with
+`n_active_tasks() > MAX_ACTIVE_TASKS > 0`, so there is always an in-flight
+buffer left to complete and the back-pressure cannot stall.  The end-of-eval
+`finalize` is untouched: `eval_impl` signals the stream's `Event` first, and
+an encoded signal makes the buffer non-empty, so every waiter still gets its
+buffer committed.
+
+After the fix the same reproduction books 40 command buffers and 0 empty
+ones, with identical results.
+---
+ mlx/backend/metal/device.h | 23 +++++++++++++++++++++++
+ mlx/backend/metal/eval.cpp | 22 +++++++++++++++++++++-
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index 8c73b2b5..887b7fe0 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -96,6 +96,29 @@ class MLX_API CommandEncoder {
+   void wait_event(std::shared_ptr<EventImpl> event, uint64_t value);
+   void signal_event(std::shared_ptr<EventImpl> event, uint64_t value);
+   bool needs_commit() const;
++  // Has ANYTHING been encoded on the current command buffer since it was
++  // created?  A buffer with no compute encoder (open or ended), no signal
++  // and no wait event carries no work and no ordering: committing it is a
++  // pure cost -- a host commit, and, if Metal schedules it anyway, tens of
++  // microseconds of device time between the buffers around it.
++  //
++  // The four terms cover every way this class writes to `buffer_`:
++  //   * `buffer_ops_`      -- dispatches encoded into an encoder;
++  //   * `encoder_`         -- an OPEN encoder (its dispatches may be 0, but
++  //                           it still becomes a compute pass on end);
++  //   * `ended_fences_`    -- an encoder that ENDED into this buffer (it
++  //                           signalled a fence and left a completion
++  //                           handler behind), even if commit() has not run;
++  //   * the event lists    -- `signal_event` / `wait_event` encode directly
++  //                           on the buffer; skipping one would hang the
++  //                           waiter.
++  // `end_encoding()` fills `ended_fences_` for every encoder it ends, and
++  // `commit()` clears it, so the third term is exactly "this buffer already
++  // has a compute pass on it".
++  bool is_empty() const {
++    return buffer_ops_ == 0 && !encoder_ && ended_fences_.empty() &&
++        signal_events_.empty() && wait_events_.empty();
++  }
+   void commit(std::function<void()> completion = nullptr);
+   void synchronize();
+ 
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+index 43fed929..ff107214 100644
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -84,7 +84,27 @@ void eval(array& arr) {
+ void finalize(Stream s) {
+   auto pool = metal::new_scoped_memory_pool();
+   auto& encoder = metal::get_command_encoder(s);
+-  auto* cb = encoder.get_command_buffer();
++  // Nothing has been encoded on this stream since its last commit: there is
++  // no work to submit and no ordering to establish, so committing would
++  // enqueue an EMPTY command buffer.  That is not free.  Metal schedules a
++  // committed buffer whether or not it holds a pass, and an empty one sits
++  // in the queue ahead of the next real buffer for tens of microseconds of
++  // pure device idle (measured 35-50 us per buffer on an M5 Max).
++  //
++  // `eval_impl` reaches here in exactly that state on its hot back-pressure
++  // path: `gpu::eval` commits when `needs_commit()` trips, which increments
++  // the active-task count, which trips `n_active_tasks() > MAX_ACTIVE_TASKS`
++  // on the very next line, which calls this on a command buffer created
++  // microseconds ago and never touched.  A decode step of a large MoE model
++  // (whose resident expert weights trip the byte cadence once per layer)
++  // paid 69 such buffers and ~1.1 ms of device idle per token.
++  //
++  // Streams that DO have work -- including the end-of-eval finalize, whose
++  // buffer carries the `Event` signal every waiter depends on -- are
++  // untouched: an encoded signal makes the buffer non-empty.
++  if (encoder.is_empty()) {
++    return;
++  }
+   encoder.end_encoding();
+   encoder.commit();
+ }
+-- 
+2.50.1 (Apple Git-155)
+
