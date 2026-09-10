@@ -24,7 +24,7 @@ optimization.*
 | 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 13.2 ʰ | 8.8 ˣ |
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 21.3 ʰ | 13.7 ˣ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | 188.0 ʰ | 114.9 ˡ |
-| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **25.9** ᵖ | 22.8 ʰ | 10.5 ˣ |
+| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **25.9** ᵖ | 21.4 ʰ | 10.5 ˣ |
 | 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 5.2 ʰ | 3.2 ˣ |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | | 53.5 ˣ |
 | 13 | gemma4-E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | 69.4 ʰ | 4.5 ˣ |
@@ -55,10 +55,14 @@ Notes:
   lead over mlx-lm on rows 3 and 6.
 - ʰ = HEAD-column cells: rerun-first medians of ≥ 2 runs on a frozen build
   of main, token streams identical to the row's release record unless
-  stated. As of 2026-09-10: rows 13/16/17/18/19 and the sentinels 4/7/11
-  are on the precision-default build 44fa042 (METALJAX_MATMUL_PRECISION=high:
-  f32 stays exact, bf16/f16 and quantized matmuls use the M5 accelerators,
-  as mlx-lm and torch-MPS do); row 10 on the ragged-decode build; every
+  stated. As of 2026-09-10: row 10 is on the current build d024710 (stacked
+  sibling packs + the re-vendored MLX fork; 21.40 / 21.40, text identical;
+  its transient byte-cadence knob read 21.47 / 21.60 there at 84-90 GB
+  peak against 85-87 GB, so it stays off); rows 13/16/17/18/19 and the
+  sentinels 4/7/11 on the precision-default build 44fa042
+  (METALJAX_MATMUL_PRECISION=high: f32 stays exact, bf16/f16 and quantized
+  matmuls use the M5 accelerators, as mlx-lm and torch-MPS do), re-read on
+  d024710 with identical streams (4 16.7, 7 13.2, 11 5.0, 14 26.6); every
   other row on the projection-pack build ad9507e, all with a 60 s cool-down
   before each row.  Row 17 has no token stream and its image statistics
   vary run to run on every binary, so no identity is claimed there; each of
