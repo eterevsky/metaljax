@@ -221,7 +221,10 @@ def run_mlx(bench, backend, prompt, n_decode):
     from mlx_lm.sample_utils import make_sampler
     import mlx.core as mx
 
-    model_ref = bench["model"].removeprefix("hf://")
+    # `mlx_model`: a local converted checkpoint for a like-for-like
+    # comparator (row 12: the f16 mirror converted to bf16; row 13: the bf16
+    # checkpoint quantized to affine 4-bit, group 64).  Default: the HF repo.
+    model_ref = bench.get("mlx_model") or bench["model"].removeprefix("hf://")
     t0 = time.monotonic()
     model, tok = load(model_ref)
     load_s = time.monotonic() - t0

@@ -706,6 +706,105 @@ def run_lora_train(repo=LORA_REPO, device="mps", dtype="bfloat16", rank=4,
                 sdpa_backward_probe=probe_sdpa_backward(device, dtype))
 
 
+TRAIN_REPO = "Qwen/Qwen3-0.6B"
+
+
+def _train_batch(vocab_size, n, seq_len, device, seed=0):
+    """MaxText's synthetic training data, in torch: uniformly random token
+    ids over the whole window, loss over the whole window (no prompt
+    masking -- MaxText's synthetic dataset has none)."""
+    import numpy as np
+    import torch
+
+    rng = np.random.default_rng(seed)
+    ids = torch.tensor(rng.integers(0, vocab_size, size=(n, seq_len)),
+                       dtype=torch.long, device=device)
+    return ids, torch.ones_like(ids), ids.clone()
+
+
+def run_full_train(repo=TRAIN_REPO, device="mps", dtype="bfloat16",
+                   seq_len=256, batch_size=1, steps=4, lr=3e-5,
+                   betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
+                   clip=1.0, attn="sdpa"):
+    """Qwen3-0.6B full-parameter pre-training step -- the torch-MPS target
+    for models.md row 19 (Qwen3-0.6B maxtext train).
+
+    Like-for-like with MaxText's train step at its defaults
+    (src/maxtext/configs/base.yml): f32 master weights with bf16 compute
+    (`weight_dtype: float32`, `dtype: bfloat16` -> f32 parameters under
+    torch.autocast(bfloat16)), AdamW lr 3e-5, betas (0.9, 0.95), eps 1e-8,
+    weight decay 0.1, gradient clipping 1.0, per-device batch 1, sequence
+    256 (the harness's MAXTEXT_TRAIN_SEQ), synthetic random tokens with the
+    loss over the whole window.  Metrics mirror `run_maxtext_train`:
+    warmup_s (the first step), step_ms (MEAN of the following `steps`
+    steps, as MaxText's adapter reports it), the loss series.
+
+    DISCLOSURE (as row 18): MPS has no fused-SDPA backward kernel, so the
+    backward pass runs the math decomposition; the record carries the
+    probe that establishes it.
+    """
+    import statistics
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    compute_dtype = getattr(torch, dtype)
+    tokenizer = AutoTokenizer.from_pretrained(repo)
+    t0 = time.monotonic()
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            repo, dtype=torch.float32, attn_implementation=attn)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            repo, torch_dtype=torch.float32, attn_implementation=attn)
+    model = model.to(device)
+    model.train()
+    _sync(device)
+    load_s = time.monotonic() - t0
+    total = sum(p.numel() for p in model.parameters())
+    vocab = int(model.get_input_embeddings().num_embeddings)
+
+    ids, mask, labels = _train_batch(vocab, batch_size * (steps + 1),
+                                     seq_len, device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=betas,
+                            eps=eps, weight_decay=weight_decay)
+
+    def step(i):
+        sl = slice(i * batch_size, (i + 1) * batch_size)
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device, dtype=compute_dtype):
+            loss = model(input_ids=ids[sl], attention_mask=mask[sl],
+                         labels=labels[sl]).loss
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        opt.step()
+        return float(loss.item())
+
+    ms, losses = [], []
+    for i in range(steps + 1):
+        t0 = time.monotonic()
+        losses.append(step(i))
+        _sync(device)
+        ms.append(1000 * (time.monotonic() - t0))
+    warm = ms[1:] or ms
+    return dict(mem_gb_torch=_mem_gb(), load_s=load_s,
+                warmup_s=ms[0] / 1000.0, first_step_ms=round(ms[0], 1),
+                step_ms=statistics.fmean(warm),
+                step_ms_median=statistics.median(warm),
+                step_ms_samples=[round(v, 1) for v in ms],
+                losses=[round(v, 4) for v in losses],
+                seq_len=seq_len, batch_size=batch_size, steps=steps,
+                optimizer="AdamW", lr=lr, betas=list(betas), eps=eps,
+                weight_decay=weight_decay, grad_clip=clip,
+                weight_dtype="float32", compute_dtype=dtype,
+                total_params=int(total), trainable_params=int(total),
+                attn_implementation=attn, attn_backward="math",
+                attn_backward_note=(
+                    "MPS has no fused-SDPA backward kernel; the backward "
+                    "pass runs the math decomposition (STATUS fn.10)"),
+                sdpa_backward_probe=probe_sdpa_backward(device, dtype))
+
+
 # -------------------------------------------------------- 3. SD 3.5 Large
 
 def run_diffusion(repo=SD35_REPO, revision=SD35_REV, device="mps",
@@ -879,6 +978,23 @@ def cmd_lora(argv):
              lr=ns.lr, attn=ns.attn, targets=targets))
 
 
+def cmd_train(argv):
+    ap = _common(argparse.ArgumentParser(prog="adapter_torch_mps train"))
+    ap.add_argument("--bench-id", default="maxtext-train-06b")
+    ap.add_argument("--model", default=TRAIN_REPO)
+    ap.add_argument("--seq-len", type=int, default=256)
+    ap.add_argument("--batch-size", type=int, default=1)
+    ap.add_argument("--steps", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=3e-5)
+    ap.add_argument("--attn", default="sdpa", choices=["sdpa", "eager"])
+    ns = ap.parse_args(argv)
+    return _run_row(
+        ns, ns.bench_id, run_full_train,
+        dict(repo=ns.model, device=ns.device, dtype=ns.dtype,
+             seq_len=ns.seq_len, batch_size=ns.batch_size, steps=ns.steps,
+             lr=ns.lr, attn=ns.attn))
+
+
 def cmd_diffusion(argv):
     ap = _common(argparse.ArgumentParser(prog="adapter_torch_mps diffusion"))
     ap.add_argument("--bench-id", default="sd35-large")
@@ -899,7 +1015,7 @@ def cmd_diffusion(argv):
 
 def main():
     """Dispatch; a sub-command-less argv is the legacy decode CLI."""
-    cmds = {"vision": cmd_vision, "lora": cmd_lora,
+    cmds = {"vision": cmd_vision, "lora": cmd_lora, "train": cmd_train,
             "diffusion": cmd_diffusion}
     argv = sys.argv[1:]
     if argv and argv[0] in cmds:

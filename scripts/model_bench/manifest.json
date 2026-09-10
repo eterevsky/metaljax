@@ -135,7 +135,7 @@
         "cpu"
       ],
       "status": "needs-adapter",
-      "note": "row 11's ORIGINAL harness, retained: rows 14/19 are maxtext-only and need a same-harness decode baseline beside them. NOT the row-11 headline any more — qwen3-06b-keras is (best-available-implementation rule, Oleg 2026-09-01). Cells from the two harnesses are not comparable."
+      "note": "row 11's ORIGINAL harness, retained: rows 14/19 are maxtext-only and need a same-harness decode baseline beside them. NOT the row-11 headline any more \u2014 qwen3-06b-keras is (best-available-implementation rule, Oleg 2026-09-01). Cells from the two harnesses are not comparable."
     },
     {
       "id": "qwen3-06b-keras",
@@ -156,11 +156,14 @@
       "model": "mixtral_8_instruct_7b_en",
       "size_gb": 93.4,
       "backends": [
-        "metaljax"
+        "metaljax",
+        "mlx"
       ],
       "cpu": false,
       "note": "over-range showcase; keras preset hosting",
-      "arch": "MixtralCausalLM"
+      "arch": "MixtralCausalLM",
+      "mlx_model": "/Users/oleg/.cache/metaljax-bench/models/mixtral-8x7b-instruct-bf16",
+      "mlx_note": "mlx-lm on the mlx-community f16 mirror converted to bf16 (f16 holds every bf16 weight exactly): the same bf16 computation as the keras row"
     },
     {
       "id": "gemma4-e2b-int4",
@@ -169,11 +172,14 @@
       "size_gb": 3.0,
       "backends": [
         "metaljax",
-        "cpu"
+        "cpu",
+        "mlx"
       ],
       "arch": "Gemma4CausalLM",
       "quant": "int4",
-      "note": "packed two-per-byte; the only real sub-byte JAX path"
+      "note": "packed two-per-byte; the only real sub-byte JAX path",
+      "mlx_model": "/Users/oleg/.cache/metaljax-bench/models/gemma-4-E2B-it-4bit-g64",
+      "mlx_note": "mlx-lm affine 4-bit group 64 of the same bf16 checkpoint (keras int4: affine 4-bit, group 64 on q / 128 on k,v)"
     },
     {
       "id": "maxtext-qwix-int8",
