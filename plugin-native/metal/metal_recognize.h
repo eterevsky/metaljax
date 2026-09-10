@@ -413,6 +413,56 @@ struct StackedDotMatch {
 };
 
 // --------------------------------------------------------------------------
+// the stacked-projection PACK (metal_stacked.cc): sibling stacked dots
+// --------------------------------------------------------------------------
+
+// B6 for the dots the stacked recognizer owns.  A scanned-layer decode step
+// reads ONE post-norm activation against several per-layer stacks -- row 10's
+// q and kv_a over the attention norm, its router and the two shared-expert
+// gates over the MLP norm -- and each is its own `gather_mm` over an
+// [L, K, N] view.  Packing concatenates those views along N ONCE per
+// executable into a contiguous [L, K, n_total] array (the relayout's wave,
+// `BuildStackedPacks`, its budget and its governor admission), so the group
+// becomes ONE gather_mm plus per-member last-axis slices, which at M == 1 are
+// views of a row-contiguous [.., n_total].
+//
+// What it is worth, measured (`row10-scout/analysis/profile-findings.md`
+// sections 3 and 10): a dispatch-count and command-buffer-count win only.
+// The pair-overlap upside B6 found on rows 7/11 is REFUTED here -- the pairs
+// a pack would fuse either already share a barrier group or, where they
+// straddle one (q/kv_a), are bandwidth-bound rather than latency-bound.
+//
+// Numerics.  The pack is the members' own [L, K, N] layout concatenated on
+// the free axis, so the packed dot is the same `gemv_t` over the same values;
+// only N changes, and a `gemv_t`'s per-output K order depends on (BM, SM, TM)
+// and not on N below K = 8192 (metal_proj.cc's `TileOf` note).  Bit-identical
+// there, and verified by stream identity on row 10.
+//
+// DECODE-ONLY (M == 1), the relayout's rule for the relayout's reason.  A
+// RELAID member never joins a group: its own pack is materialized first and
+// packing it again would hold the stack twice.  METALJAX_STACKED_PACK=0
+// declines every group (the members keep their own gather_mm).
+struct StackedPackMatch {
+  // The member matches, moved out of `plan->stacked` in BLOCK order;
+  // members[0]->root is the plan root and the only dispatched one.  A group
+  // whose pack cannot be built moves them back.
+  std::vector<std::unique_ptr<StackedDotMatch>> members;
+  mlir::Value x;      // the activation every member reads (the same Value)
+  mlir::Value layer;  // the index every member reads (the same Value)
+  int64_t L = 0, K = 0, M = 1;
+  int64_t n_total = 0;
+  std::vector<int64_t> out_band;  // the lhs free dims ++ [n_total]
+  int64_t elem_bytes = 0;
+  int64_t pack_bytes = 0;   // L * K * n_total * elem
+  int pack_slot = -1;       // index into plan->packs, once built
+  std::vector<mlir::Operation*> ops;  // members[1..]->root + every member's
+  std::string name;
+  mlir::Operation* root() const {
+    return members.empty() ? nullptr : members.front()->root;
+  }
+};
+
+// --------------------------------------------------------------------------
 // multi-span decode attention (metal_mla.cc): maxtext's MLA/GQA decode
 // --------------------------------------------------------------------------
 
@@ -657,6 +707,7 @@ struct RewritePlan {
   std::vector<std::unique_ptr<MoeMatch>> moe;
   std::vector<std::unique_ptr<RaggedMatch>> ragged;
   std::vector<std::unique_ptr<StackedDotMatch>> stacked;
+  std::vector<std::unique_ptr<StackedPackMatch>> stacked_pack;
   std::vector<std::unique_ptr<MlaMatch>> mla;
   std::vector<std::unique_ptr<GdnMatch>> gdn;
   std::vector<std::unique_ptr<RmsNormMatch>> norm;
@@ -671,6 +722,9 @@ struct RewritePlan {
   llvm::DenseMap<mlir::Operation*, MoeMatch*> moe_roots;
   llvm::DenseMap<mlir::Operation*, RaggedMatch*> ragged_roots;
   llvm::DenseMap<mlir::Operation*, StackedDotMatch*> stacked_roots;
+  // members[0]->root; every other member is absorbed and BOUND by the root's
+  // emit (the GDN/B6 precedent).
+  llvm::DenseMap<mlir::Operation*, StackedPackMatch*> stacked_pack_roots;
   llvm::DenseMap<mlir::Operation*, MlaMatch*> mla_roots;
   llvm::DenseMap<mlir::Operation*, GdnMatch*> gdn_roots;
   llvm::DenseMap<mlir::Operation*, RmsNormMatch*> norm_roots;
@@ -692,6 +746,7 @@ struct RewritePlan {
   bool empty() const {
     return qmm_roots.empty() && sdpa_roots.empty() && moe_roots.empty() &&
            ragged_roots.empty() && stacked_roots.empty() &&
+           stacked_pack_roots.empty() &&
            mla_roots.empty() && gdn_roots.empty() && norm_roots.empty() &&
            rope_roots.empty() && proj_roots.empty();
   }

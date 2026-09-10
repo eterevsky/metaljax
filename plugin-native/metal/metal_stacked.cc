@@ -26,6 +26,26 @@ ordinary slice chain runs (the recognizer file rule, metal_recognize.h).
 The dense chain's dynamic_slice clamps the layer index to [0, L-1]; the
 emit clamps identically, so out-of-range indices agree bit for bit.
 
+Two things are materialized ONCE per executable on top of that read, both in
+`BuildStackedPacks`, both governor-admitted and both charged to
+METALJAX_STACKED_RELAYOUT_MB:
+
+* the RELAYOUT (B3): a stack whose contracted axes STRADDLE the layer axis
+  in the original buffer -- maxtext's attention out-projection,
+  [heads, L, head_dim, model] -- has no [L, K, N] view of that buffer, but
+  its carried (transposed) layout does, so the pack wave materializes that
+  layout and the emit gathers from it;
+* the sibling PACK (row 10 rewrite 3, METALJAX_STACKED_PACK): several of
+  these dots in one block read ONE activation against DIFFERENT per-layer
+  stacks -- row 10's q and kv_a over the attention norm, its router and two
+  shared-expert gates over the MLP norm -- and their [L, K, N] views
+  concatenated on the free axis make one [L, K, n_total] the emit reads with
+  a SINGLE gather_mm, the members taking last-axis slices of the result
+  (views at M == 1).  B6 for the dots this file owns (metal_proj.cc, whose
+  tile policy this one follows verbatim); worth a dispatch and a
+  command-buffer count and NOT the pair overlap B6 found on rows 7/11, which
+  `row10-scout/analysis/profile-findings.md` section 3 refutes here.
+
 Licensed under the Apache License, Version 2.0.
 ==============================================================================*/
 
@@ -43,6 +63,7 @@ Licensed under the Apache License, Version 2.0.
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
 #include "llvm/ADT/DenseSet.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -448,10 +469,13 @@ std::unique_ptr<StackedDotMatch> MatchRoot(
   // -- or the identity when the emit reads a relaid pack, which IS the
   // carried layout, contiguous.
   match->back_perm.resize(perm.size());
+  // The @main argument the stack hoists to, for BOTH forms: the relayout
+  // pack reads it transposed, and a sibling pack (below) reads the proven
+  // [L, K, N] view of it straight.
+  match->origin_arg = origin_arg;
   if (relayout) {
     std::iota(match->back_perm.begin(), match->back_perm.end(), 0);
     match->relayout = true;
-    match->origin_arg = origin_arg;
     match->relayout_perm = perm;
     int64_t numel = 1;
     for (int64_t d : wdims) numel *= std::max<int64_t>(d, 1);
@@ -502,9 +526,8 @@ std::unique_ptr<StackedDotMatch> MatchRoot(
   return match;
 }
 
-}  // namespace
-
-void AnalyzeStackedDot(mlir::func::FuncOp fn, RewritePlan* plan) {
+// Fills `plan->stacked`; `GroupStackedPacks` (below) runs on top of it.
+void AnalyzeStackedDotImpl(mlir::func::FuncOp fn, RewritePlan* plan) {
   if (EnvOff("METALJAX_STACKED_DOT") || !RecognizeEnabled()) return;
   if (fn.getBody().getBlocks().size() != 1) return;
   auto module = fn->getParentOfType<mlir::ModuleOp>();
@@ -670,8 +693,269 @@ void AnalyzeStackedDot(mlir::func::FuncOp fn, RewritePlan* plan) {
   }
 }
 
+// --------------------------------------------------------------------------
+// the sibling PACK (row 10 rewrite 3): stacked dots over ONE activation
+// --------------------------------------------------------------------------
+
+// METALJAX_STACKED_PACK: 0 = off (every member keeps its own gather_mm);
+// unset/1/auto = the `auto` policy, metal_proj.cc's verbatim; all = pack
+// every member of every group (the A/B arm for the policy).
+enum class PackPolicy { kOff, kAuto, kAll };
+
+PackPolicy StackedPackPolicy() {
+  static const PackPolicy p = [] {
+    const char* v = std::getenv("METALJAX_STACKED_PACK");
+    if (v == nullptr || *v == '\0') return PackPolicy::kAuto;
+    const std::string s(v);
+    if (s == "0") return PackPolicy::kOff;
+    if (s == "all") return PackPolicy::kAll;
+    return PackPolicy::kAuto;
+  }();
+  return p;
+}
+
+const char* PackPolicyName(PackPolicy p) {
+  switch (p) {
+    case PackPolicy::kOff: return "off";
+    case PackPolicy::kAuto: return "auto";
+    case PackPolicy::kAll: return "all";
+  }
+  return "?";
+}
+
+// A per-layer matrix this large is bandwidth-bound already, so merging it
+// with a sibling buys nothing and costs L times its size in resident memory
+// (metal_proj.cc `kMaxMemberBytes`, the same constant for the same reason).
+constexpr int64_t kMaxPackMemberBytes = 64LL << 20;
+
+// The M = 1 `gemv_t` tile MLX picks for a [K -> N] read (metal_proj.cc
+// `TileOf`, its `kn` branch).  Every stacked view is [L, K, N] with the free
+// stride 1, which is exactly the `gemv_t_gather` a [K, N] weight runs -- the
+// census reads `bn4` for row 10's kv_a (N = 576) and `bn16` for its q
+// (N = 3072), which is what this returns.
+struct GemvTile {
+  int sm = 0, sn = 0, bn = 0;
+  bool operator==(const GemvTile& o) const {
+    return sm == o.sm && sn == o.sn && bn == o.bn;
+  }
+  bool operator!=(const GemvTile& o) const { return !(*this == o); }
+};
+
+GemvTile TileFor(int64_t K, int64_t N) {
+  int sm = 8, sn = 4;
+  if (K >= 8192 && N >= 2048) {
+    sm = 4;
+    sn = 8;
+  }
+  const int bn = N >= 2048 ? 16 : N >= 512 ? 4 : 2;
+  const int tn = N < 4 ? 1 : 4;
+  while (sn > 4 && (N + bn * sn * tn - 1) / (bn * sn * tn) < 32) {
+    sn /= 2;
+    sm *= 2;
+  }
+  return GemvTile{sm, sn, bn};
+}
+
+struct PackGroupKey {
+  mlir::Block* block = nullptr;
+  mlir::Value x, layer;
+  int64_t L = 0, K = 0;
+  mlir::Type elem;
+  std::vector<int64_t> lc;  // the lhs contracting dims (so M and the free
+                            // dims of the band agree across the group)
+  bool operator==(const PackGroupKey& o) const {
+    return block == o.block && x == o.x && layer == o.layer && L == o.L &&
+           K == o.K && elem == o.elem && lc == o.lc;
+  }
+};
+
+// Group `plan->stacked`'s decode members by the activation they read and
+// hand each group to `BuildStackedPacks` as one `StackedPackMatch`.  Pure
+// structure: no buffer is touched here, and a group whose pack cannot be
+// built gives its members back.
+void GroupStackedPacks(RewritePlan* plan) {
+  const PackPolicy policy = StackedPackPolicy();
+  // The packs' own kill switch, and the budget they share with the
+  // relayout; METALJAX_STACKED_RELAYOUT=0 is the RELAYOUT's switch alone,
+  // so the two forms can be bisected apart.
+  if (policy == PackPolicy::kOff || RelayoutBudgetBytes() <= 0) return;
+  if (plan->stacked.size() < 2) return;
+
+  struct Group {
+    PackGroupKey key;
+    std::vector<size_t> idx;  // positions in plan->stacked, block order
+  };
+  std::vector<Group> groups;
+  llvm::DenseSet<size_t> grouped;
+
+  for (size_t i = 0; i < plan->stacked.size(); i++) {
+    StackedDotMatch& m = *plan->stacked[i];
+    // DECODE only (the relayout's rule, for the relayout's reason), and
+    // never a RELAID member: its own pack is materialized first and packing
+    // it again would hold the same stack twice.
+    if (m.M != 1 || m.relayout || m.origin_arg < 0 || m.sn != 1) continue;
+    if (m.root == nullptr || m.root->getNumResults() != 1) continue;
+    auto dot = mlir::dyn_cast<mlir::stablehlo::DotGeneralOp>(m.root);
+    if (!dot) continue;
+    if (m.root->getBlock() == nullptr) continue;
+    PackGroupKey key;
+    try {
+      key.elem = ElemOf(dot.getResult());
+      const int64_t elem = ElemBytes(key.elem);
+      if (m.K * m.N * elem > kMaxPackMemberBytes) {
+        Debug(absl::StrCat("not a pack member (", m.name, ": the layer's ",
+                           (m.K * m.N * elem) >> 20,
+                           " MB matrix is bandwidth-bound already)"));
+        continue;
+      }
+      auto lc = dot.getDotDimensionNumbers().getLhsContractingDimensions();
+      key.lc.assign(lc.begin(), lc.end());
+      if (ShapeOf(m.x).size() < key.lc.size()) continue;
+    } catch (const Reject&) {
+      // `Reject` is not a std::exception: both arms, or a shape question
+      // this file answers by throwing would escape the analysis.
+      continue;
+    } catch (const std::exception&) {
+      continue;
+    }
+    key.block = m.root->getBlock();
+    key.x = m.x;
+    key.layer = m.layer;
+    key.L = m.L;
+    key.K = m.K;
+    bool placed = false;
+    for (Group& g : groups) {
+      if (!(g.key == key)) continue;
+      // Pairwise distinct stacks: the same argument twice would be a CSE
+      // miss upstream, and packing it buys nothing (metal_proj.cc).
+      bool dup = false;
+      for (size_t j : g.idx)
+        dup = dup || plan->stacked[j]->origin_arg == m.origin_arg;
+      if (dup) {
+        Debug(absl::StrCat("not a pack member (", m.name,
+                           ": the same stack twice in one group)"));
+      } else {
+        g.idx.push_back(i);
+      }
+      placed = true;
+      break;
+    }
+    if (!placed) {
+      Group g;
+      g.key = key;
+      g.idx.push_back(i);
+      groups.push_back(std::move(g));
+    }
+  }
+
+  for (Group& g : groups) {
+    if (g.idx.size() < 2) continue;
+    // metal_proj.cc's policy, verbatim: in a group of >= 3 with one member
+    // at least twice as wide as the next, `auto` leaves the wide one alone
+    // when the rest, packed, stay in their own gemv tile, and packs it too
+    // when they would cross into a wider tile for nothing.
+    if (policy == PackPolicy::kAuto && g.idx.size() >= 3) {
+      size_t widest = 0;
+      for (size_t i = 1; i < g.idx.size(); i++)
+        if (plan->stacked[g.idx[i]]->N > plan->stacked[g.idx[widest]]->N)
+          widest = i;
+      int64_t second = 0, rest = 0;
+      for (size_t i = 0; i < g.idx.size(); i++)
+        if (i != widest) {
+          second = std::max(second, plan->stacked[g.idx[i]]->N);
+          rest += plan->stacked[g.idx[i]]->N;
+        }
+      if (plan->stacked[g.idx[widest]]->N >= 2 * second) {
+        const GemvTile packed = TileFor(g.key.K, rest);
+        bool leave = true;
+        for (size_t i = 0; i < g.idx.size(); i++)
+          if (i != widest &&
+              TileFor(g.key.K, plan->stacked[g.idx[i]]->N) != packed)
+            leave = false;
+        if (leave) {
+          Debug(absl::StrCat(
+              "policy auto leaves the widest member alone (n=",
+              plan->stacked[g.idx[widest]]->N, " >= 2 x ", second,
+              "; the rest pack as n=", rest, " in their own gemv_t bn",
+              packed.bn, "; METALJAX_STACKED_PACK=all packs it too)"));
+          g.idx.erase(g.idx.begin() + static_cast<std::ptrdiff_t>(widest));
+        }
+      }
+    }
+    if (g.idx.size() < 2) continue;
+
+    int64_t n_total = 0;
+    for (size_t j : g.idx) n_total += plan->stacked[j]->N;
+    auto pack = std::make_unique<StackedPackMatch>();
+    std::vector<std::string> ns;
+    for (size_t j : g.idx) ns.push_back(absl::StrCat(plan->stacked[j]->N));
+    pack->x = g.key.x;
+    pack->layer = g.key.layer;
+    pack->L = g.key.L;
+    pack->K = g.key.K;
+    pack->M = 1;
+    pack->n_total = n_total;
+    pack->elem_bytes = ElemBytes(g.key.elem);
+    pack->pack_bytes = g.key.L * g.key.K * n_total * pack->elem_bytes;
+    try {
+      std::vector<int64_t> lshape = ShapeOf(g.key.x);
+      pack->out_band.assign(
+          lshape.begin(),
+          lshape.end() - static_cast<std::ptrdiff_t>(g.key.lc.size()));
+      pack->out_band.push_back(n_total);
+    } catch (const Reject& e) {
+      Debug(absl::StrCat("not a pack (", pack->name, ": ", e.why, ")"));
+      continue;
+    } catch (const std::exception& e) {
+      Debug(absl::StrCat("not a pack (", pack->name, ": ", e.what(), ")"));
+      continue;
+    }
+    pack->name = absl::StrCat("L", g.key.L, "m1k", g.key.K, "n",
+                              absl::StrJoin(ns, "+"));
+    for (size_t j : g.idx) {
+      grouped.insert(j);
+      // members[1..] are ABSORBED: their roots never dispatch, and their
+      // results are bound by the pack's emit (the GDN/B6 precedent).
+      if (j != g.idx.front()) pack->ops.push_back(plan->stacked[j]->root);
+      for (mlir::Operation* o : plan->stacked[j]->ops)
+        pack->ops.push_back(o);
+      pack->members.push_back(std::move(plan->stacked[j]));
+    }
+    Debug(absl::StrCat("matched a stacked pack (", pack->name, ", ",
+                       pack->members.size(), " dots, ",
+                       pack->pack_bytes >> 20, " MB, gemv_t bn",
+                       TileFor(g.key.K, n_total).bn, ", policy ",
+                       PackPolicyName(policy), ")"));
+    plan->stacked_pack.push_back(std::move(pack));
+  }
+
+  if (grouped.empty()) return;
+  std::vector<std::unique_ptr<StackedDotMatch>> rest;
+  for (size_t i = 0; i < plan->stacked.size(); i++)
+    if (!grouped.contains(i)) rest.push_back(std::move(plan->stacked[i]));
+  plan->stacked = std::move(rest);
+}
+
+}  // namespace
+
+void AnalyzeStackedDot(mlir::func::FuncOp fn, RewritePlan* plan) {
+  AnalyzeStackedDotImpl(fn, plan);
+  // ...and, on top of the matches it kept, the sibling packs: several of
+  // those dots read ONE activation against different per-layer stacks, and
+  // the group becomes one gather_mm over the stacks concatenated on N.
+  try {
+    GroupStackedPacks(plan);
+  } catch (const Reject& e) {
+    Debug(absl::StrCat("pack grouping failed (", e.why,
+                       "): the members keep their own dots"));
+  } catch (const std::exception& e) {
+    Debug(absl::StrCat("pack grouping failed (", e.what(),
+                       "): the members keep their own dots"));
+  }
+}
+
 absl::Status BuildStackedPacks(RewritePlan* plan, const PackContext& ctx) {
-  bool any = false;
+  bool any = !plan->stacked_pack.empty();
   for (const auto& m : plan->stacked) any = any || m->relayout;
   if (!any) return absl::OkStatus();
   if (ctx.args == nullptr) return absl::OkStatus();
@@ -728,12 +1012,77 @@ absl::Status BuildStackedPacks(RewritePlan* plan, const PackContext& ctx) {
     }
   }
   plan->stacked = std::move(kept);
+
+  // ...and the sibling PACKS, out of the SAME budget: each group's members'
+  // [L, K, N] views, concatenated on the free axis into one contiguous
+  // [L, K, n_total] the emit reads with a single gather_mm.  The relayout
+  // runs first on purpose -- it is the measured 0.69 ms/token form, and a
+  // group is worth 0.35 -- so under budget pressure the packs are what
+  // declines.  A declined group gives its members back to `plan->stacked`
+  // and they keep their own dots (the recognizer file rule).
+  std::vector<std::unique_ptr<StackedPackMatch>> kept_packs;
+  int64_t packed = 0;
+  for (auto& g : plan->stacked_pack) {
+    std::string why;
+    try {
+      if (g->members.size() < 2) Bail("a group that lost its siblings");
+      if (total + g->pack_bytes > budget)
+        Bail(absl::StrCat("the relayout budget is spent (",
+                          (total + g->pack_bytes) >> 20, " MB > ",
+                          budget >> 20, " MB, METALJAX_STACKED_RELAYOUT_MB)"));
+      std::vector<mx::array> views;
+      views.reserve(g->members.size());
+      for (const auto& mem : g->members) {
+        if (mem->origin_arg < 0 ||
+            mem->origin_arg >= static_cast<int>(ctx.args->size()))
+          Bail("a member's stack argument is out of range");
+        const mx::array& src = (*ctx.args)[mem->origin_arg];
+        // The analysis proved these strides against the ORIGINAL buffer's
+        // row-major layout, and @main's arguments are contiguous, so this is
+        // the same view the member's own emit would have gathered from.
+        views.push_back(mx::as_strided(
+            src,
+            mx::Shape{static_cast<mx::ShapeElem>(g->L),
+                      static_cast<mx::ShapeElem>(g->K),
+                      static_cast<mx::ShapeElem>(mem->N)},
+            mx::Strides{mem->sl, mem->sk, mem->sn}, /*offset=*/0));
+      }
+      // The no-panic contract: device memory held for the executable's life,
+      // admitted like a transfer of its size.
+      governor_admit(g->pack_bytes, MemWhere::kExecute);
+      mx::array pk = mx::contiguous(mx::concatenate(views, 2));
+      mx::eval(pk);
+      g->pack_slot = static_cast<int>(plan->packs.size());
+      plan->packs.push_back(pk);
+      for (const auto& mem : g->members) args.insert(mem->origin_arg);
+      total += g->pack_bytes;
+      packed++;
+      Debug(absl::StrCat("packed ", g->name, " (", g->pack_bytes >> 20,
+                         " MB once, ", g->members.size(),
+                         " dots become one)"));
+      kept_packs.push_back(std::move(g));
+      continue;
+    } catch (const Reject& e) {
+      why = e.why;
+    } catch (const std::exception& e) {
+      why = e.what();
+    }
+    Debug(absl::StrCat("the members keep their own dots (", g->name,
+                       ": the pack declined, ", why, ")"));
+    for (auto& mem : g->members) plan->stacked.push_back(std::move(mem));
+    dropped = true;
+  }
+  plan->stacked_pack = std::move(kept_packs);
+
   plan->pack_args.assign(args.begin(), args.end());
   std::sort(plan->pack_args.begin(), plan->pack_args.end());
   if (dropped) plan->rebuild();
   if (relaid > 0)
     Debug(absl::StrCat(relaid, " stack(s) relaid, ", total >> 20,
                        " MB held for the executable"));
+  if (packed > 0)
+    Debug(absl::StrCat(packed, " sibling pack(s) built, ", total >> 20,
+                       " MB held for the executable in all"));
   return absl::OkStatus();
 }
 

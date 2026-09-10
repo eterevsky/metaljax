@@ -816,6 +816,8 @@ void AnalyzeMla(mlir::func::FuncOp fn, RewritePlan* plan) {
   for (const auto& m : plan->moe) take(m->root, m->ops);
   for (const auto& m : plan->ragged) take(m->root, m->ops);
   for (const auto& m : plan->stacked) take(m->root, m->ops);
+  for (const auto& m : plan->stacked_pack)
+    if (!m->members.empty()) take(m->members.front()->root, m->ops);
   for (const auto& m : plan->proj)
     if (!m->roots.empty()) take(m->roots[0], m->ops);
 

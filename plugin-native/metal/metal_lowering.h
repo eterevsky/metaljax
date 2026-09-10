@@ -115,6 +115,7 @@ struct LoweredProgram {
   int64_t num_ragged = 0;
   int64_t num_ragged_decode = 0;
   int64_t num_stacked = 0;
+  int64_t num_stacked_pack = 0;
   int64_t num_gdn = 0;
   int64_t num_rope = 0;
   int64_t num_proj = 0;

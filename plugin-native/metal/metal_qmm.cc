@@ -2484,6 +2484,13 @@ void RewritePlan::rebuild() {
     stacked_roots[m->root] = m.get();
     for (mlir::Operation* o : m->ops) skip.insert(o);
   }
+  for (const auto& m : stacked_pack) {
+    // members[0]->root is dispatched; the other members' roots are in `ops`
+    // (absorbed) and bound by the root's emit, the GDN/B6 precedent.
+    if (m->members.empty()) continue;
+    stacked_pack_roots[m->members.front()->root] = m.get();
+    for (mlir::Operation* o : m->ops) skip.insert(o);
+  }
   for (const auto& m : mla) {
     mla_roots[m->root] = m.get();
     for (mlir::Operation* o : m->ops) skip.insert(o);

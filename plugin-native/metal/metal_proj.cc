@@ -803,6 +803,8 @@ void AnalyzeProjPack(mlir::func::FuncOp fn,
   for (const auto& m : plan->moe) take(m->root, m->ops);
   for (const auto& m : plan->ragged) take(m->root, m->ops);
   for (const auto& m : plan->stacked) take(m->root, m->ops);
+  for (const auto& m : plan->stacked_pack)
+    if (!m->members.empty()) take(m->members.front()->root, m->ops);
 
   llvm::DenseMap<mlir::StringRef, std::vector<mlir::Operation*>> call_sites;
   module.walk([&](mlir::Operation* op) {

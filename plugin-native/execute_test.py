@@ -4078,6 +4078,102 @@ def _stacked_relayout_forms():
     ]
 
 
+def _stacked_pack_forms():
+    """(label, jax function, inputs) for `_p46_stacked_pack`.
+
+    Row 10 rewrite 3: SIBLING stacked dots.  Every form is maxtext's read --
+    the stack stored [K, L, N] (param_scan_axis = 1), a loop-invariant
+    [1, 0, 2] transpose hoisted out, `lax.scan` slicing layer `i` in the
+    body -- with SEVERAL stacks read against ONE activation, which is what a
+    pack merges.  The scan's `ys` carry each member's own output per layer,
+    so a slice at the wrong offset (or a member bound to the wrong band) is
+    visible in the answer and not only in the narration.
+
+      S1  row 10's attention pair, scaled: K = 1024, n = 2048 (`gemv_t bn16`)
+          + 512 (`bn4`).  The pack is n = 2560, still bn16 -- the wide
+          member's own tile, the good case: kv_a joins q's tile.
+      S2  row 10's post-attention triple: n = 64 + 1024 + 1024.  Three
+          members, the widest not twice the next, so `auto` packs all three.
+      S3  the policy's leave-alone case: n = 2048 + 128 + 128.  The widest
+          IS twice the next and the rest, packed as 256, stay in their own
+          `bn2` -- `auto` leaves the wide member alone and packs the two
+          small ones (METALJAX_STACKED_PACK=all packs all three).
+      S4  S1 at M = 3 (a prefill program): declines, decode-only.
+      S5  an f32 pair inside ONE gemv band: n = 512 + 768, packed 1280, all
+          three `bn4`.  f32 exposes a reordering bf16 rounding would hide,
+          so this is the strict bit-identity form.
+      S6  two dots over the SAME stack (a CSE miss upstream): the duplicate
+          is refused and the group falls below two members.
+      S7  S1's widths with the wide member's weight stored [K, L, 2, 1024]
+          (row 10's q is [K, L, heads, head_dim]): its declared result is
+          [m, 2, 1024] and not the pack's [m, n_i] band, so the emit's
+          per-member RESHAPE after the slice is exercised.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+
+    dn = (((1,), (0,)), ((), ()))
+    # S46_PACK_M (test-only): the activation row count, so S4 is S1 at M > 1.
+    m_env = int(os.environ.get("S46_PACK_M", "1"))
+
+    def rnd(shape, seed, scale=1.0, dtype=ml_dtypes.bfloat16):
+        return (np.random.RandomState(seed).standard_normal(shape)
+                * scale).astype(dtype)
+
+    def form(tag, K, ns, L, m, dtype, seed, dup=False):
+        """A scanned layer body that reads ONE activation against len(ns)
+        stacks of [K, L, n_i], and hands back every member's output."""
+
+        def fn(h, *Ws):
+            def body(h, ws):
+                # The shared activation: ONE value, which is what makes the
+                # members a group (the dots' lhs is the same MLIR value).
+                a = (h * jnp.asarray(0.5, h.dtype)).astype(h.dtype)
+                mats = list(ws)
+                if dup:
+                    mats = [mats[0], mats[0]]
+                outs = tuple(lax.dot_general(a, w, dn) for w in mats)
+                fb = None
+                for o in outs:
+                    t = jnp.sum(o.astype(jnp.float32).reshape(o.shape[0], -1),
+                                axis=1, keepdims=True)
+                    fb = t if fb is None else fb + t
+                return (h + fb.astype(h.dtype) * jnp.asarray(1e-3, h.dtype),
+                        outs)
+            def to_layers(W):
+                # [K, L, n...] -> [L, K, n...]: the hoisted loop-invariant
+                # transpose maxtext's param_scan_axis = 1 produces.
+                perm = (1, 0) + tuple(range(2, W.ndim))
+                return jnp.transpose(W, perm)
+            return lax.scan(body, h, tuple(to_layers(W) for W in Ws))
+
+        # A distinct name per form: the executable narrates per jit name,
+        # and the dispatch contract compares the arms name by name.
+        fn.__name__ = f"spk_{tag}"
+        args = [rnd((m, K), seed, 0.1, dtype)]
+        for j, n in enumerate(ns):
+            free = n if isinstance(n, tuple) else (n,)
+            args.append(rnd((K, L) + free, seed + 1 + j, 0.05, dtype))
+        return fn, args
+
+    bf, f32 = ml_dtypes.bfloat16, np.float32
+    out = []
+    f, a = form('s1', 1024, (2048, 512), 3, m_env, bf, 300)
+    out.append(("S1 pair", f, a))
+    f, a = form('s2', 1024, (64, 1024, 1024), 3, m_env, bf, 320)
+    out.append(("S2 triple", f, a))
+    f, a = form('s3', 1024, (2048, 128, 128), 3, m_env, bf, 340)
+    out.append(("S3 leave-widest", f, a))
+    f, a = form('s5', 1024, (512, 768), 3, m_env, f32, 360)
+    out.append(("S5 f32 same band", f, a))
+    f, a = form('s6', 1024, (512,), 3, m_env, bf, 380, dup=True)
+    out.append(("S6 duplicate stack", f, a))
+    f, a = form('s7', 1024, ((2, 1024), 512), 3, m_env, bf, 400)
+    out.append(("S7 head-shaped member", f, a))
+    return out
+
+
 def _ragged_decode_forms():
     """(label, jax function, args) for `_p44_ragged_decode`.
 
@@ -9694,6 +9790,194 @@ def _p41_stacked_relayout(subprocess, pathlib, re):
             ("stacked relayout vs chain/CPU", against_the_slice_chain_and_cpu)]
 
 
+def _p46_stacked_pack(subprocess, pathlib, re):
+    """Row 10 rewrite 3: the SIBLING stacked pack (metal_stacked.cc).
+
+    A scanned-layer decode step reads one post-norm activation against
+    several per-layer stacks -- row 10's q and kv_a over the attention norm,
+    its router and two shared-expert gates over the MLP norm.  Each was its
+    own `gather_mm`; the pack concatenates their [L, K, N] views on the free
+    axis ONCE per executable (out of the relayout's budget, governor-
+    admitted) and the group becomes one gather_mm plus per-member last-axis
+    slices, which at M == 1 are views.
+
+    Pinned: the groups FIRE and are BUILT with the widths the policy says
+    (S1 pair, S2 triple, S3's leave-the-widest, S5's f32 band; S6's
+    duplicate stack refused); METALJAX_STACKED_PACK=0 and a zero budget
+    restore the members' own dots; the packed programs dispatch FEWER
+    kernels; every member's OWN per-layer output (the scan's `ys`, so a
+    mis-offset slice cannot hide) is bit-identical to the unpacked emit
+    where the pack shares the members' gemv band and within a ULP where it
+    crosses one, and the whole answer matches jax-CPU; and at M = 3 the
+    form declines, decode-only.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+    memo = {}
+
+    def arm(env_extra, platform="metal"):
+        import json
+        key = (platform, tuple(sorted(env_extra.items())))
+        if key in memo:
+            return memo[key]
+        child = dict(os.environ)
+        if platform == "cpu":
+            child.pop("METALJAX_PLUGIN_PATH", None)
+            child["JAX_PLATFORMS"] = "cpu"
+        child["METALJAX_DEBUG"] = "1"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--stacked-pack-forms"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if not line.startswith("SPK "):
+                continue
+            label, payload = line[4:].split("\t", 1)
+            answers[label] = [np.array(a) for a in json.loads(payload)]
+        memo[key] = (answers, proc.stdout + proc.stderr)
+        return memo[key]
+
+    def matched(text):
+        return re.findall(
+            r"stacked: matched a stacked pack \((\S+), (\d+) dots, "
+            r"(\d+) MB, gemv_t bn(\d+)", text)
+
+    def built(text):
+        return re.findall(r"stacked: packed (\S+) \((\d+) MB once", text)
+
+    def dispatches(text):
+        out = {}
+        for m in re.finditer(
+                r"\[metaljax-native\] (jit_\w+): flushes=.*?dispatches=(\d+)",
+                text):
+            out.setdefault(m.group(1), int(m.group(2)))
+        return out
+
+    def worst(a, b):
+        e = 0.0
+        for x, y in zip(a, b):
+            scale = max(float(np.max(np.abs(y))), 1e-30)
+            e = max(e, float(np.max(np.abs(x - y))) / scale)
+        return e
+
+    def same(a, b):
+        return len(a) == len(b) and all(
+            x.shape == y.shape and np.array_equal(x, y) for x, y in zip(a, b))
+
+    # name -> (members, the pack's own gemv bn, whether every member is
+    # already in that band).  S1/S2/S3 cross a band (a small member joins a
+    # wide one's tile); S5 does not.
+    WANT = {"L3m1k1024n2048+512": (2, 16, False),
+            "L3m1k1024n64+1024+1024": (3, 16, False),
+            "L3m1k1024n128+128": (2, 2, True),
+            "L3m1k1024n512+768": (2, 4, True)}
+    SAME_BAND = {"S5"}
+
+    def the_packs_fire():
+        _a, text = arm({})
+        names = {n: (int(d), int(bn)) for n, d, _mb, bn in matched(text)}
+        made = {n for n, _mb in built(text)}
+        bad = []
+        for n, (members, bn, _b) in WANT.items():
+            if n not in names:
+                bad.append(f"{n} not matched")
+            elif names[n] != (members, bn):
+                bad.append(f"{n} matched as {names[n]}, want {(members, bn)}")
+            elif n not in made:
+                bad.append(f"{n} matched but not built")
+        if bad:
+            return False, "; ".join(bad) + f"; have {sorted(names)}"
+        # S3's widest member is left alone by `auto`...
+        if "L3m1k1024n2048+128+128" in names:
+            return False, "policy auto packed S3's widest member"
+        if not re.search(r"policy auto leaves the widest member alone", text):
+            return False, "the leave-the-widest narration is missing"
+        # ...and S6's duplicate stack never becomes a group.
+        if not re.search(r"the same stack twice in one group", text):
+            return False, "the duplicate stack was not refused"
+        # S7 has S1's widths but a [m, 2, 1024] declared result, so that
+        # width must be packed TWICE -- once per program -- which is what
+        # pins the emit's per-member reshape.
+        twice = [n for n, _mb in built(text)].count("L3m1k1024n2048+512")
+        if twice != 2:
+            return False, (f"the head-shaped form (S7) packed {twice} times, "
+                           "want 2 (S1 and S7)")
+        return True, (f"{len(made)} packs built: "
+                      + ", ".join(sorted(made)))
+
+    def the_kill_switches_decline():
+        for env in ({"METALJAX_STACKED_PACK": "0"},
+                    {"METALJAX_STACKED_RELAYOUT_MB": "0"}):
+            _a, text = arm(env)
+            if matched(text) or built(text):
+                return False, f"{env} still packs: {matched(text)[:3]}"
+            if not re.search(r"stacked: matched a stacked dot", text):
+                return False, f"{env} lost the plain stacked matches too"
+        return True, ("STACKED_PACK=0 and a zero budget pack nothing and "
+                      "keep the members' own dots")
+
+    def the_form_is_decode_only():
+        _a, text = arm({"S46_PACK_M": "3"})
+        if matched(text) or built(text):
+            return False, f"packed at M=3: {matched(text)[:3]}"
+        return True, "M=3 forms decline (decode-only, the relayout's rule)"
+
+    def the_pack_removes_dispatches():
+        _a, on = arm({})
+        _b, off = arm({"METALJAX_STACKED_PACK": "0"})
+        d_on, d_off = dispatches(on), dispatches(off)
+        progs = sorted(p for p in d_off if p in d_on
+                       and p.startswith("jit_spk_")
+                       and not p.startswith("jit_spk_s6"))
+        if len(progs) < 4:
+            return False, f"dispatch narration on={d_on} off={d_off}"
+        worse = [p for p in progs if d_on[p] > d_off[p]]
+        fewer = [p for p in progs if d_on[p] < d_off[p]]
+        if worse or len(fewer) < 4:
+            return False, (f"packing did not remove dispatches: "
+                           f"on={d_on} off={d_off}")
+        return True, ", ".join(f"{d_off[p]}->{d_on[p]}" for p in progs)
+
+    def the_pack_cannot_move_an_answer():
+        on, _t = arm({})
+        off, _u = arm({"METALJAX_STACKED_PACK": "0"})
+        cpu, _v = arm({}, platform="cpu")
+        if set(on) != set(off) or set(on) != set(cpu):
+            return False, f"labels differ: {sorted(set(on) ^ set(off))}"
+        bad, exact, reported = [], [], []
+        for k in sorted(on):
+            fkey = k.split()[0]
+            if same(on[k], off[k]):
+                exact.append(k)
+                continue
+            e = worst(on[k], off[k])
+            if fkey in SAME_BAND:
+                bad.append(f"{k} differs by {e:.2e} "
+                           f"(one gemv band: must be bit-identical)")
+            elif e > 2 ** -7:
+                bad.append(f"{k} differs by {e:.2e} (> 1 ULP)")
+            else:
+                reported.append(f"{k} {e:.1e}")
+        ecpu = max(worst(on[k], cpu[k]) for k in on)
+        if bad:
+            return False, "; ".join(bad)
+        if ecpu > 2e-2:
+            return False, f"vs jax-CPU worst {ecpu:.2e}"
+        how = f"{len(exact)}/{len(on)} bit-identical with the pack off"
+        if reported:
+            how += "; band-crossing within a ULP: " + ", ".join(reported)
+        return True, f"{how}; vs jax-CPU worst {ecpu:.1e}"
+
+    return [("stacked packs fire", the_packs_fire),
+            ("stacked pack kill switches", the_kill_switches_decline),
+            ("stacked pack is decode-only", the_form_is_decode_only),
+            ("stacked pack removes dispatches", the_pack_removes_dispatches),
+            ("stacked pack cannot move an answer",
+             the_pack_cannot_move_an_answer)]
+
+
 def _p33_gdn(subprocess, pathlib, re):
     """The gated-delta-net decode step: it FIRES, it is the whole block, and
     it is on the literal chain's own values.
@@ -11948,6 +12232,22 @@ def main():
                       f"{_json.dumps([np.asarray(o).astype(np.float64).ravel().tolist() for o in outs])}",
                       flush=True)
         return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--stacked-pack-forms":
+        # Row 10 rewrite 3: the sibling stacked PACKS, through jax on the
+        # plugin -- or on the CPU when the caller says so.  Answers to
+        # stdout, the recognizer's, the pack wave's and the executable's
+        # narration to stderr.
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        import json as _json
+        import jax
+        for label, fn, args in _stacked_pack_forms():
+            outs = jax.tree_util.tree_leaves(jax.jit(fn)(*args))
+            print(f"SPK {label}\t"
+                  f"{_json.dumps([np.asarray(o).astype(np.float64).ravel().tolist() for o in outs])}",
+                  flush=True)
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--stacked-relayout-forms":
         # B3: the stacked dots whose contracted axes straddle the layer axis
         # (maxtext's attention out-projection), through jax on the plugin --
@@ -12169,6 +12469,8 @@ def main():
                                           __import__("re"))
                          + _p43_proj_pack(subprocess, pathlib,
                                           __import__("re"))
+                         + _p46_stacked_pack(subprocess, pathlib,
+                                             __import__("re"))
                          + _p44_ragged_decode(subprocess, pathlib,
                                               __import__("re"))
                          + _p25_cache_limit(subprocess, tempfile, pathlib,

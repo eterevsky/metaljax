@@ -1108,6 +1108,10 @@ bool UsesPacks(const RewritePlan* plan, mlir::ModuleOp module,
     if (sd != plan->stacked_roots.end() && sd->second->relayout &&
         sd->second->pack_slot >= 0)
       return true;
+    // ...a stacked SIBLING pack, read where its root dot is...
+    auto sp = plan->stacked_pack_roots.find(&op);
+    if (sp != plan->stacked_pack_roots.end() && sp->second->pack_slot >= 0)
+      return true;
     // ...a projection pack (B6), read where its root dot is...
     auto pj = plan->proj_roots.find(&op);
     if (pj != plan->proj_roots.end() && pj->second->pack_slot >= 0)
@@ -1525,7 +1529,8 @@ int64_t ScatterCost(LowerContext& ctx, mlir::Operation* op) {
 // fused attention.  0 = not a root.
 int64_t RootCostUnit(const RewritePlan& plan, mlir::Operation* op) {
   if (plan.qmm_roots.count(op) || plan.moe_roots.count(op) ||
-      plan.ragged_roots.count(op) || plan.stacked_roots.count(op))
+      plan.ragged_roots.count(op) || plan.stacked_roots.count(op) ||
+      plan.stacked_pack_roots.count(op))
     return 2;
   if (plan.sdpa_roots.count(op)) return 3;
   // The multi-span attention: one fused sdpa plus the span concats and the
@@ -1625,6 +1630,14 @@ int64_t RootExtraBytes(const RewritePlan& plan, mlir::Operation* op) {
     // At most one reshaped copy of the activation; the stack is read as a
     // view and the helper's whole-layer slice copy is never made.
     return ValueBytes(sd->second->x);
+  }
+  auto sp = plan.stacked_pack_roots.find(op);
+  if (sp != plan.stacked_pack_roots.end() && sp->second != nullptr) {
+    // The same, plus the packed [.., n_total] result the members' last-axis
+    // slices are views of (each member's own declared result was charged to
+    // the root it was absorbed from, which no longer dispatches).
+    const StackedPackMatch& m = *sp->second;
+    return ValueBytes(m.x) + m.M * m.n_total * m.elem_bytes;
   }
   auto ml = plan.mla_roots.find(op);
   if (ml != plan.mla_roots.end() && ml->second != nullptr) {
@@ -3050,6 +3063,8 @@ class Lowering {
   absl::Status LowerMoe(mlir::Operation* op, const MoeMatch& m);
   absl::Status LowerRagged(mlir::Operation* op, const RaggedMatch& m);
   absl::Status LowerStackedDot(mlir::Operation* op, const StackedDotMatch& m);
+  absl::Status LowerStackedPack(mlir::Operation* op,
+                                const StackedPackMatch& m);
   absl::Status LowerMla(mlir::Operation* op, const MlaMatch& m);
   absl::Status LowerGdn(mlir::Operation* op, const GdnMatch& m);
   absl::Status LowerRmsNorm(mlir::Operation* op, const RmsNormMatch& m);
@@ -8020,6 +8035,15 @@ absl::Status Lowering::LowerOpImpl(mlir::Operation* op) {
       RETURN_IF_ERROR(CheckValue(op->getResult(0)));
       return LowerStackedDot(op, *stacked->second);
     }
+    auto spack = ctx_->plan->stacked_pack_roots.find(op);
+    if (spack != ctx_->plan->stacked_pack_roots.end()) {
+      // The pack's own root has one result; the other members' results are
+      // bound by its emit (the GDN/B6 precedent) and checked there.
+      if (op->getNumResults() != 1)
+        return Decline("a recognizer root with several results");
+      RETURN_IF_ERROR(CheckValue(op->getResult(0)));
+      return LowerStackedPack(op, *spack->second);
+    }
     auto mla = ctx_->plan->mla_roots.find(op);
     if (mla != ctx_->plan->mla_roots.end()) {
       if (op->getNumResults() != 1)
@@ -8595,6 +8619,94 @@ absl::Status Lowering::LowerStackedDot(mlir::Operation* op,
   attrs.insert(attrs.end(), m.out_shape.begin(), m.out_shape.end());
   Emit(opcode, {x, w, layer}, {Bind(op->getResult(0))}, std::move(attrs),
        std::nullopt, ResultBytes(op));
+  return absl::OkStatus();
+}
+
+// metal_stacked.cc's sibling PACK: several stacked dots over ONE activation
+// become ONE `metaljax.stacked_dot` over the concatenated [L, K, n_total]
+// pack (a trailing input of the tape, threaded into this frame as a capture,
+// `UsesPacks`), then per member a last-axis `slice` and, where the member's
+// declared result is not [.., n_i], a `reshape`.  At M == 1 both are views
+// of a row-contiguous [.., n_total], exactly as in `LowerProjPack`.
+//
+// The pack IS the members' own [L, K, N] layout concatenated on the free
+// axis, so the packed dot is the same `gemv_t_gather` over the same values
+// with a larger N; below K = 8192 that kernel's per-output K order does not
+// depend on N (metal_proj.cc's `TileOf` note), so this is bit-identical to
+// the member dots.
+//
+// The emit never Declines on a matched group: a pack that is not in scope --
+// which the analysis and `UsesPacks` rule out -- lowers the members as the
+// literal stacked dots they were.
+absl::Status Lowering::LowerStackedPack(mlir::Operation* op,
+                                        const StackedPackMatch& m) {
+  if (m.members.empty() || m.members.front()->root != op)
+    return Decline("stacked: a pack rooted elsewhere");
+  for (const auto& mem : m.members) {
+    if (mem->root == nullptr || mem->root->getNumResults() != 1)
+      return Decline("stacked: a pack member with several results");
+    RETURN_IF_ERROR(CheckValue(mem->root->getResult(0)));
+  }
+  const bool in_scope = m.pack_slot >= 0 && !pack_slots_.empty() &&
+                        m.pack_slot < static_cast<int>(pack_slots_.size());
+  if (!in_scope) {
+    if (kDebug)
+      std::fprintf(stderr,
+                   "[metaljax-native] stacked: %s has no pack in scope: the "
+                   "dots run as written\n", m.name.c_str());
+    for (const auto& mem : m.members)
+      RETURN_IF_ERROR(LowerStackedDot(mem->root, *mem));
+    return absl::OkStatus();
+  }
+  for (mlir::Value v : {m.x, m.layer}) RETURN_IF_ERROR(CheckValue(v));
+  ASSIGN_OR_RETURN(int x, Slot(m.x));
+  ASSIGN_OR_RETURN(int layer, Slot(m.layer));
+  ASSIGN_OR_RETURN(int out_code, DtypeCode(op->getResult(0)));
+  ASSIGN_OR_RETURN(int opcode, Opcode("metaljax.stacked_dot"));
+  ASSIGN_OR_RETURN(int op_slice, Opcode("stablehlo.slice"));
+  ASSIGN_OR_RETURN(int op_reshape, Opcode("stablehlo.reshape"));
+  const int pack = pack_slots_[static_cast<size_t>(m.pack_slot)];
+
+  // The pack is CONTIGUOUS [L, K, n_total], so the emit's view of it is the
+  // identity permutation and the row-major strides of that shape.
+  std::vector<int64_t> attrs{3, 0, 1, 2, m.L, m.K, m.n_total,
+                             m.K * m.n_total, m.n_total, 1, m.M,
+                             static_cast<int64_t>(out_code),
+                             static_cast<int64_t>(m.out_band.size())};
+  attrs.insert(attrs.end(), m.out_band.begin(), m.out_band.end());
+  const int d_slot = nslots_++;
+  Emit(opcode, {x, pack, layer}, {d_slot}, std::move(attrs), std::nullopt,
+       Product(m.out_band) * m.elem_bytes);
+
+  const int64_t rank = static_cast<int64_t>(m.out_band.size());
+  int64_t off = 0;
+  for (const auto& mem : m.members) {
+    const int64_t n_i = mem->N;
+    std::vector<int64_t> starts(static_cast<size_t>(rank), 0);
+    std::vector<int64_t> limits = m.out_band;
+    std::vector<int64_t> strides(static_cast<size_t>(rank), 1);
+    starts.back() = off;
+    limits.back() = off + n_i;
+    std::vector<int64_t> band(m.out_band.begin(), m.out_band.end() - 1);
+    band.push_back(n_i);
+    const bool reshape = mem->out_shape != band;
+    std::vector<int64_t> sattrs{rank};
+    sattrs.insert(sattrs.end(), starts.begin(), starts.end());
+    sattrs.insert(sattrs.end(), limits.begin(), limits.end());
+    sattrs.insert(sattrs.end(), strides.begin(), strides.end());
+    const int s_slot = reshape ? nslots_++ : Bind(mem->root->getResult(0));
+    Emit(op_slice, {d_slot}, {s_slot}, std::move(sattrs), std::nullopt,
+         ResultBytes(mem->root));
+    if (reshape) {
+      std::vector<int64_t> rattrs{
+          static_cast<int64_t>(mem->out_shape.size())};
+      rattrs.insert(rattrs.end(), mem->out_shape.begin(),
+                    mem->out_shape.end());
+      Emit(op_reshape, {s_slot}, {Bind(mem->root->getResult(0))},
+           std::move(rattrs), std::nullopt, ResultBytes(mem->root));
+    }
+    off += n_i;
+  }
   return absl::OkStatus();
 }
 
@@ -10087,6 +10199,10 @@ absl::StatusOr<LoweredProgram> LowerModuleFused(
   for (const auto& m : plan.ragged)
     if (m->decode != 0) lowered->num_ragged_decode++;
   lowered->num_stacked = static_cast<int64_t>(plan.stacked.size());
+  for (const auto& m : plan.stacked_pack) {
+    lowered->num_stacked += static_cast<int64_t>(m->members.size());
+    lowered->num_stacked_pack++;
+  }
   lowered->num_gdn = static_cast<int64_t>(plan.gdn.size());
   lowered->num_rope = static_cast<int64_t>(plan.rope.size());
   lowered->num_proj = static_cast<int64_t>(plan.proj.size());
