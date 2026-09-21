@@ -92,6 +92,14 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
     extra.patch_sentencepiece_native()
     import keras_hub
 
+    # Harness variant for the int4 route: keras-hub's Gemma4 FFN "HOTFIX"
+    # multiplies by UNSCALED int4 codes (every backend decoded garbage), and
+    # keras's int4 Embedding unpacks whole tables to gather one row.  Both
+    # are restored here, never in the venv; see int4_fix.py.  Knobs:
+    # METALJAX_BENCH_INT4_FIX / _INT4_EMB = 0 reproduce the original.
+    import int4_fix
+    variant = int4_fix.install(quant)
+
     # Stream the checkpoint into the model instead of building a full set of
     # random weights first (see install_streaming_load): that build phase is
     # what put the >=50 GB rows over the machine — the peak is not
@@ -209,10 +217,18 @@ def run_keras_lm(bench, backend, prompt, n_decode, quant=None):
     ids = [int(t) for t in lm.preprocessor.tokenizer(out)][:64]
     n_new = len(lm.preprocessor.tokenizer(out)) - plen
     decode_ms = (1000 * dt - prefill_ms) / max(n_new - 1, 1)
+    # Opt-in (METALJAX_BENCH_FULL_IDS=1): the WHOLE generated stream, for
+    # cross-backend agreement past the 64-id window (row-13 evidence).
+    # Off by default, so every other row's record shape is untouched.
+    extra_ids = {}
+    if os.environ.get("METALJAX_BENCH_FULL_IDS") == "1":
+        extra_ids = {"token_ids_new":
+                     [int(t) for t in lm.preprocessor.tokenizer(out)][plen:],
+                     "gen_text": out[len(prompt):][:4000]}
     return dict(load_s=load_s, warmup_s=warmup_s, build_s=build_s,
                 prefill_ms=prefill_ms, decode_ms_tok=decode_ms,
-                out_tokens=n_new, token_ids=ids,
-                prompt_tokens=plen, stream_load=stream_info)
+                out_tokens=n_new, token_ids=ids, harness_variant=variant,
+                prompt_tokens=plen, stream_load=stream_info, **extra_ids)
 
 
 def run_mlx(bench, backend, prompt, n_decode):
