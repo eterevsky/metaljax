@@ -127,7 +127,19 @@ def parse_ledger(path):
     if len(tbl) < 3:
         return None, {}
     header = [c.strip() for c in tbl[0].strip().strip("|").split("|")]
+    # The RELEASE column is the rightmost one whose cells are bold (the
+    # ledger's convention for release cells); the HEAD and goal columns sit
+    # to its right since 2026-09 and must not be the baseline.
     col = len(header) - 1
+    for c in range(len(header) - 1, 0, -1):
+        bold = 0
+        for l in tbl[2:]:
+            cells = [x.strip() for x in l.strip().strip("|").split("|")]
+            if len(cells) > c and "**" in cells[c]:
+                bold += 1
+        if bold >= 3:
+            col = c
+            break
     label = header[col]
     rows = {}
     for l in tbl[2:]:
