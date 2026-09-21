@@ -24,10 +24,10 @@ optimization.*
 | 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | **19.8** | 13.2 ʰ | 8.8 ˣ |
 | 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | **28.5** ᴳ | 21.3 ʰ | 13.7 ˣ |
 | 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | **190.8** ᴳ | 188.0 ʰ | 114.9 ˡ |
-| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **25.9** ᵖ | 21.4 ʰ | 10.5 ˣ |
+| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | **25.9** ᵖ | 19.8 ʰ | 10.5 ˣ |
 | 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | **12.33** ᵐ | 5.2 ʰ | 3.2 ˣ |
 | 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | **85.6** ᴳ | | 53.5 ˣ |
-| 13 | gemma4-E2B keras-int4 | 340 | 336 | 81.1 | 80.3 ᴾ²⁷ | 78.0 | 78.0 | **77.0** | 69.4 ʰ | 4.5 ˣ |
+| 13 | gemma4-E2B keras-int4 ᵇ | 340 ᵇ | 336 ᵇ | 81.1 ᵇ | 80.3 ᴾ²⁷ ᵇ | 78.0 ᵇ | 78.0 ᵇ | **77.0** ᵇ | 6.0 ʰ | 4.5 ˣ |
 | 14 | Qwen3-0.6B qwix-int8 | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | **29.88** | 26.7 ʰ | |
 | 15 | Qwen3-8B qwix-int8 | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | **388.4** ᵛ | | |
 | 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | **86.68** | 42.0 ʰ | 29.8 ᵗ |
@@ -55,25 +55,29 @@ Notes:
   lead over mlx-lm on rows 3 and 6.
 - ʰ = HEAD-column cells: rerun-first medians of ≥ 2 runs on a frozen build
   of main, token streams identical to the row's release record unless
-  stated. As of 2026-09-10: row 10 is on the current build d024710 (stacked
-  sibling packs + the re-vendored MLX fork; 21.40 / 21.40, text identical;
-  its transient byte-cadence knob read 21.47 / 21.60 there at 84-90 GB
-  peak against 85-87 GB, so it stays off); rows 13/16/17/18/19 and the
-  sentinels 4/7/11 on the precision-default build 44fa042
-  (METALJAX_MATMUL_PRECISION=high: f32 stays exact, bf16/f16 and quantized
-  matmuls use the M5 accelerators, as mlx-lm and torch-MPS do), re-read on
-  d024710 with identical streams (4 16.7, 7 13.2, 11 5.0, 14 26.6); every
-  other row on the projection-pack build ad9507e, all with a 60 s cool-down
-  before each row.  Row 17 has no token stream and its image statistics
-  vary run to run on every binary, so no identity is claimed there; each of
-  its resolutions is a median of 2.  Decode sentinels on the precision build read in band (row 11 5.1,
-  row 4 16.7, row 7 13.2) with the first 64 token ids identical; rows 4 and
-  7 end generation a few tokens earlier past that window (a bf16
-  accumulation-order tie).  Rows 1/2/3 read within run spread of their
-  week-old cells; knob-off arms cleared every merge.  Row 12 has no cell:
-  the governor refused cleanly at 106.4 GB of claimed memory against its
-  105 GB ceiling (the desktop held 18 GB); it needs a lighter machine or a
-  raised ceiling with a matching guard.
+  stated. As of 2026-09-21: rows 10 and 13 and the sentinels 4/7/11/14 are
+  on the current build e46bc94 (sibling packs through peeled views,
+  chunk-boundary carry donation, loop-position specialization on by
+  default; row 10 19.72 / 19.85, row 13 6.0 / 6.0 with the row-13 harness
+  fix, sentinels 4 16.8, 7 13.2, 11 keras 5.1, 14 26.5, all streams
+  identical to their previous records); rows 16/17/18/19 on the
+  precision-default build 44fa042 (METALJAX_MATMUL_PRECISION=high: f32
+  stays exact, bf16/f16 and quantized matmuls use the M5 accelerators, as
+  mlx-lm and torch-MPS do); every other row on the projection-pack build
+  ad9507e, all with a 60 s cool-down before each row.  Row 17 has no
+  token stream and its image statistics vary run to run on every binary,
+  so no identity is claimed there; each of its resolutions is a median
+  of 2.  Row 12 has no cell: the governor refused cleanly at 106.4 GB of
+  claimed memory against its 105 GB ceiling (the desktop held 18 GB); it
+  needs a lighter machine or a raised ceiling with a matching guard.
+- ᵇ **Row 13's cells through 0.11.7 measured a numerically broken model**:
+  keras-hub's Gemma4 decoder block bypasses the int4 FFN layers' scale
+  (its "HOTFIX" multiplies by the raw int4 codes), so every backend
+  decoded one repeated token; the bench harness routes the int4 FFN
+  through the quantized layers and gathers embedding rows before unpacking
+  (scripts/model_bench/int4_fix.py, from 2026-09-21; STATUS.md fn 8).  Those
+  cells are timings of the broken graph and are NOT comparable to the
+  HEAD cell; the jax-CPU history (340 → 67.8) is broken the same way.
 - ᵐ **Row 11 changed benchmark implementation after 0.11.7** (the
   best-available-implementation rule): every cell through the 0.11.7 column
   is the maxtext decode harness and is NOT comparable to the keras-hub cells

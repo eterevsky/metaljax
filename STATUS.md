@@ -23,7 +23,7 @@ parentheses is peak footprint where measured.
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ² | **25.9** ¹¹ (86 GB) | 10.5 | — | 10.7 ¹⁰ |
 | 11 | Qwen3-0.6B (keras-hub decode) | 29.4 | **9.0** ¹³ | 3.2 ¹³ | — | 3.4 ¹⁰ |
 | 12 | Mixtral 8×7B bf16 | ✗ | **85.6** (90 GB) | 53.5 ¹⁷ (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | **67.8** ⁸ | **77.0** | 4.5 ¹⁹ | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | 71.0 ⁸ | **77.0** ⁸ | 4.5 ¹⁹ | — | — |
 | 14 | Qwen3-0.6B maxtext qwix-int8 | 143.4 | **29.88** | — | — | — |
 | 15 | *qwix-int8 Qwen3-8B* | 2118 | **388.4** (73 GB) | — | — | — |
 | 16 | SigLIP 2 (fwd b1 ms) | 533 | **86.68** | — | 29.8 (b32: 591) | — |
@@ -68,10 +68,23 @@ load ~20–30×.
    token count as the metaljax cell (the metaljax cell chat-templates it,
    ~63 tokens vs ~52 raw). The E2B cell's raw run record is lost (its
    token count is unknown); it stands as dated until re-measured.
-8. Row 13: packed int4 stays packed on metaljax (2.7 vs 10.2 GB — the
-   only sub-byte JAX path that keeps it), while XLA:CPU fuses the
-   in-graph unpack into a small net win (67.8 vs 79.2 bf16) — which is
-   why the CPU cell leads this row.
+8. Row 13: every cell through 0.11.7 (metaljax 77.0, jax-CPU 67.8 and
+   their history) measured a numerically broken model: keras-hub 0.30.0's
+   Gemma4 decoder block computes the FFN as matmul(x, layer.kernel)
+   under a "HOTFIX", and for an int4 EinsumDense `.kernel` is the raw
+   unpacked codes with no scale, so the model generated one token
+   repeated on every backend (upstream still carries it, 2026-09-19;
+   notes/keras-hub-gemma4-int4-hotfix-issue.md).  From 2026-09-21 the
+   harness routes the int4 FFN through the quantized layers and gathers
+   embedding rows before unpacking (scripts/model_bench/int4_fix.py,
+   METALJAX_BENCH_INT4_FIX / _INT4_EMB=0 reproduce the original): the
+   CPU cell is that variant at the row protocol (71.0, 128 tokens); the
+   metaljax 77.0 is the 0.11.7 release cell of the broken graph and is
+   replaced at the next release (models.md HEAD 6.0).  The two backends'
+   greedy streams part at generated token 1 on a 1-bf16-ULP tie (top-2
+   sets identical, margins 0.125 on both sides), the accepted
+   accumulation-order class; both read as correct answers.  Packed int4
+   stays packed on metaljax (2.7 vs 10.2 GB).
 9. Row 17 comparators: torch via the ungated diffusers mirror
    (adamo1139/stable-diffusion-3.5-large-ungated @5d868ff; images
    verified at both resolutions). No ungated MLX path exists for
