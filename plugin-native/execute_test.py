@@ -114,6 +114,52 @@ def _switch_case(i, x):
 # lambdas so the body reads like the cell it is.
 
 
+def _loop_spec_forms():
+    """P49's two counted loops: one with per-position slices, one without.
+
+    The first is a 90-step `scan` over THREE stacked inputs whose per-step
+    reads are `dynamic_slice`s at the loop counter, carrying two stacked
+    outputs whose writes are `dynamic_update_slice`s at the same counter --
+    the shape of a decode step over per-layer weights (row 10), in miniature.
+    Five counter-derived starts per iteration, which is what the rewrite
+    folds.  Long enough not to unroll into the enclosing trace
+    (`kUnrollMax` = 64), and the cross-lane `mean` is a reduce `msl_scan`
+    declines, so the loop really reaches `run_chunked`.
+
+    The second is a `fori_loop` over a fixed weight: a counted, compiled,
+    chunked body with NO dynamic slice at all.  It is the decline this
+    contract needs -- a body with nothing to fold must not pay one compile
+    trace per chunk.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    L, B, F = 90, 4, 8
+
+    def scan_over_stacks(h0, ws, bs, xs):
+        def step(h, inp):
+            w, b, x = inp
+            h2 = (jnp.tanh(h @ w * 0.5 + b + x)
+                  - jnp.mean(h, axis=0, keepdims=True))
+            return h2, (jnp.tanh(h2) @ w, h2 * 2.0)
+        carry, ys = jax.lax.scan(step, h0, (ws, bs, xs))
+        return carry, ys[0], ys[1]
+
+    def fori_no_stacks(h0, w):
+        def step(_i, h):
+            return (jnp.tanh(h @ w * 0.5)
+                    - jnp.mean(h, axis=0, keepdims=True))
+        return jax.lax.fori_loop(0, L, step, h0)
+
+    h0 = _rand((B, F), 900)
+    ws = _rand((L, F, F), 901) * np.float32(0.3)
+    bs = _rand((L, 1, F), 902) * np.float32(0.1)
+    xs = _rand((L, B, F), 903) * np.float32(0.2)
+    w = _rand((F, F), 904) * np.float32(0.3)
+    return [("scan over stacks", scan_over_stacks, [h0, ws, bs, xs]),
+            ("fori without stacks", fori_no_stacks, [h0, w])]
+
+
 def _msl_mingru(h0, xs, wz, wh):
     """A pure elementwise cell: `scalar` (affine) mode, one thread per lane."""
     import jax
@@ -4108,12 +4154,19 @@ def _stacked_pack_forms():
           (row 10's q is [K, L, heads, head_dim]): its declared result is
           [m, 2, 1024] and not the pack's [m, n_i] band, so the emit's
           per-member RESHAPE after the slice is exercised.
+      S8  the PEELED form, row 10's real q + kv_a shape: the two members
+          read ONE activation but do not name one Value -- the second reads
+          it through an arity-preserving `reshape` to [m, 1, K], which the
+          lowering aliases to the same slot.  Keyed on the lhs Value the
+          pair never met and each kept its own dot; the group key peels the
+          reshape (`metal_stacked.cc PeelActivationView`) and they pack.
+          f32, and both widths are already in the packed gemv band, so the
+          answer must be BIT-identical to the unpacked emit.
     """
     import jax
     import jax.numpy as jnp
     from jax import lax
 
-    dn = (((1,), (0,)), ((), ()))
     # S46_PACK_M (test-only): the activation row count, so S4 is S1 at M > 1.
     m_env = int(os.environ.get("S46_PACK_M", "1"))
 
@@ -4121,7 +4174,7 @@ def _stacked_pack_forms():
         return (np.random.RandomState(seed).standard_normal(shape)
                 * scale).astype(dtype)
 
-    def form(tag, K, ns, L, m, dtype, seed, dup=False):
+    def form(tag, K, ns, L, m, dtype, seed, dup=False, peel=False):
         """A scanned layer body that reads ONE activation against len(ns)
         stacks of [K, L, n_i], and hands back every member's output."""
 
@@ -4133,7 +4186,17 @@ def _stacked_pack_forms():
                 mats = list(ws)
                 if dup:
                     mats = [mats[0], mats[0]]
-                outs = tuple(lax.dot_general(a, w, dn) for w in mats)
+                # `peel`: every member after the first reads the activation
+                # through a [m, K] -> [m, 1, K] reshape instead of naming
+                # it, which is row 10's q/kv_a spelling.  Same bytes, same
+                # trailing contraction, a different MLIR Value.
+                xs = [a] * len(mats)
+                if peel:
+                    r = a.reshape(a.shape[0], 1, a.shape[1])
+                    xs = [a] + [r] * (len(mats) - 1)
+                outs = tuple(
+                    lax.dot_general(x, w, (((x.ndim - 1,), (0,)), ((), ())))
+                    for x, w in zip(xs, mats))
                 fb = None
                 for o in outs:
                     t = jnp.sum(o.astype(jnp.float32).reshape(o.shape[0], -1),
@@ -4171,6 +4234,8 @@ def _stacked_pack_forms():
     out.append(("S6 duplicate stack", f, a))
     f, a = form('s7', 1024, ((2, 1024), 512), 3, m_env, bf, 400)
     out.append(("S7 head-shaped member", f, a))
+    f, a = form('s8', 1024, (1024, 768), 3, m_env, f32, 420, peel=True)
+    out.append(("S8 reshape-peeled pair", f, a))
     return out
 
 
@@ -9844,6 +9909,13 @@ def _p46_stacked_pack(subprocess, pathlib, re):
             r"stacked: matched a stacked pack \((\S+), (\d+) dots, "
             r"(\d+) MB, gemv_t bn(\d+)", text)
 
+    def peeled(text):
+        """name -> how many members the narration says joined through a
+        peeled view (a reshape / sharding alias off the dot's lhs)."""
+        return {n: int(p) for n, p in re.findall(
+            r"stacked: matched a stacked pack \((\S+),.*?(\d+) member\(s\) "
+            r"joined through a peeled view", text)}
+
     def built(text):
         return re.findall(r"stacked: packed (\S+) \((\d+) MB once", text)
 
@@ -9872,8 +9944,9 @@ def _p46_stacked_pack(subprocess, pathlib, re):
     WANT = {"L3m1k1024n2048+512": (2, 16, False),
             "L3m1k1024n64+1024+1024": (3, 16, False),
             "L3m1k1024n128+128": (2, 2, True),
-            "L3m1k1024n512+768": (2, 4, True)}
-    SAME_BAND = {"S5"}
+            "L3m1k1024n512+768": (2, 4, True),
+            "L3m1k1024n1024+768": (2, 4, True)}
+    SAME_BAND = {"S5", "S8"}
 
     def the_packs_fire():
         _a, text = arm({})
@@ -9904,8 +9977,21 @@ def _p46_stacked_pack(subprocess, pathlib, re):
         if twice != 2:
             return False, (f"the head-shaped form (S7) packed {twice} times, "
                            "want 2 (S1 and S7)")
-        return True, (f"{len(made)} packs built: "
-                      + ", ".join(sorted(made)))
+        # S8's second member names a RESHAPE of the activation, not the
+        # activation: only the peel puts the pair in one group, and the
+        # narration says so.  Every other form names one Value and must
+        # report no peeled member, so this pins the peel's reach too.
+        peels = peeled(text)
+        if peels.get("L3m1k1024n1024+768") != 1:
+            return False, (f"the peeled pair (S8) reports "
+                           f"{peels.get('L3m1k1024n1024+768')} peeled "
+                           "members, want 1")
+        stray = {n: p for n, p in peels.items()
+                 if p and n != "L3m1k1024n1024+768"}
+        if stray:
+            return False, f"peeled members in a same-Value group: {stray}"
+        return True, (f"{len(made)} packs built: " + ", ".join(sorted(made))
+                      + "; S8 pairs through 1 peeled view")
 
     def the_kill_switches_decline():
         for env in ({"METALJAX_STACKED_PACK": "0"},
@@ -11831,6 +11917,197 @@ def _p36_tape_gate(subprocess, tempfile, pathlib, re):
              the_gate_cannot_move_an_answer)]
 
 
+def _p49_loop_specialize(subprocess, pathlib, re):
+    """LOOP-POSITION SPECIALIZATION (P49, METALJAX_LOOP_SPECIALIZE; default on).
+
+    A counted loop's body is compiled once and replayed at every position, so
+    the layer index is a loop-carried VALUE and every read of a per-layer
+    stack is a DYNAMIC slice: a `compute_dynamic_offset` kernel plus a row
+    copy, and an offset kernel again for every `dynamic_update_slice` into a
+    stacked accumulator.  The chunk plan already knows the positions -- chunk
+    i of a `trip=T K` replay runs exactly `start + iK .. start + iK + K - 1`
+    -- so the body is compiled PER CHUNK with those starts resolved on the
+    host: the reads become `shared_buffer_slice` VIEWS (no kernel at all) and
+    the writes keep their donation test and their window copy and lose only
+    the offset.
+
+    Four things are pinned here, in the order the rewrite can fail in:
+
+      * it FIRES on a body with counter-derived slices, on the counts the
+        body really holds, and DECLINES on one without them (a body with
+        nothing to fold must not pay a compile trace per chunk) and past
+        METALJAX_LOOP_SPECIALIZE_MAX;
+      * the DISPATCH count of a steady-state execute drops, and `cbufs` does
+        not grow -- a view charges `CommandEncoder::set_input_array` its own
+        `data_size()` against the stack's buffer where the copy charged the
+        whole stack, so the command-buffer cadence may only improve;
+      * every output byte is EQUAL to the unspecialized replay's (this is
+        index bookkeeping; there is no tolerance to spend) and the answer
+        still matches jax-CPU;
+      * a trip that is not a multiple of K keeps its remainder: the tail's
+        single-step replays are specialized at their own positions, which is
+        the off-by-one the rewrite is most exposed to.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+    SCAN = "scan over stacks"
+    FORI = "fori without stacks"
+    FIRE = re.compile(r"loop specialize: trip=(\d+) K=(\d+) variants=(\d+) "
+                      r"static starts=(\d+)/(\d+) \((\d+) slice, "
+                      r"(\d+) update\)")
+    DECLINE = re.compile(r"loop specialize: declined \(([^)]*)\)")
+    PLAN = re.compile(r"chunked loop: trip=(\d+) K=(\d+) plan=(\d+)x(\d+)"
+                      r"\+(\d+)x1")
+    STATS = re.compile(r"\[metaljax-native\] (jit_\w+): .*?"
+                       r"spec=(\d+)/(\d+)\(\+folds (\d+), declined (\d+)\)"
+                       r" dispatches=(\d+) cbufs=(\d+)")
+
+    def arm(env_extra, cpu=False):
+        import json
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        # This contract is about the CHUNKED REPLAY, so the generated-kernel
+        # path is off in every arm (both forms decline it anyway).
+        child["METALJAX_MSL"] = "0"
+        if cpu:
+            child["JAX_PLATFORMS"] = "cpu"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--loop-specialize"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("LS "):
+                label, payload = line[3:].split("\t", 1)
+                answers[label] = [np.array(v) for v in json.loads(payload)]
+        both = proc.stdout + proc.stderr
+        # The LAST stats line per program is the steady state: the first
+        # execute builds the variants and resolves their start tables.
+        last = {}
+        for m in STATS.finditer(both):
+            last[m.group(1)] = tuple(int(g) for g in m.groups()[1:])
+        return (answers, FIRE.findall(both), DECLINE.findall(both),
+                PLAN.findall(both), last)
+
+    def the_rewrite_fires_and_declines():
+        _a, fires, declines, _p, stats = arm(
+            {"METALJAX_LOOP_SPECIALIZE": "1", "METALJAX_CHUNK_MAX": "4"})
+        if len(fires) != 1:
+            return False, f"{len(fires)} loops specialized, wanted 1: {fires}"
+        trip, K, variants, folded, total, nsl, nup = (int(x) for x in fires[0])
+        # 90 = 22 x 4 + 2, so 22 chunk variants and 2 tail variants; the
+        # body slices three stacked inputs and updates two stacked outputs.
+        if (trip, K, variants) != (90, 4, 24):
+            return False, (f"narrated trip={trip} K={K} variants={variants}, "
+                           "wanted 90/4/24")
+        if (folded, total, nsl, nup) != (5, 5, 3, 2):
+            return False, (f"narrated {folded}/{total} starts ({nsl} slice, "
+                           f"{nup} update), wanted 5/5 (3 slice, 2 update)")
+        if not any("0 of 0" in d for d in declines):
+            return False, (f"the fori form did not decline for want of "
+                           f"foldable starts: {declines}")
+        spec = stats.get("jit_scan_over_stacks")
+        if spec is None or spec[1] == 0:
+            return False, f"no specialized replays counted: {stats}"
+        # ...the default (ON since 2026-09-21) fires without the flag...
+        _a, dflt_fires, _dd, _p, _ds = arm({"METALJAX_CHUNK_MAX": "4"})
+        if len(dflt_fires) != 1:
+            return False, f"the default did not specialize: {dflt_fires}"
+        # ...and the two gates that turn it off.
+        _a, off_fires, off_declines, _p, off_stats = arm(
+            {"METALJAX_LOOP_SPECIALIZE": "0", "METALJAX_CHUNK_MAX": "4"})
+        if off_fires or off_declines:
+            return False, f"=0 did not turn the rewrite off: {off_fires}"
+        if any(v[0] or v[1] for v in off_stats.values()):
+            return False, f"specialized replays with the flag off: {off_stats}"
+        _a, cap_fires, cap_declines, _p, _s = arm(
+            {"METALJAX_LOOP_SPECIALIZE": "1", "METALJAX_CHUNK_MAX": "4",
+             "METALJAX_LOOP_SPECIALIZE_MAX": "0"})
+        if cap_fires or not any("max=0" in d for d in cap_declines):
+            return False, f"the variant cap did not decline: {cap_declines}"
+        return True, (f"trip={trip} K={K}: {variants} variants, {folded}/"
+                      f"{total} starts folded ({nsl} slice, {nup} update); "
+                      "the fori form, the cap and the default all decline")
+
+    def the_dispatches_drop():
+        _a, _f, _d, _p, on = arm(
+            {"METALJAX_LOOP_SPECIALIZE": "1", "METALJAX_CHUNK_MAX": "4"})
+        _a, _f, _d, _p, off = arm(
+            {"METALJAX_LOOP_SPECIALIZE": "0", "METALJAX_CHUNK_MAX": "4"})
+        key = "jit_scan_over_stacks"
+        if key not in on or key not in off:
+            return False, f"no stats for {key}: {sorted(on)} / {sorted(off)}"
+        d_on, c_on = on[key][4], on[key][5]
+        d_off, c_off = off[key][4], off[key][5]
+        if d_on >= d_off:
+            return False, (f"dispatches {d_on} specialized vs {d_off} not -- "
+                           "no saving")
+        if c_on > c_off:
+            return False, (f"command buffers grew: {c_on} specialized vs "
+                           f"{c_off} not (the set_input_array charge)")
+        # 90 iterations x (3 slices x 2 kernels + 2 updates x 1 offset).
+        if d_off - d_on < 600:
+            return False, (f"only {d_off - d_on} dispatches removed, wanted "
+                           ">= 600")
+        return True, (f"dispatches {d_off} -> {d_on} (-{d_off - d_on}, "
+                      f"-{100 * (d_off - d_on) // d_off}%), cbufs "
+                      f"{c_off} -> {c_on}")
+
+    def the_answers_are_bit_exact():
+        # Several K, so the remainder tail is specialized at its own
+        # positions in more than one layout: 90 = 22x4+2 = 12x7+6 = 5x16+10.
+        bad = []
+        widths = []
+        base = None
+        for kmax in ("4", "7", None):
+            env = {} if kmax is None else {"METALJAX_CHUNK_MAX": kmax}
+            on, fires, _d, plans, _s = arm(
+                dict(env, METALJAX_LOOP_SPECIALIZE="1"))
+            off, _f, _d, off_plans, _s = arm(
+                dict(env, METALJAX_LOOP_SPECIALIZE="0"))
+            if not fires:
+                bad.append(f"K={kmax}: did not fire")
+                continue
+            if plans != off_plans:
+                bad.append(f"K={kmax}: the chunk plan moved {off_plans} -> "
+                           f"{plans}")
+                continue
+            trip, k, n, kk, rem = (int(x) for x in plans[0])
+            variants = int(fires[0][2])
+            if variants != n + rem:
+                bad.append(f"K={k}: {variants} variants for {n} chunks + "
+                           f"{rem} singles")
+                continue
+            widths.append((k, n, rem))
+            for label in (SCAN, FORI):
+                if label not in on or label not in off:
+                    bad.append(f"K={k}: {label} did not run")
+                    continue
+                for i, (a, b) in enumerate(zip(on[label], off[label])):
+                    if a.shape != b.shape or not np.array_equal(a, b):
+                        bad.append(f"K={k}: {label}[{i}] differs")
+            if base is None:
+                base = on
+        if bad:
+            return False, "; ".join(bad[:3])
+        cpu, _f, _d, _p, _s = arm({}, cpu=True)
+        worst = 0.0
+        for label in (SCAN, FORI):
+            for a, b in zip(base[label], cpu[label]):
+                worst = max(worst, float(np.max(np.abs(a - b))))
+        if worst > 2e-3:
+            return False, f"jax-CPU differs by {worst:.2e}"
+        layouts = ", ".join(f"K={k} ({n}x{k}+{r})" for k, n, r in widths)
+        return True, (f"bit-identical to the unspecialized replay at "
+                      f"{layouts}; jax-CPU within {worst:.1e}")
+
+    return [("loop specialization fires and declines",
+             the_rewrite_fires_and_declines),
+            ("loop specialization removes dispatches", the_dispatches_drop),
+            ("loop specialization is bit-exact", the_answers_are_bit_exact)]
+
+
 def _p38_chunk_plan(subprocess, pathlib, re):
     """The chunked replay's schedule and its byte bound (T4, findings2).
 
@@ -12076,6 +12353,172 @@ def _p38_chunk_plan(subprocess, pathlib, re):
              a_single_step_loop_narrates_no_chunks),
             ("chunk schedule cannot move an answer",
              the_schedule_cannot_move_an_answer)]
+
+
+def _p47_chunk_donate(subprocess, pathlib, re):
+    """A chunk boundary donates the carries it used to copy (control.cc
+    `run_chunked`).
+
+    The chunked replay's in-flight ring (METALJAX_CHUNK_INFLIGHT, 4) used to
+    hold each submitted chunk's CARRY ARRAYS so it could wait on them a few
+    chunks later.  Holding them made the ring an observer: `is_donatable`
+    refuses on the array's use count before the vendored MLX's
+    donate-through-the-stream's-pins test is reached, so the first
+    `dynamic_update_slice` of the NEXT chunk on a carried accumulator -- a
+    scan's stacked `ys`, a decode loop's KV cache -- copied the whole stack
+    instead of writing its window.  One copy per carry per chunk boundary:
+    on row 10's maxtext decode, 88 of 112 `slice_update_copied` per token.
+    The ring now holds each chunk's completion EVENT (in a standin array
+    with no data, since `mx::Event::wait` is not exported), which is the
+    same wait and no claim on anything the loop carries.
+
+    Measured on `--chunk-plan`'s stacked-output row: 90 iterations, one
+    slab per iteration into a 5.6 MB accumulator, so `slice_update_*`
+    counts iterations directly.  Pinned from both sides -- the boundaries
+    donate, AND the one place that must NOT donate still copies.
+    """
+    here = str(pathlib.Path(__file__).resolve())
+    memo = {}
+    STK = "chunked replay with a stacked output (90 x matmul body)"
+    COUNT = re.compile(r"slice_update_donated=(\d+) slice_update_copied=(\d+)")
+
+    def arm(env_extra):
+        import json
+        key = tuple(sorted(env_extra.items()))
+        if key in memo:
+            return memo[key]
+        child = dict(os.environ)
+        child["METALJAX_DEBUG"] = "1"
+        # The same kernel-path rule as `_p38_chunk_plan`: this is about the
+        # CHUNKED replay, so msl_scan never replaces one of these loops.
+        child["METALJAX_MSL"] = "0"
+        child.update(env_extra)
+        proc = subprocess.run([sys.executable, here, "--chunk-plan"],
+                              env=child, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).splitlines()[-1][:110])
+        answers = {}
+        for line in proc.stdout.splitlines():
+            if line.startswith("CHUNK "):
+                label, payload = line[6:].split("\t", 1)
+                answers[label] = json.loads(payload)
+        # Only the stacked-output row updates a carried accumulator, so its
+        # executable is the only one whose counters move.
+        counts = [(int(d), int(c))
+                  for d, c in COUNT.findall(proc.stdout + proc.stderr)]
+        moved = [t for t in counts if t != (0, 0)]
+        memo[key] = (answers, moved)
+        return memo[key]
+
+    def the_boundaries_donate():
+        """K=2 is the load-bearing row: the 90 iterations are 45 submitted
+        chunks, and before this every one of those boundaries copied the
+        whole 5.6 MB accumulator -- the counters read 45 donated / 45
+        copied.  K=16 (5 chunks + 10 lazy singles) read 84/6 and K=30 (3
+        chunks) 87/3.
+
+        Bounded at a QUARTER of the boundaries rather than at the one
+        structural copy below, because the vendored MLX's donation loses a
+        race from time to time: it compares the buffer's holder count with
+        its pin word, a completion handler drops a pin before it drops its
+        holder, and a read that straddles the two only ever answers "copy"
+        (mlx array.cpp `is_donatable`).  Measured 1-6 copies at K=2 over
+        repeated runs -- against 45 before, which is what the bound
+        separates.
+        """
+        bad, how = [], []
+        for kmax, chunks, was in (("2", 45, 45), ("16", 5, 6), ("30", 3, 3)):
+            _a, moved = arm({"METALJAX_CHUNK_MAX": kmax}
+                            if kmax != "16" else {})
+            if len(moved) != 1:
+                bad.append(f"K={kmax}: {len(moved)} executables moved the "
+                           f"counters ({moved})")
+                continue
+            donated, copied = moved[0]
+            if donated + copied != 90:
+                bad.append(f"K={kmax}: {donated}+{copied} updates, want 90")
+            elif copied > max(6, chunks // 4):
+                bad.append(f"K={kmax}: {copied} copies over {chunks} chunks "
+                           "(a chunk boundary is still pinning its carry)")
+            how.append(f"K={kmax} ({chunks} chunks): {donated} donated, "
+                       f"{copied} copied (was {90 - was}/{was})")
+        if bad:
+            return False, "; ".join(bad)
+        return True, "; ".join(how)
+
+    def the_loops_own_input_is_never_donated():
+        """The one copy that must stay.  `run_while` holds the loop's input
+        carries across `run_chunked` -- a chunked replay that throws falls
+        back to single steps FROM THE ORIGINAL CARRIES -- so the first
+        chunk's update may not write into them, and the held vector is what
+        stops it.  Pinned from below at every K: a build that donated here
+        would be silently wrong after a chunk failure."""
+        bad, how = [], []
+        for kmax in ("2", "16", "30"):
+            _a, moved = arm({"METALJAX_CHUNK_MAX": kmax}
+                            if kmax != "16" else {})
+            if len(moved) != 1:
+                bad.append(f"K={kmax}: counters {moved}")
+                continue
+            _donated, copied = moved[0]
+            if copied < 1:
+                bad.append(f"K={kmax}: 0 copies -- the first chunk wrote "
+                           "into the carries run_while still holds")
+            how.append(f"K={kmax}: {copied}")
+        if bad:
+            return False, "; ".join(bad)
+        return True, ("the first chunk still copies (copies by K -- "
+                      + ", ".join(how) + "); a K=16 extra is the single-step "
+                      "variant's first-call proof, which evals with the "
+                      "caller's carry vector alive")
+
+    def donation_cannot_move_an_answer():
+        """The donated write puts the same bytes in the same places; only
+        the buffer changes.  So the stacked row -- the only one with an
+        accumulator, and the one whose counters moved -- must agree bit for
+        bit with the UNCHUNKED replay (K=1, which never enters
+        `run_chunked`) and across every in-flight window."""
+        base, _ = arm({})
+        bad = []
+        for label, extra in (("unchunked (K=1)", {"METALJAX_CHUNK_MAX": "1"}),
+                             ("K=2", {"METALJAX_CHUNK_MAX": "2"}),
+                             ("K=30", {"METALJAX_CHUNK_MAX": "30"}),
+                             ("INFLIGHT=1", {"METALJAX_CHUNK_INFLIGHT": "1"}),
+                             ("INFLIGHT=2,K=2",
+                              {"METALJAX_CHUNK_INFLIGHT": "2",
+                               "METALJAX_CHUNK_MAX": "2"})):
+            other, _ = arm(extra)
+            if STK not in other:
+                bad.append(f"{label}: the stacked row did not run")
+            elif base.get(STK) != other[STK]:
+                bad.append(f"{label}: the stacked row differs")
+        if bad:
+            return False, "; ".join(bad)
+        return True, ("the 90-slab accumulator is bit-identical to the "
+                      "unchunked replay and across in-flight windows 1, 2, 4")
+
+    def the_window_still_bounds_the_host():
+        """The ring is back-pressure, and it still is: a window of 1 waits
+        on the previous chunk before building the next, and the counters
+        say the wait no longer costs a copy."""
+        _a, moved = arm({"METALJAX_CHUNK_INFLIGHT": "1",
+                         "METALJAX_CHUNK_MAX": "2"})
+        if len(moved) != 1:
+            return False, f"counters {moved}"
+        donated, copied = moved[0]
+        if donated + copied != 90 or copied > 11:
+            return False, (f"INFLIGHT=1: {donated} donated, {copied} copied")
+        return True, (f"INFLIGHT=1 at K=2: {donated} donated, {copied} "
+                      "copied (the wait, not a hold)")
+
+    return [("chunk boundaries donate their carries", the_boundaries_donate),
+            ("the loop's own input is never donated",
+             the_loops_own_input_is_never_donated),
+            ("chunk donation cannot move an answer",
+             donation_cannot_move_an_answer),
+            ("the in-flight window still bounds the host",
+             the_window_still_bounds_the_host)]
 
 
 def _arm_section(title, env_extra, tag, ref_path, compiled_arm, failures):
@@ -12360,6 +12803,26 @@ def main():
                 continue
             out = _flatten(jax.jit(fn)(*args))
             print(f"WHILE {name}\t"
+                  f"{_json.dumps([v.astype(np.float64).ravel().tolist() for v in out])}")
+        return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "--loop-specialize":
+        # P49's two counted loops, through whichever backend the caller put
+        # in the environment.  Each is jitted and called REPS times: the
+        # first execute builds the specialized variants and resolves their
+        # start tables, and the parent reads the LAST execute's counters,
+        # which is the steady state a decode loop runs in.
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        import jax
+        import json as _json
+        reps = int(os.environ.get("MJ_LS_REPS", "3"))
+        for label, fn, args in _loop_spec_forms():
+            g = jax.jit(fn)
+            for _ in range(reps):
+                out = _flatten(g(*args))
+                out = [np.asarray(v) for v in out]
+            print(f"LS {label}\t"
                   f"{_json.dumps([v.astype(np.float64).ravel().tolist() for v in out])}")
         return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--chunk-plan":
@@ -12726,8 +13189,12 @@ def main():
                                                __import__("re"))
                          + _p36_tape_gate(subprocess, tempfile, pathlib,
                                           __import__("re"))
+                         + _p49_loop_specialize(
+                             subprocess, pathlib, __import__("re"))
                          + _p38_chunk_plan(subprocess, pathlib,
                                            __import__("re"))
+                         + _p47_chunk_donate(subprocess, pathlib,
+                                             __import__("re"))
                          + _p39_kv_inplace(subprocess, pathlib,
                                            __import__("re"))
                          + _p42_rope_view(subprocess, pathlib,

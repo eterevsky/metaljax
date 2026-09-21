@@ -97,7 +97,8 @@ std::string StatsDelta(const Stats& before, const Stats& after) {
       "limit_retries=%d "
       "serial_loops=%d pipelined_loops=%d pipelined_steps=%d"
       "(+ahead %d, declined %d) "
-      "compiles=%d compiled_calls=%d unrolls=%d drops=%d/%d",
+      "compiles=%d compiled_calls=%d unrolls=%d drops=%d/%d "
+      "spec=%d/%d(+folds %d, declined %d)",
       after.flushes - before.flushes,
       after.cache_trims - before.cache_trims,
       after.loop_flushes - before.loop_flushes,
@@ -124,7 +125,14 @@ std::string StatsDelta(const Stats& before, const Stats& after) {
       after.compiled_calls - before.compiled_calls,
       after.unrolls - before.unrolls,
       after.compile_drops - before.compile_drops,
-      after.chunk_drops - before.chunk_drops);
+      after.chunk_drops - before.chunk_drops,
+      // P49 (METALJAX_LOOP_SPECIALIZE=1): position-specialized body traces
+      // BUILT, replays of one, dynamic slice/update starts they resolved on
+      // the host, and loops that asked and were declined.
+      after.spec_variants - before.spec_variants,
+      after.spec_calls - before.spec_calls,
+      after.spec_folds - before.spec_folds,
+      after.spec_declines - before.spec_declines);
 }
 
 }  // namespace

@@ -314,6 +314,59 @@ bool Program::step_shape(const Entry& e,
       const mx::Shape bounds = shape(at, 1, rank);
       const size_t plan_at =
           static_cast<size_t>(update ? 1 + rank : 1 + 2 * rank);
+      // P49: is this thread tracing a POSITION-SPECIALIZED variant of the
+      // loop body this entry belongs to, and did the position's start table
+      // resolve this entry's starts?  Then the starts are host integers and
+      // MLX's static spellings apply:
+      //
+      //   * `mx::slice(a, Shape, Shape)` is `shared_buffer_slice` -- a VIEW,
+      //     no `compute_dynamic_offset` kernel and no row copy.  A
+      //     leading-axis unit-stride slice of a row-contiguous stack is
+      //     itself row-contiguous, so every downstream kernel sees the shape
+      //     and stride class it sees today, at a different base offset.
+      //   * `mx::slice_update(a, upd, Shape, Shape)` runs the SAME donation
+      //     test (`row_contiguous && size == data_size &&
+      //     is_donatable(through_stream_pins)`) and the SAME window
+      //     `copy_gpu_inplace`; only the offset kernel goes.
+      //
+      // The values are the ones the dynamic spelling would have computed:
+      // `loop_spec` evaluates the clip expression built below, on the same
+      // operand, through the same handlers. Unplanned axes start at zero,
+      // which is what clamping their constant-zero operand yields -- the
+      // same fact `AppendStartPlan` resolves them on, so this is correct
+      // with the start plan on or off.
+      const std::vector<int32_t>* fold = nullptr;
+      if (t_spec_frame != nullptr && t_spec_frame->prog == this &&
+          t_spec_frame->spec != nullptr) {
+        auto hit = t_spec_frame->spec->starts.find(&e);
+        if (hit != t_spec_frame->spec->starts.end()) fold = &hit->second;
+      }
+      if (fold != nullptr) {
+        const mx::array& src = in(0);
+        const int64_t nstart = at[plan_at];
+        mx::Shape lo(static_cast<size_t>(rank), 0);
+        bool ok = static_cast<int64_t>(fold->size()) == nstart;
+        for (int64_t j = 0; ok && j < nstart; j++) {
+          const int64_t axis = at[plan_at + 1 + 3 * static_cast<size_t>(j)];
+          if (axis < 0 || axis >= rank) { ok = false; break; }
+          lo[static_cast<size_t>(axis)] =
+              static_cast<mx::ShapeElem>((*fold)[static_cast<size_t>(j)]);
+        }
+        if (ok) {
+          const mx::Shape win =
+              update ? in(1).shape() : shape(at, 1 + rank, rank);
+          mx::Shape hi(static_cast<size_t>(rank));
+          for (int64_t i = 0; i < rank; i++)
+            hi[static_cast<size_t>(i)] =
+                lo[static_cast<size_t>(i)] + win[static_cast<size_t>(i)];
+          if (update) {
+            env[e.outs[0]] = mx::slice_update(src, in(1), lo, hi);
+          } else {
+            env[e.outs[0]] = mx::slice(src, lo, hi);
+          }
+          break;
+        }
+      }
       auto raw_start = [&](int64_t axis) {
         return mx::reshape(
             mx::astype(in(first + static_cast<size_t>(axis)), mx::int32),

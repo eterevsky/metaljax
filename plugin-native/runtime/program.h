@@ -76,6 +76,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -314,6 +315,12 @@ struct Stats {
   int64_t compiles = 0;        // mx::compile traces built
   int64_t compile_drops = 0;   // compiled paths abandoned after a failure
   int64_t chunk_drops = 0;     // chunked loop replays abandoned
+  // P49, loop-position specialization (METALJAX_LOOP_SPECIALIZE=1).
+  int64_t spec_variants = 0;   // position-specialized body traces built
+  int64_t spec_calls = 0;      // ...replays of one (a chunk, or a tail step)
+  int64_t spec_folds = 0;      // dynamic slice/update starts resolved on the
+                               // host, summed over the variants built
+  int64_t spec_declines = 0;   // loops that asked and were declined
   int64_t unrolls = 0;         // counted loops unrolled into a trace
   int64_t pipelined_loops = 0;  // dynamic whiles that ran pipelined
   int64_t pipelined_steps = 0;  // ...iterations they retired that way
@@ -718,6 +725,74 @@ class Cursor {
 // executables at once.
 extern thread_local std::vector<MslPlan*> t_msl_pending;
 
+// --------------------------------------------------------------------------
+// P49: LOOP-POSITION SPECIALIZATION (METALJAX_LOOP_SPECIALIZE=1, default off)
+// --------------------------------------------------------------------------
+//
+// A counted loop's body is compiled ONCE and replayed at every position, so
+// the layer index is a loop-carried VALUE and every read of a per-layer stack
+// is a DYNAMIC slice: `compute_dynamic_offset` (a kernel) plus the window
+// copy, and likewise for the `dynamic_update_slice` writes into the stacked
+// accumulators a scan carries.  On the DeepSeek-V2-Lite decode step that is
+// 1,188 dispatches per token, 36 % of everything, for index arithmetic whose
+// answer the chunk plan already knows: chunk i of a `trip=26 K=2` replay runs
+// exactly positions `start + 2i` and `start + 2i + 1`.
+//
+// So: compile the body once PER CHUNK, with the start indices of the slices
+// whose starts depend only on the counter resolved on the HOST.  Those become
+// `mx::slice(a, Shape, Shape)` -- `shared_buffer_slice`, a VIEW, zero
+// dispatches -- and `mx::slice_update(a, upd, Shape, Shape)`, which keeps the
+// same donation test and the same window copy and drops only the offset
+// kernel.  Bit-identical by construction: the value folded is the one the
+// handler's own `clip(astype(x, int32), 0, bound)` computes, evaluated
+// eagerly by MLX rather than on the device, and the copy that moves the bytes
+// is the same one.
+//
+// The counter chain is LEFT IN THE GRAPH.  The body still returns
+// `add(counter, 1)` at the counter's carry position, so no carry output
+// becomes a baked constant (the 0.2.2 equal-constant-output hazard is not
+// touched), the recognizer emits that take the index as a gather operand
+// (`stacked_dot`, `ragged_idx`) still read it, and no fused elementwise
+// kernel gains a new rank-0 constant -- which is what keeps MLX's
+// `build_lib_name` from multiplying the generated Metal libraries by the
+// variant count.  The fold reaches slice SPELLINGS and nothing else.
+
+// The resolved start indices of one loop body's dynamic slice/update entries
+// at ONE loop position.  Built by `Program::loop_spec`, cached per position
+// for the life of the program (a decode loop replays the same positions once
+// per token).
+struct LoopSpec {
+  int64_t pos = 0;
+  // Entry -> one resolved start per START PLAN axis, in plan order. Keyed by
+  // the Entry's address, which is stable: `ops_` is filled at build time and
+  // never touched again, and the table is built from the same vector the
+  // walk reads. (Never id()-keyed transients -- CLAUDE.md item 16.)
+  std::unordered_map<const Entry*, std::vector<int32_t>> starts;
+  int64_t nslice = 0;    // folded dynamic_slice entries
+  int64_t nupdate = 0;   // folded dynamic_update_slice entries
+  int64_t ntotal = 0;    // DS/DUS entries in the body, folded or not
+  int64_t folded() const { return nslice + nupdate; }
+};
+
+// The body whose SPECIALIZED variant this thread is tracing, and the table
+// its dynamic slices read.  Thread-local because a trace happens on the
+// calling thread; `prog` makes it inert for every other program, so a nested
+// region walked inside the same trace (an inner while's body, a reduce's
+// fold) sees no frame of its own and keeps the dynamic spelling.
+struct SpecFrame {
+  const Program* prog = nullptr;
+  const LoopSpec* spec = nullptr;
+};
+extern thread_local const SpecFrame* t_spec_frame;
+
+// Is the rewrite enabled at all (METALJAX_LOOP_SPECIALIZE=1), and how many
+// variants may one loop build (METALJAX_LOOP_SPECIALIZE_MAX, 32)?  Read as
+// static locals rather than `Config` fields: the loader passes `configure`
+// a fixed argument list, and a perf knob that is off by default has no
+// business changing it.
+bool LoopSpecializeEnabled();
+int64_t LoopSpecializeMax();
+
 class Program {
  public:
   explicit Program(int num_slots, int num_args);
@@ -793,6 +868,43 @@ class Program {
   bool compiled_dropped() const { return compile_disabled_; }
   bool no_chunk() const { return no_chunk_; }
   void set_no_chunk() { no_chunk_ = true; }
+
+  // --- P49, loop-position specialization (see LoopSpec above) -------------
+
+  // The start indices this body's dynamic slices/updates take at loop
+  // position `pos`, or nullptr if nothing there can be folded.  `counter`
+  // is the loop's counter carry as the caller holds it -- its DTYPE, not
+  // its value: the position is `start + j`, which `AnalyzeCounted` proved.
+  //
+  // How the values are found, and why they are the ones the traced body
+  // would compute: seed the counter's slot with `pos`, forward-propagate
+  // through the entries whose inputs are ALL seeded (constants included) and
+  // whose opcode is one of the small integer ops a start index is spelled
+  // with, running each through `Program::step` -- the real handlers, so no
+  // folding semantics are written twice -- then evaluate each slice's start
+  // with the handler's own clip expression and read the integer back.  An
+  // entry that throws, or that produces anything but a small integer array,
+  // is simply not static and its slice keeps the dynamic spelling.
+  const LoopSpec* loop_spec(int counter_slot, mx::Dtype counter_dtype,
+                            int64_t pos);
+
+  // `repeat` applications of this body as one compiled graph, with the
+  // slices of application r folded to `specs[r]`.  Keyed by (repeat, pos0):
+  // a variant is only ever called at the position it was built for, which
+  // `run_chunked` computes from the same `start` the spec did.
+  const std::function<std::vector<mx::array>(const std::vector<mx::array>&)>&
+  compiled_spec(int repeat, int64_t pos0,
+                const std::vector<const LoopSpec*>& specs);
+  void prove_spec(int repeat, int64_t pos0,
+                  const std::vector<mx::array>& outs);
+
+  // Specialization state, one-way like every other compiled-path decision:
+  // 0 undecided, 1 specializing, 2 declined for the life of the program.
+  int spec_state() const { return spec_state_; }
+  void set_spec_state(int s) { spec_state_ = s; }
+  // A specialized variant failed at build or call time. Drop every one of
+  // them and never build another; the generic variant is always correct.
+  void drop_spec();
 
   // Should `run_chunked` narrate its schedule for this (trip, K)?  True the
   // first time a body runs chunked with a given pair -- a decode loop
@@ -970,6 +1082,14 @@ class Program {
   int64_t max_repeat_ = 1;
   std::vector<int> anchors_;
   std::map<int, Compiled> compiled_;
+  // P49. The specialized variants, keyed by (repeat, first position), and
+  // the per-position start tables they were traced with -- which must
+  // outlive the variants that captured them, so they are held here by
+  // pointer and never rebuilt for a position already resolved.
+  int spec_state_ = 0;
+  int spec_counter_ = -1;   // the counter slot the cache was built for
+  std::map<int64_t, std::unique_ptr<LoopSpec>> spec_cache_;
+  std::map<std::pair<int, int64_t>, Compiled> spec_compiled_;
   // `run` mutates all of the run-time state above -- the compiled-graph
   // cache above all -- so two threads calling the SAME executable would race
   // on it (jax lets one jitted function be called from any number of

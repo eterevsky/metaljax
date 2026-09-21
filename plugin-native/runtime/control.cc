@@ -17,13 +17,42 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace metaljax {
+
+// P49's two knobs, read the way every other perf switch in the engine is
+// (`ops_shape.cc::StartPlanEnabled`): a static local, so a measurement pins
+// ONE binary and the loader's fixed `configure` argument list does not move
+// for a rewrite that is off by default.
+bool LoopSpecializeEnabled() {
+  static const bool on = [] {
+    // Default ON (2026-09-21): bit-identical by construction, -1.2 ms/tok on
+    // row 10 with rows 11/14 flat, texmo gate 106/106 in this mode; =0 replays
+    // the single generic body as before.
+    const char* v = std::getenv("METALJAX_LOOP_SPECIALIZE");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+  }();
+  return on;
+}
+
+int64_t LoopSpecializeMax() {
+  static const int64_t n = [] {
+    const char* v = std::getenv("METALJAX_LOOP_SPECIALIZE_MAX");
+    if (v == nullptr) return int64_t{32};
+    const int64_t parsed = std::strtoll(v, nullptr, 10);
+    return parsed < 0 ? int64_t{0} : parsed;
+  }();
+  return n;
+}
 
 namespace {
 
@@ -36,6 +65,77 @@ bool is_alloc_failure(const std::exception& e) {
   const std::string what = e.what();
   return what.find("[metal::malloc]") != std::string::npos ||
          what.find("[malloc] Unable to allocate") != std::string::npos;
+}
+
+// --------------------------------------------------------------------------
+// P49: loop-position specialization (the rule is written out in program.h)
+// --------------------------------------------------------------------------
+
+// How many of a body's dynamic slice/update starts must fold before 13
+// compile traces are worth building. A body with nothing to fold must not
+// pay the trace time for a rewrite that would remove nothing.
+constexpr int64_t kSpecMinFolds = 4;
+
+// The most positions one body may keep a start table for, whatever the
+// variant cap allows per call: a loop whose START moves from call to call
+// (a decode loop's does not) would otherwise accumulate a table per
+// position it is ever entered at.
+constexpr size_t kSpecCacheMax = 4096;
+
+// The most result bytes an entry may produce and still be run by the VALUE
+// pass. A start index is a scalar; this is the guard that keeps a
+// broadcast_in_dim of one to a million elements out of a walk that runs
+// once per loop position.
+constexpr int64_t kSpecFoldBytes = 1024;
+
+// The opcodes a start index is spelled with: small integer arithmetic and
+// the rearrangements around it. An entry outside this set is not folded --
+// not because its handler would answer differently (the value pass runs the
+// SAME handler the trace would) but because the pass runs it EAGERLY, once
+// per loop position, and only these are cheap and free of effects enough to
+// run speculatively.
+bool IsFoldableOp(int op) {
+  switch (op) {
+    case kConstant:
+    case kConvert:
+    case kReshape:
+    case kTranspose:
+    case kBroadcastInDim:
+    case kSlice:
+    case kConcatenate:
+    case kIota:
+    case kAdd:
+    case kSubtract:
+    case kMultiply:
+    case kDivide:
+    case kRemainder:
+    case kMaximum:
+    case kMinimum:
+    case kNegate:
+    case kAbs:
+    case kSign:
+    case kClamp:
+    case kSelect:
+    case kCompare:
+    case kAnd:
+    case kOr:
+    case kXor:
+    case kNot:
+    case kShiftLeft:
+    case kShiftRightLogical:
+    case kShiftRightArithmetic:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// An index value, and nothing else: a start the value pass carries must be
+// a handful of integers. Anything wider is either not an index or too big
+// to fold, and the entry that produced it stays dynamic.
+bool IsIndexArray(const mx::array& a) {
+  return a.size() <= 64 &&
+         (a.dtype() == mx::bool_ || mx::issubdtype(a.dtype(), mx::integer));
 }
 
 // One uncompiled application of a loop body.
@@ -52,13 +152,111 @@ std::vector<mx::array> run_body(Program* body,
 std::vector<mx::array> run_chunked(Program* body,
                                    const std::vector<mx::array>& ins,
                                    const std::vector<mx::array>& caps,
-                                   int64_t trip, int64_t K, int64_t cost) {
+                                   int64_t trip, int64_t K, int64_t cost,
+                                   int64_t start, int counter_slot,
+                                   mx::Dtype counter_dtype) {
   std::vector<mx::array> vals = ins;
   const int64_t sync_every =
       std::max<int64_t>(1, 75000 / std::max<int64_t>(K * cost, 1));
-  auto chunk = [&](int64_t repeat, const std::vector<mx::array>& v) {
+  const int64_t nchunks = trip / K;
+  const int64_t rem = trip % K;
+
+  // P49: may this loop compile a body PER CHUNK, with the layer index folded
+  // into the slice spellings?  Four things decide it, once per body:
+  //
+  //   * the knob (METALJAX_LOOP_SPECIALIZE, off by default),
+  //   * the body compiles at all -- an interpreted body would pay the
+  //     folding for nothing, and a chunked replay is the only caller here,
+  //     which is what bounds the variant count by `trip/K + trip%K`,
+  //   * that count is within METALJAX_LOOP_SPECIALIZE_MAX (32), and
+  //   * the body really has starts to fold (>= kSpecMinFolds of them), read
+  //     off the FIRST position's table rather than guessed from the tape.
+  //
+  // The verdict is sticky per body (`spec_state`): a decline must not redo
+  // the probe once per token, and a loop that specializes narrates once.
+  bool spec_on = LoopSpecializeEnabled() && body->spec_state() != 2;
+  if (spec_on) {
+    const int64_t variants = nchunks + rem;
+    std::string why;
+    if (!body->may_compile(static_cast<int>(K))) {
+      why = "the body is not compiled";
+    } else if (variants > LoopSpecializeMax()) {
+      why = "variants=" + std::to_string(variants) + " > max=" +
+            std::to_string(LoopSpecializeMax());
+    } else {
+      const LoopSpec* probe =
+          body->loop_spec(counter_slot, counter_dtype, start);
+      if (probe == nullptr) {
+        why = "no start table";
+      } else if (probe->folded() < kSpecMinFolds) {
+        why = "only " + std::to_string(probe->folded()) + " of " +
+              std::to_string(probe->ntotal) +
+              " dynamic slice/update start(s) fold";
+      } else if (body->spec_state() == 0) {
+        body->set_spec_state(1);
+        debug_print(
+            "loop specialize: trip=" + std::to_string(trip) +
+            " K=" + std::to_string(K) +
+            " variants=" + std::to_string(variants) + " static starts=" +
+            std::to_string(probe->folded()) + "/" +
+            std::to_string(probe->ntotal) + " (" +
+            std::to_string(probe->nslice) + " slice, " +
+            std::to_string(probe->nupdate) + " update)");
+      }
+    }
+    if (!why.empty()) {
+      if (body->spec_state() != 2) {
+        body->set_spec_state(2);
+        g_stats.spec_declines++;
+        debug_print("loop specialize: declined (" + why + ")");
+      }
+      spec_on = false;
+    }
+  }
+
+  auto chunk = [&](int64_t repeat, int64_t pos0,
+                   const std::vector<mx::array>& v) {
     std::vector<mx::array> flat(v);
     flat.insert(flat.end(), caps.begin(), caps.end());
+    if (spec_on && body->may_compile(static_cast<int>(repeat))) {
+      // The positions this call runs are `pos0 .. pos0 + repeat - 1`, from
+      // the same `start` the probe used. A variant is therefore only ever
+      // called at the position it was built for.
+      std::vector<const LoopSpec*> specs;
+      specs.reserve(static_cast<size_t>(repeat));
+      for (int64_t r = 0; r < repeat; r++) {
+        const LoopSpec* s =
+            body->loop_spec(counter_slot, counter_dtype, pos0 + r);
+        if (s == nullptr || s->folded() == 0) break;
+        specs.push_back(s);
+      }
+      if (static_cast<int64_t>(specs.size()) == repeat) {
+        bool failed = false;
+        std::string what;
+        try {
+          std::vector<mx::array> out =
+              body->compiled_spec(static_cast<int>(repeat), pos0, specs)(flat);
+          // The same probe the generic chunk takes, for the same reason:
+          // nothing unproven may reach an async submission.
+          body->prove_spec(static_cast<int>(repeat), pos0, out);
+          g_stats.compiled_calls++;
+          g_stats.spec_calls++;
+          return out;
+        } catch (const std::exception& ex) {
+          if (is_oom(ex)) throw;
+          failed = true;
+          what = ex.what();
+        }
+        // Recovery OUTSIDE the handler (BodyRunner's rule): the failed
+        // trace's arrays must be gone before anything allocates again.
+        if (failed) {
+          debug_print(std::string("loop specialize: variant failed (") +
+                      what + "); falling back to the generic body");
+          body->drop_spec();
+          spec_on = false;
+        }
+      }
+    }
     if (body->may_compile(static_cast<int>(repeat))) {
       g_stats.compiled_calls++;
       std::vector<mx::array> out =
@@ -82,8 +280,6 @@ std::vector<mx::array> run_chunked(Program* body,
     for (int64_t r = 0; r < repeat; r++) out = run_body(body, out, caps, false);
     return out;
   };
-  const int64_t nchunks = trip / K;
-  const int64_t rem = trip % K;
   // The schedule, once per distinct (trip, K) per body under METALJAX_DEBUG:
   // `nchunks` compiled K-chunks, each submitted as it is built (a blocking
   // flush every `sync_every` of them), then `rem` single-step replays left
@@ -123,10 +319,43 @@ std::vector<mx::array> run_chunked(Program* body,
   // `inflight` behind keeps the host that many chunks ahead and no more:
   // the device never idles (inflight-1 chunks stay queued) and a finished
   // chunk's transients are back in the pool before the next one allocates.
-  // `array::wait` is a no-op on a carry that is already available or was
-  // never scheduled (a pass-through), so the wait costs nothing it should
-  // not.
+  // The ring holds each submitted chunk's completion EVENTS, never its
+  // CARRIES -- which is the whole of the back-pressure and none of its
+  // former cost.
+  //
+  // Holding the arrays made the ring an observer of every carry for
+  // `inflight` chunks, and `array::is_donatable` refuses on the array's
+  // use count before the vendored fork's through-pins test is ever reached
+  // (`array.cpp`: `array_desc_.use_count() != 1` -> false).  So the FIRST
+  // update of chunk i+1 on a carried accumulator -- a decode loop's KV
+  // cache, `metaljax.kv_update` or a `dynamic_update_slice` on the stack --
+  // found its operand held by ring slot `i % inflight` and copied the whole
+  // cache instead of writing its window in place.  Once per carry per chunk
+  // boundary: 88 of row 10's 112 `slice_update_copied` per token.
+  //
+  // One `mx::async_eval` attaches ONE event per stream to every array it
+  // schedules and signals it after the walk, so waiting on the events a
+  // chunk left behind waits for exactly that chunk's device work -- what
+  // `array::wait` did, by the same event.  A carry with no valid event was
+  // never scheduled (a pass-through) or was already settled by a blocking
+  // `loop_flush`; there is nothing to wait for either way, exactly as
+  // before.
+  //
+  // `mx::Event::wait` is not an exported symbol of the library, so each
+  // event is held by a STANDIN array -- no data, no primitive, no inputs,
+  // and therefore no buffer and no claim on anything the loop carries --
+  // whose `array::wait()` is that event's wait and nothing else.
   const int64_t inflight = std::max<int64_t>(1, g_cfg.chunk_inflight);
+  auto completion_of = [](const std::vector<mx::array>& v) {
+    std::vector<mx::array> waits;
+    for (const mx::array& a : v) {
+      if (!a.event().valid()) continue;
+      mx::array w(mx::Shape{}, mx::bool_, nullptr, {});
+      w.attach_event(a.event());
+      waits.push_back(std::move(w));
+    }
+    return waits;
+  };
   if (body->narrate_chunk_plan(trip, K)) {
     const int64_t blocking = nchunks / sync_every;
     debug_print("chunked loop: trip=" + std::to_string(trip) +
@@ -139,7 +368,7 @@ std::vector<mx::array> run_chunked(Program* body,
   }
   std::vector<std::vector<mx::array>> ring(static_cast<size_t>(inflight));
   for (int64_t i = 0; i < nchunks; i++) {
-    vals = chunk(K, vals);
+    vals = chunk(K, start + i * K, vals);
     // Async-flush each chunk (a blocking sync per chunk serializes CPU
     // and GPU); block only often enough to bound pending buffers.
     if ((i + 1) % sync_every == 0) {
@@ -149,9 +378,11 @@ std::vector<mx::array> run_chunked(Program* body,
     }
     std::vector<mx::array>& slot = ring[static_cast<size_t>(i % inflight)];
     for (mx::array& a : slot) a.wait();   // chunk i - inflight, if any
-    slot = vals;
+    // Taken AFTER the submission: that is where the events are attached.
+    slot = completion_of(vals);
   }
-  for (int64_t i = 0; i < rem; i++) vals = chunk(1, vals);
+  for (int64_t i = 0; i < rem; i++)
+    vals = chunk(1, start + nchunks * K + i, vals);
   loop_flush(vals, (trip % std::max<int64_t>(sync_every * K, 1)) * cost);
   return vals;
 }
@@ -261,6 +492,187 @@ class BodyRunner {
 
 }  // namespace
 
+// P49. The start indices this body's dynamic slices and updates take at ONE
+// loop position, resolved on the host. Declared in program.h, where the rule
+// and its bit-identity argument are written out.
+//
+// Two passes in one walk over the tape:
+//
+//   STRUCTURAL -- a slot is "static" if it is the loop counter, or the
+//     result of an entry all of whose inputs are static (a constant's inputs
+//     are none, so every small integer constant seeds too). Sound by
+//     construction: a program input that is not the counter is never
+//     static, so nothing that varies between iterations can be folded.
+//
+//   VALUE -- the static entries are RUN, through `Program::step`, with the
+//     counter's slot holding `pos`. The handlers that compute the value are
+//     therefore the same ones the traced body would use; nothing about
+//     what a convert or a clamp means is written a second time here. The
+//     drop lists are cleared for the pass (a slot released mid-walk would
+//     be unavailable to a later slice) and the whole walk's arrays die with
+//     the local env.
+//
+// The start itself is then the handler's own expression --
+// `clip(astype(raw, int32), 0, bound)` on the same value -- evaluated once
+// and read back as an integer. Costs one small eval per position, on the
+// first call that asks; a decode loop's positions are the same every token.
+const LoopSpec* Program::loop_spec(int counter_slot, mx::Dtype counter_dtype,
+                                   int64_t pos) {
+  if (counter_slot < 0 || counter_slot >= nslots_) return nullptr;
+  if (spec_counter_ != counter_slot) {
+    spec_cache_.clear();
+    spec_counter_ = counter_slot;
+  }
+  auto cached = spec_cache_.find(pos);
+  if (cached != spec_cache_.end()) return cached->second.get();
+  if (spec_cache_.size() >= kSpecCacheMax) return nullptr;
+  // A position the counter's dtype cannot hold exactly is not this loop's
+  // position at all. Integer counters only: `AnalyzeCounted` proved the body
+  // adds ONE to it, and `start + j` is that sum for every j.
+  if (!mx::issubdtype(counter_dtype, mx::integer)) return nullptr;
+  if (pos < 0 || pos > (int64_t{1} << 31) - 1) return nullptr;
+
+  auto spec = std::make_unique<LoopSpec>();
+  spec->pos = pos;
+
+  struct PendingStart {
+    const Entry* e;
+    std::vector<mx::array> vals;
+    bool update;
+  };
+  std::vector<PendingStart> pending;
+
+  try {
+    std::vector<std::optional<mx::array>> env(static_cast<size_t>(nslots_));
+    std::vector<char> is_static(static_cast<size_t>(nslots_), 0);
+    env[static_cast<size_t>(counter_slot)] = mx::array(pos, counter_dtype);
+    is_static[static_cast<size_t>(counter_slot)] = 1;
+
+    for (const Entry& e : ops_) {
+      if (e.op == kDynamicSlice || e.op == kDynamicUpdateSlice) {
+        // Never static itself: operand 0 is the stack. What is asked of it
+        // is only whether each start the START PLAN kept is known here.
+        spec->ntotal++;
+        const std::vector<int64_t>& at = e.attrs;
+        const bool update = e.op == kDynamicUpdateSlice;
+        const size_t first = update ? 2 : 1;
+        const int64_t rank = at[0];
+        const size_t plan_at =
+            static_cast<size_t>(update ? 1 + rank : 1 + 2 * rank);
+        const int64_t nstart = at[plan_at];
+        std::vector<mx::array> vals;
+        bool ok = nstart > 0;
+        for (int64_t j = 0; ok && j < nstart; j++) {
+          const size_t p = plan_at + 1 + 3 * static_cast<size_t>(j);
+          const int64_t axis = at[p];
+          if (at[p + 1] != 0) {
+            // Already resolved at lowering (`AppendStartPlan`): carry its
+            // value through unchanged, so the folded spelling reads the
+            // same start on every axis the plan kept.
+            vals.push_back(
+                mx::array(static_cast<int>(at[p + 2]), mx::int32));
+            continue;
+          }
+          const size_t operand = first + static_cast<size_t>(axis);
+          if (operand >= e.ins.size()) { ok = false; break; }
+          const int slot = e.ins[operand];
+          if (slot < 0 || slot >= nslots_ ||
+              !is_static[static_cast<size_t>(slot)] ||
+              !env[static_cast<size_t>(slot)]) {
+            ok = false;
+            break;
+          }
+          // The handler's own expression, on the same operand -- but on the
+          // CPU stream. It is `clip(astype(raw, int32), 0, bound)` on ONE
+          // integer, and running it on the device would hand Metal a command
+          // buffer per loop position for arithmetic the host can do for
+          // nothing (measured: +90 command buffers on a 90-step scan, for
+          // 450 scalars). Integer clip and convert are exact on either
+          // device, so the VALUE is the device's; only where it is computed
+          // moves.
+          const mx::StreamOrDevice cpu = mx::Device::cpu;
+          vals.push_back(mx::clip(
+              mx::reshape(mx::astype(*env[static_cast<size_t>(slot)],
+                                     mx::int32, cpu),
+                          mx::Shape{}, cpu),
+              mx::array(0, mx::int32),
+              mx::array(static_cast<int>(at[1 + axis]), mx::int32), cpu));
+        }
+        if (ok) {
+          pending.push_back({&e, std::move(vals), update});
+          if (update) {
+            spec->nupdate++;
+          } else {
+            spec->nslice++;
+          }
+        }
+        continue;
+      }
+      if (!IsFoldableOp(e.op) || !e.regions.empty() || e.host || e.msl)
+        continue;
+      if (e.bytes > kSpecFoldBytes) continue;
+      bool ready = true;
+      for (int s : e.ins) {
+        if (s < 0 || s >= nslots_ || !is_static[static_cast<size_t>(s)] ||
+            !env[static_cast<size_t>(s)]) {
+          ready = false;
+          break;
+        }
+      }
+      if (!ready) continue;
+      // Without the drop list: the pass's env is its own, and a slot the
+      // real walk releases here may still be a later slice's start.
+      Entry probe = e;
+      probe.drops.clear();
+      bool ok = true;
+      try {
+        step(probe, env, false);
+      } catch (const std::exception&) {
+        ok = false;
+      }
+      if (ok) {
+        for (int s : probe.outs) {
+          if (s < 0 || s >= nslots_ || !env[static_cast<size_t>(s)] ||
+              !IsIndexArray(*env[static_cast<size_t>(s)])) {
+            ok = false;
+            break;
+          }
+        }
+      }
+      for (int s : probe.outs) {
+        if (s < 0 || s >= nslots_) continue;
+        if (ok) {
+          is_static[static_cast<size_t>(s)] = 1;
+        } else {
+          env[static_cast<size_t>(s)].reset();
+        }
+      }
+    }
+
+    // One eval for the whole position: every start is a rank-0 int32.
+    std::vector<mx::array> flat;
+    for (const PendingStart& p : pending)
+      flat.insert(flat.end(), p.vals.begin(), p.vals.end());
+    if (!flat.empty()) mx::eval(flat);
+    for (const PendingStart& p : pending) {
+      std::vector<int32_t> starts;
+      starts.reserve(p.vals.size());
+      for (const mx::array& a : p.vals) starts.push_back(a.item<int32_t>());
+      spec->starts.emplace(p.e, std::move(starts));
+    }
+  } catch (const std::exception& ex) {
+    if (is_oom(ex)) throw;   // the governor's refusal is never swallowed
+    pending.clear();
+    debug_print(std::string("loop specialize: start table failed (") +
+                ex.what() + ")");
+    return nullptr;
+  }
+
+  const LoopSpec* out = spec.get();
+  spec_cache_.emplace(pos, std::move(spec));
+  return out;
+}
+
 // ops/control.py _while, transliterated. Every branch here had a comment
 // in that file explaining what it is for; the policy numbers (cost,
 // cadence, chunk size, which bodies may be compiled) are computed by the
@@ -337,7 +749,9 @@ void Program::run_while(const Entry& e,
     if (K > 1) {
       bool failed = false;
       try {
-        vals = run_chunked(body, ins, body_caps, trip, K, cost);
+        vals = run_chunked(body, ins, body_caps, trip, K, cost, start,
+                           static_cast<int>(k),
+                           ins[static_cast<size_t>(k)].dtype());
       } catch (const std::exception& ex) {
         // MLX's compiler can reject big fused traces ("Too many
         // inputs/outputs fused..."). Fall back to single-step replays,

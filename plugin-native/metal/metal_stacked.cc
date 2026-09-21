@@ -756,16 +756,69 @@ GemvTile TileFor(int64_t K, int64_t N) {
   return GemvTile{sm, sn, bn};
 }
 
+// The ACTIVATION behind a member's `dot.getLhs()`, for the group key alone.
+//
+// Two sibling projections over one activation do not necessarily name the
+// same MLIR Value: jax spells row 10's q as a dot over the attention norm's
+// result and its kv_a as a dot over a `reshape` of it, so the two lhs Values
+// differ while the bytes they read are the same.  Peeling those views is
+// what lets the pair meet in one group.
+//
+// Only element-order- AND numel-preserving steps are peeled:
+//
+//   `stablehlo.reshape`           row-major reinterpretation by definition;
+//   `optimization_barrier`,       the lowering's own arity-preserving
+//   `sdy.sharding_constraint`,    aliases -- `LowerOp` binds the result to
+//   `sdy.reshard`,                the OPERAND'S SLOT, so the two spellings
+//   `Sharding` / `annotate_       are already one array at replay time.
+//   device_placement` custom calls
+//
+// so the peeled value holds exactly the elements the lhs holds, in the same
+// order.  The recognizer has already proven each member contracts its
+// TRAILING dims in order (`MatchRoot`), i.e. its lhs flattens to [M, K]
+// element-exactly; with M == 1 and one K across the group, two members whose
+// peels land on the same Value therefore read the SAME [K] band, byte for
+// byte.  The emit keeps the group ROOT's own lhs, so nothing about the
+// peeled value has to be lowerable.
+mlir::Value PeelActivationView(mlir::Value v) {
+  for (int depth = 0; depth < 8; depth++) {
+    mlir::Operation* d = v.getDefiningOp();
+    if (d == nullptr) break;
+    const std::string n = OpName(d);
+    if (n == "stablehlo.reshape") {
+      if (d->getNumOperands() != 1) break;
+      v = d->getOperand(0);
+      continue;
+    }
+    bool alias = n == "stablehlo.optimization_barrier" ||
+                 n == "sdy.sharding_constraint" || n == "sdy.reshard";
+    if (n == "stablehlo.custom_call") {
+      auto t = d->getAttrOfType<mlir::StringAttr>("call_target_name");
+      alias = t && (t.getValue() == "Sharding" ||
+                    t.getValue() == "annotate_device_placement");
+    }
+    if (!alias || d->getNumResults() != d->getNumOperands()) break;
+    // Arity-preserving: result i is operand i.
+    auto res = mlir::dyn_cast<mlir::OpResult>(v);
+    if (!res) break;
+    v = d->getOperand(res.getResultNumber());
+  }
+  return v;
+}
+
+// `x` is the PEELED activation (above), not the lhs any member names: that
+// is what makes a reshaped sibling a member instead of a group of one.  The
+// lhs contracting dims are NOT part of the key -- they differ exactly when
+// the reshape does -- because every member is already known to flatten to
+// [M = 1, K] and the key pins K.
 struct PackGroupKey {
   mlir::Block* block = nullptr;
   mlir::Value x, layer;
   int64_t L = 0, K = 0;
   mlir::Type elem;
-  std::vector<int64_t> lc;  // the lhs contracting dims (so M and the free
-                            // dims of the band agree across the group)
   bool operator==(const PackGroupKey& o) const {
     return block == o.block && x == o.x && layer == o.layer && L == o.L &&
-           K == o.K && elem == o.elem && lc == o.lc;
+           K == o.K && elem == o.elem;
   }
 };
 
@@ -808,9 +861,21 @@ void GroupStackedPacks(RewritePlan* plan) {
                            " MB matrix is bandwidth-bound already)"));
         continue;
       }
-      auto lc = dot.getDotDimensionNumbers().getLhsContractingDimensions();
-      key.lc.assign(lc.begin(), lc.end());
-      if (ShapeOf(m.x).size() < key.lc.size()) continue;
+      const size_t nc =
+          dot.getDotDimensionNumbers().getLhsContractingDimensions().size();
+      const std::vector<int64_t> xshape = ShapeOf(m.x);
+      if (xshape.size() < nc) continue;
+      // The band this member reads IS its whole lhs: `MatchRoot` proved the
+      // contraction takes the trailing dims in order, so numel(x) = M * K,
+      // and M == 1 here.  Stated rather than assumed, because it is the
+      // premise that makes a peeled sibling's band the same bytes.
+      int64_t numel = 1;
+      for (int64_t d : xshape) numel *= d;
+      if (numel != m.K) {
+        Debug(absl::StrCat("not a pack member (", m.name, ": its lhs holds ",
+                           numel, " elements for a K of ", m.K, ")"));
+        continue;
+      }
     } catch (const Reject&) {
       // `Reject` is not a std::exception: both arms, or a shape question
       // this file answers by throwing would escape the analysis.
@@ -819,7 +884,7 @@ void GroupStackedPacks(RewritePlan* plan) {
       continue;
     }
     key.block = m.root->getBlock();
-    key.x = m.x;
+    key.x = PeelActivationView(m.x);
     key.layer = m.layer;
     key.L = m.L;
     key.K = m.K;
@@ -889,7 +954,18 @@ void GroupStackedPacks(RewritePlan* plan) {
     auto pack = std::make_unique<StackedPackMatch>();
     std::vector<std::string> ns;
     for (size_t j : g.idx) ns.push_back(absl::StrCat(plan->stacked[j]->N));
-    pack->x = g.key.x;
+    // The pack's lhs is the SURVIVING root's own `dot.getLhs()` -- its
+    // spelling, not the peeled one the key carries, so `Slot(m.x)` resolves
+    // to a value this block defines before the root; and the root is
+    // `g.idx.front()`, which the policy branch above may just have changed.
+    // The band takes its free dims from that same lhs; a member whose lhs is
+    // spelled with a different rank gets the emit's per-member `reshape`
+    // (`LowerStackedPack`), which its own `out_shape` already drives.
+    StackedDotMatch& rep = *plan->stacked[g.idx.front()];
+    auto rep_dot = mlir::cast<mlir::stablehlo::DotGeneralOp>(rep.root);
+    const size_t rep_nc =
+        rep_dot.getDotDimensionNumbers().getLhsContractingDimensions().size();
+    pack->x = rep.x;
     pack->layer = g.key.layer;
     pack->L = g.key.L;
     pack->K = g.key.K;
@@ -898,10 +974,10 @@ void GroupStackedPacks(RewritePlan* plan) {
     pack->elem_bytes = ElemBytes(g.key.elem);
     pack->pack_bytes = g.key.L * g.key.K * n_total * pack->elem_bytes;
     try {
-      std::vector<int64_t> lshape = ShapeOf(g.key.x);
+      std::vector<int64_t> lshape = ShapeOf(rep.x);
       pack->out_band.assign(
           lshape.begin(),
-          lshape.end() - static_cast<std::ptrdiff_t>(g.key.lc.size()));
+          lshape.end() - static_cast<std::ptrdiff_t>(rep_nc));
       pack->out_band.push_back(n_total);
     } catch (const Reject& e) {
       Debug(absl::StrCat("not a pack (", pack->name, ": ", e.why, ")"));
@@ -921,11 +997,18 @@ void GroupStackedPacks(RewritePlan* plan) {
         pack->ops.push_back(o);
       pack->members.push_back(std::move(plan->stacked[j]));
     }
+    // How many members reached the group through a peeled view rather than
+    // by naming the pack's own lhs: the one number that says whether the
+    // peel is what built this pack.
+    int peeled = 0;
+    for (const auto& mem : pack->members)
+      if (mem->x != pack->x) peeled++;
     Debug(absl::StrCat("matched a stacked pack (", pack->name, ", ",
                        pack->members.size(), " dots, ",
                        pack->pack_bytes >> 20, " MB, gemv_t bn",
                        TileFor(g.key.K, n_total).bn, ", policy ",
-                       PackPolicyName(policy), ")"));
+                       PackPolicyName(policy), ", ", peeled,
+                       " member(s) joined through a peeled view)"));
     plan->stacked_pack.push_back(std::move(pack));
   }
 
