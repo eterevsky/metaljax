@@ -1,7 +1,7 @@
 """Release gate step 2 — diff a pinned-suite run against the approved whitelist.
 
     .venv/bin/python scripts/release/jax_suite_diff.py <run-outdir> \
-        [--whitelist notes/data/pinned-0.11.0-failures.txt] \
+        [--whitelist notes/data/pinned-0.11.2-failures.txt] \
         [--driver-log LOG] [--driver-rc N] [--seconds S] \
         [--md OUT.md] [--json OUT.json] [--smoke]
 
@@ -32,8 +32,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_WHITELIST = ROOT / "notes" / "data" / "pinned-0.11.0-failures.txt"
-TESTS_PREFIX = "jax-v0.11.0/tests"
+DEFAULT_WHITELIST = ROOT / "notes" / "data" / "pinned-0.11.2-failures.txt"
+TESTS_PREFIX = "jax-v0.11.2/tests"
 
 COUNT_RE = re.compile(r"(\d+) (passed|failed|skipped|error|errors|xfailed|xpassed)")
 
@@ -177,7 +177,7 @@ def main():
         L.append("")
     if fixed:
         L.append(f"<details><summary>Fixed since the whitelist ({len(fixed)}) — "
-                 f"remove from notes/data/pinned-0.11.0-failures.txt on approval"
+                 f"remove from notes/data/pinned-0.11.2-failures.txt on approval"
                  f"</summary>")
         L.append("")
         for f, ids in by_file(fixed).items():

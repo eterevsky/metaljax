@@ -136,8 +136,9 @@ libmlx_metaljax.dylib         ── our vendored, privately install-named
 - Apple-silicon Mac (developed on an M5 Max, macOS 26.5, Xcode 26.6 —
   any arm64 Mac with a recent Xcode/CLT should work).
 - [uv](https://docs.astral.sh/uv/) (only for creating the venv).
-- Python **3.14** and jax/jaxlib **0.11.x** (what the venv setup below
-  installs; the vendored PJRT header matches jaxlib 0.11.0).
+- Python **3.14** and jax/jaxlib **0.11.x** (tested against 0.11.2, the
+  pinned release; the plugin's XLA and PJRT header are jaxlib 0.11.0's, which
+  jaxlib 0.11.2 negotiates down to).
 
 ## Developing from source
 

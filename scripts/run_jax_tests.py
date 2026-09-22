@@ -23,10 +23,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 # Default: the reference clone (~HEAD of 2026-07-23, slightly ahead of the
-# jax 0.11.0 release we pin — expect version-skew failures). Point --tests
-# at jax-v0.11.0/tests for the exact-release suite.
+# jax release we pin — expect version-skew failures). Point --tests at
+# jax-v0.11.2/tests for the exact-release suite (the pin since 2026-09-22).
 TESTS = ROOT / "jax" / "tests"
-PY = ROOT / ".venv" / "bin" / "python"
+# METALJAX_TEST_PY overrides the interpreter (e.g. a venv with a newer
+# jax/jaxlib, to run the next pinned release before main's venv moves).
+PY = Path(os.environ.get("METALJAX_TEST_PY", ROOT / ".venv" / "bin" / "python"))
 
 COUNT_RE = re.compile(
     r"(\d+) (passed|failed|skipped|error|errors|xfailed|xpassed)")
@@ -114,7 +116,7 @@ def main():
                     help="only files whose name contains this")
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--tests", default=None,
-                    help="alternate tests directory (e.g. jax-v0.11.0/tests)")
+                    help="alternate tests directory (e.g. jax-v0.11.2/tests)")
     args = ap.parse_args()
 
     outdir = Path(args.outdir)

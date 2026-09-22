@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release gate step 2 — pinned jax-v0.11.0 test suite.
+# Release gate step 2 — pinned jax-v0.11.2 test suite (the jax release we pin).
 #
 #   scripts/release/jax_suite.sh [--smoke]
 #
@@ -8,13 +8,13 @@
 # approval run (2026-07-31, tree 725bd84):
 #
 #     .venv/bin/python scripts/run_jax_tests.py <outdir> \
-#         --jobs 1 --tests jax-v0.11.0/tests
+#         --jobs 1 --tests jax-v0.11.2/tests
 #
 # --jobs 1 is load-bearing: parallel (3/4-job) runs UNDER-report failures
 # (campaign lesson, CLAUDE.md item 20 — fft_test showed 3 failures at 4 jobs
 # vs 5 sequentially).  The --tests path must stay RELATIVE: pytest node ids
-# inherit it, and the whitelist notes/data/pinned-0.11.0-failures.txt is
-# keyed on "jax-v0.11.0/tests/<file>.py::...".
+# inherit it, and the whitelist notes/data/pinned-0.11.2-failures.txt is
+# keyed on "jax-v0.11.2/tests/<file>.py::...".
 #
 # Wall time: ~3.5 h for all 164 files (17:01 -> 20:37 on the reference run).
 #
@@ -54,7 +54,7 @@ gate_say "jax pinned suite -> $OUTDIR"
 T0=$(gate_now)
 # ${EXTRA[@]+...}: bash 3.2 + set -u errors on an empty array expansion
 "$MJ_PY" "$MJ_ROOT/scripts/run_jax_tests.py" "$OUTDIR" \
-    --jobs "${JAX_SUITE_JOBS:-1}" --tests jax-v0.11.0/tests \
+    --jobs "${JAX_SUITE_JOBS:-1}" --tests jax-v0.11.2/tests \
     ${EXTRA[@]+"${EXTRA[@]}"} \
     > "$LOG" 2>&1
 RC=$?

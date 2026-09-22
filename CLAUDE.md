@@ -52,7 +52,9 @@ executes on the Metal device through plain `jax.numpy`.
 
 - All changes live in `/Users/oleg/metaljax`. **Never modify `metaljax/jax/`**
   or `metaljax/llvm-project/` — read-only reference clones (gitignored).
-  JAX clone HEAD ≈ 2026-07-23, matches installed jax 0.11.0.
+  JAX clone HEAD ≈ 2026-07-23 (jax 0.11.0 era). The pinned release is
+  jax 0.11.2 (`jax-v0.11.2/`, since 2026-09-22; `notes/jax-0.11.2-pin.md`);
+  `jax-v0.11.0/` is kept as history.
 - Git: repo remote is git@github.com:eterevsky/metaljax.git. **Commit locally;
   never push** — Oleg pushes himself. No PRs.
 - Releases: build + smoke-test wheels locally, but **never upload to
@@ -92,7 +94,7 @@ executes on the Metal device through plain `jax.numpy`.
   which imported the pip `mlx`; the vendoring battery's row-1 A/B is the
   worked example.)
 - Python via **uv**: venv at `metaljax/.venv` (CPython 3.14.4), installed:
-  `jax 0.11.0`, `jaxlib 0.11.0`, numpy, pytest (no `mlx` — the plugin ships
+  `jax 0.11.2`, `jaxlib 0.11.2`, numpy, pytest (no `mlx` — the plugin ships
   its own). Run things with `.venv/bin/python`.
 - Correctness bar: every implemented op/feature gets a pytest comparing Metal
   results against the CPU backend (tolerances appropriate for f32).
@@ -512,7 +514,10 @@ executes on the Metal device through plain `jax.numpy`.
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
-  0.11.0 / mlx 0.32 ship cp314 wheels). torch (CPU wheel) installed only so
+  0.11.2 / mlx 0.32 ship cp314 wheels). The plugin's XLA stays at jax
+  0.11.0's commit (131bf41): jaxlib 0.11.2 negotiates PJRT/VHLO down to it.
+  The maxtext benchmark venv stays on jax 0.11.0 until a flax release
+  supports 0.11.2 (flax <= 0.12.9 imports the renamed hijax.HiPrimitive). torch (CPU wheel) installed only so
   texmo modules import; the JAX path never calls it.
 - Consumers depend on metaljax via a path dependency (uv sources, editable
   or not). The wheel carries the plugin dylib + the vendored MLX runtime

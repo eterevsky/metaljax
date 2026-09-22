@@ -14,6 +14,7 @@ plugin/build/
 src/metaljax/lib/
 .DS_Store
 jax-v0.11.0/
+jax-v0.11.2/
 native/build/
 # bazel convenience symlinks for the native PJRT plugin workspace
 plugin-native/bazel-*
