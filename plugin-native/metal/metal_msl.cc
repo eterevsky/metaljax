@@ -44,11 +44,24 @@ void MslDecline(std::string what) {
   throw e;
 }
 
+// `mj_fmod` is stablehlo.remainder on floats: C's fmod (the DIVIDEND's sign,
+// a zero included), spelled exactly as the interpreted handler's kernel
+// spells it (ops_elementwise.cc `float_remainder`) so both paths give the one
+// exact answer.  `metal::precise::` by name: a generated kernel is built with
+// MLX's default compile options, where a bare `metal::fmod` is fast::fmod,
+// x - y * trunc(x / y) -- inexact, and the reason this helper exists (the
+// table spelled it bare until 0.11.2).  It computes in float for every float
+// dtype: fmod's result is always representable in its operands' own format,
+// so the typed destination local rounds nothing.
 const char kMslKernelHeader[] = R"(
 static inline float mj_expm1(float x) {
     float u = metal::precise::exp(x);
     float d = u - 1.0f;
     return (u == 1.0f) ? x : d * (x / metal::precise::log(u));
+}
+static inline float mj_fmod(float a, float b) {
+    float r = metal::precise::fmod(metal::abs(a), metal::abs(b));
+    return (r == 0.0f) ? a * 0.0f : ((a < 0.0f) ? -r : r);
 }
 )";
 
@@ -1255,6 +1268,13 @@ std::vector<Sym*> MslAnalyzer::EvalOp(mlir::Operation* o, Env& env) {
   if (MslUnaryOps().count(name) != 0)
     return {MakeElem(arena_, name, ins, ins[0]->dtype, ins[0]->shape)};
 
+  // An INTEGER remainder has no MSL spelling in the table (mj_fmod is a
+  // float function, and `metal::fmod` on ints does not even resolve): it
+  // stays with the interpreted handler, whose integer arm is the reference.
+  if (name == "stablehlo.remainder" && ins[0]->dtype != "f32" &&
+      ins[0]->dtype != "f16" && ins[0]->dtype != "bf16")
+    MslDecline(absl::StrCat("remainder on ", ins[0]->dtype));
+
   if (MslBinaryOps().count(name) != 0)
     return {MakeElem(arena_, name, ins, ins[0]->dtype,
                      Bshape(ins[0]->shape, ins[1]->shape))};
@@ -2316,7 +2336,7 @@ const std::map<std::string, std::string>& MslBinaryOps() {
       {"stablehlo.maximum", "metal::max({0}, {1})"},
       {"stablehlo.minimum", "metal::min({0}, {1})"},
       {"stablehlo.power", "metal::precise::pow({0}, {1})"},
-      {"stablehlo.remainder", "metal::fmod({0}, {1})"},
+      {"stablehlo.remainder", "mj_fmod((float)({0}), (float)({1}))"},
       {"stablehlo.and", "({0} && {1})"},
       {"stablehlo.or", "({0} || {1})"},
       {"stablehlo.xor", "({0} != {1})"},

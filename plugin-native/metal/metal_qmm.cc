@@ -199,7 +199,8 @@ std::string ElName(mlir::Value v) {
 
 bool IsIntEl(mlir::Value v) {
   const std::string el = ElName(v);
-  return el == "i4" || el == "ui4" || el == "i8" || el == "i16" ||
+  return el == "i2" || el == "ui2" || el == "i4" || el == "ui4" ||
+         el == "i8" || el == "i16" ||
          el == "i32" || el == "i64" || el == "ui8" || el == "ui16" ||
          el == "ui32" || el == "ui64";
 }
@@ -274,7 +275,8 @@ bool ParseCodes(mlir::Value v, Codes* out) {
       // Unsigned wrap semantics: not worth modelling (qmm.py).
       const std::string el = ElName(base);
       int width = 0;
-      if (el == "i4") width = 4;
+      if (el == "i2") width = 2;
+      else if (el == "i4") width = 4;
       else if (el == "i8") width = 8;
       else if (el == "i16") width = 16;
       else if (el == "i32") width = 32;

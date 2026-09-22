@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from helpers import check
+from helpers import check, run_metal
 
 F = np.array([-2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 2.5], np.float32)
 P = np.array([0.1, 0.7, 1.3, 2.9, 4.2], np.float32)  # positive
@@ -49,6 +49,80 @@ def test_power():
 
 def test_remainder_float():
     check(jax.lax.rem, F, np.array([2.0, 2.0, -2.0, 3.0, -3.0, 2.0, 2.0], np.float32))
+
+
+def _rem_pairs(dtype):
+    # Random pairs over 16 decades of ratio, then every edge value against
+    # every edge value: signed zeros, infinities, NaN, huge/tiny magnitudes,
+    # and 0.2578125 = 16 * 0.01611328125 exactly, where the inexact spelling
+    # x - y * trunc(x / y) answers y instead of 0.  (No f32/bf16 subnormals:
+    # the GPU flushes them, like every float op here.)
+    rng = np.random.default_rng(7)
+    edge = np.array([0.0, -0.0, 1.0, -1.0, 2.5, -2.5, 3.0, -3.0, np.inf,
+                     -np.inf, np.nan, 1e-30, -1e-30, 7.0, -7.0, 65504.0,
+                     1e30, -1e30, 0.2578125, 0.01611328125], np.float32)
+    n = 4096
+    a = (rng.standard_normal(n) * 10.0 ** rng.integers(-4, 5, n))
+    b = (rng.standard_normal(n) * 10.0 ** rng.integers(-4, 5, n))
+    a = np.concatenate([a.astype(np.float32), np.repeat(edge, len(edge))])
+    b = np.concatenate([b.astype(np.float32), np.tile(edge, len(edge))])
+    with np.errstate(over="ignore"):
+        return a.astype(dtype), b.astype(dtype)
+
+
+def _same_bits(got, want):
+    got = np.asarray(got)
+    want = np.asarray(want)
+    assert got.dtype == want.dtype and got.shape == want.shape
+    u = np.uint32 if got.itemsize == 4 else np.uint16
+    nan = np.isnan(want.astype(np.float32))
+    assert np.array_equal(np.isnan(got.astype(np.float32)), nan)
+    bad = (got.view(u) != want.view(u)) & ~nan
+    assert not bad.any(), (f"{int(bad.sum())} elements differ, e.g. "
+                           f"{got[bad][:4]} vs {want[bad][:4]}")
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16, jnp.bfloat16])
+def test_remainder_float_is_exact_fmod(dtype):
+    # stablehlo.remainder is C's fmod, whose result is always exact: the
+    # plugin must match np.fmod and jax-CPU BIT FOR BIT, sign of zero
+    # included -- in a fused (compiled) program too, where MLX's own
+    # remainder used Metal's fast fmod (jax-v0.11.2 lax_test
+    # testOpAgainstNumpy594).
+    a, b = _rem_pairs(dtype)
+    want = np.fmod(a.astype(np.float32), b.astype(np.float32)).astype(dtype)
+    got = run_metal(jax.lax.rem, a, b)[0]
+    _same_bits(got, want)
+    with jax.default_device(jax.devices("cpu")[0]):
+        cpu = np.asarray(jax.jit(jax.lax.rem)(a, b))
+    _same_bits(got, cpu)
+    # ...fused among other ops, with a broadcast (stride-0) divisor.
+    f = lambda x: (jax.lax.rem(x, jnp.asarray(0.7, dtype)), x * 2)
+    with jax.default_device(jax.devices("cpu")[0]):
+        cpu = [np.asarray(v) for v in jax.jit(f)(a)]
+    for g, w in zip(run_metal(f, a), cpu):
+        _same_bits(g, w)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16, jnp.bfloat16])
+def test_remainder_float_in_scan_matches_cpu(dtype):
+    # The same op inside a counted loop, which the generated msl_scan kernel
+    # claims (its table spelled a bare `metal::fmod`, fast in a generated
+    # kernel): bit-exact against jax-CPU.
+    def loop(h, xs):
+        def body(c, x):
+            c = jax.lax.rem(x * jnp.asarray(300.0, c.dtype),
+                            jnp.abs(c) + jnp.asarray(0.01, c.dtype))
+            return c, c
+        return jax.lax.scan(body, h, xs)
+
+    rng = np.random.default_rng(8)
+    h0 = rng.standard_normal((8, 16)).astype(dtype)
+    xs = rng.standard_normal((32, 8, 16)).astype(dtype)
+    with jax.default_device(jax.devices("cpu")[0]):
+        cpu = [np.asarray(v) for v in jax.jit(loop)(h0, xs)]
+    for g, w in zip(run_metal(loop, h0, xs), cpu):
+        _same_bits(g, w)
 
 
 def test_int_arith():

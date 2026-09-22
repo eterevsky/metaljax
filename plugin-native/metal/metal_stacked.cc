@@ -795,7 +795,8 @@ mlir::Value PeelActivationView(mlir::Value v) {
     if (n == "stablehlo.custom_call") {
       auto t = d->getAttrOfType<mlir::StringAttr>("call_target_name");
       alias = t && (t.getValue() == "Sharding" ||
-                    t.getValue() == "annotate_device_placement");
+                    t.getValue() == "annotate_device_placement" ||
+                    t.getValue() == "LayoutConstraint");
     }
     if (!alias || d->getNumResults() != d->getNumOperands()) break;
     // Arity-preserving: result i is operand i.

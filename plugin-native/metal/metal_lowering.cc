@@ -123,10 +123,11 @@ const absl::flat_hash_set<std::string>& SimpleOps() {
 //  * an arithmetic result is re-gridded only on the OCP FP4/FP6 formats,
 //    whose grids are coarse enough (16 or 64 points) that keeping full f16
 //    precision between ops diverges from XLA after a single operation -- on
-//    f4E2M1FN, 4 + 4 is 6, not 8 -- and, for i4/ui4, only on the three ops
-//    XLA's 4-bit wrap is visible through.  The float8 family deliberately
-//    stays unrounded between ops, exactly as it has since the emulation
-//    landed in Stage 1; the tests are measured against that engine.
+//    f4E2M1FN, 4 + 4 is 6, not 8 -- and, for the integer grids (i4/ui4,
+//    i2/ui2), on the ops XLA's `bits`-bit wrap is visible through
+//    (`IsIntGridWrapOp`).  The float8 family deliberately stays unrounded
+//    between ops, exactly as it has since the emulation landed in Stage 1;
+//    the tests are measured against that engine.
 bool IsUnaryRegridOp(absl::string_view name) {
   return name == "stablehlo.abs" || name == "stablehlo.cbrt" ||
          name == "stablehlo.ceil" || name == "stablehlo.cosine" ||
@@ -141,6 +142,29 @@ bool IsUnaryRegridOp(absl::string_view name) {
          name == "stablehlo.sign" || name == "stablehlo.sine" ||
          name == "stablehlo.sqrt" || name == "stablehlo.tan" ||
          name == "stablehlo.tanh";
+}
+
+// The sub-byte INTEGER grids, whose values live in an int8/uint8 storage.
+bool IsIntGrid(absl::string_view el) {
+  return el == "i4" || el == "ui4" || el == "i2" || el == "ui2";
+}
+
+// The ops whose result on an integer grid can leave the type's range from
+// in-range operands -- add, subtract and multiply (the three Stage 1 wrapped),
+// and, since int2 made them everyday (a 4-value type: -(-2) is -2, 1 << 1 is
+// -2, ~1 is 2 in ui2), negate, abs (abs(INT_MIN) is INT_MIN), not (the
+// unsigned pair: ~x in a uint8 storage is 255 - x), divide (INT_MIN / -1) and
+// power.  The wrap is the identity on an in-range value, so a result that
+// stays in range pays one elementwise op and nothing else.  (Measured against
+// jax-CPU for i4/ui4/i2/ui2; shift_right_logical, popcnt and clz read the
+// storage's 8 bits rather than the logical width and are NOT fixed by a
+// wrap -- a known gap, unchanged.)
+bool IsIntGridWrapOp(absl::string_view name) {
+  return name == "stablehlo.add" || name == "stablehlo.subtract" ||
+         name == "stablehlo.multiply" || name == "stablehlo.negate" ||
+         name == "stablehlo.abs" || name == "stablehlo.not" ||
+         name == "stablehlo.divide" || name == "stablehlo.power" ||
+         name == "stablehlo.shift_left";
 }
 
 bool IsBinaryRegridOp(absl::string_view name) {
@@ -431,20 +455,32 @@ int64_t RegridOf(mlir::Operation* op, absl::string_view name) {
           .getElementType());
   if (!code.has_value()) return -1;
   if (name == "stablehlo.convert") return *code;
-  // A bitcast_convert onto i4/ui4 hands back raw NIBBLES, and turning those
-  // into the storage values IS `quantize_emulated` (ops/shape.py's
-  // `_from_nibbles` calls exactly that) -- so it rides the same field.
-  if (name == "stablehlo.bitcast_convert" && (*el == "i4" || *el == "ui4"))
-    return *code;
+  // A bitcast_convert onto an integer grid hands back raw NIBBLES (or 2-bit
+  // crumbs), and turning those into the storage values IS
+  // `quantize_emulated` (ops/shape.py's `_from_nibbles` calls exactly that)
+  // -- so it rides the same field.
+  if (name == "stablehlo.bitcast_convert" && IsIntGrid(*el)) return *code;
+  if (IsIntGrid(*el)) return IsIntGridWrapOp(name) ? *code : -1;
   const bool arith = IsUnaryRegridOp(name) || IsBinaryRegridOp(name);
   if (!arith) return -1;
   if (*el == "f4E2M1FN" || *el == "f6E2M3FN" || *el == "f6E3M2FN")
     return *code;
-  if ((*el == "i4" || *el == "ui4") &&
-      (name == "stablehlo.add" || name == "stablehlo.multiply" ||
-       name == "stablehlo.subtract"))
-    return *code;
   return -1;
+}
+
+// A float stablehlo.remainder runs as a small kernel of its own (see
+// ops_elementwise.cc `float_remainder`), built at its first eval -- so it is
+// built and proven HERE, at lowering, outside any trace, once per dtype.  An
+// unproven dtype is not an error: the handler runs its fused-op spelling.
+void ProveFloatRemainder(mlir::Operation* op, absl::string_view name) {
+  if (name != "stablehlo.remainder" || op->getNumResults() != 1) return;
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+  if (!t) return;
+  std::optional<std::string> el = TapeElementName(t.getElementType());
+  if (!el.has_value() || (*el != "f32" && *el != "f16" && *el != "bf16"))
+    return;
+  std::optional<mx::Dtype> dt = MxDtypeOf(t.getElementType());
+  if (dt.has_value()) prove_float_remainder(*dt);
 }
 
 // reduce_window's own materialization cap (tape.py `_WINDOW_MAX`); above it
@@ -4186,10 +4222,9 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerShift(
   return std::vector<int64_t>{0, 0};
 }
 
-// tape.py `_lower_bitcast_convert`, the byte-multiple arm.  Which arm runs is
-// a static property of the two element widths, and the other arm -- the
-// 4-bit one -- cannot be reached: i4/ui4 have no dtype code, so a program
-// holding one declines on its element type long before this.
+// tape.py `_lower_bitcast_convert`.  Which arm runs is a static property of
+// the two element widths: the byte-multiple arm is a view, the sub-byte one
+// (an i4/ui4 or i2/ui2 end) packs or unpacks.
 absl::StatusOr<std::vector<int64_t>> Lowering::LowerBitcastConvert(
     mlir::Operation* op) {
   ASSIGN_OR_RETURN(int code, DtypeCode(op->getResult(0)));
@@ -4203,9 +4238,10 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerBitcastConvert(
   if (!src.has_value() || !dst.has_value())
     return Decline("bitcast_convert element type");
   // A bitcast reads BITS, so the storage has to BE the logical bit pattern.
-  // i4/ui4 are the one emulated pair this can reconstruct (whole nibbles);
-  // the f8/f6/f4 grids hold VALUES in a wider float, so their bit patterns
-  // simply do not exist on this device (ops/shape.py raised the same way).
+  // The integer grids are the emulated types this can reconstruct (whole
+  // nibbles or 2-bit crumbs, sign-extended in the storage); the f8/f6/f4
+  // grids hold VALUES in a wider float, so their bit patterns simply do not
+  // exist on this device (ops/shape.py raised the same way).
   int64_t ib = 8 * static_cast<int64_t>(src->size());
   int64_t ob = 8 * static_cast<int64_t>(dst->size());
   // `CheckValue` has already run on both, so both names exist.
@@ -4214,34 +4250,41 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerBitcastConvert(
   for (const std::string* n : {&in_name, &out_name}) {
     const int kind = EmulatedKindOfName(*n);
     if (kind < 0) continue;
-    if (*n != "i4" && *n != "ui4")
+    if (*n != "i4" && *n != "ui4" && *n != "i2" && *n != "ui2")
       return Decline(absl::StrCat("bitcast_convert on ", *n,
                                   ": metaljax stores it in a wider dtype, so "
                                   "its bit pattern is unavailable"));
     (n == &in_name ? ib : ob) = EmulatedBits(kind);
   }
-  if (ib != 4 && ob != 4) {
+  if (ib >= 8 && ob >= 8) {
     int64_t kind = 0;
     if (dst->size() < src->size()) kind = 1;
     else if (dst->size() > src->size()) kind = 2;
     return std::vector<int64_t>{code, kind};
   }
-  // A 4-bit end. XLA packs two values per byte along the minor-most
-  // dimension, low nibble first, and a width-changing bitcast adds (or
+  // A sub-byte end. XLA packs 8 / bits values per byte along the minor-most
+  // dimension, lowest bits first, and a width-changing bitcast adds (or
   // removes) exactly that trailing ratio dim -- so a row-major flatten makes
   // the packed byte stream contiguous and the whole thing is one linear
   // reinterpretation. The result element type does the un-packing arithmetic
   // through the entry's `regrid` (`_from_nibbles` IS `quantize_emulated`).
+  // Two sub-byte ends of DIFFERENT widths (i2 <-> i4) would repack
+  // sub-byte fields into sub-byte fields; nothing emits that, so it declines.
+  if (ib < 8 && ob < 8 && ib != ob)
+    return Decline(absl::StrCat("bitcast_convert between ", in_name, " and ",
+                                out_name));
+  const int64_t bits = std::min(ib, ob);
   ASSIGN_OR_RETURN(std::vector<int64_t> out_shape, Dims(op->getResult(0)));
   ASSIGN_OR_RETURN(std::vector<int64_t> in_shape, Dims(op->getOperand(0)));
   int64_t kind;
   if (Product(in_shape) == 0) kind = 6;         // zeros of the result type
-  else if (ib == 4 && ob == 4) kind = 3;        // reinterpret in place
-  else if (ib == 4) kind = 4;                   // pack pairs into bytes
+  else if (ib == ob) kind = 3;                  // reinterpret in place
+  else if (ib < 8) kind = 4;                    // pack fields into bytes
   else kind = 5;                                // unpack each byte
   std::vector<int64_t> attrs{code, kind,
                              static_cast<int64_t>(out_shape.size())};
   attrs.insert(attrs.end(), out_shape.begin(), out_shape.end());
+  attrs.push_back(bits);
   return attrs;
 }
 
@@ -5852,7 +5895,8 @@ absl::Status Lowering::LowerConstant(mlir::Operation* op) {
         store(i++, dt == mx::int8 ? static_cast<double>(v.getSExtValue())
                                   : static_cast<double>(v.getZExtValue()));
       }
-      if (i != n) return Decline("an i4 constant of the wrong length");
+      if (i != n)
+        return Decline("a sub-byte integer constant of the wrong length");
     } else {
       int64_t i = 0;
       for (const llvm::APFloat& v : dense.getValues<llvm::APFloat>()) {
@@ -6565,8 +6609,15 @@ absl::Status Lowering::LowerCustomCall(mlir::Operation* op) {
   const std::string target = CallTarget(op);
   if (target.empty()) return Decline("a custom call with no target name");
 
-  // Single-device: a sharding annotation is the identity.
-  if (target == "Sharding" || target == "annotate_device_placement") {
+  // Single-device: a sharding annotation is the identity.  So is jax's
+  // `with_layout_constraint` (target "LayoutConstraint"): it asks XLA to give
+  // the value a physical layout, which changes where its bytes sit and never
+  // what the values are -- and every buffer here is dense row-major, with no
+  // other layout to give it.  (Only main's own arguments and results expose a
+  // layout to the caller, and `CheckLayoutMode` refuses a non-default one
+  // there by name.)
+  if (target == "Sharding" || target == "annotate_device_placement" ||
+      target == "LayoutConstraint") {
     if (op->getNumResults() != op->getNumOperands())
       return Decline(absl::StrCat("custom call ", target,
                                   " is not an arity-preserving alias"));
@@ -8316,6 +8367,7 @@ absl::Status Lowering::LowerOpImpl(mlir::Operation* op) {
   }
   std::vector<int> outs{Bind(op->getResult(0))};
   TaintResults(op, name, ins, outs);
+  ProveFloatRemainder(op, name);
   Emit(opcode, std::move(ins), outs, std::move(attrs), std::nullopt,
        ResultBytes(op), {}, {}, {}, RegridOf(op, name));
   return absl::OkStatus();
@@ -9190,6 +9242,7 @@ absl::StatusOr<int> Lowering::LowerMoeNode(const MoeMatch& m,
         return Decline(absl::StrCat("moe: ", name, " needs its own lowering"));
       }
       ASSIGN_OR_RETURN(int opcode, Opcode(name));
+      ProveFloatRemainder(node.op, name);
       Emit(opcode, std::move(ins), {s}, std::move(attrs), std::nullopt, 0, {},
            {}, {}, RegridOf(node.op, name));
       return s;

@@ -182,3 +182,16 @@ def test_rank0_dynamic_slice():
     check(lambda x, u: jax.vmap(
         lambda a, b: jax.lax.dynamic_update_slice(a, b, ()))(x, u),
         np.arange(4, dtype=np.float32), np.ones(4, np.float32))
+
+
+def test_with_layout_constraint_is_identity():
+    # jax's with_layout_constraint lowers to a `LayoutConstraint` custom call;
+    # every buffer here is dense row-major and a layout never changes values,
+    # so it is an alias (it used to decline by name).
+    from jax.experimental.layout import Layout, with_layout_constraint
+    x = np.arange(24, dtype=np.float32).reshape(4, 6)
+    for lay in ((1, 0), (0, 1)):
+        check(lambda a, lay=lay: with_layout_constraint(
+            a * 2.0 + 1.0, Layout(major_to_minor=lay)).sum(axis=0), x)
+    check(jax.grad(lambda a: (with_layout_constraint(
+        a, Layout(major_to_minor=(0, 1))) ** 2).sum()), x)

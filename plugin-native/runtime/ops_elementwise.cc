@@ -9,9 +9,14 @@
 
 #include "program.h"
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace metaljax {
@@ -110,7 +115,161 @@ mx::array shift_guard(int kind, const mx::array& a, const mx::array& b,
   return mx::where(over, shift_fill(kind, a, b), shift_apply(kind, a, b));
 }
 
+// stablehlo.remainder on floats: C's fmod, which is EXACT (the remainder of
+// two floats is always representable in their format, so there is one right
+// answer, and np.fmod / jax-CPU give it).
+//
+// Neither MLX spelling can be trusted with it.  a - trunc(a / b) * b (the
+// Python engine's, until 0.11.2's lax_test testOpAgainstNumpy594 caught it)
+// rounds the quotient and the product: ~55 % of random elements wrong, 1.2e-6
+// in f32, 2.2 in bf16, inf in f16 where a / b overflows.  mx::remainder is
+// Metal's `fmod` plus a python-sign fix-up -- exact in MLX's PRECOMPILED
+// kernels (the metallib is built -fno-fast-math, where `metal::fmod` is the
+// precise one) but NOT once mx::compile fuses it: MLX JIT-builds fused
+// kernels with the library defaults, and there `metal::fmod` is fast::fmod,
+// x - y * trunc(x / y) again (measured: 72 of 20k f32 pairs and 82 bf16 ones
+// wrong in a jit, sign flips and |r| >= |b| among them; 0 eager).
+//
+// So the remainder is its own small kernel, spelled with
+// `metal::precise::fmod` so no compile option can take it back: fmod on the
+// MAGNITUDES, then the dividend's sign -- a nonzero r takes a's, and a zero
+// takes it too (a * 0 is +-0 with a's sign for every finite a; an infinite
+// or NaN a has a NaN r and never reaches that arm).  Computed in float for
+// every float dtype: fmod's result is exact in the operands' own format, so
+// the store rounds nothing.  Bit-exact against np.fmod -- value and sign of
+// zero, +-inf, NaN, tiny and huge divisors -- in f32, f16 and bf16, eager
+// and fused (execute_test `_p50`).  One dispatch that does not fuse; float
+// remainder is rare, and a wrong answer is not a speed.
+const char kFmodSource[] = R"(
+    uint i = thread_position_in_grid.x;
+    float a = static_cast<float>(x[i]);
+    float b = static_cast<float>(y[i]);
+    float r = metal::precise::fmod(metal::abs(a), metal::abs(b));
+    out[i] = static_cast<T>((r == 0.0f) ? a * 0.0f : ((a < 0.0f) ? -r : r));
+)";
+
+struct FmodState {
+  std::mutex mu;
+  std::optional<mx::fast::CustomKernelFunction> fn;
+  // Per dtype: absent = never proven, false = would not build or answered
+  // wrong (the fused-op fallback runs), true = the kernel runs.
+  std::map<int, bool> ok;
+};
+
+FmodState& Fmod() {
+  static FmodState* s = new FmodState();
+  return *s;
+}
+
+int FmodKey(mx::Dtype dt) {
+  if (dt == mx::float32) return 0;
+  if (dt == mx::float16) return 1;
+  if (dt == mx::bfloat16) return 2;
+  return -1;
+}
+
+// Always on FLAT operands: the kernel indexes one dimension, and a rank-0
+// operand would change its signature (MLX passes a 0-dim input by value) and
+// with it the library -- one the lowering never proved.  Flat, every call of
+// a dtype is the very kernel `prove_float_remainder` built.
+mx::array fmod_launch(const mx::fast::CustomKernelFunction& fn,
+                      const mx::array& a, const mx::array& b) {
+  const int64_t n = static_cast<int64_t>(a.size());
+  const int tg = static_cast<int>(std::min<int64_t>(n, 256));
+  const mx::Shape flat{static_cast<mx::ShapeElem>(n)};
+  mx::array r = fn({mx::reshape(a, flat), mx::reshape(b, flat)}, {flat},
+                   {a.dtype()}, {static_cast<int>(n), 1, 1}, {tg, 1, 1},
+                   {{"T", a.dtype()}}, std::nullopt, false, {})[0];
+  return mx::reshape(r, a.shape());
+}
+
+// The fused-op arm, for a dtype the kernel could not be proven on (and a
+// zero-size or >2^31-element operand): mx::remainder is exact wherever it
+// is not fused.
+mx::array fmod_ops(const mx::array& a, const mx::array& b) {
+  mx::array r = mx::remainder(mx::abs(a), mx::abs(b));
+  return mx::where(mx::equal(r, weak(0.0, r)), mx::multiply(a, weak(0.0, a)),
+                   mx::where(mx::less(a, weak(0.0, a)), mx::negative(r), r));
+}
+
+mx::array float_remainder(const mx::array& a0, const mx::array& b0) {
+  mx::array a = a0, b = b0;
+  if (a.shape() != b.shape()) {
+    std::vector<mx::array> ab = mx::broadcast_arrays({a, b});
+    a = ab[0];
+    b = ab[1];
+  }
+  const int key = FmodKey(a.dtype());
+  if (key < 0 || b.dtype() != a.dtype() || a.size() == 0 ||
+      a.size() >= (size_t{1} << 31))
+    return fmod_ops(a, b);
+  FmodState& st = Fmod();
+  std::optional<mx::fast::CustomKernelFunction> fn;
+  {
+    std::lock_guard<std::mutex> lock(st.mu);
+    auto it = st.ok.find(key);
+    if (it == st.ok.end() || !it->second) return fmod_ops(a, b);
+    fn = st.fn;
+  }
+  return fmod_launch(*fn, a, b);
+}
+
 }  // namespace
+
+bool prove_float_remainder(mx::Dtype dt) {
+  const int key = FmodKey(dt);
+  if (key < 0) return false;
+  FmodState& st = Fmod();
+  std::lock_guard<std::mutex> lock(st.mu);
+  auto it = st.ok.find(key);
+  if (it != st.ok.end()) return it->second;
+  bool ok = false;
+  try {
+    if (!st.fn.has_value())
+      st.fn = mx::fast::metal_kernel("mjn_fmod", {"x", "y"}, {"out"},
+                                     kFmodSource);
+    // Built at its first eval, so prove it here, synchronously, on the
+    // cases that tell a precise fmod from a fast one and the sign rules
+    // from a careless spelling: fmod(5.5, 2) = 1.5, fmod(-4, 2) = -0,
+    // fmod(-7, -2.5) = -2, fmod(1, 0) = NaN, and 0.2578125 = 16 * 0.01611328125
+    // exactly, where x - y * trunc(x / y) answers y instead of 0.  TWICE:
+    // MLX binds an operand of fewer than 8 elements in the `constant`
+    // address space and a larger one in `device`, which is a different
+    // kernel (and library) -- so both are the ones that later run.
+    const std::vector<float> av{5.5f, -4.0f, -7.0f, 1.0f, 0.2578125f};
+    const std::vector<float> bv{2.0f, 2.0f, -2.5f, 0.0f, 0.01611328125f};
+    ok = true;
+    for (int reps : {1, 4}) {
+      std::vector<float> ar, br;
+      for (int k = 0; k < reps; k++) {
+        ar.insert(ar.end(), av.begin(), av.end());
+        br.insert(br.end(), bv.begin(), bv.end());
+      }
+      const int n = static_cast<int>(ar.size());
+      mx::array a = mx::astype(mx::array(ar.data(), {n}, mx::float32), dt);
+      mx::array b = mx::astype(mx::array(br.data(), {n}, mx::float32), dt);
+      mx::array r = mx::astype(fmod_launch(*st.fn, a, b), mx::float32);
+      mx::eval(r);
+      const float* v = r.data<float>();
+      for (int k = 0; k < reps; k++, v += 5)
+        ok = ok && v[0] == 1.5f && v[1] == 0.0f && std::signbit(v[1]) &&
+             v[2] == -2.0f && std::isnan(v[3]) && v[4] == 0.0f &&
+             !std::signbit(v[4]);
+    }
+    static const char* const kNames[] = {"f32", "f16", "bf16"};
+    debug_print(ok ? std::string("float remainder kernel proven for ") +
+                         kNames[key]
+                   : std::string("float remainder kernel answered wrong for ") +
+                         kNames[key] + "; the fused ops run instead");
+  } catch (const std::exception& e) {
+    if (is_oom(e)) return false;   // the machine, not the kernel: unproven
+    debug_print(std::string("float remainder kernel did not build (") +
+                e.what() + "); the fused ops run instead");
+    ok = false;
+  }
+  st.ok[key] = ok;
+  return ok;
+}
 
 bool Program::step_elementwise(const Entry& e,
                                std::vector<std::optional<mx::array>>& env,
@@ -333,9 +492,9 @@ bool Program::step_elementwise(const Entry& e,
     }
     case kRemainder: {
       // _remainder: StableHLO's remainder takes the sign of the
-      // DIVIDEND (truncated division). mx.remainder takes the sign of
-      // the divisor, like python's %, so the float arm spells the
-      // truncation out; the integer arm rides on int_trunc_div.
+      // DIVIDEND (C's fmod, truncated division); the integer arm rides on
+      // int_trunc_div, the float arm is `float_remainder` (its note says
+      // why it is a kernel of its own).
       const mx::array& a = in(0);
       const mx::array& b = in(1);
       if (is_int(a.dtype())) {
@@ -343,11 +502,7 @@ bool Program::step_elementwise(const Entry& e,
             mx::subtract(a, mx::multiply(int_trunc_div(a, b), b)),
             a.dtype());
       } else {
-        mx::array q = mx::divide(a, b);
-        // _trunc
-        mx::array t = mx::where(mx::less(q, weak(0.0, q)), mx::ceil(q),
-                                mx::floor(q));
-        env[e.outs[0]] = mx::subtract(a, mx::multiply(t, b));
+        env[e.outs[0]] = float_remainder(a, b);
       }
       break;
     }

@@ -82,6 +82,23 @@ def test_effort_levels_are_not_env_overrides():
     """jax applies these on ExecutableBuildOptions itself, so they must
     never reach (and be refused by) the option validator."""
     from jax._src import config as jconfig
+    if jax.__version_info__ >= (0, 11, 2):
+        # jax 0.11.2 removed exec_time_optimization_effort /
+        # memory_fitting_effort from its build options, so the key falls
+        # through to XLA's validator and is refused -- by jax-CPU exactly
+        # as by this plugin.  Pin that parity; optimization_level remains a
+        # build option and must still pass.
+        for dev in (_metal(), jax.devices("cpu")[0]):
+            with jax.default_device(dev):
+                with pytest.raises(jax.errors.JaxRuntimeError,
+                                   match="No such compile option"):
+                    jax.jit(lambda x: x * 2.0, compiler_options={
+                        "exec_time_optimization_effort": 0.0})(1.0)
+        with jax.default_device(_metal()):
+            from jax._src.compiler import CompilerEffortLevel
+            jax.jit(lambda x: x * 2.0, compiler_options={
+                "optimization_level": CompilerEffortLevel.O1.value})(1.0)
+        return
     with jax.default_device(_metal()):
         jax.jit(lambda x: x * 2.0, compiler_options={
             "exec_time_optimization_effort": 0.0})(1.0)

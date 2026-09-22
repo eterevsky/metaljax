@@ -219,6 +219,14 @@ def test_linalg_half_precision():
         metal = jax.devices("metal")[0]
     except RuntimeError:
         pytest.skip("metal plugin not available")
+    if jax.__version_info__ >= (0, 11, 2):
+        # jax 0.11.2 gave the lax.linalg primitives dtype rules: a half
+        # dtype is refused at trace time on every backend, before it could
+        # reach the plugin.  Pin that, so a jax that reopens it is noticed.
+        with jax.default_device(metal):
+            with pytest.raises(TypeError, match="does not accept dtype"):
+                jax.jit(jnp.linalg.eigh)(jnp.eye(4, dtype=jnp.bfloat16))
+        return
     rng3 = np.random.default_rng(6)
     x = rng3.standard_normal((4, 4)).astype(np.float32)
     sym = x + x.T

@@ -56,6 +56,9 @@ const NamedDtype kDtypes[] = {
     {"f6E2M3FN", mx::float16},      {"f6E3M2FN", mx::float16},
     {"f4E2M1FN", mx::float16},      {"i4", mx::int8},
     {"ui4", mx::uint8},
+    // jax 0.11.2 exposes jnp.int2 / jnp.uint2 (ml_dtypes' 2-bit integers):
+    // the i4 pair's storage and grid at half the width.
+    {"i2", mx::int8},               {"ui2", mx::uint8},
 };
 constexpr int kNumDtypes = sizeof(kDtypes) / sizeof(kDtypes[0]);
 
@@ -66,7 +69,7 @@ constexpr int kFirstEmulated = 13;
 // `quantize_emulated`, `NO_NAN_EMULATED`, `_HAS_INF`, and ml_dtypes' finfo,
 // whose numbers are all exact powers of two or exact halves and are written
 // out here rather than recomputed).
-enum Kind { kFloatGrid = 0, kInt4, kUint4, kE8M0 };
+enum Kind { kFloatGrid = 0, kSignedInt, kUnsignedInt, kE8M0 };
 // What a magnitude past the grid's largest finite value becomes.
 enum Over { kOverNaN = 0, kOverInf, kOverSaturate };
 
@@ -77,6 +80,7 @@ struct Emulated {
   double maxval;  // largest finite magnitude
   Over over;
   double minexp, maxexp;   // E8M0 only
+  int bits = 0;             // the integer grids' logical width
 };
 
 const Emulated kEmulated[] = {
@@ -95,8 +99,10 @@ const Emulated kEmulated[] = {
     {kFloatGrid, 3, 0x1p0, 7.5, kOverSaturate, 0, 0},      // f6E2M3FN
     {kFloatGrid, 2, 0x1p-2, 28.0, kOverSaturate, 0, 0},    // f6E3M2FN
     {kFloatGrid, 1, 0x1p0, 6.0, kOverSaturate, 0, 0},      // f4E2M1FN
-    {kInt4, 0, 0, 0, kOverNaN, 0, 0},                      // i4
-    {kUint4, 0, 0, 0, kOverNaN, 0, 0},                     // ui4
+    {kSignedInt, 0, 0, 0, kOverNaN, 0, 0, 4},              // i4
+    {kUnsignedInt, 0, 0, 0, kOverNaN, 0, 0, 4},            // ui4
+    {kSignedInt, 0, 0, 0, kOverNaN, 0, 0, 2},              // i2
+    {kUnsignedInt, 0, 0, 0, kOverNaN, 0, 0, 2},            // ui2
 };
 static_assert(sizeof(kEmulated) / sizeof(kEmulated[0]) ==
                   kNumDtypes - kFirstEmulated,
@@ -127,21 +133,41 @@ bool is_emulated(int64_t code) {
 mx::array quantize_emulated(const mx::array& x, int64_t code) {
   const Emulated& g = grid(code);
   const mx::Dtype storage = dtype_of(code);
-  if (g.kind == kInt4) {
-    // 4-bit wrap, sign-extended: ((v + 8) mod 16) - 8. `mx::remainder` is
+  if (g.kind == kSignedInt || g.kind == kUnsignedInt) {
+    const bool is_signed = g.kind == kSignedInt;
+    const int64_t m = int64_t{1} << g.bits;           // 16 for i4, 4 for i2
+    const int64_t lo = is_signed ? -(m / 2) : 0;
+    const int64_t hi = is_signed ? m / 2 - 1 : m - 1;
+    mx::array v = x;
+    if (is_float(v.dtype())) {
+      // A FLOAT source is XLA's float->int convert, which SATURATES (LLVM's
+      // fptosi.sat): truncate toward zero, clamp to the type's range, NaN to
+      // zero -- measured on jax-CPU, -100 -> -8 / +inf -> 7 for i4, -> -2 / 1
+      // for i2, every negative -> 0 for the unsigned pair.  (ml_dtypes'
+      // astype WRAPS instead, and so did this grid before 0.11.2's int2:
+      // 100.0 -> i4 answered 4 where XLA says 7.)  Clamped in the float,
+      // where the bounds are exact, so the int cast below cannot overflow.
+      v = mx::where(mx::isnan(v), weak(0.0, v),
+                    mx::clip(v, weak(static_cast<double>(lo), v),
+                             weak(static_cast<double>(hi), v)));
+    }
+    // An INTEGER source wraps, `bits`-bit two's complement -- XLA's integer
+    // convert and its arithmetic both keep the low bits: signed
+    // ((v + m/2) mod m) - m/2, unsigned v mod m.  `mx::remainder` is
     // Python's `%` (the sign follows the divisor), which is what makes this
-    // right for negatives.
-    mx::array v = mx::astype(x, mx::int32);
-    v = mx::subtract(
-        mx::remainder(mx::add(v, mx::array(8, mx::int32)),
-                      mx::array(16, mx::int32)),
-        mx::array(8, mx::int32));
+    // right for negatives; int32 keeps every source's low 32 bits, and m
+    // divides 2^32.
+    v = mx::astype(v, mx::int32);
+    if (is_signed) {
+      v = mx::subtract(
+          mx::remainder(mx::add(v, mx::array(static_cast<int>(m / 2),
+                                             mx::int32)),
+                        mx::array(static_cast<int>(m), mx::int32)),
+          mx::array(static_cast<int>(m / 2), mx::int32));
+    } else {
+      v = mx::remainder(v, mx::array(static_cast<int>(m), mx::int32));
+    }
     return mx::astype(v, storage);
-  }
-  if (g.kind == kUint4) {
-    return mx::astype(mx::remainder(mx::astype(x, mx::int32),
-                                    mx::array(16, mx::int32)),
-                      storage);
   }
   if (g.kind == kE8M0) {
     // Exponent-only log-scale format: the nearest power of two. The floor at

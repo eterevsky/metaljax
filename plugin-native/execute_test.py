@@ -160,6 +160,267 @@ def _loop_spec_forms():
             ("fori without stacks", fori_no_stacks, [h0, w])]
 
 
+# P50-P52 (jax 0.11.2): the forms three contract groups run through BOTH
+# backends in a child each.  The answers are compared EXACTLY -- a float by
+# its bits (any NaN is one NaN), everything else by its value -- so each
+# form's outputs are encoded by `_exact_payload`.
+
+# The pairs a float remainder is hardest on: signed zeros, infinities, NaN,
+# huge and tiny magnitudes (+-6e-8 is subnormal in f16, which the kernel
+# computes in f32), and 0.2578125 = 16 * 0.01611328125 EXACTLY, where
+# x - y * trunc(x / y) answers y instead of 0 (all three exact in bf16, f16
+# and f32).  No f32/bf16 SUBNORMAL: the GPU flushes those to zero (the known
+# denormal-FTZ difference, jax-CPU's own answer differs from np.fmod there
+# too), which is a property of every float op here, not of this one.
+_REM_EDGE = [0.0, -0.0, 1.0, -1.0, 2.5, -2.5, 3.0, -3.0, np.inf, -np.inf,
+             np.nan, 1e-30, -1e-30, 7.0, -7.0, 65504.0, 1e30, -1e30,
+             0.2578125, 0.01611328125, 6e-8, -6e-8]
+
+
+def _rem_inputs():
+    """P50's operand pairs per float dtype: 8192 random pairs spanning 16
+    decades of ratio, then every EDGE value against every EDGE value."""
+    rng = np.random.default_rng(50)
+    edge = np.asarray(_REM_EDGE, np.float32)
+    out = {}
+    for name, dt in (("f32", np.float32), ("f16", np.float16),
+                     ("bf16", ml_dtypes.bfloat16)):
+        n = 8192
+        a = rng.standard_normal(n) * 10.0 ** rng.integers(-4, 5, n)
+        b = rng.standard_normal(n) * 10.0 ** rng.integers(-4, 5, n)
+        A = np.concatenate([a.astype(np.float32), np.repeat(edge, len(edge))])
+        B = np.concatenate([b.astype(np.float32), np.tile(edge, len(edge))])
+        with np.errstate(over="ignore"):   # 1e30 is inf in f16, on purpose
+            out[name] = (A.astype(dt), B.astype(dt))
+    return out
+
+
+def _rem_fmod(a, b):
+    """np.fmod in the operands' own dtype: computed in f32 (every f16/bf16
+    value is exact there, and so is fmod's result), then stored back, which
+    rounds nothing."""
+    return np.fmod(a.astype(np.float32), b.astype(np.float32)).astype(a.dtype)
+
+
+def _p50_forms():
+    """P50 (stablehlo.remainder on floats is C's fmod, exactly)."""
+    import jax
+    import jax.numpy as jnp
+
+    forms = []
+    for name, (A, B) in _rem_inputs().items():
+        dt = A.dtype
+        forms.append((f"rem {name}", lambda x, y: jax.lax.rem(x, y), [A, B]))
+        # A splat divisor (a broadcast, stride-0 operand) and a remainder
+        # fused among other ops, rank 0 included.
+        forms.append((f"rem {name} splat divisor",
+                      lambda x, d=dt: (jax.lax.rem(x, jnp.asarray(0.7, d)),
+                                       x * jnp.asarray(2.0, d)), [A]))
+        forms.append((f"rem {name} rank 0",
+                      lambda x, y: jax.lax.rem(x, y), [A[5], B[7]]))
+        # jnp's python-style `%` is remainder plus a select on the signs.
+        forms.append((f"mod {name}", lambda x, y: x % y, [A, B]))
+
+    def loop(h, xs):
+        def body(c, x):
+            c = jax.lax.rem(x * jnp.asarray(300.0, c.dtype),
+                            jnp.abs(c) + jnp.asarray(0.01, c.dtype))
+            return c, c
+        return jax.lax.scan(body, h, xs)
+
+    rng = np.random.default_rng(51)
+    for name, dt in (("f32", np.float32), ("f16", np.float16),
+                     ("bf16", ml_dtypes.bfloat16)):
+        forms.append((f"msl rem {name}", loop,
+                      [rng.standard_normal((8, 16)).astype(dt),
+                       rng.standard_normal((32, 8, 16)).astype(dt)]))
+
+    def int_loop(h, xs):
+        def body(c, x):
+            c = jax.lax.rem(x * 7 + c, jnp.asarray(13, c.dtype)) + 5
+            return c, c
+        return jax.lax.scan(body, h, xs)
+
+    forms.append(("msl rem i32", int_loop,
+                  [rng.integers(-50, 50, (8, 16)).astype(np.int32),
+                   rng.integers(-1000, 1000, (32, 8, 16)).astype(np.int32)]))
+    return forms
+
+
+def _p51_forms():
+    """P51 (jnp.int2 / jnp.uint2, and the int4 pair's convert semantics).
+
+    Every convert direction, the arithmetic whose result can leave a 2-bit
+    range (and the ops that cannot), constants, and the bitcasts both ways --
+    each through jax, cast to i32 before it leaves the program so the answer
+    is a plain integer on either backend.  The int4 pair rides along because
+    the same grid code now serves both: a float convert SATURATES (XLA's
+    fptosi.sat -- 100.0 -> i4 is 7, not ml_dtypes' wrapped 4) and negate /
+    shift_left / divide / not wrap.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    fvals = np.asarray([-100.0, -3.7, -2.5, -2.0, -1.5, -1.0, -0.5, -0.0,
+                        0.0, 0.4, 0.5, 1.0, 1.5, 1.9, 2.0, 2.5, 3.0, 3.9, 4.0,
+                        7.9, 8.0, 15.5, 16.0, 100.0, np.inf, -np.inf, np.nan],
+                       np.float32)
+    grids = {"int2": (jnp.int2, np.arange(-2, 2), 2),
+             "uint2": (jnp.uint2, np.arange(0, 4), 2),
+             "int4": (jnp.int4, np.arange(-8, 8), 4),
+             "uint4": (jnp.uint4, np.arange(0, 16), 4)}
+    i32 = jnp.int32
+    forms = []
+    for n, (dt, vals, bits) in grids.items():
+        host = vals.astype(np.int8).astype(np.dtype(dt))
+        for src in (np.float32, np.float16, ml_dtypes.bfloat16):
+            forms.append((f"{n} from {np.dtype(src).name}",
+                          lambda x, dt=dt: x.astype(dt).astype(i32),
+                          [fvals.astype(src)]))
+        forms.append((f"{n} from i32 (wraps)",
+                      lambda x, dt=dt: x.astype(dt).astype(i32),
+                      [np.arange(-20, 20, dtype=np.int32)]))
+        forms.append((f"{n} from u32 (wraps)",
+                      lambda x, dt=dt: x.astype(dt).astype(i32),
+                      [np.asarray([0, 1, 2, 3, 5, 0xFFFFFFFF, 0x80000001],
+                                  np.uint32)]))
+        if n in ("int4", "uint4"):
+            # The pair's own arithmetic predates this change except for the
+            # wraps below.
+            ops = [("neg", lambda x, y: -x), ("not", lambda x, y: ~x),
+                   ("shl", jax.lax.shift_left)]
+        else:
+            ops = [("add", lambda x, y: x + y), ("sub", lambda x, y: x - y),
+                   ("mul", lambda x, y: x * y), ("max", jnp.maximum),
+                   ("min", jnp.minimum), ("and", lambda x, y: x & y),
+                   ("or", lambda x, y: x | y), ("xor", lambda x, y: x ^ y),
+                   ("shl", jax.lax.shift_left),
+                   ("neg", lambda x, y: -x), ("not", lambda x, y: ~x),
+                   ("sign", lambda x, y: jnp.sign(x)),
+                   ("select", lambda x, y: jnp.where(x < y, x, y))]
+            if n == "int2":
+                ops.append(("sra", jax.lax.shift_right_arithmetic))
+        A = np.repeat(vals, len(vals)).astype(np.int32)
+        B = np.tile(vals, len(vals)).astype(np.int32)
+        for opn, op in ops:
+            forms.append((f"{n} {opn}",
+                          lambda x, y, dt=dt, op=op:
+                          op(x.astype(dt), y.astype(dt)).astype(i32),
+                          [A, B]))
+        nz = np.where(B == 0, 1, B).astype(np.int32)
+        for opn, op in (("div", jax.lax.div), ("rem", jax.lax.rem)):
+            forms.append((f"{n} {opn}",
+                          lambda x, y, dt=dt, op=op:
+                          op(x.astype(dt), y.astype(dt)).astype(i32),
+                          [A, nz]))
+        for tgt in (jnp.float32, jnp.bfloat16, jnp.float16, jnp.int8,
+                    jnp.uint8, jnp.int32):
+            forms.append((f"{n} to {jnp.dtype(tgt).name}",
+                          lambda x, dt=dt, tgt=tgt: x.astype(dt).astype(tgt),
+                          [vals.astype(np.int32)]))
+        # An int2 buffer IN and OUT of the program (the host transfer both
+        # ways), a constant of the type, splat and dense.
+        forms.append((f"{n} passthrough", lambda x: x, [host]))
+        forms.append((f"{n} arithmetic out", lambda x: x + x, [host]))
+        forms.append((f"{n} splat constant",
+                      lambda x, dt=dt, v=int(vals[-1]):
+                      (x + jnp.asarray(v, dt)).astype(i32), [host]))
+        forms.append((f"{n} dense constant",
+                      lambda x, dt=dt, h=host: (x * jnp.asarray(h)).astype(i32),
+                      [host]))
+        # Bitcasts: 8 / bits fields per byte, lowest bits first.
+        per = 8 // bits
+        raw = np.asarray([0b11100100, 0x01, 0x80, 0x7F, 0xFF, 0x5A], np.uint8)
+        bc = jax.lax.bitcast_convert_type
+        forms.append((f"{n} bitcast from u8",
+                      lambda x, dt=dt: bc(x, dt).astype(i32), [raw]))
+        forms.append((f"{n} bitcast from i16",
+                      lambda x, dt=dt: bc(x, dt).astype(i32),
+                      [raw.view(np.int16)]))
+        forms.append((f"{n} bitcast from f32",
+                      lambda x, dt=dt: bc(x, dt).astype(i32),
+                      [np.asarray([1.0, -2.5, 3e7], np.float32)]))
+        forms.append((f"{n} bitcast from rank 0",
+                      lambda x, dt=dt: bc(x, dt).astype(i32), [np.int8(-77)]))
+        packed = np.resize(vals, 8 * per).astype(np.int8).astype(np.dtype(dt))
+        forms.append((f"{n} bitcast to u8",
+                      lambda x: bc(x, jnp.uint8), [packed.reshape(8, per)]))
+        forms.append((f"{n} bitcast to i16",
+                      lambda x: bc(x, jnp.int16), [packed.reshape(4, 2 * per)]))
+        forms.append((f"{n} bitcast to f32",
+                      lambda x: bc(x, jnp.float32),
+                      [packed.reshape(2, 4 * per)]))
+        forms.append((f"{n} bitcast to rank 0",
+                      lambda x: bc(x, jnp.int8), [packed[:per]]))
+        twin = {"int2": jnp.uint2, "uint2": jnp.int2, "int4": jnp.uint4,
+                "uint4": jnp.int4}[n]
+        forms.append((f"{n} bitcast same width",
+                      lambda x, twin=twin: bc(x, twin).astype(i32), [host]))
+        forms.append((f"{n} empty",
+                      lambda x, dt=dt: x.astype(dt).astype(i32),
+                      [np.zeros((0, 3), np.float32)]))
+    return forms
+
+
+def _p51_overlap_program(quant_dtype):
+    """jax-v0.11.2 overlap_test.py::test_avoid_excess_precision's program, as
+    the test spells it (program_order and all), returning its answer."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental.overlap import program_order
+
+    @jax.jit
+    def f(x):
+        @program_order(enforce=True)
+        def g(x):
+            amax = jnp.abs(x).max(axis=-1, keepdims=True).astype(jnp.float32)
+            scale = amax / jnp.iinfo(quant_dtype).max
+            q = jnp.rint(x / scale).astype(quant_dtype)
+            r = q.astype(jnp.float32) * scale
+            return jnp.linalg.norm(r.astype(x.dtype) - x, ord=2, axis=-1)
+        return g(x)
+
+    x = jax.random.normal(jax.random.key(123), [16, 256], dtype=jnp.bfloat16)
+    return f(x)
+
+
+def _p52_forms():
+    """P52 (jax's `with_layout_constraint` custom call is an alias here)."""
+    import jax
+    from jax.experimental.layout import Layout, with_layout_constraint
+
+    x = _rand((4, 6), 520)
+    forms = []
+    for lay in ((1, 0), (0, 1)):
+        def f(a, lay=lay):
+            c = with_layout_constraint(a * 2.0 + 1.0, Layout(major_to_minor=lay))
+            return c.sum(axis=0), with_layout_constraint(a, Layout(lay))[0]
+        forms.append((f"layout constraint {lay}", f, [x]))
+    forms.append(("layout constraint under grad",
+                  jax.grad(lambda a: (with_layout_constraint(
+                      a, Layout(major_to_minor=(0, 1))) ** 2).sum()), [x]))
+    return forms
+
+
+def _exact_payload(outs):
+    """Outputs as exact JSON: [dtype, values] per output, a float by its BITS
+    (with every NaN as None -- payloads are not an answer), anything else by
+    its value."""
+    rows = []
+    for o in outs:
+        a = np.asarray(o)
+        name = str(a.dtype)
+        if name in ("float32", "float16", "bfloat16"):
+            u = a.reshape(-1).view(np.uint32 if a.itemsize == 4 else np.uint16)
+            nan = np.isnan(a.reshape(-1).astype(np.float32))
+            vals = [None if m else int(v) for v, m in zip(u.tolist(),
+                                                          nan.tolist())]
+        else:
+            vals = a.reshape(-1).astype(np.int64).tolist()
+        rows.append([name, list(a.shape), vals])
+    return rows
+
+
 def _msl_mingru(h0, xs, wz, wh):
     """A pure elementwise cell: `scalar` (affine) mode, one thread per lane."""
     import jax
@@ -10698,9 +10959,16 @@ def _p39_kv_inplace(subprocess, pathlib, re):
         # read-after case DECLINES with the reason, and the fori_loop case
         # narrates nothing: its rebuild sits inside jax's `closed_call`
         # wrapper, which the analysis does not see through (documented).
+        # jax >= 0.11.2 no longer wraps a fori_loop body in `closed_call`,
+        # so the fori case is visible to the analysis and rewrites too (its
+        # 2 layers x k,v = 4 updates, narrated twice).
         updates = sorted(int(u) for _c, u in rewrote)
-        if updates != [4, 4, 4, 4, 6, 6]:
-            return False, f"rewrote updates {updates}, wanted [4, 4, 4, 4, 6, 6]"
+        want = [4, 4, 4, 4, 6, 6]
+        from importlib.metadata import version as _pkg_version
+        if tuple(int(p) for p in _pkg_version("jax").split(".")[:3]) >= (0, 11, 2):
+            want = [4, 4, 4, 4, 4, 4, 6, 6]
+        if updates != want:
+            return False, f"rewrote updates {updates}, wanted {want}"
         if len(declined) != 2 or not all(
                 "read after an overlapping update" in d for d in declined):
             return False, f"declines {declined}, wanted 2 x read-after"
@@ -12108,6 +12376,214 @@ def _p49_loop_specialize(subprocess, pathlib, re):
             ("loop specialization is bit-exact", the_answers_are_bit_exact)]
 
 
+_P5X_ARMS = {}
+
+
+def _p5x_arm(subprocess, pathlib, group, env_extra, cpu=False):
+    """One child running P50/P51/P52's forms (`--p5x-forms <group>`): the
+    answers by label, and the narration (METALJAX_DEBUG is on).  Memoized:
+    the contracts of a group share their arms."""
+    import json
+    key = (group, tuple(sorted(env_extra.items())), cpu)
+    if key in _P5X_ARMS:
+        return _P5X_ARMS[key]
+    here = str(pathlib.Path(__file__).resolve())
+    child = dict(os.environ)
+    child["METALJAX_DEBUG"] = "1"
+    if cpu:
+        child["JAX_PLATFORMS"] = "cpu"
+    child.update(env_extra)
+    proc = subprocess.run([sys.executable, here, "--p5x-forms", group],
+                          env=child, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout
+                            ).strip().splitlines()[-1][:110])
+    answers = {}
+    for line in proc.stdout.splitlines():
+        if line.startswith("P5X "):
+            label, payload = line[4:].split("\t", 1)
+            answers[label] = json.loads(payload)
+    _P5X_ARMS[key] = (answers, proc.stdout + proc.stderr)
+    return _P5X_ARMS[key]
+
+
+def _p5x_same(got, want, labels=None):
+    """The labels whose answers differ (an error on either side counts), and
+    how many elements were compared exactly."""
+    bad, n = [], 0
+    for label in (labels if labels is not None else sorted(want)):
+        g, w = got.get(label), want.get(label)
+        if g is None or w is None:
+            bad.append(f"{label}: missing")
+        elif isinstance(g, str) or isinstance(w, str):
+            bad.append(f"{label}: {g if isinstance(g, str) else w}")
+        elif g != w:
+            bad.append(f"{label}: differs")
+        else:
+            n += sum(len(row[2]) for row in g)
+    return bad, n
+
+
+def _p50_float_remainder(subprocess, pathlib, re):
+    """FLOAT REMAINDER IS C's fmod, BIT FOR BIT (P50, jax 0.11.2).
+
+    stablehlo.remainder on floats has exactly one right answer -- fmod's
+    result is always representable -- and three spellings of it got it
+    wrong here until 0.11.2's lax_test testOpAgainstNumpy594 (rem, f16)
+    looked: the interpreted handler's a - trunc(a / b) * b (~55 % of random
+    elements, inf in f16), and, underneath the fix for that, MLX's own
+    remainder once mx::compile FUSES it and the generated msl_scan kernels'
+    bare `metal::fmod` -- both built with Metal's fast math functions, where
+    fmod is x - y * trunc(x / y) again.  Pinned here, against np.fmod and
+    jax-CPU, EXACTLY (value and sign of zero; any NaN is a NaN):
+
+      * f32 / f16 / bf16 over 8192 random pairs spanning 16 decades of ratio
+        plus every pair of edge values, compiled (the default) AND eager
+        (METALJAX_COMPILE=0), with a splat divisor, at rank 0, and through
+        jnp's `%`;
+      * inside a counted loop the generated kernel claims (three float
+        dtypes narrated as `compiled plan`) and in the same loop with
+        METALJAX_MSL=0; an INTEGER remainder in a loop declines the plan
+        instead of reaching a kernel that cannot build.
+    """
+
+    def fmod_rows():
+        return {f"rem {name}": _exact_payload([_rem_fmod(A, B)])
+                for name, (A, B) in _rem_inputs().items()}
+
+    def arms_agree(env_extra, what):
+        metal, _ = _p5x_arm(subprocess, pathlib, "p50", env_extra)
+        cpu, _ = _p5x_arm(subprocess, pathlib, "p50", {}, cpu=True)
+        want = fmod_rows()
+        bad, n = _p5x_same(metal, want, sorted(want))
+        if bad:
+            return False, f"{what} vs np.fmod: " + "; ".join(bad[:3])
+        bad, m = _p5x_same(metal, cpu)
+        if bad:
+            return False, f"{what} vs jax-CPU: " + "; ".join(bad[:3])
+        return True, (f"{what}: {n} remainders == np.fmod, {len(cpu)} forms "
+                      f"({m} elements) == jax-CPU, bit for bit")
+
+    def compiled():
+        _m, said = _p5x_arm(subprocess, pathlib, "p50", {})
+        proven = sorted(set(re.findall(
+            r"float remainder kernel proven for (\w+)", said)))
+        if proven != ["bf16", "f16", "f32"]:
+            return False, (f"the kernel was proven for {proven}, wanted all "
+                           "three float dtypes")
+        return arms_agree({}, "compiled")
+
+    def eager():
+        return arms_agree({"METALJAX_COMPILE": "0"}, "eager")
+
+    def in_msl_kernels():
+        loops = ["msl rem f32", "msl rem f16", "msl rem bf16", "msl rem i32"]
+        metal, said = _p5x_arm(subprocess, pathlib, "p50", {})
+        plain, _ = _p5x_arm(subprocess, pathlib, "p50", {"METALJAX_MSL": "0"})
+        cpu, _ = _p5x_arm(subprocess, pathlib, "p50", {}, cpu=True)
+        plans = said.count("msl_scan: compiled plan")
+        if plans != 3:
+            return False, (f"{plans} loops took a generated kernel, wanted "
+                           "the three float ones")
+        if "remainder on i32" not in said:
+            return False, "the integer remainder did not decline the plan"
+        if "failed to build" in said:
+            return False, "a generated kernel failed to build"
+        for arm, got in (("kernel", metal), ("METALJAX_MSL=0", plain)):
+            bad, _n = _p5x_same(got, cpu, loops)
+            if bad:
+                return False, f"{arm}: " + "; ".join(bad[:3])
+        return True, ("3 float loops on a generated kernel and the i32 one "
+                      "declined; both arms == jax-CPU, bit for bit")
+
+    return [("float rem == fmod (compiled)", compiled),
+            ("float rem == fmod (eager)", eager),
+            ("float rem in msl kernels", in_msl_kernels)]
+
+
+def _p51_int2(subprocess, pathlib, re):
+    """jnp.int2 / jnp.uint2 (P51, jax 0.11.2), EXACTLY as jax-CPU has them.
+
+    jax 0.11.2 exposes ml_dtypes' 2-bit integers; the plugin declined them at
+    compile ("element type <unknown>", jax-v0.11.2's overlap_test
+    test_avoid_excess_precision).  They are the i4 pair's emulation at half
+    the width: an int8/uint8 storage holding the value, a 2-bit wrap, one
+    byte per element on the wire, four fields per byte in a bitcast.  Pinned
+    against jax-CPU, exactly: converts from every float (XLA SATURATES --
+    and so, since this change, does the int4 pair, which used to wrap like
+    ml_dtypes) and from wider ints (which wrap); the arithmetic, including
+    what leaves the range (negate, not, shift_left, divide now wrap for all
+    four types); converts out; constants; buffers in and out of a program;
+    the bitcasts both ways; the device_put round trip; and the overlap
+    test's own program.
+    """
+
+    def forms_match():
+        metal, _ = _p5x_arm(subprocess, pathlib, "p51", {})
+        cpu, _ = _p5x_arm(subprocess, pathlib, "p51", {}, cpu=True)
+        exact = [k for k in cpu if not k.startswith("overlap")]
+        bad, n = _p5x_same(metal, cpu, exact)
+        if bad:
+            return False, "; ".join(bad[:3])
+        return True, f"{len(exact)} forms ({n} elements) == jax-CPU, exactly"
+
+    def eager_matches():
+        metal, _ = _p5x_arm(subprocess, pathlib, "p51",
+                            {"METALJAX_COMPILE": "0"})
+        cpu, _ = _p5x_arm(subprocess, pathlib, "p51", {}, cpu=True)
+        exact = [k for k in cpu if not k.startswith("overlap")]
+        bad, n = _p5x_same(metal, cpu, exact)
+        if bad:
+            return False, "; ".join(bad[:3])
+        return True, f"eager: {len(exact)} forms ({n} elements) == jax-CPU"
+
+    def overlap_program():
+        metal, _ = _p5x_arm(subprocess, pathlib, "p51", {})
+        cpu, _ = _p5x_arm(subprocess, pathlib, "p51", {}, cpu=True)
+        label = "overlap program int2"
+        g, w = metal.get(label), cpu.get(label)
+        if isinstance(g, str) or g is None:
+            return False, f"metal: {g}"
+        if isinstance(w, str) or w is None:
+            return False, f"jax-CPU: {w}"
+        if g[0] != w[0] or g[1] != w[1]:
+            return False, f"{g[0]}{g[1]} vs jax-CPU {w[0]}{w[1]}"
+        a, b = np.asarray(g[2]), np.asarray(w[2])
+        # A bf16 norm: the bar is bf16's own rounding (2^-8), relative.
+        worst = float(np.max(np.abs(a - b) / np.maximum(np.abs(b), 1e-6)))
+        if worst > 2 ** -7:
+            return False, f"relative error {worst:.1e}"
+        return True, f"runs; within {worst:.1e} of jax-CPU (bf16)"
+
+    return [("int2 forms == jax-CPU", forms_match),
+            ("int2 forms == jax-CPU (eager)", eager_matches),
+            ("overlap_test int2 program", overlap_program)]
+
+
+def _p52_layout_constraint(subprocess, pathlib, re):
+    """jax's `with_layout_constraint` RUNS (P52, jax 0.11.2).
+
+    It lowers to a `LayoutConstraint` custom call, which the plugin declined
+    by name.  A layout decides where a value's bytes sit, never what the
+    values are, and every buffer here is dense row-major, so the call is an
+    arity-preserving alias like the sharding annotations.  Pinned: the
+    default layout, a transposed one and the constraint under grad all run
+    and match jax-CPU exactly.  (jax-v0.11.2's layout_test
+    test_host_auto_layout still fails: it is TPU-only -- it skips on cpu/gpu
+    by platform name and asserts a TPU memory space in the compiled HLO.)
+    """
+
+    def runs_and_matches():
+        metal, _ = _p5x_arm(subprocess, pathlib, "p52", {})
+        cpu, _ = _p5x_arm(subprocess, pathlib, "p52", {}, cpu=True)
+        bad, n = _p5x_same(metal, cpu)
+        if bad:
+            return False, "; ".join(bad[:3])
+        return True, f"{len(cpu)} forms ({n} elements) == jax-CPU, exactly"
+
+    return [("with_layout_constraint runs", runs_and_matches)]
+
+
 def _p38_chunk_plan(subprocess, pathlib, re):
     """The chunked replay's schedule and its byte bound (T4, findings2).
 
@@ -12805,6 +13281,52 @@ def main():
             print(f"WHILE {name}\t"
                   f"{_json.dumps([v.astype(np.float64).ravel().tolist() for v in out])}")
         return 0
+    if len(sys.argv) > 2 and sys.argv[1] == "--p5x-forms":
+        # P50-P52's forms through whichever backend the caller put in the
+        # environment, one line per form: the label, then the outputs as
+        # exact JSON (or the error that stopped them, as a string).
+        if os.environ.get("JAX_PLATFORMS") != "cpu":
+            os.environ.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+            os.environ["JAX_PLATFORMS"] = "metal"
+        import json as _json
+        import jax
+        import jax.numpy as jnp
+        group = sys.argv[2]
+        forms = {"p50": _p50_forms, "p51": _p51_forms,
+                 "p52": _p52_forms}[group]()
+        for label, fn, args in forms:
+            try:
+                payload = _exact_payload(_flatten(jax.jit(fn)(*args)))
+            except Exception as exc:  # noqa: BLE001 - the parent reports it
+                payload = (f"{type(exc).__name__}: "
+                           f"{str(exc).splitlines()[0][:160]}")
+            print(f"P5X {label}\t{_json.dumps(payload)}", flush=True)
+        if group == "p51":
+            # The host transfer both ways with no program in between, and
+            # the overlap test's program (a bf16 norm: compared with a
+            # tolerance, so its values go out as floats).
+            for n in ("int2", "uint2"):
+                vals = np.arange(-2, 2) if n == "int2" else np.arange(4)
+                host = np.resize(vals, (3, 5)).astype(np.int8).astype(
+                    np.dtype(getattr(jnp, n)))
+                try:
+                    back = np.asarray(jax.device_put(host))
+                    payload = [[str(back.dtype), list(back.shape),
+                                back.reshape(-1).astype(np.int64).tolist()]]
+                except Exception as exc:  # noqa: BLE001
+                    payload = f"{type(exc).__name__}: {exc}"[:160]
+                print(f"P5X {n} device_put round trip\t"
+                      f"{_json.dumps(payload)}", flush=True)
+            try:
+                out = np.asarray(_p51_overlap_program(jnp.int2))
+                payload = [str(out.dtype), list(out.shape),
+                           out.astype(np.float64).reshape(-1).tolist()]
+            except Exception as exc:  # noqa: BLE001
+                payload = (f"{type(exc).__name__}: "
+                           f"{str(exc).splitlines()[0][:160]}")
+            print(f"P5X overlap program int2\t{_json.dumps(payload)}",
+                  flush=True)
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--loop-specialize":
         # P49's two counted loops, through whichever backend the caller put
         # in the environment.  Each is jitted and called REPS times: the
@@ -13191,6 +13713,11 @@ def main():
                                           __import__("re"))
                          + _p49_loop_specialize(
                              subprocess, pathlib, __import__("re"))
+                         + _p50_float_remainder(
+                             subprocess, pathlib, __import__("re"))
+                         + _p51_int2(subprocess, pathlib, __import__("re"))
+                         + _p52_layout_constraint(
+                             subprocess, pathlib, __import__("re"))
                          + _p38_chunk_plan(subprocess, pathlib,
                                            __import__("re"))
                          + _p47_chunk_donate(subprocess, pathlib,
@@ -13363,6 +13890,17 @@ def main():
             ok = worst < 1e-2
             detail = f"ok (worst invariant {worst:.1e})" if ok else \
                 f"FAIL: worst invariant {worst:.1e}"
+        except TypeError as exc:
+            # jax >= 0.11.2 gives the lax.linalg primitives dtype rules
+            # (float32/float64/complex only), so jax itself refuses a
+            # half-precision factorization at trace time, on every backend,
+            # before anything reaches this plugin.  The plugin's half-dtype
+            # handlers still serve jax 0.11.0/0.11.1.
+            if "does not accept dtype" in str(exc):
+                ok, detail = True, ("n/a: jax " + jax.__version__ +
+                                    " refuses half-precision linalg itself")
+            else:
+                ok, detail = False, f"FAIL: {str(exc).splitlines()[0][:90]}"
         except BaseException as exc:  # noqa: BLE001
             ok, detail = False, f"FAIL: {str(exc).splitlines()[0][:90]}"
         print(f"{label + ' linalg (no CPU rule)':<32} {'':>12}  {detail}")

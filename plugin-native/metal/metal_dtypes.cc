@@ -32,15 +32,16 @@ namespace {
 // The emulated element types, in the `EMULATED` order of Stage 1's
 // src/metaljax/dtypes.py (deleted 0.11.6, ef5774d) --
 // which is also the order of the runtime's own grid table, though nothing
-// depends on that: both sides key by NAME.  `sem` is nullptr for the two
-// integer grids, whose encoding is the low nibble and needs no float
-// machinery.
+// depends on that: both sides key by NAME.  `sem` is nullptr for the
+// integer grids (i4/ui4, and i2/ui2 since jax 0.11.2 exposes jnp.int2), whose
+// encoding is the low `bits` of the byte, two's complement for the signed
+// pair, and needs no float machinery.
 struct EmulatedWire {
   const char* name;
   xla::PrimitiveType wire;
   int bits;
   const llvm::fltSemantics& (*sem)();
-  bool integer;   // i4 / ui4
+  bool integer;   // i4 / ui4 / i2 / ui2
   bool is_signed;
 };
 
@@ -62,6 +63,8 @@ const EmulatedWire kEmulated[] = {
     {"f4E2M1FN", xla::F4E2M1FN, 4, &llvm::APFloat::Float4E2M1FN, false, false},
     {"i4", xla::S4, 4, nullptr, true, true},
     {"ui4", xla::U4, 4, nullptr, true, false},
+    {"i2", xla::S2, 2, nullptr, true, true},
+    {"ui2", xla::U2, 2, nullptr, true, false},
 };
 constexpr int kNumEmulated = sizeof(kEmulated) / sizeof(kEmulated[0]);
 
@@ -90,9 +93,12 @@ float EmulatedDecode(int kind, uint8_t code) {
       w.bits >= 8 ? code : static_cast<uint8_t>(code & ((1u << w.bits) - 1));
   if (w.integer) {
     if (!w.is_signed) return static_cast<float>(masked);
-    // Two's complement in the low nibble: 0x8..0xF are -8..-1.
-    return static_cast<float>(masked >= 8 ? static_cast<int>(masked) - 16
-                                          : static_cast<int>(masked));
+    // Two's complement in the low `bits`: for i4 0x8..0xF are -8..-1, for
+    // i2 0b10..0b11 are -2..-1.
+    const int half = 1 << (w.bits - 1);
+    return static_cast<float>(static_cast<int>(masked) >= half
+                                  ? static_cast<int>(masked) - 2 * half
+                                  : static_cast<int>(masked));
   }
   if (w.wire == xla::F8E8M0FNU) {
     // Exponent only, unsigned, no zero: code c is 2^(c-127) and 0xFF is the
@@ -113,11 +119,12 @@ float EmulatedDecode(int kind, uint8_t code) {
 uint8_t EmulatedEncode(int kind, float value) {
   const EmulatedWire& w = kEmulated[kind];
   if (w.integer) {
-    // 4-bit wrap, which is what the device-side grid already applied; doing
-    // it again here is what keeps a value that never met the grid (a host
-    // buffer built from a wider numpy array) honest.
+    // `bits`-bit wrap, which is what the device-side grid already applied;
+    // doing it again here is what keeps a value that never met the grid (a
+    // host buffer built from a wider numpy array) honest.
     const int v = static_cast<int>(std::llrint(static_cast<double>(value)));
-    return static_cast<uint8_t>(static_cast<unsigned>(v) & 0x0Fu);
+    return static_cast<uint8_t>(static_cast<unsigned>(v) &
+                                ((1u << w.bits) - 1));
   }
   if (w.wire == xla::F8E8M0FNU) {
     // Anything that is not a positive power of two in [2^-127, 2^127] --
@@ -190,7 +197,8 @@ std::optional<std::string> TapeElementName(mlir::Type type) {
     const unsigned w = it.getWidth();
     if (it.isSigned()) return std::nullopt;
     if (w == 1) return std::string("i1");
-    if (w != 4 && w != 8 && w != 16 && w != 32 && w != 64) return std::nullopt;
+    if (w != 2 && w != 4 && w != 8 && w != 16 && w != 32 && w != 64)
+      return std::nullopt;
     return absl::StrCat(it.isUnsigned() ? "ui" : "i", w);
   }
   // The emulated float grids, spelled out one by one for the reason this

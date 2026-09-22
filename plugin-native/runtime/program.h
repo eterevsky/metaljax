@@ -186,16 +186,24 @@ enum Op : int {
 
 mx::Dtype dtype_of(int64_t code);
 
-// The emulated grids (dtypes.py `EMULATED`): i4/ui4 and the f8/f6/f4 formats,
-// whose values live EXACTLY in a wider storage dtype (`dtype_of` returns that
-// storage, so every handler that builds a result of the declared type gets it
-// right without knowing the grid exists). What the grid is needed for is
-// two things and only two: rounding a value onto the grid, and knowing that
-// the code names one at all. The LOGICAL bit width bitcast_convert reads and
-// the host transfer's encode/decode are the tape BUILDER's, and live there;
-// nothing in a replay needs either.
+// The emulated grids (dtypes.py `EMULATED`): i4/ui4, i2/ui2 and the f8/f6/f4
+// formats, whose values live EXACTLY in a wider storage dtype (`dtype_of`
+// returns that storage, so every handler that builds a result of the declared
+// type gets it right without knowing the grid exists). What the grid is
+// needed for is two things and only two: rounding a value onto the grid, and
+// knowing that the code names one at all. The LOGICAL bit width
+// bitcast_convert reads (handed over in its attributes) and the host
+// transfer's encode/decode are the tape BUILDER's, and live there.
 bool is_emulated(int64_t code);
 mx::array quantize_emulated(const mx::array& x, int64_t code);
+
+// stablehlo.remainder on f32/f16/bf16 runs as a small kernel of its own
+// (ops_elementwise.cc `float_remainder` says why).  Build and probe it for
+// `dt`, synchronously, once per dtype, and remember the verdict: the lowering
+// calls this, outside any trace, for every float remainder it emits.  False
+// when it would not build or answered wrong -- the handler then runs the
+// fused-op spelling, which is exact only where MLX does not fuse it.
+bool prove_float_remainder(mx::Dtype dt);
 
 bool is_bool(const mx::Dtype& d);
 bool is_float(const mx::Dtype& d);
@@ -554,6 +562,9 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //                       [B, G, K, Ntail]), 2 the lhs ([B, G, Mtail, K])
 //   kBitcastConvert     [dtype, kind]           kind: 0 same width,
 //                                               1 narrowing, 2 widening
+//                       [dtype, kind, rank, out shape..., bits] for a
+//                       sub-byte (i4/ui4, i2/ui2) end: kind 3 in place,
+//                       4 pack, 5 unpack, 6 empty
 //   kDynamicSlice       [rank, clamp bounds..., sizes..., <start plan>]
 //   kDynamicUpdateSlice [rank, clamp bounds..., <start plan>]
 //                       (sizes = update's shape)

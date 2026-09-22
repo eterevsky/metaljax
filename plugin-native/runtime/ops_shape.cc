@@ -225,12 +225,13 @@ bool Program::step_shape(const Entry& e,
 
     case kBitcastConvert: {
       // ops/shape.py _bitcast_convert. The byte-multiple arms are a view:
-      // MLX's storage IS the XLA layout there. A 4-bit end is not -- an
-      // i4/ui4 value lives in a whole byte here and XLA packs two per byte
-      // along the minor-most dimension, low nibble first -- so a row-major
-      // flatten makes the packed stream contiguous and the pack or unpack
-      // is one linear reinterpretation. Every emulated type OTHER than
-      // i4/ui4 is declined at lowering: a value stored in a wider float has
+      // MLX's storage IS the XLA layout there. A sub-byte end is not -- an
+      // i4/ui4 (i2/ui2) value lives in a whole byte here and XLA packs two
+      // (four) per byte along the minor-most dimension, lowest bits first
+      // -- so a row-major flatten makes the packed stream contiguous and the
+      // pack or unpack is one linear reinterpretation. The field width is
+      // the last attribute. Every emulated type OTHER than the integer
+      // grids is declined at lowering: a value stored in a wider float has
       // no bit pattern on this device to read.
       mx::Dtype dt = dtype_of(at[0]);
       if (at[1] == 0) {
@@ -250,6 +251,9 @@ bool Program::step_shape(const Entry& e,
         break;
       }
       mx::Shape out_shape = shape(at, 3, at[2]);
+      const int bits = static_cast<int>(at[3 + at[2]]);
+      const int per = 8 / bits;                   // fields per byte
+      const int64_t mask = (int64_t{1} << bits) - 1;
       if (at[1] == 6) {   // nothing to reinterpret
         env[e.outs[0]] = mx::zeros(out_shape, dt);
         break;
@@ -259,33 +263,39 @@ bool Program::step_shape(const Entry& e,
         return mx::reshape(a, mx::Shape{-1});
       };
       if (at[1] == 3) {
-        // i4 <-> ui4: reinterpret the nibble in place. The entry's regrid
-        // turns the nibbles into the result type's storage values.
+        // i4 <-> ui4 (i2 <-> ui2): reinterpret the field in place. The
+        // entry's regrid turns the fields into the result type's storage
+        // values.
         env[e.outs[0]] = mx::reshape(
-            mx::bitwise_and(mx::astype(flat(in(0)), mx::uint8), u8(0x0F)),
+            mx::bitwise_and(mx::astype(flat(in(0)), mx::uint8), u8(mask)),
             out_shape);
         break;
       }
       if (at[1] == 4) {
-        // Pack pairs into bytes, low nibble first, then read the byte
-        // stream as the (byte-multiple) result type.
+        // Pack `per` fields into each byte, field j at bits [j*bits,
+        // (j+1)*bits), then read the byte stream as the (byte-multiple)
+        // result type. The fields of one byte are disjoint, so OR is sum.
         mx::array n =
-            mx::bitwise_and(mx::astype(flat(in(0)), mx::uint8), u8(0x0F));
+            mx::bitwise_and(mx::astype(flat(in(0)), mx::uint8), u8(mask));
         const mx::Shape stop{n.shape()[0]};
-        mx::array lo = mx::slice(n, mx::Shape{0}, stop, mx::Shape{2});
-        mx::array hi = mx::slice(n, mx::Shape{1}, stop, mx::Shape{2});
-        env[e.outs[0]] = mx::reshape(
-            mx::view(mx::bitwise_or(lo, mx::left_shift(hi, u8(4))), dt),
-            out_shape);
+        mx::array packed = mx::slice(n, mx::Shape{0}, stop, mx::Shape{per});
+        for (int j = 1; j < per; j++) {
+          mx::array f = mx::slice(n, mx::Shape{j}, stop, mx::Shape{per});
+          packed = mx::bitwise_or(packed, mx::left_shift(f, u8(j * bits)));
+        }
+        env[e.outs[0]] = mx::reshape(mx::view(packed, dt), out_shape);
         break;
       }
-      // Unpack each byte into (low, high). Again the regrid does the last
-      // step, from nibbles to the result type's storage values.
+      // Unpack each byte into its `per` fields, lowest first. Again the
+      // regrid does the last step, from fields to the result type's storage
+      // values.
       mx::array b = flat(mx::view(mx::reshape(in(0), mx::Shape{-1, 1}),
                                   mx::uint8));
-      mx::array lo = mx::bitwise_and(b, u8(0x0F));
-      mx::array hi = mx::right_shift(b, u8(4));
-      env[e.outs[0]] = mx::reshape(flat(mx::stack({lo, hi}, -1)), out_shape);
+      std::vector<mx::array> fields;
+      for (int j = 0; j < per; j++)
+        fields.push_back(
+            mx::bitwise_and(mx::right_shift(b, u8(j * bits)), u8(mask)));
+      env[e.outs[0]] = mx::reshape(flat(mx::stack(fields, -1)), out_shape);
       break;
     }
 

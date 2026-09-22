@@ -37,9 +37,10 @@ struct WireType {
   size_t host_item;         // bytes per element on the PJRT wire
   bool widen;               // wire is f64/c128, device is f32/c64
   int lanes;                // f32 scalars per element when widening (1 or 2)
-  // An EMULATED element type (i4/ui4 and the f8/f6/f4 grids), whose device
-  // storage holds the VALUE in a wider dtype: the wire byte is the type's own
-  // encoding, so the transfer is a per-element CONVERSION rather than a copy.
+  // An EMULATED element type (i2/ui2, i4/ui4 and the f8/f6/f4 grids), whose
+  // device storage holds the VALUE in a wider dtype: the wire byte is the
+  // type's own encoding, so the transfer is a per-element CONVERSION rather
+  // than a copy.
   // `EmulatedKind` names which grid; -1 for every real type.
   int emulated = -1;
 };
@@ -52,9 +53,10 @@ std::optional<WireType> WireTypeOf(xla::PrimitiveType type);
 // ml_dtypes implements and is what the host transfer needs to agree with.
 int EmulatedKindOfName(const std::string& name);
 int EmulatedKindOfPrimitive(xla::PrimitiveType type);
-// LOGICAL bits of one value (4 for i4/ui4/f4, 6 for the f6 pair, 8 for f8) --
-// what XLA's memory layout counts and what a bitcast_convert reads, which is
-// NOT the width of the storage the device holds it in.
+// LOGICAL bits of one value (2 for i2/ui2, 4 for i4/ui4/f4, 6 for the f6
+// pair, 8 for f8) -- what XLA's memory layout counts and what a
+// bitcast_convert reads, which is NOT the width of the storage the device
+// holds it in.
 int EmulatedBits(int kind);
 // Wire byte -> value, and value -> wire byte (round to nearest, ties to even;
 // overflow by the format's own rule -- an infinity, a NaN, or saturation).
