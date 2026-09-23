@@ -36,6 +36,8 @@ run $V/bench/bin/python llama31-8b-bf16 cpu
 run $V/bench/bin/python gpt-oss-20b metaljax
 run $V/bench/bin/python gemma4-26b-a4b metaljax
 run $V/bench/bin/python gemma4-e2b-int4 metaljax
+run $V/bench/bin/python qwen3-06b-keras metaljax
+run $V/bench/bin/python qwen3-06b-keras cpu
 run $V/bench/bin/python gemma4-e2b-int4 cpu
 run $V/bench/bin/python siglip2-so400m metaljax
 run $V/bench/bin/python siglip2-so400m cpu

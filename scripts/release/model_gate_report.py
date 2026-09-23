@@ -58,7 +58,10 @@ ROW_BENCH = {
     5:  ("qwen3-8b-bf16", "decode_ms_tok"),
     6:  ("llama31-8b-bf16", "decode_ms_tok"),
     7:  ("gpt-oss-20b", "decode_ms_tok"),
-    11: ("qwen3-06b-maxtext", "decode_ms_tok"),
+    # Row 11's headline is the keras-hub harness since 2026-09-02; the
+    # maxtext arm (qwen3-06b-maxtext) is a same-harness baseline for rows
+    # 14/19, not the row, so it never stands in for the ledger cell.
+    11: ("qwen3-06b-keras", "decode_ms_tok"),
     13: ("gemma4-e2b-int4", "decode_ms_tok"),
     14: ("maxtext-qwix-int8", "decode_ms_tok"),
     16: ("siglip2-so400m", "step_ms"),
