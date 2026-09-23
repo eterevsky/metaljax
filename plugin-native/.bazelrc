@@ -6,8 +6,10 @@
 # itself plus the macOS toolchain selection that jax's .bazelrc contributes.
 
 # --- from xla/.bazelrc -------------------------------------------------------
-# XLA at this pin is still a WORKSPACE-mode build; Bazel 8 defaults the other
-# way, so both flags are required.
+# We build XLA in WORKSPACE mode.  Bazel 8 defaults the other way, and XLA at
+# this pin (91888df6) now does too: its .bazelrc gates WORKSPACE mode behind
+# `--config=workspace`, which sets exactly these two flags.  We do not import
+# xla/.bazelrc, so set them here unconditionally (no --config needed).
 common --noenable_bzlmod --enable_workspace
 
 # Turn off empty glob check (flipped in Bazel 8).
@@ -25,7 +27,21 @@ common:clang_local --@rules_ml_toolchain//common:enable_hermetic_cc=False
 common:clang_local --repo_env USE_HERMETIC_CC_TOOLCHAIN=0
 
 # --- XLA's shared TF configuration ------------------------------------------
-import /Users/oleg/metaljax/xla/tensorflow.bazelrc
+import /Users/oleg/metaljax/xla-91888df6/tensorflow.bazelrc
+
+# tensorflow.bazelrc at this pin (new since 131bf41) sets
+# `--experimental_downloader_config=bazel_downloader.cfg` for build / test /
+# fetch / sync / query -- a RELATIVE path, which bazel resolves against the
+# workspace root, i.e. against plugin-native/, where no such file exists.
+# Re-point it at XLA's own copy (absolute, like the import above) rather than
+# copying the file in: the mirror list then moves with the pin instead of
+# going stale here.  Per-command lines, because a `common` line would be
+# overridden by tensorflow.bazelrc's per-command ones.
+build --experimental_downloader_config=/Users/oleg/metaljax/xla-91888df6/bazel_downloader.cfg
+test --experimental_downloader_config=/Users/oleg/metaljax/xla-91888df6/bazel_downloader.cfg
+fetch --experimental_downloader_config=/Users/oleg/metaljax/xla-91888df6/bazel_downloader.cfg
+sync --experimental_downloader_config=/Users/oleg/metaljax/xla-91888df6/bazel_downloader.cfg
+query --experimental_downloader_config=/Users/oleg/metaljax/xla-91888df6/bazel_downloader.cfg
 
 # --- macOS toolchain (from jax/.bazelrc) ------------------------------------
 # tensorflow.bazelrc sets --apple_crosstool_top etc. for :macos, but selecting

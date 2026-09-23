@@ -6,16 +6,22 @@ jax/jaxlib 0.11.2 (released 2026-09-17) replaces 0.11.0 as the pinned release: t
 jax/jaxlib 0.11.2.  The wheel's dependency range (`jax>=0.11,<0.12`) is unchanged: the plugin still runs
 on 0.11.0.
 
-## What stays
+## The plugin's XLA and the maxtext venv
 
-- **The plugin's XLA stays at 131bf41** (jax 0.11.0's).  jaxlib 0.11.2 pins XLA 91888df6 (now through
-  bzlmod), but negotiates down: it accepts any plugin with PJRT C API minor >= 29 (its strictest feature
-  check is >= 110; ours is 114, 91888df6's 115 only deprecates the Triton extension), and it serializes
-  StableHLO to the lower of its VHLO version (1.20) and the plugin's (1.18) -- 1.19/1.20 add
-  CollectiveReduce, has_dynamic_root and mixed-fp8 convolutions, none of which jax 0.11.2 emits.
-  Moving XLA is its own cycle: WORKSPACE builds are deprecated upstream (jax 0.11.2 is bzlmod-only),
-  `xla/tsl/platform/status_macros.h` is gone (316 unqualified macro uses), `computation_placer_hdr` moved,
-  and a new binary re-opens every release number.  Scout: `logs/jax0112/xla-scout/findings.md`.
+- **The plugin's XLA moved to 91888df6** (jax 0.11.2's, the `archive_override` in
+  `jax-v0.11.2/MODULE.bazel`; 2026-09-23, checkout `metaljax/xla-91888df6`; `metaljax/xla` keeps 0.11.0's
+  131bf41 so older commits still build).  Still a WORKSPACE build: jax 0.11.2 is bzlmod-only and XLA
+  gates WORKSPACE mode behind `--config=workspace` ("to be removed"), so the next pin move is likely the
+  bzlmod migration.  The move needed `compatibility_proxy_repo()` (rules_cc 0.2.20), an absolute
+  `--experimental_downloader_config` (tensorflow.bazelrc's is relative), `ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS`
+  on the four plugin-shell targets (XLA deleted `xla/tsl/platform/status_macros.h`, which did exactly
+  that), and `device_assignment` for the removed `computation_placer_hdr`; no source change otherwise.
+  The plugin now reports PJRT C API 0.115 (was 0.114) and VHLO 1.20.0 (was 1.18.0), so jaxlib 0.11.2 no
+  longer downgrades programs: two-operand `collective_broadcast` (VHLO 1.20) now compiles, and
+  `collective_reduce` (1.19; jax does not emit it) reaches the plugin and declines by name.  jaxlib 0.11.0
+  still loads the new plugin (identical `execute_test`).  Old vs new binary on jax 0.11.2: execute_test,
+  ingest_test, pytest (526 + 1 xfail) and texmo_gate (106/106) identical, compile cost unchanged
+  (`logs/xla918/`).  Scout: `logs/jax0112/xla-scout/findings.md`.
 - **The maxtext benchmark venv stays on jax 0.11.0.**  jax 0.11.2 renamed `jax.experimental.hijax.
   HiPrimitive` to `HiPrim`; every released flax (latest 0.12.9) still imports the old name, so
   `flax.nnx` cannot load.  flax main fixed it on 2026-08-21 (unreleased).  The maxtext rows (10, 11's

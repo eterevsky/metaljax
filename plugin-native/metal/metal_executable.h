@@ -39,7 +39,7 @@ Licensed under the Apache License, Version 2.0.
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_executable.h"
-#include "xla/service/computation_placer.h"
+#include "xla/service/device_assignment.h"
 #include "xla/shape.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"

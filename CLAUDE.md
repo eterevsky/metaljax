@@ -514,8 +514,10 @@ executes on the Metal device through plain `jax.numpy`.
 
 ## Environment note
 - venv is **Python 3.14.4** (texmo needs PEP-649 lazy annotations; jaxlib
-  0.11.2 / mlx 0.32 ship cp314 wheels). The plugin's XLA stays at jax
-  0.11.0's commit (131bf41): jaxlib 0.11.2 negotiates PJRT/VHLO down to it.
+  0.11.2 / mlx 0.32 ship cp314 wheels). The plugin's XLA is jax
+  0.11.2's commit (91888df6, checkout `xla-91888df6/`, WORKSPACE mode;
+  `xla/` keeps 0.11.0's 131bf41 for older commits): PJRT C API 0.115,
+  VHLO 1.20. jaxlib 0.11.0 (maxtext venv) still negotiates it down.
   The maxtext benchmark venv stays on jax 0.11.0 until a flax release
   supports 0.11.2 (flax <= 0.12.9 imports the renamed hijax.HiPrimitive). torch (CPU wheel) installed only so
   texmo modules import; the JAX path never calls it.

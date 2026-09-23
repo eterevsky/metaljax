@@ -12,7 +12,10 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 # the *calling* package's repository -- i.e. against this workspace, where
 # //xla/tsl/... does not exist.  This is the same list from
 # xla/xla.default.bzl, re-spelled with @xla// / @tsl// prefixes; diff it
-# against XLA's whenever the pin moves.
+# against XLA's whenever the pin moves.  (Last diffed at 91888df6: identical
+# targets.  Upstream now spells env_impl "@tsl//tsl/platform:env_impl", but
+# that is a deps-only cc_library wrapping @xla//xla/tsl/platform:env_impl --
+# the real target, which is what we name.)
 XLA_SHARED_OBJECT_SENSITIVE_DEPS = [
     "@xla//xla:autotune_results_proto_cc_impl",
     "@xla//xla:autotuning_proto_cc_impl",

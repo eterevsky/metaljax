@@ -1,19 +1,28 @@
 # Bazel workspace for the fully-native metaljax PJRT plugin (Stage 2).
 #
-# The XLA dependency is a *local* checkout (metaljax/xla), pinned to the exact
-# commit jax 0.11.0 uses (see jax-v0.11.0/third_party/xla/revision.bzl).  Using
-# local_repository instead of tf_http_archive avoids re-downloading ~500 MB and
-# is the arrangement JAX itself documents for local XLA development.
+# The XLA dependency is a *local* checkout (metaljax/xla-91888df6), pinned to
+# the exact commit jax 0.11.2 uses: 91888df6ce85102c30220e41d952065925e10886,
+# the archive_override in jax-v0.11.2/MODULE.bazel.  (Before 2026-09-23 the
+# pin was 131bf41, jax 0.11.0's XLA, in metaljax/xla -- which stays checked
+# out there for building older commits.)  Using local_repository instead of
+# tf_http_archive avoids re-downloading ~500 MB and is the arrangement JAX
+# itself documents for local XLA development.
 #
-# The load() cascade below mirrors xla/WORKSPACE, with the CUDA / NCCL /
-# NVSHMEM / wheel-versioning stanzas dropped: we build C++ only, for macOS
-# arm64, and never touch a GPU-vendor repository.
+# jax 0.11.2 itself is bzlmod-only.  XLA at this pin defaults to bzlmod too
+# but still supports WORKSPACE mode behind its `--config=workspace` ("to be
+# removed after bzlmod migration is complete"); we stay on WORKSPACE and set
+# the same two flags that config sets directly in .bazelrc.
+#
+# The load() cascade below mirrors xla-91888df6/WORKSPACE, with the Linux
+# register_toolchains() lines and the PJRT-wheel versioning repos
+# (nightly_timestamp, rc_number) dropped: we build C++ only, for macOS arm64.
+# The GPU-vendor repository rules stay, as no-ops (see the note above them).
 # buildifier: disable=load-on-top
 workspace(name = "metaljax_plugin_native")
 
 local_repository(
     name = "xla",
-    path = "/Users/oleg/metaljax/xla",
+    path = "/Users/oleg/metaljax/xla-91888df6",
 )
 
 load("@xla//:workspace4.bzl", "xla_workspace4")
@@ -27,6 +36,13 @@ xla_workspace3()
 load("@bazel_features//:deps.bzl", "bazel_features_deps")
 
 bazel_features_deps()
+
+# New at 91888df6 (mirrors xla-91888df6/WORKSPACE): rules_cc moved 0.2.0 ->
+# 0.2.20, whose WORKSPACE setup needs its compatibility proxy repo created
+# before anything loads rules_cc's cc_* rules.
+load("@rules_cc//cc:extensions.bzl", "compatibility_proxy_repo")
+
+compatibility_proxy_repo()
 
 # Hermetic C++ toolchain machinery.  On macOS we build with --config=clang_local
 # (see .bazelrc), which routes through @local_config_apple_cc instead, but the

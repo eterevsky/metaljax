@@ -41,16 +41,28 @@ cc_library(
     ],
 )
 
+# The four plugin-shell / lowering sources below use absl's status macros
+# UNQUALIFIED (ASSIGN_OR_RETURN / RETURN_IF_ERROR, ~316 uses).  Through XLA
+# 131bf41 they arrived via xla/tsl/platform/status_macros.h, which defined
+# ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS and included
+# absl/status/status_macros.h; XLA deleted that header (it spells them
+# ABSL_ASSIGN_OR_RETURN now).  Same absl LTS (20260526.0) at both pins, so
+# defining the macro per target and including absl's header directly is the
+# identical expansion -- absl documents exactly this local_defines spelling.
+_UNQUALIFIED_STATUS_MACROS = ["ABSL_DEFINE_UNQUALIFIED_STATUS_MACROS"]
+
 cc_library(
     name = "metal_buffer",
     srcs = ["metal_buffer.cc"],
     hdrs = ["metal_buffer.h"],
+    local_defines = _UNQUALIFIED_STATUS_MACROS,
     deps = [
         ":metal_dtypes",
         ":metal_stream",
         "//runtime",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
@@ -130,6 +142,7 @@ cc_library(
     name = "metal_lowering",
     srcs = ["metal_lowering.cc"],
     hdrs = ["metal_lowering.h"],
+    local_defines = _UNQUALIFIED_STATUS_MACROS,
     deps = [
         ":metal_dtypes",
         ":metal_msl",
@@ -138,6 +151,7 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
@@ -156,6 +170,7 @@ cc_library(
     name = "metal_executable",
     srcs = ["metal_executable.cc"],
     hdrs = ["metal_executable.h"],
+    local_defines = _UNQUALIFIED_STATUS_MACROS,
     deps = [
         ":metal_buffer",
         ":metal_lowering",
@@ -165,6 +180,7 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
@@ -182,7 +198,7 @@ cc_library(
         "@xla//xla/pjrt:pjrt_client",
         "@xla//xla/pjrt:pjrt_executable",
         "@xla//xla/pjrt:utils",
-        "@xla//xla/service:computation_placer_hdr",
+        "@xla//xla/service:device_assignment",
         "@xla//xla/tsl/platform:statusor",
     ],
 )
@@ -191,6 +207,7 @@ cc_library(
     name = "metal_client",
     srcs = ["metal_client.cc"],
     hdrs = ["metal_client.h"],
+    local_defines = _UNQUALIFIED_STATUS_MACROS,
     deps = [
         ":metal_buffer",
         ":metal_dtypes",
@@ -201,6 +218,7 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",

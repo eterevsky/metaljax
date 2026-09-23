@@ -56,9 +56,11 @@ contract, both load orders). The list is also why the dylib is 46 MB and not
 ctypes callback here, so the GIL enters this plugin inside a user callback and
 nowhere else. Its C ABI is `runtime/host_callback.h`.
 
-XLA comes from the read-only `metaljax/xla` checkout via `local_repository`
-(pinned to jax 0.11.0's XLA revision); MLX is our vendored build, staged in
-`src/metaljax/lib/mlx` by `scripts/vendor_mlx.sh` and picked up through
+XLA comes from the read-only `metaljax/xla-91888df6` checkout via
+`local_repository` (pinned to jax 0.11.2's XLA revision, built in WORKSPACE
+mode; `metaljax/xla` keeps jax 0.11.0's 131bf41 for older commits); MLX is
+our vendored build, staged in `src/metaljax/lib/mlx` by
+`scripts/vendor_mlx.sh` and picked up through
 `third_party/mlx` (`METALJAX_MLX_DIR` overrides the location — that is also
 the build-level A/B lever between MLX trees). First build is ~7 minutes,
 everything after that is seconds (see `--disk_cache` in `.bazelrc`).
