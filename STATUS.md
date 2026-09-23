@@ -12,26 +12,26 @@ parentheses is peak footprint where measured.
 | # | benchmark | jax CPU | metaljax | mlx-lm | torch-MPS | llama.cpp |
 |---|---|---|---|---|---|---|
 | 1 | gemma4-31B bf16 | ✗ f32=123 GB | **123.1** ¹² (63 GB) | 133.1 ⁷ | 148.7 | 111.2 ¹⁰ |
-| 2 | gemma4-12B bf16 | 316.1 (f32) | **56.5** ¹² (26 GB) | 58.3 ⁷ | 67.6 | 44.2 ¹⁰ |
+| 2 | gemma4-12B bf16 | 314.1 (f32) | **56.2** ¹² (26 GB) | 58.3 ⁷ | 67.6 | 44.2 ¹⁰ |
 | 3 | gemma4-26B-A4B (MoE) | ✗ guard-killed @34 GB ⁶ | **31.1** ¹² | **17.0** | — | 16.9 ¹⁰ |
-| 4 | gemma4-E2B bf16 | 67.6 (bf16→f32) ⁵ | **16.9** ¹² | 10.5 ⁷ | — | — |
-| 5 | Qwen3-8B bf16 | 211.0 (bf16→f32) ⁵ | **36.0** (17 GB) | 30.4 | 38.1 | 29.6 ¹⁰ |
-| 6 | Llama-3.1-8B bf16 | 206.3 (bf16→f32) ⁵ | **37.5** | 29.4 | 35.5 | 29.2 ¹⁰ |
-| 7 | gpt-oss-20b | ✗ ¹ | **15.6** ¹² (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 ¹⁶ |
+| 4 | gemma4-E2B bf16 | 67.4 (bf16→f32) ⁵ | **16.9** ¹² | 10.5 ⁷ | — | — |
+| 5 | Qwen3-8B bf16 | 205.0 (bf16→f32) ⁵ | **36.0** (17 GB) | 30.4 | 38.1 | 29.6 ¹⁰ |
+| 6 | Llama-3.1-8B bf16 | 203.9 (bf16→f32) ⁵ | **37.3** | 29.4 | 35.5 | 29.2 ¹⁰ |
+| 7 | gpt-oss-20b | ✗ ¹ | **13.2** ¹² (34 GB) | **8.8** (13.8 GB, native MXFP4) | — | 6.7 ¹⁶ |
 | 8 | Qwen3.6-35B-A3B (MoE) | ✗ 144 GB | **23.3** (73 GB) | **13.7** | — | 15.3 ¹⁰ |
-| 9 | R1-Distill-32B | ✗ 131 GB | **196.0** ¹² (69 GB) | 131.8 | — | 114.9 ¹⁰ |
+| 9 | R1-Distill-32B | ✗ 131 GB | **199.7** ¹² (69 GB) | 131.8 | — | 114.9 ¹⁰ |
 | 10 | DeepSeek-V2-Lite (maxtext) | ✗ needs 50–105 GB ² | **19.8** ¹¹ (90 GB) | 10.5 | — | 10.7 ¹⁰ |
-| 11 | Qwen3-0.6B (keras-hub decode) | 29.4 | **5.1** ¹³ | 3.2 ¹³ | — | 3.4 ¹⁰ |
-| 12 | Mixtral 8×7B bf16 | ✗ | **72.0** (93 GB) | 53.5 ¹⁷ (93.4 GB) | — | — |
-| 13 | gemma4-E2B keras-int4 (packed) | 67.9 ⁸ | **6.0** ⁸ (48 GB load peak) | 4.5 ¹⁹ | — | — |
-| 14 | Qwen3-0.6B maxtext qwix-int8 | 142.6 | **26.39** | — | — | — |
-| 15 | *qwix-int8 Qwen3-8B* | 2118 | **268.4** (52 GB) | — | — | — |
-| 16 | SigLIP 2 (fwd b1 ms) | 536.9 | **41.67** | — | 29.8 (b32: 591) | — |
-| 17 | SD 3.5 Large (ms/diff-step) | ✗ ⁴ | **456.5** @512², **2076.0** @1024² ¹² | ✗ ⁹ | 553 @512², 3078 @1024² ⁹ ¹⁸ | — |
-| 18 | LoRA gemma4-E2B train (ms/step) | 2316 | **112.1** | — | 135.6 ³ | — |
-| 19 | Qwen3-0.6B maxtext train (ms/step) | 1397 | **362.6** | — | 818 ²⁰ | — |
-| 20 | *aspirational* Qwen3-235B-A22B 3-bit (mlx quant) | ✗ | **43.3** (103 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
-| 21 | Qwen3.8-27B bf16 (dense hybrid) | ✗ ¹⁴ | **142.7** (57 GB) | **106.4** ¹⁵ | — | 98.2 ¹⁰ |
+| 11 | Qwen3-0.6B (keras-hub decode) | 28.5 | **5.1** ¹³ | 3.2 ¹³ | — | 3.4 ¹⁰ |
+| 12 | Mixtral 8×7B bf16 | ✗ | **70.8** (93 GB) | 53.5 ¹⁷ (93.4 GB) | — | — |
+| 13 | gemma4-E2B keras-int4 (packed) | 67.4 ⁸ | **6.0** ⁸ (48 GB load peak) | 4.5 ¹⁹ | — | — |
+| 14 | Qwen3-0.6B maxtext qwix-int8 | 144.4 | **26.37** | — | — | — |
+| 15 | *qwix-int8 Qwen3-8B* | 2118 | **267.7** (52 GB) | — | — | — |
+| 16 | SigLIP 2 (fwd b1 ms) | 358.5 | **41.86** | — | 29.8 (b32: 591) | — |
+| 17 | SD 3.5 Large (ms/diff-step) | ✗ ⁴ | **462.5** @512², **2061.8** @1024² ¹² | ✗ ⁹ | 553 @512², 3078 @1024² ⁹ ¹⁸ | — |
+| 18 | LoRA gemma4-E2B train (ms/step) | 1360 | **119.8** ¹² | — | 135.6 ³ | — |
+| 19 | Qwen3-0.6B maxtext train (ms/step) | 1406 | **362.8** | — | 818 ²⁰ | — |
+| 20 | *aspirational* Qwen3-235B-A22B 3-bit (mlx quant) | ✗ | **45.2** (103 GB) | **28.0** (102.9 GB, load 12 s) | — | — |
+| 21 | Qwen3.8-27B bf16 (dense hybrid) | ✗ ¹⁴ | **142.5** (57 GB) | **106.4** ¹⁵ | — | 98.2 ¹⁰ |
 
 **mlx-lm gap band (same Metal library underneath — the optimization
 target):** 31B **0.95×** (126.1 vs 133.1); 12B ~parity (57.3 vs a dated
@@ -78,7 +78,8 @@ load ~20–30×.
    harness routes the int4 FFN through the quantized layers and gathers
    embedding rows before unpacking (scripts/model_bench/int4_fix.py,
    METALJAX_BENCH_INT4_FIX / _INT4_EMB=0 reproduce the original): the
-   CPU cell is that variant at the row protocol (71.0, 128 tokens); the
+   CPU cell is that variant at the row protocol on jax 0.11.2 (67.4, 128
+   tokens; its stream now equals metaljax's 64/64); the
    0.11.8 cell (6.0, 128 tokens) is the variant on the release binary; the
    0.11.7 cell (77.0) timed the broken graph.  The two backends'
    greedy streams part at generated token 1 on a 1-bf16-ULP tie (top-2
@@ -112,24 +113,25 @@ load ~20–30×.
     documented envelope; the shipped default sits under this row's
     restore transient). The cell decodes the manifest prompt (50 DeepSeek
     tokens in a 64-slot prefill) for 128 tokens, loop-only average of 127
-    steps, on the 0.11.8 release binary (19.76, peak 90 GB) — the
+    steps, on the 0.11.8 release binary (19.76, jax 0.11.0 maxtext venv) — the
     comparators' workload; the harness variant `MAXTEXT_RNG_PRESPLIT=1`
-    (the RNG split hoisted out of the timed loop) reads 19.07 on the same
+    (the RNG split hoisted out of the timed loop) reads 19.13 on the same
     binary. The checkpoint load peaks 99–111 GB against the 105 GB
     projected guard, so about a third of its cells die at load (never
     during decode, never a panic) and are rerun.
-12. Greedy token agreement vs jax-CPU on the 0.11.8 gate: rows 2/5/6 are
-    exact 64/64; row 4 parts at token 51/64 (the certified-benign tie, the
-    same stream 0.11.7 recorded); rows 1/3/7/8/9/12/20/21 have no CPU cell.
-    Cross-release, rows 4/5/6/7/20/21 are token-identical to their 0.11.7
-    records; row 2 flipped back to the 0.11.6/CPU stream; rows 1 and 3
-    carry tie flips (a 0-ULP tie at generated 45; an undecided preamble
-    position at generated 3) — notes/release-gates-0.11.8.md. In-battery
-    vs standalone (the suite-context class): row 7 15.6 vs 13.2 / 13.2,
-    row 3 31.1 vs 28.3 / 28.3 (the in-battery cells are the table's, as in
-    0.11.7); row 17 at 1024² 2152 in sequence vs 2076 standalone (the
-    standalone cell is the table's); row 9 196.0 / 199.2 / 185.4 across
-    three draws (a ±4 % row).
+12. The 0.11.8 cells: gate of 2026-09-23 on the release binary, jax 0.11.2
+    (the maxtext rows 10/14/15/19 on jax 0.11.0: no released flax imports on
+    0.11.2); the jax-CPU cells are jax 0.11.2's (it moved LoRA 2316 -> 1360 and
+    SigLIP 537 -> 359).  Greedy agreement vs jax-CPU: rows 2/5/6/13 exact
+    64/64; row 4 parts at 51/64 (the certified-benign tie).  Every metaljax
+    stream equals the 2026-09-21 gate's; against 0.11.7 rows 4/5/6/7/20/21
+    are identical, row 2 flipped back to the CPU stream, rows 1 and 3 carry
+    tie flips (notes/release-gates-0.11.8.md).  In-battery vs standalone (the
+    suite-context class): row 3 31.1 vs 28.2 / 28.3; row 18 119.8 vs
+    113.0-113.8 on either binary and either jax (the in-battery cells are the
+    table's, as in 0.11.7); row 17 at 1024² 2081.0 in sequence vs 2061.8
+    standalone (the standalone cell is the table's); row 9 185-200 across six
+    draws on two binaries (a ±4 % row).
 13. Row 11 harness: keras-hub `Qwen3CausalLM` on `hf://Qwen/Qwen3-0.6B`
     (bench id `qwen3-06b-keras`), replacing the maxtext decode harness
     under the best-available-implementation rule (Oleg, 2026-09-01) —
@@ -142,7 +144,8 @@ load ~20–30×.
     128-token window (3.2 / 3.2, 2026-09-06; the earlier 3.0 was a
     64-token generate).
     0.11.8 release cell: 5.1 ms/tok on the release binary (the row's first
-    release-gate cell; 128 tokens; stream identical to its HEAD record).
+    release-gate cell; 128 tokens; stream identical to its HEAD record);
+    jax-CPU 28.5 on jax 0.11.2.
 14. Row 21 CPU: 55.6 GB of bf16 weights plus the checkpoint's own page
     cache reaches ~116 GB of 128; two guarded attempts (the second with
     the load throttled to 0.4 GB/s) were killed during the load at RSS

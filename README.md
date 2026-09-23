@@ -24,7 +24,7 @@ binary of every release (the table under *Benchmarks*, the ledgers
 [`models.md`](models.md) and [`STATUS.md`](STATUS.md)). Training steps beat
 PyTorch's MPS backend on both training rows; decode trails the
 Metal-native inference stacks (mlx-lm, llama.cpp) by 1.1–1.9×. Every
-release is gated by the pinned JAX test suite (99.54 % passing), a
+release is gated by the pinned JAX test suite (jax 0.11.2, 99.53 % passing), a
 whole-model correctness sweep against the CPU backend (106/106), and the
 model battery. Coverage gaps remain — unsupported constructs are declined
 at compile time, naming the op. If a Metal backend ever lands upstream in
@@ -32,6 +32,15 @@ the JAX ecosystem, this package will be deprecated in its favor.
 
 ## What's new in 0.11.8
 
+- **jax 0.11.2.** The pinned release (and its test suite) moved from jax
+  0.11.0 to 0.11.2; the plugin keeps working with 0.11.0/0.11.1. Moving
+  surfaced a **silent-wrongness bug fixed in this release**: floating-point
+  `lax.rem` / `jnp.fmod` was inexact on every earlier release (up to 1 ULP of
+  the dividend in f32, large errors in bf16, and overflow to inf in f16); it
+  is now bit-exact against the CPU backend. Also new: `int2`/`uint2` (and
+  sub-byte integer conversions now saturate like jax-CPU), and
+  `with_layout_constraint` is accepted. Note jax 0.11.2 itself refuses
+  bf16/f16 linear algebra at trace time. Details: `notes/jax-0.11.2-pin.md`.
 - **Precision default.** `METALJAX_MATMUL_PRECISION=high` is now the
   shipped default: f32 GEMM/attention stay **off** the M5's neural
   accelerators (exact, the pinned ~1e-6-vs-f64 class), while bf16/f16 and
@@ -202,11 +211,13 @@ print(g, g.device)"
 
 ## Coverage and known gaps
 
-Running the test suite of the exact jax release we pin (v0.11.0) executes
-28,202 tests with **99.54 % passing** — 28,073 passed / 129 failed (plus
-6,161 skipped), measured 2026-09-21 on the release binary. The failing set
-is **id-for-id identical** to the previous two releases: zero new
-failures, zero regressions. It concentrates in
+Running the test suite of the exact jax release we pin (v0.11.2) executes
+28,814 tests with **99.53 % passing** — 28,679 passed / 135 failed (plus
+6,120 skipped), measured 2026-09-23 on the release binary. Against the
+previous release's set (on jax 0.11.0) nothing regressed: the 11 added ids
+are 9 complex-plane accuracy tests that jax-CPU fails identically, one f64
+test and one TPU-only layout test, and the two genuine new failures jax
+0.11.2 exposed were fixed (`notes/jax-0.11.2-pin.md`). It concentrates in
 `export_harnesses_multi_platform_test` (44), `lobpcg_test` (27),
 `x64_context_test` (13 — the f64 policy below), `api_test` (5),
 `export_test` (5), `shape_poly_test` (4), `xla_transform_test` (4) and
@@ -360,8 +371,8 @@ scripts/                   benchmark, gate & release drivers
 
 ### Real models
 
-Twenty-one models through unmodified JAX code, all measured 2026-09-21 on
-the 0.11.8 release binary (`frozen-m2main-7434ae86`), one GPU process at a
+Twenty-one models through unmodified JAX code, all measured 2026-09-23 on
+the 0.11.8 release binary (`frozen-j112main-12c5a8d1`, jax 0.11.2), one GPU process at a
 time with a cool-down between rows, timed through `np.asarray`
 (`jax.block_until_ready` is a no-op on this backend). **goal** is the best
 non-metaljax cell for that row at the **same precision and workload** —
@@ -377,27 +388,27 @@ metaljax is ahead.
 | # | model | metric | **metaljax 0.11.8** | goal (framework) | ratio |
 |---|---|---|---:|---:|---:|
 | 1 | gemma4-31B bf16 | ms/tok | **123.1** | 111.2 llama.cpp | 1.11× |
-| 2 | gemma4-12B bf16 | ms/tok | **56.5** | 44.2 llama.cpp | 1.28× |
+| 2 | gemma4-12B bf16 | ms/tok | **56.2** | 44.2 llama.cpp | 1.27× |
 | 3 | gemma4-26B-A4B bf16 (MoE) | ms/tok | **31.1** | 16.9 llama.cpp | 1.84× |
 | 4 | gemma4-E2B bf16 | ms/tok | **16.9** | 10.5 mlx-lm | 1.61× |
 | 5 | Qwen3-8B bf16 | ms/tok | **36.0** | 29.6 llama.cpp | 1.22× |
-| 6 | Llama-3.1-8B bf16 | ms/tok | **37.5** | 29.2 llama.cpp | 1.28× |
-| 7 | gpt-oss-20b (native MXFP4) | ms/tok | **15.6** | 8.8 mlx-lm | 1.77× |
+| 6 | Llama-3.1-8B bf16 | ms/tok | **37.3** | 29.2 llama.cpp | 1.28× |
+| 7 | gpt-oss-20b (native MXFP4) | ms/tok | **13.2** | 8.8 mlx-lm | 1.50× |
 | 8 | Qwen3.6-35B-A3B (MoE) | ms/tok | **23.3** | 13.7 mlx-lm | 1.70× |
-| 9 | R1-Distill-32B bf16 | ms/tok | **196.0** | 114.9 llama.cpp | 1.71× |
+| 9 | R1-Distill-32B bf16 | ms/tok | **199.7** | 114.9 llama.cpp | 1.74× |
 | 10 | DeepSeek-V2-Lite (maxtext) | ms/tok | **19.8** | 10.5 mlx-lm | 1.89× |
 | 11 | Qwen3-0.6B (keras-hub) | ms/tok | **5.1** | 3.2 mlx-lm | 1.59× |
-| 12 | Mixtral 8×7B bf16 | ms/tok | **72.0** | 53.5 mlx-lm | 1.35× |
+| 12 | Mixtral 8×7B bf16 | ms/tok | **70.8** | 53.5 mlx-lm | 1.32× |
 | 13 | gemma4-E2B keras-int4 | ms/tok | **6.0** | 4.5 mlx-lm 4-bit | 1.33× |
 | 14 | Qwen3-0.6B qwix-int8 | ms/tok | **26.4** | — | — |
-| 15 | Qwen3-8B qwix-int8 | ms/tok | **268.4** | — | — |
-| 16 | SigLIP 2 (b1 forward) | ms | **41.7** | 29.8 torch-MPS | 1.40× |
-| 17 | SD 3.5 Large @512² | ms/step | **456.5** | 553 torch-MPS | **0.83×** |
-| 17 | SD 3.5 Large @1024² | ms/step | **2076** | 3078 torch-MPS | **0.70×** |
-| 18 | LoRA gemma4-E2B train | ms/step | **112.1** | 135.6 torch-MPS | **0.83×** |
-| 19 | Qwen3-0.6B maxtext train | ms/step | **362.6** | 818 torch-MPS | **0.44×** |
-| 20 | Qwen3-235B-A22B 3-bit | ms/tok | **43.3** | 28.0 mlx-lm | 1.55× |
-| 21 | Qwen3.8-27B bf16 | ms/tok | **142.7** | 98.2 llama.cpp | 1.45× |
+| 15 | Qwen3-8B qwix-int8 | ms/tok | **267.7** | — | — |
+| 16 | SigLIP 2 (b1 forward) | ms | **41.9** | 29.8 torch-MPS | 1.41× |
+| 17 | SD 3.5 Large @512² | ms/step | **462.5** | 553 torch-MPS | **0.84×** |
+| 17 | SD 3.5 Large @1024² | ms/step | **2062** | 3078 torch-MPS | **0.67×** |
+| 18 | LoRA gemma4-E2B train | ms/step | **119.8** | 135.6 torch-MPS | **0.88×** |
+| 19 | Qwen3-0.6B maxtext train | ms/step | **362.8** | 818 torch-MPS | **0.44×** |
+| 20 | Qwen3-235B-A22B 3-bit | ms/tok | **45.2** | 28.0 mlx-lm | 1.61× |
+| 21 | Qwen3.8-27B bf16 | ms/tok | **142.5** | 98.2 llama.cpp | 1.45× |
 
 Reading the table: metaljax is ahead of PyTorch-MPS on every training and
 diffusion row, and behind the dedicated Metal inference stacks on decode —
