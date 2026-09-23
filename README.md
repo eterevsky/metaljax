@@ -40,7 +40,16 @@ the JAX ecosystem, this package will be deprecated in its favor.
   is now bit-exact against the CPU backend. Also new: `int2`/`uint2` (and
   sub-byte integer conversions now saturate like jax-CPU), and
   `with_layout_constraint` is accepted. Note jax 0.11.2 itself refuses
-  bf16/f16 linear algebra at trace time. Details: `notes/jax-0.11.2-pin.md`.
+  bf16/f16 linear algebra at trace time. The plugin now builds against
+  jax 0.11.2's own XLA commit (PJRT C API 0.115, StableHLO/VHLO 1.20, so
+  jaxlib no longer downgrades programs to an older VHLO for it); jaxlib
+  0.11.0 still loads it. Details: `notes/jax-0.11.2-pin.md`.
+- **Integer shifts, popcnt and clz match XLA bit for bit** (a
+  silent-wrongness fix): `lax.shift_right_arithmetic` on unsigned integers
+  ran as a logical shift, negative or very large shift amounts escaped the
+  saturation guard into Metal's mod-width shift, and the emulated
+  2/4-bit integers shifted and counted their 8-bit storage. All are now
+  exact against the CPU backend.
 - **Precision default.** `METALJAX_MATMUL_PRECISION=high` is now the
   shipped default: f32 GEMM/attention stay **off** the M5's neural
   accelerators (exact, the pinned ~1e-6-vs-f64 class), while bf16/f16 and
@@ -372,7 +381,7 @@ scripts/                   benchmark, gate & release drivers
 ### Real models
 
 Twenty-one models through unmodified JAX code, all measured 2026-09-23 on
-the 0.11.8 release binary (`frozen-j112main-12c5a8d1`, jax 0.11.2), one GPU process at a
+the 0.11.8 release binary (`frozen-x918main-e2ffcc75`, jax 0.11.2), one GPU process at a
 time with a cool-down between rows, timed through `np.asarray`
 (`jax.block_until_ready` is a no-op on this backend). **goal** is the best
 non-metaljax cell for that row at the **same precision and workload** —
@@ -392,23 +401,23 @@ metaljax is ahead.
 | 3 | gemma4-26B-A4B bf16 (MoE) | ms/tok | **31.1** | 16.9 llama.cpp | 1.84× |
 | 4 | gemma4-E2B bf16 | ms/tok | **16.9** | 10.5 mlx-lm | 1.61× |
 | 5 | Qwen3-8B bf16 | ms/tok | **36.0** | 29.6 llama.cpp | 1.22× |
-| 6 | Llama-3.1-8B bf16 | ms/tok | **37.3** | 29.2 llama.cpp | 1.28× |
+| 6 | Llama-3.1-8B bf16 | ms/tok | **38.6** | 29.2 llama.cpp | 1.32× |
 | 7 | gpt-oss-20b (native MXFP4) | ms/tok | **13.2** | 8.8 mlx-lm | 1.50× |
-| 8 | Qwen3.6-35B-A3B (MoE) | ms/tok | **23.3** | 13.7 mlx-lm | 1.70× |
-| 9 | R1-Distill-32B bf16 | ms/tok | **199.7** | 114.9 llama.cpp | 1.74× |
-| 10 | DeepSeek-V2-Lite (maxtext) | ms/tok | **19.8** | 10.5 mlx-lm | 1.89× |
+| 8 | Qwen3.6-35B-A3B (MoE) | ms/tok | **23.4** | 13.7 mlx-lm | 1.71× |
+| 9 | R1-Distill-32B bf16 | ms/tok | **199.9** | 114.9 llama.cpp | 1.74× |
+| 10 | DeepSeek-V2-Lite (maxtext) | ms/tok | **19.6** | 10.5 mlx-lm | 1.87× |
 | 11 | Qwen3-0.6B (keras-hub) | ms/tok | **5.1** | 3.2 mlx-lm | 1.59× |
-| 12 | Mixtral 8×7B bf16 | ms/tok | **70.8** | 53.5 mlx-lm | 1.32× |
+| 12 | Mixtral 8×7B bf16 | ms/tok | **69.0** | 53.5 mlx-lm | 1.29× |
 | 13 | gemma4-E2B keras-int4 | ms/tok | **6.0** | 4.5 mlx-lm 4-bit | 1.33× |
-| 14 | Qwen3-0.6B qwix-int8 | ms/tok | **26.4** | — | — |
-| 15 | Qwen3-8B qwix-int8 | ms/tok | **267.7** | — | — |
-| 16 | SigLIP 2 (b1 forward) | ms | **41.9** | 29.8 torch-MPS | 1.41× |
-| 17 | SD 3.5 Large @512² | ms/step | **462.5** | 553 torch-MPS | **0.84×** |
-| 17 | SD 3.5 Large @1024² | ms/step | **2062** | 3078 torch-MPS | **0.67×** |
-| 18 | LoRA gemma4-E2B train | ms/step | **119.8** | 135.6 torch-MPS | **0.88×** |
+| 14 | Qwen3-0.6B qwix-int8 | ms/tok | **26.3** | — | — |
+| 15 | Qwen3-8B qwix-int8 | ms/tok | **265.3** | — | — |
+| 16 | SigLIP 2 (b1 forward) | ms | **41.8** | 29.8 torch-MPS | 1.40× |
+| 17 | SD 3.5 Large @512² | ms/step | **460.6** | 553 torch-MPS | **0.83×** |
+| 17 | SD 3.5 Large @1024² | ms/step | **2090** | 3078 torch-MPS | **0.68×** |
+| 18 | LoRA gemma4-E2B train | ms/step | **126.1** | 135.6 torch-MPS | **0.93×** |
 | 19 | Qwen3-0.6B maxtext train | ms/step | **362.8** | 818 torch-MPS | **0.44×** |
 | 20 | Qwen3-235B-A22B 3-bit | ms/tok | **45.2** | 28.0 mlx-lm | 1.61× |
-| 21 | Qwen3.8-27B bf16 | ms/tok | **142.5** | 98.2 llama.cpp | 1.45× |
+| 21 | Qwen3.8-27B bf16 | ms/tok | **142.3** | 98.2 llama.cpp | 1.45× |
 
 Reading the table: metaljax is ahead of PyTorch-MPS on every training and
 diffusion row, and behind the dedicated Metal inference stacks on decode —
@@ -417,8 +426,8 @@ optimization target, and llama.cpp's hand-written kernels lead even
 mlx-lm on bf16. Rows without a goal cell have no like-for-like
 non-metaljax implementation (rows 14/15 are qwix-quantized JAX models).
 Several rows do not run on the JAX CPU backend at all at these sizes;
-where they do, the CPU cells are in `STATUS.md` (e.g. row 19: 1402 vs
-362.6 ms/step, row 16: 533 vs 41.7 ms, row 2: 316.1 vs 56.5 ms/token).
+where they do, the CPU cells are in `STATUS.md` (e.g. row 19: 1414 vs
+362.8 ms/step, row 16: 361.5 vs 41.8 ms, row 2: 314.2 vs 56.2 ms/token).
 
 Correctness for these rows is gated the same night: greedy token streams
 are compared against the jax-CPU backend, and every divergence is
@@ -434,8 +443,8 @@ several million) plus a 223-config performance sweep. At this release:
 **106/106 correct** — one jitted training chunk per config executed on
 both backends from identical inputs, every output leaf compared against
 jax-CPU at a 1-ULP sensitivity-scaled tolerance — and the perf sweep is
-**1.09× faster** than the standing anchor over 223 matched configs (82
-configs improved >5 %, 4 regressed >5 %).
+**1.11× faster** than the standing anchor over 223 matched configs (116
+configs improved >5 %, one regressed >5 %).
 
 How it gets there: pure programs and counted-loop (`scan`/`fori_loop`)
 bodies are traced once into a fused Metal graph and replayed; small

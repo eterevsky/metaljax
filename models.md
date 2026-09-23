@@ -20,22 +20,22 @@ optimization.*
 | 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | 33.4 | **31.1** |  | 16.9 ˡ |
 | 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | 24.0 | **16.9** |  | 10.5 ˣ |
 | 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | 42.0 | **36.0** |  | 29.6 ˡ |
-| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | 42.2 | **37.3** |  | 29.2 ˡ |
+| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | 42.2 | **38.6** |  | 29.2 ˡ |
 | 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | 19.8 | **13.2** |  | 8.8 ˣ |
-| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | 28.5 ᴳ | **23.3** ᴳ |  | 13.7 ˣ |
-| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | 190.8 ᴳ | **199.7** ᴳ |  | 114.9 ˡ |
-| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | 25.9 ᵖ | **19.8** ᵖ |  | 10.5 ˣ |
+| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | 28.5 ᴳ | **23.4** ᴳ |  | 13.7 ˣ |
+| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | 190.8 ᴳ | **199.9** ᴳ |  | 114.9 ˡ |
+| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | 25.9 ᵖ | **19.6** ᵖ |  | 10.5 ˣ |
 | 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | 12.33 ᵐ | **5.1** |  | 3.2 ˣ |
-| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | 85.6 ᴳ | **70.8** ᴳ |  | 53.5 ˣ |
+| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | 85.6 ᴳ | **69.0** ᴳ ˢ |  | 53.5 ˣ |
 | 13 | gemma4-E2B keras-int4 ᵇ | 340 ᵇ | 336 ᵇ | 81.1 ᵇ | 80.3 ᴾ²⁷ ᵇ | 78.0 ᵇ | 78.0 ᵇ | 77.0 ᵇ | **6.0** |  | 4.5 ˣ |
-| 14 | Qwen3-0.6B qwix-int8 | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | 29.88 | **26.37** |  |  |
-| 15 | Qwen3-8B qwix-int8 | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | 388.4 ᵛ | **267.7** ᵛ |  |  |
-| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | 86.68 | **41.86** |  | 29.8 ᵗ |
-| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | 1249.3 / 4961.6 | **462.5 / 2061.8** ˢ |  | 553 / 3078 ᵗ |
-| 18 | LoRA gemma4-E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | 362.1 | **119.8** |  | 135.6 ᵗ |
+| 14 | Qwen3-0.6B qwix-int8 | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | 29.88 | **26.32** |  |  |
+| 15 | Qwen3-8B qwix-int8 | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | 388.4 ᵛ | **265.3** ᵛ |  |  |
+| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | 86.68 | **41.77** |  | 29.8 ᵗ |
+| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | 1249.3 / 4961.6 | **460.6 / 2090.4** |  | 553 / 3078 ᵗ |
+| 18 | LoRA gemma4-E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | 362.1 | **126.1** |  | 135.6 ᵗ |
 | 19 | Qwen3-0.6B maxtext train (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | 444.6 | **362.8** |  | 818 ᵗ |
 | 20 | Qwen3-235B-A22B 3-bit (mlx quant) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | 56.2 ᴳ | **45.2** ᴳ |  | 28.0 ˣ |
-| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | 154.9 | **142.5** |  | 98.2 ˡ |
+| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | 154.9 | **142.3** |  | 98.2 ˡ |
 
 Notes:
 
@@ -57,7 +57,8 @@ Notes:
   of main, token streams identical to the row's release record unless
   stated. As of 2026-09-23 the column is empty: the 0.11.8 gate re-measured
   every row on the release binary (notes/release-gates-0.11.8.md) after the
-  jax 0.11.2 pin, and no merge has landed since.
+  jax 0.11.2 pin, the XLA move and the shift fix, and no merge has landed
+  since.
 - ᵇ **Row 13's cells through 0.11.7 measured a numerically broken model**:
   keras-hub's Gemma4 decoder block bypasses the int4 FFN layers' scale
   (its "HOTFIX" multiplies by the raw int4 codes), so every backend
@@ -67,9 +68,10 @@ Notes:
   cells are timings of the broken graph and are NOT comparable to the
   HEAD cell; the jax-CPU history (340 → 67.8) is broken the same way.
 - ˢ (0.11.8 column) = standalone re-run: the row read high inside the gate's
-  sequence and resolved to this value alone (row 17 at 1024²: 2081.0 in sequence).
-  Rows 3 and 18 keep their in-battery cells (31.1, 119.8) with the standalone
-  readings (28.2 / 28.3, 113.0–113.8) in STATUS.md fn 12, the 0.11.7 convention.
+  sequence and resolved to this value alone (row 12: 73.3 in sequence).
+  Rows 3, 6 and 18 keep their in-battery cells (31.1, 38.6, 126.1) with the
+  standalone readings (28.2 / 28.2, 34.5 / 34.6, 113.3 / 113.9) in STATUS.md
+  fn 12, the 0.11.7 convention.
   The 0.11.8 column was measured 2026-09-23 on jax 0.11.2 (the maxtext rows 10,
   14, 15, 19 on jax 0.11.0: no released flax imports on 0.11.2); rows 8, 9, 12,
   20 under the memory governor as before.
