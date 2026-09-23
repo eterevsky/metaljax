@@ -74,45 +74,80 @@ mx::array as_unsigned(const mx::array& x, int64_t how, mx::Dtype u) {
   return x;
 }
 
-// ops/elementwise._shift_right_logical: a signed operand shifts as its
-// unsigned twin so the sign bit does not fill.
-mx::array shift_right_logical(const mx::array& a, const mx::array& b) {
-  if (is_unsigned(a.dtype()) || is_bool(a.dtype()))
-    return mx::right_shift(a, b);
-  mx::Dtype u = unsigned_of(a.dtype());
-  return mx::astype(mx::right_shift(mx::astype(a, u), mx::astype(b, u)),
-                    a.dtype());
+// XLA shifts the operand's LOGICAL bits -- `bits` of them: the storage's
+// width for a real type, 2 or 4 for the emulated sub-byte integers, whose
+// int8/uint8 storage holds the VALUE (sign- or zero-extended).  These are
+// the two views of those bits every shift is spelled with.  Same-width
+// signedness changes are astype, which is modular (the Python engine's
+// logical shift already round-tripped through it).
+//
+// The low `bits` bits, ZERO-extended, in the storage's unsigned twin: what a
+// logical shift moves, and what the shift AMOUNT is compared by.
+mx::array zext_bits(const mx::array& a, int64_t bits) {
+  mx::array u = mx::astype(a, unsigned_of(a.dtype()));
+  if (bits < 8 * static_cast<int64_t>(a.itemsize()))
+    u = mx::bitwise_and(u, mx::array((int64_t{1} << bits) - 1, u.dtype()));
+  return u;
 }
 
-// kind: 0 shift_left, 1 shift_right_logical, 2 shift_right_arithmetic.
-mx::array shift_apply(int kind, const mx::array& a, const mx::array& b) {
+// ...and SIGN-extended from bit bits-1, in the storage's signed twin: what an
+// arithmetic shift moves, whatever the type's signedness.  XLA's AShr is an
+// LLVM op on signless integers, so an unsigned operand's top bit fills too
+// (uint8 0x80 >> 1 is 0xC0, not 0x40).
+mx::array sext_bits(const mx::array& a, int64_t bits) {
+  const mx::Dtype s = signed_of(a.dtype());
+  if (bits >= 8 * static_cast<int64_t>(a.itemsize())) return mx::astype(a, s);
+  // (z ^ half) - half on the zero-extended bits.
+  mx::array z = mx::astype(zext_bits(a, bits), s);
+  mx::array half = mx::array(int64_t{1} << (bits - 1), s);
+  return mx::subtract(mx::bitwise_xor(z, half), half);
+}
+
+// kind: 0 shift_left, 1 shift_right_logical, 2 shift_right_arithmetic, by an
+// amount already known to be below `bits`.  A sub-byte result may leave the
+// type's range (a left shift, the logical shift of a negative i4, the
+// arithmetic shift of a ui4 with its top bit set): the entry's regrid wraps
+// it (metal_lowering.cc `IsIntGridWrapOp`).
+mx::array shift_apply(int kind, const mx::array& a, const mx::array& b,
+                      int64_t bits) {
   if (kind == 0) return mx::left_shift(a, b);
-  if (kind == 1) return shift_right_logical(a, b);
-  return mx::right_shift(a, b);
+  if (kind == 1)
+    return mx::astype(mx::right_shift(zext_bits(a, bits), zext_bits(b, bits)),
+                      a.dtype());
+  mx::array s = sext_bits(a, bits);
+  return mx::astype(mx::right_shift(s, mx::astype(b, s.dtype())), a.dtype());
 }
 
 // What XLA yields for a shift by at least the operand's bit width: zero,
-// except that an arithmetic shift keeps filling with the sign bit.
-mx::array shift_fill(int kind, const mx::array& a, const mx::array& b) {
+// except that an arithmetic shift keeps filling with the top bit.
+mx::array shift_fill(int kind, const mx::array& a, int64_t bits) {
   if (kind == 2) {
-    int w = static_cast<int>(a.itemsize()) * 8;
-    return mx::right_shift(a, mx::array(w - 1, b.dtype()));
+    mx::array s = sext_bits(a, bits);
+    const int w = static_cast<int>(s.itemsize()) * 8;
+    return mx::astype(mx::right_shift(s, mx::array(w - 1, s.dtype())),
+                      a.dtype());
   }
   return mx::zeros_like(a);
 }
 
 // ops/elementwise._shift_guard. Metal's shifts are mod-width (x86-style),
-// XLA's saturate; `at` says whether tape.py found the amount to be a
-// compile-time splat, in which case only one arm is emitted.
+// XLA's saturate, and XLA compares the amount UNSIGNED against the width
+// (elemental_ir_emitter's ICmpULT): a negative amount is a huge one, and
+// saturates like it.  `at` is [static?, amount, bits]: whether the lowering
+// found the amount to be a compile-time splat -- in which case only one arm
+// is emitted, and `amount` is already `bits` when it is out of range -- and
+// the operand's logical width.
 mx::array shift_guard(int kind, const mx::array& a, const mx::array& b,
                       const std::vector<int64_t>& at) {
-  int w = static_cast<int>(a.itemsize()) * 8;
+  const int64_t bits = at[2];
   if (at[0]) {
-    return at[1] >= w ? shift_fill(kind, a, b) : shift_apply(kind, a, b);
+    return at[1] >= bits ? shift_fill(kind, a, bits)
+                         : shift_apply(kind, a, b, bits);
   }
-  mx::array over = mx::greater_equal(mx::astype(b, mx::int32),
-                                     mx::array(w, mx::int32));
-  return mx::where(over, shift_fill(kind, a, b), shift_apply(kind, a, b));
+  mx::array bu = zext_bits(b, bits);
+  mx::array over = mx::greater_equal(bu, mx::array(bits, bu.dtype()));
+  return mx::where(over, shift_fill(kind, a, bits),
+                   shift_apply(kind, a, b, bits));
 }
 
 // stablehlo.remainder on floats: C's fmod, which is EXACT (the remainder of
@@ -689,11 +724,16 @@ bool Program::step_elementwise(const Entry& e,
       // ops/elementwise._popcnt / _clz. `_as_unsigned` then SWAR; clz
       // first smears the highest set bit down (log2(width) rounds) so
       // the population count of the smear is width - leading zeros.
+      // `bits` is the LOGICAL width: an i2/i4 storage is sign-extended, so
+      // its unsigned view is cut to the type's own bits first.
       const mx::array& x = in(0);
       mx::Dtype u_dt = dtype_of(at[0]);
       bool wide = at[2] != 0;
       int64_t bits = at[3];
       mx::array u = as_unsigned(x, at[1], u_dt);
+      if (bits < 8 * static_cast<int64_t>(u.itemsize()))
+        u = mx::bitwise_and(u, mx::array((int64_t{1} << bits) - 1,
+                                         u.dtype()));
       if (e.op == kClz) {
         for (int64_t s = 1; s < bits; s *= 2)
           u = mx::bitwise_or(u, mx::right_shift(u, mx::array(s, u.dtype())));

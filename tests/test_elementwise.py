@@ -152,11 +152,6 @@ def test_shifts():
 
 _SHIFTS = [jax.lax.shift_left, jax.lax.shift_right_arithmetic,
            jax.lax.shift_right_logical]
-# shift_right_arithmetic on an UNSIGNED operand is excluded everywhere
-# below: mx.right_shift never propagates the top bit for unsigned dtypes,
-# so metaljax already disagrees with XLA there. Pre-existing and unrelated
-# to the static-amount peephole (it fails identically on the dynamic path).
-_UNSIGNED_SHIFTS = [jax.lax.shift_left, jax.lax.shift_right_logical]
 
 
 @pytest.mark.parametrize("fn", _SHIFTS)
@@ -165,16 +160,17 @@ def test_shift_by_splat_constant(fn, amt):
     # A constant shift amount reaches the handler as broadcast_in_dim of a
     # splat constant; the guard is then resolved statically (in-range ->
     # bare shift, out-of-range -> the fill), so both arms must still match
-    # XLA: 0 for left/logical, sign propagation for arithmetic.
+    # XLA: 0 for left/logical, top-bit propagation for arithmetic -- on an
+    # UNSIGNED operand too (XLA's AShr ignores signedness).
     a = np.array([1, 2, -4, 8, -16, -1, 0x7FFFFFFF, np.int32(-2**31)], np.int32)
     check(lambda x: fn(x, jnp.full_like(x, amt)), a)
     for dt in (np.int8, np.int16):
         s = np.array([1, 2, -128, 127, 0, -3], np.int64).astype(dt)
         check(lambda x: fn(x, jnp.full_like(x, amt)), s)
-    if fn in _UNSIGNED_SHIFTS:
-        for dt in (np.uint8, np.uint32):
-            u = np.array([1, 2, 0, 255], np.int64).astype(dt)
-            check(lambda x: fn(x, jnp.full_like(x, amt)), u)
+    for dt in (np.uint8, np.uint16, np.uint32):
+        u = np.array([1, 2, 0, 255, 128, 0x8001, 0xFFFF, 0x80000000,
+                      0xFFFFFFFF], np.int64).astype(dt)
+        check(lambda x: fn(x, jnp.full_like(x, amt)), u)
 
 
 @pytest.mark.parametrize("fn", _SHIFTS)
@@ -183,8 +179,88 @@ def test_shift_by_dynamic_amount(fn):
     a = np.array([1, 2, -4, 8, -16, -1, 0x7FFFFFFF], np.int32)
     s = np.array([0, 1, 2, 31, 32, 40, 33], np.int32)
     check(fn, a, s)
-    if fn in _UNSIGNED_SHIFTS:
-        check(fn, a.astype(np.uint32), s.astype(np.uint32))
+    check(fn, a.astype(np.uint32), s.astype(np.uint32))
+
+
+@pytest.mark.parametrize("fn", _SHIFTS)
+@pytest.mark.parametrize("dt", [np.uint8, np.int8])
+def test_shift_every_8bit_pair(fn, dt):
+    # Every value against every amount: 128 of the 256 uint8 values used to
+    # shift right ARITHMETICALLY as if logically (0x80 >> 1 is 0xC0), and a
+    # negative int8 amount slipped past the width guard (x << -128 was x).
+    v = np.arange(256).astype(np.uint8).view(dt)
+    check(fn, np.repeat(v, 256), np.tile(v, 256))
+
+
+@pytest.mark.parametrize("fn", _SHIFTS)
+def test_shift_amount_compared_unsigned(fn):
+    # XLA compares the amount UNSIGNED against the width: a negative amount
+    # and a uint32 one >= 2^31 are huge, and saturate (0, or the top-bit fill).
+    for dt, amts in ((np.int16, [-1, -16, -17, -32768, 15, 16]),
+                     (np.int32, [-1, -32, -2**31, 31, 32]),
+                     (np.uint32, [2**31, 2**32 - 1, 2**32 - 32, 31, 32])):
+        amts = np.asarray(amts, np.int64).astype(dt)
+        vals = np.asarray([1, -1, 0x4000, -0x4000, 7], np.int64).astype(dt)
+        check(fn, np.repeat(vals, len(amts)), np.tile(amts, len(vals)))
+        check(lambda x: fn(x, jnp.full_like(x, amts[0])), vals)
+
+
+def _module64(ty, op, n):
+    # x64 is off, so 64-bit operands cross as u32 pairs and are bitcast
+    # inside the program.
+    pair, vec = f"tensor<{n}x2xui32>", f"tensor<{n}x{ty}>"
+    unary = op in ("popcnt", "count_leading_zeros")
+    args = "%x" if unary else "%x, %y"
+    return f"""
+module @m {{
+  func.func public @main(%a: {pair}, %b: {pair}) -> {pair} {{
+    %x = stablehlo.bitcast_convert %a : ({pair}) -> {vec}
+    %y = stablehlo.bitcast_convert %b : ({pair}) -> {vec}
+    %r = stablehlo.{op} {args} : {vec}
+    %o = stablehlo.bitcast_convert %r : ({vec}) -> {pair}
+    return %o : {pair}
+  }}
+}}
+"""
+
+
+@pytest.mark.parametrize("ty", ["ui64", "i64"])
+@pytest.mark.parametrize("op", ["shift_left", "shift_right_logical",
+                                "shift_right_arithmetic", "popcnt",
+                                "count_leading_zeros"])
+def test_bits_64(ty, op):
+    from jax._src.lib import xla_client as xc
+
+    vals = np.asarray([0, 1, 3, 2**63, 2**63 - 1, 2**64 - 1, 2**32,
+                       0xF0F0F0F0F0F0F0F0], np.uint64)
+    amts = np.asarray(list(range(0, 66, 3)) + [63, 64, 2**64 - 1, 2**63,
+                                               2**32, 2**32 + 1], np.uint64)
+    a = np.repeat(vals, len(amts)).view(np.uint32).reshape(-1, 2)
+    b = np.tile(amts, len(vals)).view(np.uint32).reshape(-1, 2)
+    text = _module64(ty, op, a.shape[0])
+    outs = []
+    for dev in (jax.devices("cpu")[0], jax.devices("metal")[0]):
+        exe = dev.client.compile_and_load(text, [dev], xc.CompileOptions())
+        out = exe.execute([jax.device_put(a, dev), jax.device_put(b, dev)])
+        outs.append(np.asarray(out[0]))
+    np.testing.assert_array_equal(outs[1], outs[0])
+
+
+@pytest.mark.parametrize("dt", [np.int8, np.uint8, np.int16, np.uint16,
+                                np.int32, np.uint32])
+def test_popcnt_clz_every_width(dt):
+    # Every value of the 8- and 16-bit types; edges plus random for 32-bit.
+    w = 8 * np.dtype(dt).itemsize
+    if w <= 16:
+        v = np.arange(2 ** w).astype(np.dtype(f"u{w // 8}")).view(dt)
+    else:
+        rng = np.random.default_rng(32)
+        v = np.concatenate([
+            np.asarray([0, 1, 2**31 - 1, 2**31, 2**32 - 1, 0x00010000],
+                       np.int64),
+            rng.integers(0, 2**32, 500, dtype=np.int64)]).astype(dt)
+    check(jax.lax.population_count, v)
+    check(jax.lax.clz, v)
 
 
 def test_shift_by_nonsplat_constant():

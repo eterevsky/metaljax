@@ -264,6 +264,16 @@ mx::Dtype unsigned_of(const mx::Dtype& d) {
   return d;
 }
 
+// ...and the same-width signed type (an arithmetic shift's view of an
+// unsigned operand), or the type itself.
+mx::Dtype signed_of(const mx::Dtype& d) {
+  if (d == mx::uint8) return mx::int8;
+  if (d == mx::uint16) return mx::int16;
+  if (d == mx::uint32) return mx::int32;
+  if (d == mx::uint64) return mx::int64;
+  return d;
+}
+
 // MLX's Python bindings promote a python scalar to the ARRAY's dtype (a
 // "weak" type): `mx.abs(x) + 0.5` on float16 stays float16, while a bare
 // C++ `array(0.5)` is float32 and would promote the whole expression to

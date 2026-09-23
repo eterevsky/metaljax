@@ -157,6 +157,43 @@ def test_int2_transfer_and_bitcast(name):
            .reshape(3, 8))
 
 
+_SUBBYTE = {"int2": (jnp.int2, np.arange(-2, 2)),
+            "uint2": (jnp.uint2, np.arange(0, 4)),
+            "int4": (jnp.int4, np.arange(-8, 8)),
+            "uint4": (jnp.uint4, np.arange(0, 16))}
+_SHIFTS = (jax.lax.shift_left, jax.lax.shift_right_logical,
+           jax.lax.shift_right_arithmetic)
+
+
+@pytest.mark.parametrize("name", sorted(_SUBBYTE))
+def test_subbyte_shifts_every_code(name):
+    # The 8-bit storage holds the VALUE; XLA shifts the type's own bits:
+    # int4 -8 >>> 1 is 4 (not 124), uint4 8 >> 1 arithmetic is 12 (not 4),
+    # and an amount >= the LOGICAL width (uint2 << 2) saturates.
+    dt, vals = _SUBBYTE[name]
+    a = np.repeat(vals, len(vals)).astype(np.int32)
+    b = np.tile(vals, len(vals)).astype(np.int32)
+    for op in _SHIFTS:
+        _exact(lambda x, y: op(x.astype(dt), y.astype(dt)).astype(jnp.int32),
+               a, b)
+        for k in vals:                      # the statically resolved guard
+            _exact(lambda x, k=int(k): op(x.astype(dt), jnp.full(
+                x.shape, k, dt)).astype(jnp.int32), vals.astype(np.int32))
+    host = vals.astype(np.int8).astype(np.dtype(dt))
+    _exact(lambda x: jax.lax.shift_right_arithmetic(x, x), host)  # in AND out
+
+
+@pytest.mark.parametrize("name", sorted(_SUBBYTE))
+def test_subbyte_popcnt_clz_every_code(name):
+    # Counted over the type's own bits -- except an int4 POPCNT, which XLA
+    # widens to s8 first (popcnt(int4(-1)) is 8, i.e. -8): jax's answer, and
+    # the one matched.  int4/int2 popcnt and clz used to decline outright.
+    dt, vals = _SUBBYTE[name]
+    for op in (jax.lax.population_count, jax.lax.clz):
+        _exact(lambda x: op(x.astype(dt)).astype(jnp.int32),
+               vals.astype(np.int32))
+
+
 def test_int2_overlap_program():
     # jax-v0.11.2 overlap_test::test_avoid_excess_precision's quantizer.
     def f(x):

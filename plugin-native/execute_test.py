@@ -160,9 +160,9 @@ def _loop_spec_forms():
             ("fori without stacks", fori_no_stacks, [h0, w])]
 
 
-# P50-P52 (jax 0.11.2): the forms three contract groups run through BOTH
-# backends in a child each.  The answers are compared EXACTLY -- a float by
-# its bits (any NaN is one NaN), everything else by its value -- so each
+# P50-P52 (jax 0.11.2) and P53: the forms these contract groups run through
+# BOTH backends in a child each.  The answers are compared EXACTLY -- a float
+# by its bits (any NaN is one NaN), everything else by its value -- so each
 # form's outputs are encoded by `_exact_payload`.
 
 # The pairs a float remainder is hardest on: signed zeros, infinities, NaN,
@@ -399,6 +399,170 @@ def _p52_forms():
     forms.append(("layout constraint under grad",
                   jax.grad(lambda a: (with_layout_constraint(
                       a, Layout(major_to_minor=(0, 1))) ** 2).sum()), [x]))
+    return forms
+
+
+def _p53_grid(dt):
+    """P53's (value, amount) pairs for one real integer dtype: for the 8-bit
+    pair EVERY value against EVERY amount (65,536 pairs); wider, the edge
+    values plus 100 random ones against every amount up to past the width,
+    and the amounts only an UNSIGNED compare sees as huge (the negative ones,
+    and 2^31 and up for a uint32)."""
+    info = np.iinfo(dt)
+    w = 8 * np.dtype(dt).itemsize
+    if w == 8:
+        vals = np.arange(info.min, info.max + 1).astype(dt)
+        amts = vals
+    else:
+        rng = np.random.default_rng(53 + w)
+        edge = [0, 1, 2, 3, info.max, info.min, info.max // 2,
+                info.max // 2 + 1, info.min + 1, info.max - 1]
+        vals = np.concatenate([
+            np.asarray(edge, np.int64).astype(dt),
+            rng.integers(info.min, info.max, 100, dtype=np.int64,
+                         endpoint=True).astype(dt)])
+        amts = list(range(0, w + 3)) + [-1, -2, -w, -w - 1, 2 * w, 127, 128,
+                                        255, 256, 257, info.max, info.min,
+                                        info.max - 1]
+        if w == 32:
+            amts += [1 << 16, (1 << 16) + 1, (1 << 31) - 1]
+        amts = np.asarray(amts, np.int64).astype(dt)
+    return (vals, np.repeat(vals, len(amts)), np.tile(amts, len(vals)))
+
+
+_P53_U64 = [0, 1, 2, 3, 2**63, 2**63 - 1, 2**64 - 1, 2**63 + 1, 2**32,
+            2**32 - 1, 2**31, 0xF0F0F0F0F0F0F0F0, 0x0123456789ABCDEF]
+_P53_U64_AMTS = list(range(0, 67)) + [2**64 - 1, 2**64 - 64, 2**63, 2**32,
+                                      2**32 + 1, 2**31, 128, 255, 256]
+
+
+def _p53_module(ty, op, n, splat=None):
+    """A 64-bit shift / popcnt / clz as hand-written StableHLO: x64 is off,
+    so the operands come in (and the answer goes out) as u32 PAIRS and are
+    bitcast to `ty` inside the program."""
+    pair, vec = f"tensor<{n}x2xui32>", f"tensor<{n}x{ty}>"
+    params = f"%a: {pair}"
+    if op in ("popcnt", "count_leading_zeros"):
+        body = f"%r = stablehlo.{op} %x : {vec}"
+    elif splat is not None:
+        body = (f"%y = stablehlo.constant dense<{splat}> : {vec}\n"
+                f"    %r = stablehlo.{op} %x, %y : {vec}")
+    else:
+        params += f", %b: {pair}"
+        body = (f"%y = stablehlo.bitcast_convert %b : ({pair}) -> {vec}\n"
+                f"    %r = stablehlo.{op} %x, %y : {vec}")
+    return f"""
+module @p53 {{
+  func.func public @main({params}) -> {pair} {{
+    %x = stablehlo.bitcast_convert %a : ({pair}) -> {vec}
+    {body}
+    %o = stablehlo.bitcast_convert %r : ({vec}) -> {pair}
+    return %o : {pair}
+  }}
+}}
+"""
+
+
+def _p53_forms():
+    """P53 (shifts, popcnt and clz exactly as XLA has them).
+
+    A form is (label, fn, args) as in P50-P52, or (label, module text, args)
+    for the 64-bit ones, which jax cannot spell with x64 off.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    lax = jax.lax
+    shifts = (("shl", lax.shift_left), ("srl", lax.shift_right_logical),
+              ("sra", lax.shift_right_arithmetic))
+    forms = []
+    for dt in (np.int8, np.uint8, np.int16, np.uint16, np.int32, np.uint32):
+        name = np.dtype(dt).name
+        w = 8 * np.dtype(dt).itemsize
+        vals, A, B = _p53_grid(dt)
+        for opn, op in shifts:
+            forms.append((f"{name} {opn}", op, [A, B]))
+            # A splat amount resolves the guard statically: both arms, and
+            # -1 (a huge amount, unsigned).
+            for k in (0, 1, w - 1, w, w + 1, 2 * w, -1):
+                forms.append((f"{name} {opn} splat {k}",
+                              lambda x, op=op, k=k, dt=dt:
+                              op(x, jnp.full(x.shape, np.asarray(k).astype(
+                                  dt))), [vals]))
+            forms.append((f"{name} {opn} rank 0", op, [A[-7], B[-7]]))
+        forms.append((f"{name} popcnt", lax.population_count, [vals]))
+        forms.append((f"{name} clz", lax.clz, [vals]))
+
+    # The emulated sub-byte integers, every code against every code: the
+    # shifts, popcnt and clz read the LOGICAL bits, not the 8-bit storage.
+    i32 = jnp.int32
+    grids = {"int2": (jnp.int2, np.arange(-2, 2)),
+             "uint2": (jnp.uint2, np.arange(0, 4)),
+             "int4": (jnp.int4, np.arange(-8, 8)),
+             "uint4": (jnp.uint4, np.arange(0, 16))}
+    for name, (dt, vals) in grids.items():
+        A = np.repeat(vals, len(vals)).astype(np.int32)
+        B = np.tile(vals, len(vals)).astype(np.int32)
+        v32 = vals.astype(np.int32)
+        for opn, op in shifts:
+            forms.append((f"{name} {opn}",
+                          lambda x, y, op=op, dt=dt:
+                          op(x.astype(dt), y.astype(dt)).astype(i32), [A, B]))
+            for k in vals:
+                forms.append((f"{name} {opn} splat {k}",
+                              lambda x, op=op, dt=dt, k=int(k):
+                              op(x.astype(dt), jnp.full(x.shape, k, dt)
+                                 ).astype(i32), [v32]))
+        for opn, op in (("popcnt", lax.population_count), ("clz", lax.clz)):
+            forms.append((f"{name} {opn}",
+                          lambda x, op=op, dt=dt: op(x.astype(dt)).astype(i32),
+                          [v32]))
+        # A sub-byte buffer in and out of the program, no convert around it.
+        host = vals.astype(np.int8).astype(np.dtype(dt))
+        forms.append((f"{name} sra in and out",
+                      lambda x: lax.shift_right_arithmetic(x, x), [host]))
+
+    # 64-bit, through hand-written modules.
+    u64 = np.asarray(_P53_U64, np.uint64)
+    A = np.repeat(u64, len(_P53_U64_AMTS))
+    B = np.tile(np.asarray(_P53_U64_AMTS, np.uint64), len(u64))
+
+    def pairs(v):
+        return np.asarray(v, np.uint64).view(np.uint32).reshape(-1, 2)
+
+    for ty in ("ui64", "i64"):
+        for op in ("shift_left", "shift_right_logical",
+                   "shift_right_arithmetic"):
+            forms.append((f"{ty} {op}", _p53_module(ty, op, len(A)),
+                          [pairs(A), pairs(B)]))
+            for k in (0, 1, 31, 32, 63, 64, 65, -1):
+                if k < 0 and ty == "ui64":
+                    k = 2**64 - 1
+                forms.append((f"{ty} {op} splat {k}",
+                              _p53_module(ty, op, len(u64), k), [pairs(u64)]))
+        for op in ("popcnt", "count_leading_zeros"):
+            forms.append((f"{ty} {op}", _p53_module(ty, op, len(u64)),
+                          [pairs(u64)]))
+
+    # Inside a counted loop (msl_scan has no spelling for a shift, so the
+    # body runs as a compiled graph -- the contract pins that decline) and
+    # fused among other ops.
+    def loop(h, xs):
+        def body(c, x):
+            c = (lax.shift_right_arithmetic(c, x & 7)
+                 ^ lax.shift_left(c, jnp.full_like(c, 3))) \
+                + lax.shift_right_logical(x, jnp.full_like(x, 1))
+            return c, c
+        return lax.scan(body, h, xs)
+
+    rng = np.random.default_rng(530)
+    for dt in (np.uint8, np.uint32, np.int16):
+        info = np.iinfo(dt)
+        forms.append((f"msl loop {np.dtype(dt).name}", loop,
+                      [rng.integers(info.min, info.max, (8, 16),
+                                    endpoint=True).astype(dt),
+                       rng.integers(info.min, info.max, (24, 8, 16),
+                                    endpoint=True).astype(dt)]))
     return forms
 
 
@@ -12380,7 +12544,7 @@ _P5X_ARMS = {}
 
 
 def _p5x_arm(subprocess, pathlib, group, env_extra, cpu=False):
-    """One child running P50/P51/P52's forms (`--p5x-forms <group>`): the
+    """One child running P50-P53's forms (`--p5x-forms <group>`): the
     answers by label, and the narration (METALJAX_DEBUG is on).  Memoized:
     the contracts of a group share their arms."""
     import json
@@ -12582,6 +12746,65 @@ def _p52_layout_constraint(subprocess, pathlib, re):
         return True, f"{len(cpu)} forms ({n} elements) == jax-CPU, exactly"
 
     return [("with_layout_constraint runs", runs_and_matches)]
+
+
+def _p53_shifts(subprocess, pathlib, re):
+    """SHIFTS, POPCNT AND CLZ ARE XLA's, BIT FOR BIT (P53).
+
+    Three ways the plugin disagreed with jax-CPU until 2026-09-23 (the first
+    found adding int2, commit e96f861), all pinned here EXACTLY:
+
+      * shift_right_arithmetic on an UNSIGNED operand ran as a logical
+        shift.  XLA's AShr is an LLVM op on signless integers, so the top bit
+        fills whatever the type's signedness: uint8 0x80 >> 1 is 0xC0 (128 of
+        the 256 uint8 values differed per amount), and a shift by the width
+        or past it fills with the top bit rather than answering 0.
+      * the out-of-range guard compared the amount as a SIGNED int32, where
+        XLA compares it unsigned at the operand's width (elemental_ir_emitter
+        `SaturateShiftIfNecessary`, ICmpULT): a negative amount, a uint32
+        one >= 2^31 and a 64-bit one >= 2^32 slipped past it into Metal's
+        mod-width shift (int8 x << -128 answered x).
+      * the emulated i2/ui2/i4/ui4 hold their VALUE in an 8-bit storage, and
+        the logical shift, popcnt and clz read all 8 bits: int4 -8 >>> 1
+        answered 124 (XLA: 4), uint4 clz answered 28-32, and popcnt/clz on
+        the signed pair declined outright.  One XLA quirk is matched rather
+        than "fixed": both XLA backends widen an S4 popcnt to S8 before
+        counting (FloatNormalization; FloatSupport exempts clz and the right
+        shifts from that upcast, not popcnt), so popcnt(int4(-1)) is 8,
+        wrapped to -8 -- jax's answer, and now the plugin's.
+
+    Every 8-bit value against every 8-bit amount for all three shifts; the
+    16/32-bit types on edge + random values against in-range, boundary and
+    unsigned-huge amounts; every code of every sub-byte type against every
+    code; u64/i64 through hand-written modules; splat amounts (the guard
+    resolved at lowering, both arms); rank 0; popcnt and clz everywhere; a
+    shift-heavy counted loop per dtype.  Compiled (the default) and eager
+    (METALJAX_COMPILE=0).  msl_scan kernels have no spelling for these ops:
+    the loops must narrate that decline, so a kernel that grows one is a
+    change this contract notices.
+    """
+
+    def arms_agree(env_extra, what):
+        metal, _ = _p5x_arm(subprocess, pathlib, "p53", env_extra)
+        cpu, _ = _p5x_arm(subprocess, pathlib, "p53", {}, cpu=True)
+        bad, n = _p5x_same(metal, cpu)
+        if bad:
+            return False, f"{what}: " + "; ".join(bad[:3])
+        return True, f"{what}: {len(cpu)} forms ({n} elements) == jax-CPU"
+
+    def msl_declines_shifts():
+        _m, said = _p5x_arm(subprocess, pathlib, "p53", {})
+        declines = set(re.findall(
+            r"msl_scan: not eligible \(op (stablehlo\.shift_\w+)\)", said))
+        if not declines:
+            return False, "no msl_scan decline naming a shift was narrated"
+        return True, "loops decline msl_scan at " + ", ".join(sorted(declines))
+
+    return [("shifts/popcnt/clz == jax-CPU",
+             lambda: arms_agree({}, "compiled")),
+            ("shifts/popcnt/clz == jax-CPU (eager)",
+             lambda: arms_agree({"METALJAX_COMPILE": "0"}, "eager")),
+            ("msl_scan declines shift loops", msl_declines_shifts)]
 
 
 def _p38_chunk_plan(subprocess, pathlib, re):
@@ -13282,7 +13505,7 @@ def main():
                   f"{_json.dumps([v.astype(np.float64).ravel().tolist() for v in out])}")
         return 0
     if len(sys.argv) > 2 and sys.argv[1] == "--p5x-forms":
-        # P50-P52's forms through whichever backend the caller put in the
+        # P50-P53's forms through whichever backend the caller put in the
         # environment, one line per form: the label, then the outputs as
         # exact JSON (or the error that stopped them, as a string).
         if os.environ.get("JAX_PLATFORMS") != "cpu":
@@ -13293,10 +13516,13 @@ def main():
         import jax.numpy as jnp
         group = sys.argv[2]
         forms = {"p50": _p50_forms, "p51": _p51_forms,
-                 "p52": _p52_forms}[group]()
+                 "p52": _p52_forms, "p53": _p53_forms}[group]()
         for label, fn, args in forms:
             try:
-                payload = _exact_payload(_flatten(jax.jit(fn)(*args)))
+                # A str is a hand-written module (P53's 64-bit forms).
+                outs = (_run_module(fn, args) if isinstance(fn, str)
+                        else _flatten(jax.jit(fn)(*args)))
+                payload = _exact_payload(outs)
             except Exception as exc:  # noqa: BLE001 - the parent reports it
                 payload = (f"{type(exc).__name__}: "
                            f"{str(exc).splitlines()[0][:160]}")
@@ -13718,6 +13944,7 @@ def main():
                          + _p51_int2(subprocess, pathlib, __import__("re"))
                          + _p52_layout_constraint(
                              subprocess, pathlib, __import__("re"))
+                         + _p53_shifts(subprocess, pathlib, __import__("re"))
                          + _p38_chunk_plan(subprocess, pathlib,
                                            __import__("re"))
                          + _p47_chunk_donate(subprocess, pathlib,

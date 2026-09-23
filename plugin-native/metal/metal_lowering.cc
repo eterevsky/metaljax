@@ -155,17 +155,23 @@ bool IsIntGrid(absl::string_view el) {
 // and, since int2 made them everyday (a 4-value type: -(-2) is -2, 1 << 1 is
 // -2, ~1 is 2 in ui2), negate, abs (abs(INT_MIN) is INT_MIN), not (the
 // unsigned pair: ~x in a uint8 storage is 255 - x), divide (INT_MIN / -1) and
-// power.  The wrap is the identity on an in-range value, so a result that
-// stays in range pays one elementwise op and nothing else.  (Measured against
-// jax-CPU for i4/ui4/i2/ui2; shift_right_logical, popcnt and clz read the
-// storage's 8 bits rather than the logical width and are NOT fixed by a
-// wrap -- a known gap, unchanged.)
+// power.  The shifts, popcnt and clz work on the type's LOGICAL bits (the
+// entries carry the width) and hand back the right low bits, which the wrap
+// turns into the storage value: a logical shift of a negative i4 (-8 >> 1 is
+// 4), an arithmetic shift of a ui4 with its top bit set (8 >> 1 is 12), an
+// i2's popcnt or clz of 2 (which is -2), and an i4's popcnt, which XLA counts
+// on the widened byte (`LowerPopcnt`: 8 is -8).  The wrap is the identity on an
+// in-range value, so a result that stays in range pays one elementwise op and
+// nothing else.  (Measured against jax-CPU for i4/ui4/i2/ui2, every code.)
 bool IsIntGridWrapOp(absl::string_view name) {
   return name == "stablehlo.add" || name == "stablehlo.subtract" ||
          name == "stablehlo.multiply" || name == "stablehlo.negate" ||
          name == "stablehlo.abs" || name == "stablehlo.not" ||
          name == "stablehlo.divide" || name == "stablehlo.power" ||
-         name == "stablehlo.shift_left";
+         name == "stablehlo.shift_left" ||
+         name == "stablehlo.shift_right_logical" ||
+         name == "stablehlo.shift_right_arithmetic" ||
+         name == "stablehlo.popcnt" || name == "stablehlo.count_leading_zeros";
 }
 
 bool IsBinaryRegridOp(absl::string_view name) {
@@ -4211,16 +4217,28 @@ std::optional<int64_t> StaticSplatInt(mlir::Value v) {
 }
 
 // tape.py `_lower_shift`.  XLA defines a shift by >= the operand's bit width
-// as 0 (logical/left) or the sign fill (arithmetic); Metal's shifts are
-// mod-width.  Whether the amount is a compile-time splat is a pure IR
-// question, answered once here; which side of the width it falls on stays in
-// C++, where the operand's byte width is known.
+// as 0 (logical/left) or the top-bit fill (arithmetic), comparing the amount
+// UNSIGNED -- a negative amount saturates too; Metal's shifts are mod-width.
+// The entry carries [static?, amount, bits]: whether the amount is a
+// compile-time splat (a pure IR question, answered once here; an
+// out-of-range one is carried as `bits` itself), and the operand's LOGICAL
+// width, which for the emulated i2/ui2/i4/ui4 is not their 8-bit storage's.
 absl::StatusOr<std::vector<int64_t>> Lowering::LowerShift(
     mlir::Operation* op) {
   if (op->getNumOperands() != 2) return Decline("a shift without an amount");
+  auto t = mlir::dyn_cast<mlir::RankedTensorType>(op->getOperand(0).getType());
+  auto it = t ? mlir::dyn_cast<mlir::IntegerType>(t.getElementType())
+              : mlir::IntegerType();
+  // StableHLO's verifier admits 2..64-bit integers only (no i1).
+  if (!it || it.getWidth() < 2 || it.getWidth() > 64)
+    return Decline("a shift on a non-integer operand");
+  const int64_t bits = it.getWidth();
   std::optional<int64_t> c = StaticSplatInt(op->getOperand(1));
-  if (c.has_value() && *c >= 0) return std::vector<int64_t>{1, *c};
-  return std::vector<int64_t>{0, 0};
+  if (!c.has_value()) return std::vector<int64_t>{0, 0, bits};
+  // A negative value is a signed type's (or a u64's past 2^63): unsigned, it
+  // is at least 2^(bits-1) >= bits.
+  const bool over = *c < 0 || *c >= bits;
+  return std::vector<int64_t>{1, over ? bits : *c, bits};
 }
 
 // tape.py `_lower_bitcast_convert`.  Which arm runs is a static property of
@@ -4423,6 +4441,8 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerPopcnt(
   else if (*el == "i32") unsigned_name = "ui32";
   else if (*el == "i64") unsigned_name = "ui64";
   else if (*el == "i1") unsigned_name = "ui8";
+  else if (*el == "i4") unsigned_name = "ui4";
+  else if (*el == "i2") unsigned_name = "ui2";
   if (unsigned_name.rfind("ui", 0) != 0)
     return Decline(absl::StrCat("popcnt/clz on ", *el));
   std::optional<int> ucode = CodeForName(unsigned_name);
@@ -4430,10 +4450,24 @@ absl::StatusOr<std::vector<int64_t>> Lowering::LowerPopcnt(
   // `_as_unsigned` VIEWS a signed operand (same bits) but CASTS a bool.
   const int64_t view = *el == "i1" ? 0 : (*el != unsigned_name ? 1 : 2);
   const bool wide = unsigned_name == "ui64";
+  // The LOGICAL width: the handler cuts the sub-byte pair's (sign-extended)
+  // 8-bit storage to it, and clz counts from it.
   int64_t bits = 32;
   if (unsigned_name == "ui8") bits = 8;
   else if (unsigned_name == "ui16") bits = 16;
   else if (unsigned_name == "ui64") bits = 64;
+  else if (unsigned_name == "ui4") bits = 4;
+  else if (unsigned_name == "ui2") bits = 2;
+  // Except an int4 POPCNT, which XLA widens to s8 before it counts (both
+  // backends run FloatNormalization(S4 -> S8); FloatSupport exempts clz and
+  // the right shifts from that upcast because it changes their answers, but
+  // not popcnt).  jax's answer for a negative int4 is therefore the popcount
+  // of its sign-extended byte, wrapped back to 4 bits -- popcnt(int4(-1)) is
+  // 8, which is -8 -- and that is matched here, bit for bit with jax-CPU.
+  // int2 is not widened (there is no S2 normalization) and a uint4's
+  // widening is a zero extension, which counts the same.
+  if (*el == "i4" && op->getName().getStringRef() == "stablehlo.popcnt")
+    bits = 8;
   // A bool widens to uint8, and the handler counts over mx::bool_'s byte.
   if (*el == "i1") bits = 8;
   return std::vector<int64_t>{*ucode, view, wide ? 1 : 0, bits, code};

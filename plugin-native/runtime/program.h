@@ -211,6 +211,7 @@ bool is_complex(const mx::Dtype& d);
 bool is_unsigned(const mx::Dtype& d);
 bool is_int(const mx::Dtype& d);
 mx::Dtype unsigned_of(const mx::Dtype& d);
+mx::Dtype signed_of(const mx::Dtype& d);
 mx::array weak(double v, const mx::array& a);
 mx::array weak_int(int64_t v, const mx::array& a);
 mx::array fresh_copy(const mx::array& a);
@@ -550,7 +551,7 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //   kReduce             [kind, ndims, dims...]  kind: 0 sum 1 prod 2 max
 //                                               3 min 4 any 5 all
 //   kArgReduce          [is_max, dim]           two results: (value, index)
-//   kShift*             [static?, amount]       see shift_guard
+//   kShift*             [static?, amount, bits] see shift_guard
 //   kDotGeneral         [lrank, lperm..., rrank, rperm..., B, M, K, N,
 //                        out_dtype, out_rank, out_shape..., kind, chunk,
 //                        batch side, batch groups, batch tail]
