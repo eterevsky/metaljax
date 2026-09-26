@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -138,6 +139,139 @@ bool IsIndexArray(const mx::array& a) {
          (a.dtype() == mx::bool_ || mx::issubdtype(a.dtype(), mx::integer));
 }
 
+// --------------------------------------------------------------------------
+// The loop IN-FLIGHT bound (METALJAX_LOOP_INFLIGHT_MB)
+// --------------------------------------------------------------------------
+//
+// What a counted loop's cadences bound is the OP COUNT between its sync
+// points (`period`, `sync_every`, the chunk count K) -- and none of them
+// bounds what those ops hold.  MLX allocates every intermediate of a
+// submission when it ENCODES it and frees it only when the command buffer
+// that reads it completes (backend/metal/eval.cpp pins every input until
+// then), so the bytes a loop holds are the transients of every iteration
+// it has submitted and the device has not yet finished.  A host that
+// encodes faster than the device executes runs the whole op-count window
+// ahead of it.  Measured on the texmo 10k-weight train chunk (a compiled
+// 256-step training loop whose inner scans are generated msl kernels, so
+// the host never waits inside an iteration): 14 iterations queued per
+// submission, 0.3 GB each, MLX's active memory 0.4 -> 4.8 GB in 20 ms, a
+// 5.5 GB process for a 0.3 GB working set -- and RESOURCE_EXHAUSTED on a
+// crowded 32 GB machine.  MLX's own back-pressure (transforms.cpp
+// MAX_ACTIVE_TASKS, 10 command buffers) never fires there: one 357-kernel
+// iteration is less than one 800-op command buffer.
+//
+// So a loop whose op-count window could queue more than the budget runs
+// under a byte window instead:
+//
+//   * UNIT: the bytes one submission holds until it completes, MEASURED --
+//     the growth of `mx::get_active_memory()` across one submission.  When
+//     `async_eval` returns, MLX has allocated everything the submission
+//     encodes and freed none of it, so the growth is what it holds (its
+//     transients plus the carries it produces) -- PROVIDED nothing else
+//     frees inside the reading: an earlier submission completing, or the
+//     late completion handlers of a blocking read just before it (MLX
+//     signals a command buffer's event from the device and releases its
+//     buffers in the handler, which runs after).  Each arm arranges that
+//     its own way (`run_single_bounded`, `run_chunked`).  The lowering's
+//     estimate (`body_bytes`, the gate's `real=`) only decides whether to
+//     measure: it charges every intermediate a fused graph never
+//     materializes, 1132 MB against the 0.3 GB measured on that chunk.
+//     Measured once per loop run: the shapes are fixed for its life.
+//
+//   * WINDOW: after each submission the host waits for the OLDEST ones
+//     until at most `keep` remain in flight -- a wait on work already
+//     submitted, so the newer submissions keep the device busy through it.
+//     At the encode of the next one, `keep + 1` submissions are
+//     outstanding, which is what `keep` is solved for.  Never below one:
+//     one submission in flight while the next is encoded is the overlap
+//     the loop exists to keep, so a unit bigger than half the budget runs
+//     at two in flight rather than serializing.
+//
+// The completions are waited through the same event standins as the
+// chunked arm's ring (`completion_of`), for the same reason: the window
+// must never hold a carry, or the next iteration's in-place update copies
+// it.  A submission that went SYNCHRONOUSLY (loop_submit's `t_msl_pending`
+// rule, a blocking flush, or one with nothing left to schedule) is complete
+// when it returns, and so is everything submitted before it on the stream:
+// it empties the window, and it measures nothing.
+//
+// The op-unit accounting (`loop_account`: the loop-clear cadence and the
+// governor's admits) is untouched: it runs at the same iterations with the
+// same charges whatever the window does.
+
+// One standin per carry a submission scheduled: the EVENT `mx::async_eval`
+// attached to it and nothing else (see `run_chunked`'s ring for why a carry
+// itself must never be held).
+std::vector<mx::array> completion_of(const std::vector<mx::array>& v) {
+  std::vector<mx::array> waits;
+  for (const mx::array& a : v) {
+    if (!a.event().valid()) continue;
+    mx::array w(mx::Shape{}, mx::bool_, nullptr, {});
+    w.attach_event(a.event());
+    waits.push_back(std::move(w));
+  }
+  return waits;
+}
+
+// Would `loop_submit(v)` right now be ASYNCHRONOUS -- the only kind of
+// submission that stays in flight, and so the only kind worth measuring?
+// It blocks while a traced msl kernel is unproven (`t_msl_pending`), and it
+// is a no-op when everything in `v` is already scheduled (a compiled
+// chunk's first call is settled by `prove_compiled`).
+bool submits_async(const std::vector<mx::array>& v) {
+  if (!t_msl_pending.empty()) return false;
+  for (const mx::array& a : v)
+    if (a.status() == mx::array::Status::unscheduled) return true;
+  return false;
+}
+
+// The submissions of one loop that may still be in flight, oldest first.
+class LoopWindow {
+ public:
+  // After a submission: an asynchronous one joins the window; a synchronous
+  // one has completed, with everything before it, and empties it.
+  void submitted(const std::vector<mx::array>& vals, bool async) {
+    if (async) {
+      ring_.push_back(completion_of(vals));
+    } else {
+      ring_.clear();
+    }
+  }
+
+  // Wait for the oldest submissions until at most `keep` are left.
+  void keep_at_most(int64_t keep) {
+    while (static_cast<int64_t>(ring_.size()) > keep) {
+      for (mx::array& a : ring_.front()) a.wait();
+      ring_.pop_front();
+      waits_++;
+    }
+  }
+
+  bool empty() const { return ring_.empty(); }
+  int64_t waits() const { return waits_; }
+
+ private:
+  std::deque<std::vector<mx::array>> ring_;
+  int64_t waits_ = 0;
+};
+
+int64_t active_bytes() { return static_cast<int64_t>(mx::get_active_memory()); }
+
+std::string mb_str(int64_t bytes) {
+  char buf[32];
+  std::snprintf(buf, sizeof buf, "%.0f",
+                static_cast<double>(bytes) / 1048576.0);
+  return std::string(buf);
+}
+
+// `keep` for a window of submissions of `unit` bytes each: `keep + 1` of
+// them fit the budget, at least one, at most `max_keep`.
+int64_t window_keep(int64_t budget, int64_t unit, int64_t max_keep) {
+  const int64_t fit = budget / std::max<int64_t>(unit, 1) - 1;
+  return std::max<int64_t>(1, std::min<int64_t>(fit, std::max<int64_t>(
+                                                        max_keep, 1)));
+}
+
 // One uncompiled application of a loop body.
 std::vector<mx::array> run_body(Program* body,
                                 const std::vector<mx::array>& vals,
@@ -154,7 +288,8 @@ std::vector<mx::array> run_chunked(Program* body,
                                    const std::vector<mx::array>& caps,
                                    int64_t trip, int64_t K, int64_t cost,
                                    int64_t start, int counter_slot,
-                                   mx::Dtype counter_dtype) {
+                                   mx::Dtype counter_dtype,
+                                   int64_t body_bytes) {
   std::vector<mx::array> vals = ins;
   const int64_t sync_every =
       std::max<int64_t>(1, 75000 / std::max<int64_t>(K * cost, 1));
@@ -346,16 +481,6 @@ std::vector<mx::array> run_chunked(Program* body,
   // and therefore no buffer and no claim on anything the loop carries --
   // whose `array::wait()` is that event's wait and nothing else.
   const int64_t inflight = std::max<int64_t>(1, g_cfg.chunk_inflight);
-  auto completion_of = [](const std::vector<mx::array>& v) {
-    std::vector<mx::array> waits;
-    for (const mx::array& a : v) {
-      if (!a.event().valid()) continue;
-      mx::array w(mx::Shape{}, mx::bool_, nullptr, {});
-      w.attach_event(a.event());
-      waits.push_back(std::move(w));
-    }
-    return waits;
-  };
   if (body->narrate_chunk_plan(trip, K)) {
     const int64_t blocking = nchunks / sync_every;
     debug_print("chunked loop: trip=" + std::to_string(trip) +
@@ -366,20 +491,72 @@ std::vector<mx::array> run_chunked(Program* body,
                 " inflight=" + std::to_string(inflight) +
                 " (singles trail lazily)");
   }
-  std::vector<std::vector<mx::array>> ring(static_cast<size_t>(inflight));
+  // ...and under the loop IN-FLIGHT budget (`LoopWindow` above), `inflight`
+  // is a ceiling rather than the window: a chunk is K iterations of
+  // transients, and the ring keeps `inflight + 1` of them outstanding at
+  // the encode of the next -- up to `sync_every` chunks between blocking
+  // flushes.  Where the lowering's estimate says that could exceed the
+  // budget, the first chunks are measured (below) and the window shrinks to
+  // what fits (never below one chunk behind the one being encoded; never
+  // above `inflight`).  Nothing else changes: an unengaged loop
+  // keeps `inflight`, and the window waits on exactly the chunks the fixed
+  // ring did (a blocking flush settles every chunk before it, so emptying
+  // the window there drops only waits that would have returned at once).
+  const int64_t budget = g_cfg.loop_inflight_bytes;
+  const int64_t queued_max = std::min<int64_t>(inflight + 1, sync_every);
+  bool measure = budget > 0 && body_bytes > 0 && nchunks > 1 &&
+                 K * body_bytes * queued_max > budget;
+  int64_t keep = inflight;
+  // How a chunk's bytes are read.  Not on chunk 0: its submission also
+  // evaluates whatever the loop's initial carries still owe, and on a
+  // program's first call `prove_compiled` has already settled it.  Not by
+  // waiting for a quiet device either: a loop entered right after a
+  // blocking read still has the completion handlers of that read's command
+  // buffers to run, and their frees land inside the first reading.  So the
+  // growth is read across the next TWO asynchronous chunk submissions and
+  // the larger taken: while chunk i is encoded the device is executing the
+  // ones before it, and a predecessor that completes inside the reading
+  // (its frees are negative growth) can spoil one sample, not two.  The
+  // window follows the larger reading from the first sample on, so the
+  // bound holds from chunk 1; until a sample exists the fixed ring's
+  // `inflight` applies, which waits on nothing before chunk `inflight`.
+  // Synchronous submissions (an unproven kernel pending, a `sync_every`
+  // flush) complete before they return and are never sampled.
+  int64_t unit = 0, samples = 0;
+  LoopWindow ring;
   for (int64_t i = 0; i < nchunks; i++) {
+    const bool probe = measure && i >= 1 && t_msl_pending.empty();
+    const int64_t before = probe ? active_bytes() : 0;
     vals = chunk(K, start + i * K, vals);
     // Async-flush each chunk (a blocking sync per chunk serializes CPU
     // and GPU); block only often enough to bound pending buffers.
-    if ((i + 1) % sync_every == 0) {
+    const bool flush = (i + 1) % sync_every == 0;
+    const bool async = !flush && submits_async(vals);
+    if (flush) {
       loop_flush(vals, sync_every * K * cost);
     } else {
       loop_submit(vals);
     }
-    std::vector<mx::array>& slot = ring[static_cast<size_t>(i % inflight)];
-    for (mx::array& a : slot) a.wait();   // chunk i - inflight, if any
+    if (probe && async) {
+      // The window follows the largest reading so far, so a first sample
+      // already bounds chunk 1 onwards; the second can only shrink it.
+      unit = std::max<int64_t>({unit, active_bytes() - before, 1});
+      keep = window_keep(budget, unit, inflight);
+      samples++;
+    }
+    if (measure && samples == 2) {
+      measure = false;
+      if (g_cfg.debug && body->narrate_window(K, keep))
+        debug_print("chunked loop window: trip=" + std::to_string(trip) +
+                    " K=" + std::to_string(K) + " est=" +
+                    mb_str(body_bytes) + "MB/iter measured=" + mb_str(unit) +
+                    "MB/chunk budget=" + mb_str(budget) +
+                    "MB keep=" + std::to_string(keep) + " (inflight " +
+                    std::to_string(inflight) + ")");
+    }
     // Taken AFTER the submission: that is where the events are attached.
-    slot = completion_of(vals);
+    ring.submitted(vals, async);
+    ring.keep_at_most(keep);   // chunk i - keep, if any
   }
   for (int64_t i = 0; i < rem; i++)
     vals = chunk(1, start + nchunks * K + i, vals);
@@ -489,6 +666,137 @@ class BodyRunner {
   bool probe_ = false;
   int limit_retries_ = 0;
 };
+
+// The single-step arm under the loop IN-FLIGHT budget (`LoopWindow` above).
+//
+// The op-count cadence it replaces submits `period` iterations as ONE
+// submission and blocks every `hard_every`: on a body whose host side never
+// waits (a compiled graph with its inner scans traced in as generated
+// kernels), every iteration of a submission is encoded before the device
+// has finished the first, and the loop holds `period` iterations of
+// transients at once.  Here:
+//
+//   1. Iteration 1 is SETTLED.  A compiled body's is already (BodyRunner's
+//      probe is a blocking eval, on every loop run); an interpreted one's is
+//      settled here -- the one extra sync this arm adds, once per loop run.
+//   2. Iteration 2 is submitted ALONE, with nothing of the loop in flight,
+//      and measured: the growth of MLX's active memory across its build and
+//      submission is what one iteration holds until the device finishes it
+//      (an interpreted body's own inner sync points retire part of it
+//      during the build; what they retire is not in flight, so the growth is
+//      still the right number).  While an unproven kernel makes every
+//      submission synchronous (the first run of a program that traces one)
+//      there is no growth to read -- the submission has completed when it
+//      returns -- but nothing is in flight past it either: the groups are
+//      then sized so ONE fits the budget, from the estimate or from MLX's
+//      peak counter where that bounds the probe tighter.
+//   3. From there, `group` iterations per submission -- the op-count period,
+//      or fewer where a third of the budget holds fewer -- and a window of
+//      `keep` submissions behind the one being encoded, `keep + 1` of them
+//      fitting the budget, never more than the `hard_every / group` the
+//      blocking cadence allowed.  The waits replace the blocking flushes:
+//      each is on the oldest submission, so the device keeps executing the
+//      newer ones through it.
+//
+// The op-unit accounting runs at the old iterations with the old charges.
+// The tail -- iterations after the last submission -- stays lazy, as it
+// always did.
+std::vector<mx::array> run_single_bounded(Program* body, BodyRunner& runner,
+                                          std::vector<mx::array> vals,
+                                          int64_t trip, int64_t period,
+                                          int64_t hard_every, int64_t cost,
+                                          int64_t budget, int64_t body_bytes) {
+  LoopWindow window;
+  // (1)
+  vals = runner.run_one(vals);
+  loop_eval(vals);
+  if (period == 1) loop_account(cost);
+
+  // What one iteration holds: the estimate until (2) reads it.  `how` says
+  // which it is, for the narration.
+  int64_t unit = body_bytes;
+  const char* how = "estimated";
+  bool measured = false;   // an asynchronous submission's growth was read
+  bool bounded = false;    // a synchronous one's peak bound was read
+  int64_t group = 1, keep = 1;
+  auto plan = [&](bool async_mode) {
+    const int64_t u = std::max<int64_t>(unit, 1);
+    if (async_mode) {
+      group = std::max<int64_t>(1, std::min<int64_t>(period, budget / (3 * u)));
+      keep = window_keep(budget, group * u,
+                         std::max<int64_t>(1, hard_every / group));
+    } else {
+      // Every submission blocks until it completes, so one is in flight at a
+      // time and it alone must fit.
+      group = std::max<int64_t>(1, std::min<int64_t>(period, budget / u));
+      keep = 1;
+    }
+  };
+  plan(t_msl_pending.empty());
+  int64_t pending = 0, submits = 0, max_active = 0;
+  for (int64_t i = 2; i <= trip; i++) {
+    // (2): alone, with nothing of the loop in flight, once per mode.
+    const bool async_mode = t_msl_pending.empty();
+    const bool probe = pending == 0 && window.empty() &&
+                       (async_mode ? !measured : !bounded);
+    int64_t before = 0;
+    if (probe) {
+      // A blocking eval returns when the device SIGNALS the last command
+      // buffer's event; MLX releases what the buffer held in its completion
+      // handler, which runs after.  Read before the handlers have run, the
+      // counter still holds iteration 1's transients, their frees land
+      // inside the measurement, and it reads ~0 (measured: 0 MB for a
+      // 300 MB iteration).
+      (void)DispatchSnapshotSettled();
+      before = active_bytes();
+    }
+    vals = runner.run_one(vals);
+    pending++;
+    if (probe || pending >= group) {
+      const bool async = submits_async(vals);
+      loop_submit(vals);
+      submits++;
+      pending = 0;
+      // Right after an encode is where the window is fullest.
+      const int64_t now = (probe || g_cfg.debug) ? active_bytes() : 0;
+      max_active = std::max(max_active, now);
+      if (probe) {
+        if (async) {
+          unit = std::max<int64_t>(1, now - before);
+          how = "measured";
+          measured = true;
+        } else {
+          // A synchronous submission has freed what it held by now; the one
+          // witness left is MLX's PEAK counter, the most ever active: the
+          // submission never held more than `peak - before`.  Exact when
+          // it set the peak (a fresh process); an upper bound, taken only
+          // where it is tighter than the estimate, when it did not.
+          const int64_t cap =
+              static_cast<int64_t>(mx::get_peak_memory()) - before;
+          if (cap > 0 && cap < unit) {
+            unit = cap;
+            how = "peak-bounded";
+          }
+          bounded = true;
+        }
+        plan(async_mode);
+      }
+      window.submitted(vals, async);
+      window.keep_at_most(keep);   // (3)
+    }
+    if (i % period == 0) loop_account(period * cost);
+  }
+  if (g_cfg.debug && body->narrate_window(group, keep))
+    debug_print("loop window: trip=" + std::to_string(trip) +
+                " period=" + std::to_string(period) + " est=" +
+                mb_str(body_bytes) + "MB/iter " + how + "=" + mb_str(unit) +
+                "MB/iter budget=" + mb_str(budget) + "MB group=" +
+                std::to_string(group) + " keep=" + std::to_string(keep) +
+                " submits=" + std::to_string(submits) +
+                " waits=" + std::to_string(window.waits()) +
+                " max_active=" + mb_str(max_active) + "MB");
+  return vals;
+}
 
 }  // namespace
 
@@ -694,6 +1002,9 @@ void Program::run_while(const Entry& e,
   const int64_t period = std::max<int64_t>(at[8], 1);
   const bool chunkable = at[9] != 0;
   const int64_t kmax = at[10];
+  // The lowering's per-iteration byte estimate (the gate's `real=`), which
+  // decides whether the in-flight bound engages; absent (-1) never does.
+  const int64_t body_bytes = at.size() > 12 ? at[12] : -1;
 
   Program* cond = e.regions[0].get();
   Program* body = e.regions[1].get();
@@ -751,7 +1062,7 @@ void Program::run_while(const Entry& e,
       try {
         vals = run_chunked(body, ins, body_caps, trip, K, cost, start,
                            static_cast<int>(k),
-                           ins[static_cast<size_t>(k)].dtype());
+                           ins[static_cast<size_t>(k)].dtype(), body_bytes);
       } catch (const std::exception& ex) {
         // MLX's compiler can reject big fused traces ("Too many
         // inputs/outputs fused..."). Fall back to single-step replays,
@@ -783,6 +1094,26 @@ void Program::run_while(const Entry& e,
     const int64_t hard_floor = 8;
     const int64_t hard_every =
         period * std::max<int64_t>(1, (hard_floor + period - 1) / period);
+    // The in-flight bound (`run_single_bounded`), where the estimate says
+    // this cadence could queue more than the budget between two blocking
+    // points -- and where nothing inside an iteration waits for the device
+    // already: a body that runs as ONE compiled graph, or an interpreted one
+    // too small for its own eager flush to fire.  An interpreted body the
+    // estimate puts past METALJAX_EAGER_FLUSH_MB settles itself inside
+    // every iteration (those flushes block, METALJAX_EAGER_FLUSH_SYNC=1),
+    // which bounds what it leaves in flight, and it is left exactly as it
+    // was.  Everywhere else, the cadence below exactly as it was.
+    const int64_t budget = g_cfg.loop_inflight_bytes;
+    const bool self_settling =
+        !runner.compiled() && g_cfg.eager_flush_bytes > 0 &&
+        g_cfg.flush_sync_every == 1 && body_bytes >= g_cfg.eager_flush_bytes;
+    if (budget > 0 && body_bytes > 0 && trip >= 2 && !self_settling &&
+        std::min(trip, hard_every) * body_bytes > budget) {
+      vals = run_single_bounded(body, runner, std::move(vals), trip, period,
+                                hard_every, cost, budget, body_bytes);
+      write_results(e, env, vals);
+      return;
+    }
     for (int64_t i = 1; i <= trip; i++) {
       vals = runner.run_one(vals);
       if (i % period == 0) {

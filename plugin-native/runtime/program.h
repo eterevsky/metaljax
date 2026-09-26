@@ -293,6 +293,14 @@ struct Config {
   // holds them (a KV cache root). Past this cap the bubble it hides is
   // worth less than the copy, and the loop reads first.
   int64_t while_ahead_copy_bytes = 128LL << 20;  // METALJAX_WHILE_AHEAD_COPY_MB
+  // The IN-FLIGHT budget of one loop: the device bytes its submitted but
+  // not yet completed iterations may hold (control.cc `LoopWindow`, where
+  // the reason is written out).  MLX allocates every intermediate of a
+  // submission when it ENCODES it and frees it only when the command buffer
+  // completes, so a host that runs ahead of the device holds every queued
+  // iteration's transients at once -- 5 GB for a 0.3 GB training step on
+  // the texmo 10k-weight train chunk.  0 = the op-count cadence alone.
+  int64_t loop_inflight_bytes = 1024LL << 20;  // METALJAX_LOOP_INFLIGHT_MB
   bool debug = false;                         // METALJAX_DEBUG
   bool memdbg = false;                        // METALJAX_MEMDBG
 };
@@ -308,7 +316,7 @@ void configure(int64_t eager_flush_bytes, int64_t flush_sync_every,
                int64_t loop_clear_cost, int64_t ingest_clear_bytes,
                int64_t while_pipeline, int64_t chunk_inflight,
                int64_t while_submit_ahead, int64_t while_ahead_copy_bytes,
-               bool debug, bool memdbg);
+               int64_t loop_inflight_bytes, bool debug, bool memdbg);
 
 struct Stats {
   int64_t flushes = 0;         // eager byte-denominated sync points
@@ -621,7 +629,12 @@ inline bool is_identity_perm(const std::vector<int>& p) {
 //                       position `b`; kind 2 = a constant zero
 //   kWhile              [ncarry, ncond_caps, nbody_caps, counted, k,
 //                        bound_kind, bound, cost, period, chunkable, kmax,
-//                        body_compile_max]
+//                        body_compile_max, body_bytes]
+//                       body_bytes: the lowering's estimate of the device
+//                       bytes one iteration materializes, net of its
+//                       write-only accumulators (the gate's `real=`); the
+//                       loop in-flight bound's static half. Optional: a tape
+//                       without it (12 attrs) never engages that bound.
 //                       regions [cond, body]; ins [carry..., cond caps...,
 //                       body caps...]; bound_kind 0 static N, 1 carry index,
 //                       2 index into the cond's captures
@@ -930,6 +943,15 @@ class Program {
     return true;
   }
 
+  // The same, for the loop in-flight window a run of this body settled on
+  // (control.cc `LoopWindow`): one line per distinct (group or K, keep).
+  bool narrate_window(int64_t group, int64_t keep) {
+    if (window_group_ == group && window_keep_ == keep) return false;
+    window_group_ = group;
+    window_keep_ = keep;
+    return true;
+  }
+
   size_t num_ops() const { return ops_.size(); }
   int num_slots() const { return nslots_; }
   int num_args() const { return nargs_; }
@@ -1086,6 +1108,8 @@ class Program {
   bool no_chunk_ = false;
   int64_t chunk_plan_trip_ = -1;   // last narrated chunk plan (debug only)
   int64_t chunk_plan_k_ = -1;
+  int64_t window_group_ = -1;      // last narrated in-flight window (debug)
+  int64_t window_keep_ = -1;
   // P27 + P28: what this program's own flush history has established about
   // it -- the hard-flush count and the live-set water marks `flush_bound`'s
   // three rules read. See FlushState.

@@ -319,6 +319,13 @@ void ConfigureFromEnv() {
       /*while_submit_ahead=*/EnvInt("METALJAX_WHILE_SUBMIT_AHEAD", 1),
       /*while_ahead_copy_bytes=*/EnvInt("METALJAX_WHILE_AHEAD_COPY_MB", 128) *
           (int64_t{1} << 20),
+      // The loop IN-FLIGHT budget (control.cc `LoopWindow`): the device
+      // bytes a loop's submitted-but-unfinished iterations may hold before
+      // the host waits for the oldest.  0 restores the op-count cadence
+      // alone.
+      /*loop_inflight_bytes=*/
+      std::max<int64_t>(EnvInt("METALJAX_LOOP_INFLIGHT_MB", 1024), 0) *
+          (int64_t{1} << 20),
       /*debug=*/EnvFlag("METALJAX_DEBUG"),
       /*memdbg=*/EnvFlag("METALJAX_MEMDBG"));
 

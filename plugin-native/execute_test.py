@@ -12807,6 +12807,192 @@ def _p53_shifts(subprocess, pathlib, re):
             ("msl_scan declines shift loops", msl_declines_shifts)]
 
 
+# The loop in-flight bound (P54): a counted loop whose body is device-heavy
+# and host-light -- three 1024x1024 f32 products per iteration, ~16 MB of
+# transients, a 4 KB carry -- so the host builds iterations far faster than
+# the device runs them.  MLX allocates what a submission encodes and frees it
+# only when the command buffer completes, so whatever the op-count cadence
+# queues is live at once.  The probe reads MLX's own PEAK active memory (the
+# plugin's vendored libmlx, found among the loaded images), which is what the
+# bound is about and which nothing in the plugin resets.
+_P54_WINDOW = r'''
+import ctypes, os
+import numpy as np
+import jax, jax.numpy as jnp
+
+N = 1024
+TRIP = int(os.environ.get("MJ_P54_TRIP", "96"))
+rs = np.random.RandomState(11)
+w = jax.device_put(((rs.rand(N, N) - 0.5) / N).astype(np.float32))
+c0 = jax.device_put(rs.rand(N).astype(np.float32))
+
+
+def body(i, c):
+    m = jnp.outer(c, c) * jnp.float32(1e-3) + w
+    t = jnp.tanh(m @ w)
+    u = t @ w.T
+    return jnp.mean(u, axis=0) + c * jnp.float32(0.5)
+
+
+f = jax.jit(lambda c: jax.lax.fori_loop(0, TRIP, body, c))
+outs = [np.asarray(f(c0)) for _ in range(3)]
+
+
+def mlx():
+    dyld = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    dyld._dyld_get_image_name.restype = ctypes.c_char_p
+    for i in range(dyld._dyld_image_count()):
+        name = dyld._dyld_get_image_name(i).decode()
+        if name.endswith("libmlx_metaljax.dylib"):
+            lib = ctypes.CDLL(name)
+            lib._ZN3mlx4core15get_peak_memoryEv.restype = ctypes.c_size_t
+            return lib
+    raise SystemExit("libmlx_metaljax.dylib is not loaded")
+
+
+print("[probe] answer %s" % outs[-1].tobytes().hex()[:64])
+print("[probe] checksum %.9e" % float(np.sum(outs[-1].astype(np.float64))))
+print("[probe] same %d" % int(all(np.array_equal(o, outs[0]) for o in outs)))
+print("[probe] peak_mb %d" % (mlx()._ZN3mlx4core15get_peak_memoryEv() >> 20))
+'''
+
+
+def _p54_loop_window(subprocess, tempfile, pathlib, re):
+    """The loop IN-FLIGHT bound (control.cc `LoopWindow`,
+    METALJAX_LOOP_INFLIGHT_MB).
+
+    A counted loop's cadences bound the OP COUNT between its sync points,
+    never the bytes those ops hold -- and MLX allocates every intermediate
+    of a submission at ENCODE time and frees it only when its command
+    buffer completes, so a host that outruns the device holds every queued
+    iteration's transients at once: the texmo 10k-weight train chunk held
+    5.5 GB for a 0.3 GB step (14 iterations per submission), and a crowded
+    32 GB machine refused it.  Where the lowering's estimate says the
+    cadence could queue more than the budget, the loop now measures what
+    one submission holds (active-memory growth, on a quiet device) and keeps
+    only as many in flight as fit, waiting on the OLDEST.
+
+    Pinned on `_P54_WINDOW` (a 96-step fori_loop of three 1024^2 products,
+    ~16 MB of transients per iteration) with msl_scan off, from both arms:
+      * the single-step arm (chunking forced off with
+        METALJAX_CHUNK_MAX_COST=0): under a 128 MB budget MLX's peak stays
+        near it and the loop narrates its window; with the knob at 0 the
+        op-count cadence is back -- no window, a 64-iteration submission,
+        and a peak several times higher;
+      * the chunked arm (METALJAX_CHUNK_MAX=4, 64 MB chunks): the in-flight
+        ring shrinks from METALJAX_CHUNK_INFLIGHT=4 to what the budget holds;
+      * the answers are BIT-identical across every arm: only where the host
+        waits moves.
+    """
+    memo = {}
+    WIN = re.compile(r"\] loop window: trip=(\d+) period=(\d+) est=(\d+)MB/iter "
+                     r"(\w[\w-]*)=(\d+)MB/iter budget=(\d+)MB group=(\d+) "
+                     r"keep=(\d+)")
+    CWIN = re.compile(r"\] chunked loop window: trip=(\d+) K=(\d+) "
+                      r"est=\d+MB/iter measured=(\d+)MB/chunk budget=(\d+)MB "
+                      r"keep=(\d+) \(inflight (\d+)\)")
+
+    def arm(extra):
+        key = tuple(sorted(extra.items()))
+        if key in memo:
+            return memo[key]
+        env = dict(os.environ)
+        env["METALJAX_DEBUG"] = "1"
+        env["METALJAX_MSL"] = "0"
+        env["JAX_PLATFORMS"] = "metal"
+        env.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        env.update(extra)
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(_P54_WINDOW)
+            script = fh.name
+        try:
+            proc = subprocess.run([sys.executable, script], env=env,
+                                  capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(script)
+            except OSError:
+                pass
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout
+                                ).strip().splitlines()[-1][:110])
+        text = proc.stdout + proc.stderr
+        probe = dict(re.findall(r"\[probe\] (\w+) (\S+)", proc.stdout))
+        memo[key] = (probe, WIN.findall(text), CWIN.findall(text), text)
+        return memo[key]
+
+    SINGLE = {"METALJAX_CHUNK_MAX_COST": "0"}
+    CHUNK = {"METALJAX_CHUNK_MAX": "4"}
+    ON = {"METALJAX_LOOP_INFLIGHT_MB": "128"}
+    OFF = {"METALJAX_LOOP_INFLIGHT_MB": "0"}
+
+    def single_step_stays_under_the_budget():
+        probe, wins, _c, _t = arm({**SINGLE, **ON})
+        if probe.get("same") != "1":
+            return False, "the three calls disagree"
+        if not wins:
+            return False, "no `loop window:` narration under a 128 MB budget"
+        _trip, _period, _est, how, unit, budget, group, keep = wins[-1]
+        peak = int(probe["peak_mb"])
+        # The budget, plus what lives outside the window: the weights and
+        # carries (~4 MB) and one submission's overshoot of the estimate.
+        if peak > 128 + 64:
+            return False, (f"peak {peak} MB over a 128 MB budget ({how}="
+                           f"{unit}MB/iter group={group} keep={keep})")
+        return True, (f"peak {peak} MB, {how}={unit}MB/iter group={group} "
+                      f"keep={keep}")
+
+    def knob_off_restores_the_cadence():
+        on, _w, _c, _t = arm({**SINGLE, **ON})
+        off, wins, _c2, _t2 = arm({**SINGLE, **OFF})
+        if wins:
+            return False, f"the knob at 0 still narrated a window: {wins[-1]}"
+        if off.get("answer") != on.get("answer"):
+            return False, "the arms disagree (only sync points may move)"
+        p_on, p_off = int(on["peak_mb"]), int(off["peak_mb"])
+        if p_off < 3 * p_on:
+            return False, (f"op-count cadence peaked at {p_off} MB against "
+                           f"{p_on} MB bounded: the probe no longer queues")
+        return True, f"peak {p_off} MB unbounded vs {p_on} MB, same answer"
+
+    def chunked_ring_shrinks_to_the_budget():
+        on, _w, cwins, _t = arm({**CHUNK, **ON})
+        off, _w2, cwins_off, _t2 = arm({**CHUNK, **OFF})
+        if not cwins:
+            return False, "no `chunked loop window:` narration"
+        if cwins_off:
+            return False, f"the knob at 0 still narrated {cwins_off[-1]}"
+        _trip, k, unit, budget, keep, inflight = cwins[-1]
+        if int(keep) >= int(inflight):
+            return False, (f"K={k} chunks of {unit} MB kept {keep} of "
+                           f"{inflight} in flight under 128 MB")
+        if off.get("answer") != on.get("answer"):
+            return False, "the arms disagree (only sync points may move)"
+        p_on, p_off = int(on["peak_mb"]), int(off["peak_mb"])
+        # keep + 1 chunks in flight (never fewer than two), plus the ~4 MB
+        # of weights and carries; the fixed ring holds `inflight + 1`.
+        if p_on > max(128, 2 * int(unit)) + 64 or 2 * p_off < 3 * p_on:
+            return False, (f"peak {p_on} MB bounded vs {p_off} MB at the "
+                           f"fixed ring (chunks of {unit} MB, keep {keep})")
+        return True, (f"K={k}: {unit} MB/chunk, keep {keep} of {inflight}: "
+                      f"peak {p_on} MB vs {p_off} MB")
+
+    def the_default_budget_moves_no_answer():
+        base, _w, _c, _t = arm({**SINGLE, **OFF})
+        dflt, _w2, _c2, _t2 = arm(dict(SINGLE))
+        chunk, _w3, _c3, _t3 = arm(dict(CHUNK))
+        if not (base.get("answer") == dflt.get("answer")
+                == chunk.get("answer")):
+            return False, "answers differ across the default arms"
+        return True, "single-step, chunked and unbounded agree bit for bit"
+
+    return [("loop window: single-step bound", single_step_stays_under_the_budget),
+            ("loop window: knob off = cadence", knob_off_restores_the_cadence),
+            ("loop window: chunked ring", chunked_ring_shrinks_to_the_budget),
+            ("loop window: answers", the_default_budget_moves_no_answer)]
+
+
 def _p38_chunk_plan(subprocess, pathlib, re):
     """The chunked replay's schedule and its byte bound (T4, findings2).
 
@@ -13947,6 +14133,8 @@ def main():
                          + _p53_shifts(subprocess, pathlib, __import__("re"))
                          + _p38_chunk_plan(subprocess, pathlib,
                                            __import__("re"))
+                         + _p54_loop_window(subprocess, tempfile, pathlib,
+                                            __import__("re"))
                          + _p47_chunk_donate(subprocess, pathlib,
                                              __import__("re"))
                          + _p39_kv_inplace(subprocess, pathlib,

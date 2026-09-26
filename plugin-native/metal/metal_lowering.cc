@@ -7273,8 +7273,13 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
   // are big, because every chunk boundary copies them.
   int64_t chain_bytes = 0;
   const int64_t acc_mb = AccumulatorBytes(*ctx_, body_block, &chain_bytes) >> 20;
-  const int64_t real_mb =
-      std::max<int64_t>(0, BlockBytes(*ctx_, body_block) - chain_bytes) >> 20;
+  // The body's bytes net of its write-only accumulators, which also rides to
+  // the executor (attrs[12]): the static half of the loop's IN-FLIGHT bound
+  // (runtime/control.cc `LoopWindow`), which engages only where this
+  // estimate says the op-count cadence could queue more than the budget.
+  const int64_t real_bytes =
+      std::max<int64_t>(0, BlockBytes(*ctx_, body_block) - chain_bytes);
+  const int64_t real_mb = real_bytes >> 20;
   const bool acc_veto = kChunkAccMb >= 0 && acc_mb > kChunkAccMb;
   const int64_t by_chunk_bytes =
       (kChunkBytesMb <= 0 || acc_veto)
@@ -7341,7 +7346,8 @@ absl::Status Lowering::LowerWhile(mlir::Operation* op) {
                              period,
                              chunkable,
                              kmax,
-                             body_compile_max};
+                             body_compile_max,
+                             real_bytes};
 
   std::vector<int> ins;
   for (mlir::Value v : op->getOperands()) {
