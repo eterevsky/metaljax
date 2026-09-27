@@ -12993,6 +12993,235 @@ def _p54_loop_window(subprocess, tempfile, pathlib, re):
             ("loop window: answers", the_default_budget_moves_no_answer)]
 
 
+# The governor's hard line gives back what the process RETAINS (P55): the
+# P54 loop again, with the in-flight bound OFF so the op-count cadence queues
+# a submission's worth of transients -- which land in MLX's buffer cache when
+# their command buffers complete, and stay there.  The process then holds
+# ~1 GB for a loop whose live set is a few MB.  Two calls, so the second one
+# meets the first one's cache; after them the child clears MLX's pool itself
+# and waits for the OS to take the pages back, which is the SETTLED footprint
+# the budget below is placed against.  Footprints are the guard's metric
+# (`phys_footprint`, read through proc_pid_rusage).
+_P55_RETENTION = r'''
+import ctypes, os, time
+import numpy as np
+import jax, jax.numpy as jnp
+
+
+class _RU(ctypes.Structure):   # rusage_info_v2, whole: the kernel writes all of it
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [(n, ctypes.c_uint64) for n in (
+        "ri_user_time", "ri_system_time", "ri_pkg_idle_wkups",
+        "ri_interrupt_wkups", "ri_pageins", "ri_wired_size", "ri_resident_size",
+        "ri_phys_footprint", "ri_proc_start_abstime", "ri_proc_exit_abstime",
+        "ri_child_user_time", "ri_child_system_time", "ri_child_pkg_idle_wkups",
+        "ri_child_interrupt_wkups", "ri_child_pageins",
+        "ri_child_elapsed_abstime", "ri_diskio_bytesread",
+        "ri_diskio_byteswritten")]
+
+
+_LIBC = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+
+
+def foot_mb():
+    r = _RU()
+    _LIBC.proc_pid_rusage(os.getpid(), 2, ctypes.byref(r))
+    return r.ri_phys_footprint >> 20
+
+
+N = 1024
+TRIP = 256
+rs = np.random.RandomState(11)
+w = jax.device_put(((rs.rand(N, N) - 0.5) / N).astype(np.float32))
+c0 = jax.device_put(rs.rand(N).astype(np.float32))
+
+
+def body(i, c):
+    m = jnp.outer(c, c) * jnp.float32(1e-3) + w
+    t = jnp.tanh(m @ w)
+    u = t @ w.T
+    return jnp.mean(u, axis=0) + c * jnp.float32(0.5)
+
+
+f = jax.jit(lambda c: jax.lax.fori_loop(0, TRIP, body, c))
+outs = []
+for k in range(2):
+    try:
+        outs.append(np.asarray(f(c0)))
+        print("[probe] retained_mb %d" % foot_mb(), flush=True)
+    except BaseException as exc:                                # noqa: BLE001
+        print("[probe] raised %s" % " ".join(str(exc).split())[:600],
+              flush=True)
+        break
+if len(outs) == 2:
+    print("[probe] answer %s" % outs[-1].tobytes().hex()[:64])
+    print("[probe] same %d" % int(np.array_equal(outs[0], outs[1])))
+dyld = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+dyld._dyld_get_image_name.restype = ctypes.c_char_p
+for i in range(dyld._dyld_image_count()):
+    name = dyld._dyld_get_image_name(i).decode()
+    if name.endswith("libmlx_metaljax.dylib"):
+        ctypes.CDLL(name)._ZN3mlx4core11clear_cacheEv()
+time.sleep(1.0)   # the OS takes released Metal pages back asynchronously
+print("[probe] settled_mb %d" % foot_mb())
+'''
+
+
+# ...and a program that is REALLY over: `_GOV_GROWTH`'s shape (512 MB of
+# live arrays a step, all kept), printing the refusal whole -- the split is
+# at its end.
+_P55_OVER = r'''
+import numpy as np, jax, jax.numpy as jnp
+
+x = jax.device_put(np.zeros(1 << 27, np.float32))          # 512 MB
+step = [jax.device_put(np.float32(i)) for i in range(32)]
+f = jax.jit(lambda a, i: a + i)
+held = []
+for i in range(32):
+    try:
+        held.append(f(x, step[i]))
+    except BaseException as exc:                            # noqa: BLE001
+        print("[probe] refused at %d: %s" % (i, " ".join(str(exc).split())))
+        break
+else:
+    print("[probe] never refused")
+print("[probe] alive")
+'''
+
+
+def _p55_hard_line_reclaim(subprocess, tempfile, pathlib, re):
+    """Past a hard line the governor gives back what the process RETAINS
+    before it stalls or refuses (memory.cc `reclaim_hard`).
+
+    The texmo train chunk was refused holding 5.1 GB in MLX's buffer cache
+    and 0.03 GB live ("Needed 0.0 GB more"): the hard line's one reclaim was
+    rate-limited away (a reclaim had run <250 ms earlier) or ran before the
+    buffers reached the cache (in flight, or waiting on their command
+    buffer's completion handler), and the stall never cleared again.  Now the
+    hard line SETTLES the device, clears with no rate limit, and does both
+    again at every stall tick.
+
+    Pinned on `_P55_RETENTION` (the P54 loop, in-flight bound off, ~1 GB
+    retained over a few-MB live set), from three arms:
+      * no budget: the precondition -- the process really retains that
+        much more than its settled footprint;
+      * METALJAX_MEM_BUDGET_MB halfway between the two: both calls complete
+        with the unbudgeted arm's answer, and the narration shows the hard
+        line reclaiming from the cache (the pre-fix binary, b583c2c,
+        refuses here in every run measured, 6 of 6: "this process holds
+        1.0 GB" of a ~0.3 GB settled footprint);
+      * a program that is REALLY over (`_P55_OVER`, 512 MB of live arrays a
+        step past 4 GB) still refuses, promptly -- the stall bounded by
+        METALJAX_MEM_STALL_MS -- and the refusal splits what the process
+        holds into live arrays, MLX's cache and the rest, with the live
+        arrays carrying it.
+    """
+    STALL_MS = 2000
+    memo = {}
+
+    def run(source, extra):
+        key = (source is _P55_RETENTION, tuple(sorted(extra.items())))
+        if key in memo:
+            return memo[key]
+        env = dict(os.environ)
+        env.update({"METALJAX_MSL": "0", "METALJAX_LOOP_INFLIGHT_MB": "0",
+                    "METALJAX_MEMDBG": "1", "JAX_PLATFORMS": "metal",
+                    "METALJAX_MEM_STALL_MS": str(STALL_MS),
+                    "METALJAX_MEM_SAMPLE_US": "0"})   # never a stale sample
+        env.setdefault("METALJAX_PLUGIN_PATH", str(_DEFAULT_DYLIB))
+        env.update({k: str(v) for k, v in extra.items()})
+        with tempfile.NamedTemporaryFile("w", suffix=".py",
+                                         delete=False) as fh:
+            fh.write(source)
+            script = fh.name
+        try:
+            proc = subprocess.run([sys.executable, script], env=env,
+                                  capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(script)
+            except OSError:
+                pass
+        out = (proc.stdout or "") + (proc.stderr or "")
+        probe = {}
+        for k, v in re.findall(r"\[probe\] (\w+) (.*)", proc.stdout or ""):
+            probe.setdefault(k, v.strip())
+        memo[key] = (proc.returncode, probe, out)
+        return memo[key]
+
+    def free_arm():
+        rc, probe, out = run(_P55_RETENTION, {})
+        if rc or "raised" in probe or "settled_mb" not in probe:
+            raise RuntimeError(f"the unbudgeted arm failed: {out.strip()[-160:]}")
+        retained = max(int(m) for m in re.findall(
+            r"\[probe\] retained_mb (\d+)", out))
+        return probe, retained, int(probe["settled_mb"])
+
+    def the_probe_retains_its_cache():
+        _probe, retained, settled = free_arm()
+        if retained - settled < 400:
+            return False, (f"retained {retained} MB against {settled} MB "
+                           "settled: the probe no longer fills MLX's cache")
+        return True, f"retained {retained} MB, settled {settled} MB"
+
+    def retention_is_reclaimed_not_refused():
+        free, retained, settled = free_arm()
+        if retained - settled < 400:
+            return False, "precondition failed (see the probe arm)"
+        budget = (retained + settled) // 2
+        rc, probe, out = run(_P55_RETENTION,
+                             {"METALJAX_MEM_BUDGET_MB": budget})
+        if rc:
+            return False, out.strip()[-160:]
+        if "raised" in probe:
+            return False, (f"refused under a {budget} MB budget (settled "
+                           f"{settled} MB): {probe['raised'][:200]}")
+        if probe.get("same") != "1" or probe.get("answer") != free.get("answer"):
+            return False, "the budgeted arm's answer differs"
+        reclaims = re.findall(
+            r"reclaimed: (?:hard line|stall tick \d+) \(settled in [\d.]+ ms"
+            r"[^;]*; MLX cache [\d.]+ GB found, ([\d.]+) GB once settled, "
+            r"cleared to ([\d.]+) GB", out)
+        took = [float(a) for a, b in reclaims if float(b) == 0.0]
+        if not took or max(took) < 0.1:
+            return False, (f"the hard line never reclaimed the cache "
+                           f"({len(reclaims)} reclaims narrated)")
+        stalls = [float(s) for s in re.findall(r"stalled=([\d.]+)ms", out)]
+        return True, (f"budget {budget} MB: {len(reclaims)} hard-line "
+                      f"reclaims, up to {max(took):.1f} GB each, longest "
+                      f"stall {max(stalls or [0.0]):.0f} ms")
+
+    def really_over_still_refuses():
+        rc, _probe, out = run(_P55_OVER, {"METALJAX_MEM_BUDGET_MB": 4096})
+        if rc:
+            return False, out.strip()[-160:]
+        if "[probe] never refused" in out:
+            return False, "16 GB of live arrays admitted under a 4 GB budget"
+        if "[probe] alive" not in out:
+            return False, "the process did not survive its refusal"
+        m = re.search(r"this process holds ([\d.]+) GB \(([\d.]+) GB in live "
+                      r"MLX arrays, ([\d.]+) GB in MLX's buffer cache, "
+                      r"([\d.]+) GB other\)", out)
+        if not m:
+            return False, f"no split in the refusal: {out.strip()[-200:]}"
+        held, live, cache, _other = (float(g) for g in m.groups())
+        if live < 3.0 or cache > 0.1:
+            return False, (f"holds {held} GB split {live} live / {cache} "
+                           "cached: the split does not show the real need")
+        stalls = [float(s) for s in re.findall(r"refused: .*stalled=([\d.]+)ms",
+                                               out)]
+        if len(stalls) != 1:
+            return False, f"{len(stalls)} refusals narrated for one"
+        if stalls[0] > STALL_MS + 500:
+            return False, (f"stalled {stalls[0]:.0f} ms against "
+                           f"METALJAX_MEM_STALL_MS={STALL_MS}")
+        return True, (f"holds {held} GB ({live} live, {cache} cached), "
+                      f"refused after {stalls[0]:.0f} ms")
+
+    return [("hard line: the probe retains", the_probe_retains_its_cache),
+            ("hard line: reclaims retention", retention_is_reclaimed_not_refused),
+            ("hard line: over still refuses", really_over_still_refuses)]
+
+
 def _p38_chunk_plan(subprocess, pathlib, re):
     """The chunked replay's schedule and its byte bound (T4, findings2).
 
@@ -14135,6 +14364,8 @@ def main():
                                            __import__("re"))
                          + _p54_loop_window(subprocess, tempfile, pathlib,
                                             __import__("re"))
+                         + _p55_hard_line_reclaim(subprocess, tempfile,
+                                                  pathlib, __import__("re"))
                          + _p47_chunk_donate(subprocess, pathlib,
                                              __import__("re"))
                          + _p39_kv_inplace(subprocess, pathlib,

@@ -28,7 +28,8 @@ The largest tensor in the program is 32 MB. Kit (module, repro, lowered-ceiling 
   stall never reclaims again. Traced through the stall: MLX active 0.03 GB, cache 5.12 GB, then the
   refusal "this process holds 5.4 GB" -- almost all of it reclaimable cache. Reproduced by setting
   `METALJAX_MEM_SYS_MB` to this machine's baseline + 1.5 / 3 / 4.5 GB: all three refused. (The
-  governor's stall loop is a separate, unfixed issue; this change removes the cause.)
+  governor's side is fixed separately: past a hard line it now settles the device and clears MLX's
+  cache before the stall and at every tick of it -- runtime/memory.cc `reclaim_hard`.)
 
 ## The fix (runtime/control.cc `LoopWindow`)
 

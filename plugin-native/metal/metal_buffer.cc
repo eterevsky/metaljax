@@ -298,18 +298,23 @@ absl::StatusOr<std::unique_ptr<xla::PjRtBuffer>> MetalBuffer::CopyToMemorySpace(
         "supported.");
   }
   ASSIGN_OR_RETURN(mx::array settled, Settled());
-  // The governor gates this bulk path too (the no-panic contract): a loop of
-  // `device_put(x, may_alias=False)` moves a model's worth of bytes, and the
-  // gate has to be BEFORE the copy that makes them resident.
-  try {
-    governor_admit(static_cast<int64_t>(settled.nbytes()), MemWhere::kIngest);
-  } catch (const std::exception& e) {
-    return absl::ResourceExhaustedError(e.what());
-  }
-  mx::array fresh = mx::copy(settled);
+  mx::array fresh = mx::copy(settled);   // lazy: nothing allocated yet
   {
     BindThread();
     std::unique_lock<std::recursive_mutex> submission = SubmissionLock();
+    // The governor gates this bulk path too (the no-panic contract): a loop
+    // of `device_put(x, may_alias=False)` moves a model's worth of bytes, and
+    // the gate has to be BEFORE the eval that makes them resident.  INSIDE
+    // the submission lock, like every other call site: past a hard line the
+    // governor settles the device, which commits and waits on this thread's
+    // MLX stream -- a stream another thread may be encoding into unless the
+    // lock keeps it out (runtime/memory.cc `reclaim_hard`).
+    try {
+      governor_admit(static_cast<int64_t>(settled.nbytes()),
+                     MemWhere::kIngest);
+    } catch (const std::exception& e) {
+      return absl::ResourceExhaustedError(e.what());
+    }
     fresh.eval();   // honestly ready, like every buffer this plugin hands out
     // The second bulk-ingest entry: a loop of `device_put(x, may_alias=False)`
     // moves as many bytes as one of BufferFromHostBuffer, and unlike that one

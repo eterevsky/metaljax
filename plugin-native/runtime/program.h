@@ -357,6 +357,11 @@ struct Stats {
   int64_t mem_stalls = 0;       // ladder step 3: waits that cleared
   int64_t mem_stall_ns = 0;     // ...time spent waiting (cleared or not)
   int64_t mem_refusals = 0;     // ladder step 4: clean OOM errors raised
+  // Past a hard line the governor settles the device before it clears
+  // (memory.cc `reclaim_hard`): the time those settles took, and what the
+  // clears after them handed back from MLX's pool.
+  int64_t mem_settle_ns = 0;
+  int64_t mem_cleared_bytes = 0;
   int64_t pages_released = 0;   // page-cache bytes invalidated after ingest
   int64_t pages_deactivated = 0;  // ...and bytes only deactivated (COW maps)
   int64_t page_sweeps = 0;      // sweeps of this process's own mappings

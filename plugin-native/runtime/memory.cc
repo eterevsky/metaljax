@@ -48,6 +48,7 @@
 #include "program.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -417,12 +418,19 @@ std::string where_name(MemWhere where) {
   return "?";
 }
 
-void meter(const char* tag, const MemSample& s, int64_t want) {
+void meter(const char* tag, const MemSample& s, int64_t want,
+           const std::string& suffix = std::string()) {
   if (!g_cfg.memdbg && !g_cfg.debug) return;
+  // `active=`/`cache=` split what `foot=` holds between MLX's live arrays and
+  // its buffer pool -- the difference between a process that NEEDS its
+  // footprint and one that is merely retaining it.  Appended after `press=`
+  // so a reader of the older fields reads them unchanged.
   debug_line("[metaljax-gov] " + std::string(tag) + ": want=" + gb(want) +
              "G foot=" + gb(s.footprint) + "G claimed=" + gb(s.claimed) +
              "G free=" + gb(s.free) + "G file=" + gb(s.file) +
-             "G press=" + std::to_string(s.pressure));
+             "G press=" + std::to_string(s.pressure) + " active=" +
+             gb(static_cast<int64_t>(mx::get_active_memory())) + "G cache=" +
+             gb(static_cast<int64_t>(mx::get_cache_memory())) + "G" + suffix);
 }
 
 // Reclaim what this process can, at most once every 250 ms: a governor that
@@ -441,6 +449,174 @@ void reclaim(const char* why) {
   // pressure can arrive between two transfers (or in a phase that makes none).
   sweep_page_cache(g_gov.sweep_min);
   if (g_cfg.memdbg) debug_line("[metaljax-gov] reclaimed: " + std::string(why));
+}
+
+// --------------------------------------------------------------------------
+// past the hard line: settle, then reclaim
+// --------------------------------------------------------------------------
+//
+// `reclaim` above is the SOFT line's lever, and both of its properties are
+// wrong past a hard line, where the caller is about to stall or fail:
+//
+//  * its 250 ms rate limit. It exists so a steady state that brushes the
+//    squeeze line does not dump MLX's pool at every admit (P25's 70 ms a
+//    clear). Past a hard line there is no steady state to protect, and the
+//    limit is what refused the texmo train chunk: one loop sync point's
+//    hard line reclaimed and stalled until the footprint fell, the NEXT sync
+//    point was over the line again inside 250 ms of that reclaim, and its
+//    reclaim was skipped -- then five seconds of stall with 5.1 GB in MLX's
+//    cache and 0.03 GB live, and a refusal that said the process holds
+//    5.4 GB and needs 0.0 GB more.
+//  * its timing. A clear can only return buffers that are IN the cache, and
+//    at a governor call site they often are not yet: a loop sync point
+//    leaves the chunks it submitted asynchronously still running (their
+//    transients are ACTIVE), and even after a blocking eval the buffers
+//    reach the cache only later -- MLX's blocking eval returns when the
+//    device SIGNALS the last command buffer's event, and the buffers are
+//    released afterwards, in that buffer's completion handler (control.cc
+//    `run_single_bounded` measured the gap: active memory read right after a
+//    blocking eval showed 0 MB for a 375 MB iteration). A few milliseconds
+//    later the handlers have moved everything into the cache, and nothing
+//    was going to clear it again.
+//
+// So past a hard line the governor SETTLES the device first -- waits for the
+// work in flight and then for its completion handlers -- and clears after,
+// with no rate limit; and it does so again on every stall tick, so that what
+// finishes during a stall goes back to the OS at once.
+//
+// THE WAIT, and why it cannot wedge. `mx::synchronize()` commits this
+// thread's stream and blocks until its last command buffer completes. It
+// waits on a COMMAND BUFFER, never on an array's event: the wedge
+// `loop_submit` guards against (an `async_eval` that threw mid-walk leaves
+// arrays with events nothing will signal, and `Event::wait` has no timeout)
+// is a host-side wait on one of those events, which this is not. Nor can the
+// command buffer itself be waiting on one: within a stream MLX orders work by
+// position and encodes no event waits; it encodes a GPU-side wait only for an
+// input ANOTHER stream produced, whose signal that stream's eval committed
+// before it returned. (The exception is the same abandoned walk, an event
+// whose signal was never encoded -- and a stream that has encoded a wait on
+// one of those is wedged at its next blocking read whatever the governor
+// does; the governor cannot turn a healthy stream into that.) The handler
+// wait after it is a poll with a cap. control.cc's submit-ahead recovery
+// makes the same call for the same reason (retiring whatever an abandoned
+// walk encoded).
+//
+// THE STREAM, and why every caller must hold the submission lock. The stream
+// `synchronize` commits is THIS thread's, but a thread-unsafe stream is
+// evaluable from any thread (metal_stream.h), and another thread reading one
+// of this thread's results encodes into this stream's encoder. Every
+// `governor_admit` call site holds `SubmissionLock()`, so in the shipped
+// configuration no other thread is encoding:
+//   * the transfers (metal_client.cc `BufferFromHostBuffer`; metal_buffer.cc
+//     `CopyToMemorySpace`, whose gate moved inside the lock for this);
+//   * program entry (metal_executable.cc `RunOnce`), and the pack wave it
+//     runs (metal_stacked.cc, metal_proj.cc) -- which also holds the
+//     executable's `fuse_mu_`, a lock nothing on the device side takes;
+//   * hard flushes (program.cc, right after a blocking eval);
+//   * loop sync points (runtime.cc `loop_account`), which on a pipelined or
+//     windowed loop run with the loop's own submissions in flight: the
+//     settle waits for them, so past a hard line the loop gives up its
+//     host/device overlap at that sync point -- the degrade.
+// None of them is inside an MLX eval or an `mx::compile` trace. Under
+// METALJAX_CONCURRENT_EXECUTE=1 that lock owns nothing, so the governor does
+// not commit -- it only polls, bounded, for what is already committed to
+// finish -- and a stall tick picks up whatever completes later.
+
+// The flag `SubmissionLock` reads (metal_stream.cc), read the same way.
+bool submission_serialized() {
+  static const bool serialized = [] {
+    const char* v = std::getenv("METALJAX_CONCURRENT_EXECUTE");
+    return !(v != nullptr && std::string(v) == "1");
+  }();
+  return serialized;
+}
+
+// How long the settle waits for completion handlers once the device is done
+// with its buffers (or, under concurrent execute, for committed work at all).
+// Handlers run microseconds after the device finishes; the cap is for a
+// queue some other thread keeps busy, where waiting for "idle" could last as
+// long as that thread runs -- a stall tick settles again 10 ms later.
+constexpr uint64_t kSettleCapNs = 50ull * 1000 * 1000;
+
+// Wait for the device: this thread's stream drained (when that is safe, see
+// above), then every committed command buffer's completion handler run.
+// Returns whether the handlers all ran inside the cap.
+bool settle_device() {
+  if (submission_serialized()) {
+    try {
+      mx::synchronize();
+    } catch (const std::exception& e) {
+      // A command buffer that FAILED reports here -- the device's error, not
+      // the governor's, and the events MLX poisoned with it still raise it
+      // to whoever waits on that work. The settle has done its job either
+      // way: a failed buffer has completed.
+      if (g_cfg.memdbg || g_cfg.debug)
+        debug_line(std::string("[metaljax-gov] settle: the device reported: ") +
+                   e.what());
+    }
+  }
+  const uint64_t t0 = now_ns();
+  mx::metal::DispatchStats d = mx::metal::dispatch_stats();
+  while (d.completed_command_buffers < d.command_buffers) {
+    if (now_ns() - t0 >= kSettleCapNs) return false;
+    struct timespec ts = {0, 20000L};   // 20 us, as DispatchSnapshotSettled
+    nanosleep(&ts, nullptr);
+    d = mx::metal::dispatch_stats();
+  }
+  return true;
+}
+
+// What one hard-line reclaim did, for the narration.
+struct HardReclaim {
+  int64_t settle_ns = 0;
+  bool settled = true;
+  int64_t cache_found = 0;     // MLX's cache when the governor arrived
+  int64_t cache_settled = 0;   // ...once the device had settled
+  int64_t live = 0;            // MLX's active memory after the settle
+};
+
+// Past a hard line: settle, then reclaim -- unconditionally, and exactly the
+// levers `reclaim` pulls (gc, MLX's pool, this process's mapped pages).
+// `collect` gates the Python collection: it takes the GIL and walks the whole
+// heap (tens of ms in a jax process, stopping every other Python thread), so
+// the stall ticks run it once a second rather than at every 10 ms tick --
+// what a tick is for is the device's tail reaching MLX's pool, which the clear
+// returns without it.
+HardReclaim reclaim_hard(bool collect) {
+  HardReclaim r;
+  r.cache_found = static_cast<int64_t>(mx::get_cache_memory());
+  const uint64_t t0 = now_ns();
+  r.settled = settle_device();
+  r.settle_ns = static_cast<int64_t>(now_ns() - t0);
+  r.cache_settled = static_cast<int64_t>(mx::get_cache_memory());
+  r.live = static_cast<int64_t>(mx::get_active_memory());
+  g_reclaim_ns = now_ns();   // ...and the soft line's reclaim has nothing
+                             // left to do for the next 250 ms either
+  g_stats.mem_reclaims++;
+  g_stats.mem_settle_ns += r.settle_ns;
+  if (collect) gc_collect();
+  mx::clear_cache();
+  g_stats.mem_cleared_bytes +=
+      std::max<int64_t>(0, r.cache_settled -
+                               static_cast<int64_t>(mx::get_cache_memory()));
+  sweep_page_cache(g_gov.sweep_min);
+  return r;
+}
+
+std::string ms(int64_t ns) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.1f", ns / 1e6);
+  return std::string(buf);
+}
+
+void narrate_reclaim(const std::string& why, const HardReclaim& r) {
+  if (!g_cfg.memdbg) return;
+  debug_line("[metaljax-gov] reclaimed: " + why + " (settled in " +
+             ms(r.settle_ns) + " ms" + (r.settled ? "" : ", handlers pending") +
+             "; MLX cache " + gb(r.cache_found) + " GB found, " +
+             gb(r.cache_settled) + " GB once settled, cleared to " +
+             gb(static_cast<int64_t>(mx::get_cache_memory())) +
+             " GB; live " + gb(r.live) + " GB)");
 }
 
 // The hard lines. `want` is what the caller is about to make resident.
@@ -557,6 +733,9 @@ MemSample governor_sample(bool force) {
 //   3. STALL    -- past a hard line, wait (bounded, narrated) for the
 //                  machine to come back: the memory may belong to a phase
 //                  that is about to end, and a slow answer beats an error.
+//                  Before it and at every tick of it, SETTLE the device and
+//                  clear MLX's pool (`reclaim_hard`): what the process is
+//                  retaining rather than using goes back first.
 //   4. REFUSE   -- still past the hard line: throw, which the PJRT boundary
 //                  turns into RESOURCE_EXHAUSTED naming what was needed,
 //                  what was available and which variable moves the line.
@@ -593,25 +772,61 @@ void governor_admit(int64_t want, MemWhere where) {
     return;
   }
 
-  // Hard line. Reclaim, then stall, then refuse.
-  reclaim("hard line");
+  // Hard line. Settle and reclaim, then stall -- settling and reclaiming again
+  // at every tick -- then refuse (see `reclaim_hard` for why each step
+  // settles first and none of them is rate-limited).
+  const uint64_t t_hard = now_ns();
+  const int64_t cleared0 = g_stats.mem_cleared_bytes;
+  narrate_reclaim("hard line", reclaim_hard(/*collect=*/true));
   s = governor_sample(/*force=*/true);
   if (!over_hard_line(s, want, &why)) {
     g_stats.mem_degrades++;
+    meter("hard line cleared", s, want,
+          " cleared=" + gb(g_stats.mem_cleared_bytes - cleared0) + "G in " +
+              ms(static_cast<int64_t>(now_ns() - t_hard)) + "ms");
     return;
   }
   meter("hard line", s, want);
   const uint64_t deadline = now_ns() +
       static_cast<uint64_t>(g_gov.stall_ms) * 1000000ull;
   uint64_t last_say = 0;
+  int64_t ticks = 0;
+  auto stalled = [&]() {
+    return " stalled=" + ms(static_cast<int64_t>(now_ns() - t_hard)) +
+           "ms ticks=" + std::to_string(ticks) + " cleared=" +
+           gb(g_stats.mem_cleared_bytes - cleared0) + "G";
+  };
+  // The tick is 10 ms, not the 100 it was, because the commonest stall is
+  // now the governor waiting for ITSELF: a cleared pool leaves the numbers
+  // the hard lines read only as the OS takes the released Metal buffers'
+  // pages back, which it does asynchronously. Measured (5 GB cleared, three
+  // runs): `clear_cache` returns in 0.2 ms, this process's footprint falls
+  // 40-250 ms later, and the machine's wired count -- the bulk of `claimed`,
+  // which METALJAX_MEM_SYS_MB is read against -- ~1.0 s later. A tick is
+  // cheap: a settle with nothing in flight commits one empty command buffer
+  // and returns in ~0.1 ms, a clear of an empty pool is microseconds, the
+  // page-cache sweep limits itself to once a second, and a sample is two
+  // syscalls.
+  constexpr uint64_t kTickNs = 10ull * 1000 * 1000;
   while (now_ns() < deadline) {
-    struct timespec ts = {0, 100000000L};   // 100 ms
+    const uint64_t t_tick = now_ns();
+    const uint64_t left = deadline - t_tick;
+    const uint64_t nap = left < kTickNs ? left : kTickNs;
+    struct timespec ts = {0, static_cast<long>(nap)};
     nanosleep(&ts, nullptr);
-    g_stats.mem_stall_ns += 100000000LL;
+    ticks++;
+    // What finished while this thread slept -- the tail of its own stream,
+    // or memory another process gave back -- is only returned to the OS if
+    // somebody clears MLX's pool, and past the hard line that is the
+    // governor.
+    const HardReclaim r = reclaim_hard(/*collect=*/ticks % 100 == 0);
+    if (r.cache_settled >= (1LL << 20))
+      narrate_reclaim("stall tick " + std::to_string(ticks), r);
+    g_stats.mem_stall_ns += static_cast<int64_t>(now_ns() - t_tick);
     s = governor_sample(/*force=*/true);
     if (!over_hard_line(s, want, &why)) {
       g_stats.mem_stalls++;
-      meter("stall cleared", s, want);
+      meter("stall cleared", s, want, stalled());
       return;
     }
     if (now_ns() - last_say > 1000000000ull) {
@@ -621,13 +836,23 @@ void governor_admit(int64_t want, MemWhere where) {
     }
   }
   g_stats.mem_refusals++;
-  meter("refused", s, want);
+  meter("refused", s, want, stalled());
+  // What the process holds, split three ways: MLX's live arrays (what the
+  // program really needs), MLX's buffer pool (retention -- and just cleared,
+  // so a large number here would be a governor bug), and the rest of the
+  // footprint (transferred buffers MLX adopted without counting them, host
+  // memory, the runtime itself).
+  const int64_t live = static_cast<int64_t>(mx::get_active_memory());
+  const int64_t pool = static_cast<int64_t>(mx::get_cache_memory());
+  const int64_t other = std::max<int64_t>(0, s.footprint - live - pool);
   throw std::runtime_error(
       "metaljax out of memory at " + where_name(where) + ": " + why +
       ". Needed " + gb(want) + " GB more; the machine has " + gb(s.total) +
       " GB total, " + gb(s.free) + " GB free and " + gb(s.file) +
       " GB in the page cache, and this process holds " + gb(s.footprint) +
-      " GB. Raise METALJAX_MEM_BUDGET_MB / METALJAX_MEM_SYS_MB to allow more "
+      " GB (" + gb(live) + " GB in live MLX arrays, " + gb(pool) +
+      " GB in MLX's buffer cache, " + gb(other) + " GB other). "
+      "Raise METALJAX_MEM_BUDGET_MB / METALJAX_MEM_SYS_MB to allow more "
       "(at the risk of paging the machine), or run a smaller model.");
 }
 
