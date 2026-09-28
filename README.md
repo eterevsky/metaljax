@@ -17,7 +17,7 @@ hood a native plugin lowers the compiled StableHLO programs onto
 via Metal. The wheel carries its own patched MLX runtime, so nothing else
 needs installing.
 
-**Status**: beta. Twenty-one real models — LLM decode (dense, MoE,
+**Status**: beta. Twenty real models — LLM decode (dense, MoE,
 quantized), a vision encoder, diffusion, LoRA and full-parameter training
 — run end-to-end through unmodified JAX code, and are re-measured on the
 binary of every release (the table under *Benchmarks*, the ledgers
@@ -29,6 +29,26 @@ whole-model correctness sweep against the CPU backend (106/106), and the
 model battery. Coverage gaps remain — unsupported constructs are declined
 at compile time, naming the op. If a Metal backend ever lands upstream in
 the JAX ecosystem, this package will be deprecated in its favor.
+
+## What's new in 0.11.9
+
+- **Training loops no longer hold many steps' worth of memory at once.** A
+  counted loop (a `lax.scan` over training steps) used to decide how much
+  work to queue ahead of the GPU by op count alone, and MLX allocates every
+  intermediate when work is queued — so a 10k-weight recurrent LM's
+  256-step training chunk briefly held 5 GB for a 0.3 GB working set and
+  died with `RESOURCE_EXHAUSTED` on a busy 32 GB machine. Loops now measure
+  what each queued step holds and keep at most `METALJAX_LOOP_INFLIGHT_MB`
+  (1 GB) in flight, waiting on the oldest step so the GPU stays busy: that
+  chunk now peaks at 1.1 GB and runs ~17 % faster (the old cadence drained
+  the GPU at every sync), and texmo's own multi-model training loop peaks
+  at 4.9 GB instead of 8.5.
+- **The memory governor gives back its own cache before it gives up.**
+  Past a hard line it now waits for in-flight GPU work to finish and clears
+  MLX's buffer cache, at the start of the stall and on every tick of it,
+  instead of once and rate-limited; a refusal now says how much of what the
+  process holds is live arrays and how much is cache.
+  Details: [`notes/loop-inflight-window-2026-09.md`](notes/loop-inflight-window-2026-09.md).
 
 ## What's new in 0.11.8
 
@@ -342,6 +362,7 @@ category in [`notes/env-flags.md`](notes/env-flags.md).
 | `METALJAX_EAGER_FLUSH_MB` | `1024` | Safety net for programs that run op by op: after this much estimated result data with no sync point, the engine settles what is live so the pending graph stays bounded. `0` disables it. |
 | `METALJAX_INGEST_CLEAR_MB` | `8192` | Reclamation cadence of the host→device transfer path, in megabytes ingested — a model load reaches no other sync point. `0` disables it. |
 | `METALJAX_CHUNK_MAX` | `16` | Max loop iterations replayed per compiled chunk. |
+| `METALJAX_LOOP_INFLIGHT_MB` | `1024` | How many bytes of submitted-but-unfinished loop iterations may be in flight before the host waits for the oldest. Bounds the memory of training loops whose host side runs ahead of the GPU; `0` restores the op-count cadence alone. |
 | `METALJAX_LOOP_SPECIALIZE` | `1` | Compile a counted loop's body once per chunk with the loop position folded into its dynamic slice starts (bit-identical, fewer dispatches). `0` replays one generic body. |
 | `METALJAX_PROJ_PACK` | `auto` | Sibling decode projections over one activation packed into one dot over concatenated weights (`_MB` caps the device memory the packs may hold). `0` declines every group, `all` packs every eligible member. |
 | `METALJAX_STACKED_PACK` | `auto` | The same for stacked per-layer dots reading one activation: one `gather_mm` over their concatenated views (`METALJAX_STACKED_RELAYOUT_MB` caps it). `0` declines, `all` packs everything. |
@@ -380,8 +401,8 @@ scripts/                   benchmark, gate & release drivers
 
 ### Real models
 
-Twenty-one models through unmodified JAX code, all measured 2026-09-23 on
-the 0.11.8 release binary (`frozen-x918main-e2ffcc75`, jax 0.11.2), one GPU process at a
+Twenty models through unmodified JAX code, all measured 2026-09-27/28 on
+the 0.11.9 release binary (`frozen-0119main-c8577cab`, jax 0.11.2), one GPU process at a
 time with a cool-down between rows, timed through `np.asarray`
 (`jax.block_until_ready` is a no-op on this backend). **goal** is the best
 non-metaljax cell for that row at the **same precision and workload** —
@@ -394,30 +415,29 @@ Metric: LLM rows = warm decode ms/token; vision = forward ms; diffusion =
 ms/diffusion-step; training = ms/step. Lower is better; ratio < 1 means
 metaljax is ahead.
 
-| # | model | metric | **metaljax 0.11.8** | goal (framework) | ratio |
+| # | model | metric | **metaljax 0.11.9** | goal (framework) | ratio |
 |---|---|---|---:|---:|---:|
-| 1 | gemma4-31B bf16 | ms/tok | **123.1** | 111.2 llama.cpp | 1.11× |
-| 2 | gemma4-12B bf16 | ms/tok | **56.2** | 44.2 llama.cpp | 1.27× |
-| 3 | gemma4-26B-A4B bf16 (MoE) | ms/tok | **31.1** | 16.9 llama.cpp | 1.84× |
+| 1 | gemma4-31B bf16 | ms/tok | **123.2** | 111.2 llama.cpp | 1.11× |
+| 2 | gemma4-12B bf16 | ms/tok | **58.1** | 44.2 llama.cpp | 1.31× |
+| 3 | gemma4-26B-A4B bf16 (MoE) | ms/tok | **31.2** | 16.9 llama.cpp | 1.85× |
 | 4 | gemma4-E2B bf16 | ms/tok | **16.9** | 10.5 mlx-lm | 1.61× |
-| 5 | Qwen3-8B bf16 | ms/tok | **36.0** | 29.6 llama.cpp | 1.22× |
-| 6 | Llama-3.1-8B bf16 | ms/tok | **38.6** | 29.2 llama.cpp | 1.32× |
+| 5 | Qwen3-8B bf16 | ms/tok | **36.2** | 29.6 llama.cpp | 1.22× |
+| 6 | Llama-3.1-8B bf16 | ms/tok | **39.2** | 29.2 llama.cpp | 1.34× |
 | 7 | gpt-oss-20b (native MXFP4) | ms/tok | **13.2** | 8.8 mlx-lm | 1.50× |
-| 8 | Qwen3.6-35B-A3B (MoE) | ms/tok | **23.4** | 13.7 mlx-lm | 1.71× |
-| 9 | R1-Distill-32B bf16 | ms/tok | **199.9** | 114.9 llama.cpp | 1.74× |
-| 10 | DeepSeek-V2-Lite (maxtext) | ms/tok | **19.6** | 10.5 mlx-lm | 1.87× |
+| 8 | Qwen3.6-35B-A3B (MoE) | ms/tok | **23.5** | 13.7 mlx-lm | 1.72× |
+| 9 | R1-Distill-32B bf16 | ms/tok | **198.3** | 114.9 llama.cpp | 1.73× |
+| 10 | DeepSeek-V2-Lite (maxtext) | ms/tok | **20.3** | 10.5 mlx-lm | 1.93× |
 | 11 | Qwen3-0.6B (keras-hub) | ms/tok | **5.1** | 3.2 mlx-lm | 1.59× |
-| 12 | Mixtral 8×7B bf16 | ms/tok | **69.0** | 53.5 mlx-lm | 1.29× |
+| 12 | Mixtral 8×7B bf16 | ms/tok | **70.5** | 53.5 mlx-lm | 1.32× |
 | 13 | gemma4-E2B keras-int4 | ms/tok | **6.0** | 4.5 mlx-lm 4-bit | 1.33× |
 | 14 | Qwen3-0.6B qwix-int8 | ms/tok | **26.3** | — | — |
-| 15 | Qwen3-8B qwix-int8 | ms/tok | **265.3** | — | — |
+| 15 | Qwen3-8B qwix-int8 | ms/tok | **265.5** | — | — |
 | 16 | SigLIP 2 (b1 forward) | ms | **41.8** | 29.8 torch-MPS | 1.40× |
-| 17 | SD 3.5 Large @512² | ms/step | **460.6** | 553 torch-MPS | **0.83×** |
-| 17 | SD 3.5 Large @1024² | ms/step | **2090** | 3078 torch-MPS | **0.68×** |
-| 18 | LoRA gemma4-E2B train | ms/step | **126.1** | 135.6 torch-MPS | **0.93×** |
-| 19 | Qwen3-0.6B maxtext train | ms/step | **362.8** | 818 torch-MPS | **0.44×** |
-| 20 | Qwen3-235B-A22B 3-bit | ms/tok | **45.2** | 28.0 mlx-lm | 1.61× |
-| 21 | Qwen3.8-27B bf16 | ms/tok | **142.3** | 98.2 llama.cpp | 1.45× |
+| 17 | SD 3.5 Large @512² | ms/step | **457.2** | 553 torch-MPS | **0.83×** |
+| 17 | SD 3.5 Large @1024² | ms/step | **2103** | 3078 torch-MPS | **0.68×** |
+| 18 | LoRA gemma4-E2B train | ms/step | **115.1** | 135.6 torch-MPS | **0.85×** |
+| 19 | Qwen3-0.6B maxtext train | ms/step | **362.6** | 818 torch-MPS | **0.44×** |
+| 21 | Qwen3.8-27B bf16 | ms/tok | **142.6** | 98.2 llama.cpp | 1.45× |
 
 Reading the table: metaljax is ahead of PyTorch-MPS on every training and
 diffusion row, and behind the dedicated Metal inference stacks on decode —
@@ -426,8 +446,11 @@ optimization target, and llama.cpp's hand-written kernels lead even
 mlx-lm on bf16. Rows without a goal cell have no like-for-like
 non-metaljax implementation (rows 14/15 are qwix-quantized JAX models).
 Several rows do not run on the JAX CPU backend at all at these sizes;
-where they do, the CPU cells are in `STATUS.md` (e.g. row 19: 1414 vs
-362.8 ms/step, row 16: 361.5 vs 41.8 ms, row 2: 314.2 vs 56.2 ms/token).
+where they do, the CPU cells are in `STATUS.md` (e.g. row 19: 1398 vs
+362.6 ms/step, row 16: 363.6 vs 41.7 ms, row 2: 312.1 vs 58.1 ms/token).
+Row 20 (Qwen3-235B-A22B 3-bit, 45.2 ms/tok at 0.11.8) left the suite at
+0.11.9: it needs ~104 GB of a 128 GB machine, more than a desktop session
+leaves free (`STATUS.md` fn 21).
 
 Correctness for these rows is gated the same night: greedy token streams
 are compared against the jax-CPU backend, and every divergence is
@@ -443,7 +466,7 @@ several million) plus a 223-config performance sweep. At this release:
 **106/106 correct** — one jitted training chunk per config executed on
 both backends from identical inputs, every output leaf compared against
 jax-CPU at a 1-ULP sensitivity-scaled tolerance — and the perf sweep is
-**1.11× faster** than the standing anchor over 223 matched configs (116
+**1.14× faster** than the standing anchor over 223 matched configs (134
 configs improved >5 %, one regressed >5 %).
 
 How it gets there: pure programs and counted-loop (`scan`/`fori_loop`)

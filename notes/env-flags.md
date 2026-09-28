@@ -8,6 +8,7 @@ macOS/MLX updates), **debug-bisect** (diagnosis only).
 |---|---|---|---|
 | `METALJAX_CHUNK_MAX` | `16` | user knob | max loop iterations per compiled chunk (default 16) |
 | `METALJAX_CHUNK_MAX_COST` | `1500` | user knob | only chunk bodies cheaper than this (default 1500) |
+| `METALJAX_LOOP_INFLIGHT_MB` | `1024` | user knob | plugin-native: the device bytes a counted loop's submitted-but-unfinished iterations may hold before the host waits for the oldest (runtime/control.cc `LoopWindow`); 0 = the op-count cadence alone (the 0.11.8 behaviour) |
 | `METALJAX_CLEAR_PERIOD` | `50000` | user knob | engine cache clear every N executes (default 50000); 0 disables |
 | `METALJAX_COMPILE` | `1` | debug-bisect | =0 disables mx.compile everywhere |
 | `METALJAX_COMPILE_OPTIONS` | `` | user knob | =ignore skips XLA compile-option validation |

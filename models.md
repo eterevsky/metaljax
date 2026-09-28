@@ -13,29 +13,29 @@ notes/release-gates-<version>.md). Comparators, footnotes and the current
 release's cells: STATUS.md. Append a column per release / major
 optimization.*
 
-| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 | 0.11.6 | 0.11.7 | 0.11.8 | HEAD | goal |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | 126.1 | **123.1** |  | 111.2 ˡ |
-| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | 57.3 | **56.2** |  | 44.2 ˡ |
-| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | 33.4 | **31.1** |  | 16.9 ˡ |
-| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | 24.0 | **16.9** |  | 10.5 ˣ |
-| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | 42.0 | **36.0** |  | 29.6 ˡ |
-| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | 42.2 | **38.6** |  | 29.2 ˡ |
-| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | 19.8 | **13.2** |  | 8.8 ˣ |
-| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | 28.5 ᴳ | **23.4** ᴳ |  | 13.7 ˣ |
-| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | 190.8 ᴳ | **199.9** ᴳ |  | 114.9 ˡ |
-| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | 25.9 ᵖ | **19.6** ᵖ |  | 10.5 ˣ |
-| 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | 12.33 ᵐ | **5.1** |  | 3.2 ˣ |
-| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | 85.6 ᴳ | **69.0** ᴳ ˢ |  | 53.5 ˣ |
-| 13 | gemma4-E2B keras-int4 ᵇ | 340 ᵇ | 336 ᵇ | 81.1 ᵇ | 80.3 ᴾ²⁷ ᵇ | 78.0 ᵇ | 78.0 ᵇ | 77.0 ᵇ | **6.0** |  | 4.5 ˣ |
-| 14 | Qwen3-0.6B qwix-int8 | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | 29.88 | **26.32** |  |  |
-| 15 | Qwen3-8B qwix-int8 | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | 388.4 ᵛ | **265.3** ᵛ |  |  |
-| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | 86.68 | **41.77** |  | 29.8 ᵗ |
-| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | 1249.3 / 4961.6 | **460.6 / 2090.4** |  | 553 / 3078 ᵗ |
-| 18 | LoRA gemma4-E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | 362.1 | **126.1** |  | 135.6 ᵗ |
-| 19 | Qwen3-0.6B maxtext train (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | 444.6 | **362.8** |  | 818 ᵗ |
-| 20 | Qwen3-235B-A22B 3-bit (mlx quant) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | 56.2 ᴳ | **45.2** ᴳ |  | 28.0 ˣ |
-| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | 154.9 | **142.3** |  | 98.2 ˡ |
+| # | benchmark | 0.11.1 | 0.11.2 | 0.11.3 | 0.11.4 | 0.11.5 | 0.11.6 | 0.11.7 | 0.11.8 | 0.11.9 | HEAD | goal |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | gemma4-31B | 363 | 350 | 237.5 | 301.6 | 235.5 | 235.2 | 126.1 | 123.1 | **123.2** |  | 111.2 ˡ |
+| 2 | gemma4-12B | 101 | 97.1 | 92.5 | 92.9 ᴾ²⁷ | 92.3 | 92.1 | 57.3 | 56.2 | **58.1** |  | 44.2 ˡ |
+| 3 | gemma4-26B-A4B (MoE) | 473 | 284 | 44.3 | 43.4 | 43.5 | 43.3 | 33.4 | 31.1 | **31.2** |  | 16.9 ˡ |
+| 4 | gemma4-E2B | 28.9 | 29.5 | 27.5 | 27.0 | 27.2 | 27.2 | 24.0 | 16.9 | **16.9** |  | 10.5 ˣ |
+| 5 | Qwen3-8B | 60.3 | 60.4 | 57.8 | 58.1 | 57.9 | 57.6 | 42.0 | 36.0 | **36.2** |  | 29.6 ˡ |
+| 6 | Llama-3.1-8B | 58.6 | 57.3 | 54.2 | 54.7 | 54.5 | 54.3 | 42.2 | 38.6 | **39.2** |  | 29.2 ˡ |
+| 7 | gpt-oss-20b | 220 | 222 | 22.2 | 22.0 | 21.7 | 21.3 | 19.8 | 13.2 | **13.2** ˢ |  | 8.8 ˣ |
+| 8 | Qwen3.6-35B-A3B | ✗ | ✗ | ✗ | ✗ | 29.7 ᴳ | 29.4 ᴳ | 28.5 ᴳ | 23.4 ᴳ | **23.5** ᴳ |  | 13.7 ˣ |
+| 9 | R1-Distill-32B | ✗ | ✗ | 217.7 | 214.4 | 210.3 ᴳ | 211.0 ᴳ | 190.8 ᴳ | 199.9 ᴳ | **198.3** ᴳ |  | 114.9 ˡ |
+| 10 | DeepSeek-V2-Lite ᵖ | ✗ | ✗ | ✗ | ✗ | 1871.1 ᴳ | 1948.2 ᴳ | 25.9 ᵖ | 19.6 ᵖ | **20.3** ᵖ |  | 10.5 ˣ |
+| 11 | Qwen3-0.6B decode ᵐ | ✗ | 16.0 ᵐ | 15.8 ᵐ | 16.63 ᵐ | 16.35 ᵐ | 16.35 ᵐ | 12.33 ᵐ | 5.1 | **5.1** |  | 3.2 ˣ |
+| 12 | Mixtral 8×7B | ✗ | ✗ | ✗ | ✗ | ✗ | 91.3 ᴳ | 85.6 ᴳ | 69.0 ᴳ ˢ | **70.5** ᴳ ˢ |  | 53.5 ˣ |
+| 13 | gemma4-E2B keras-int4 ᵇ | 340 ᵇ | 336 ᵇ | 81.1 ᵇ | 80.3 ᴾ²⁷ ᵇ | 78.0 ᵇ | 78.0 ᵇ | 77.0 ᵇ | 6.0 | **6.0** |  | 4.5 ˣ |
+| 14 | Qwen3-0.6B qwix-int8 | 48.3 | 48.5 | 32.5 | 35.0 | 31.77 | 31.85 | 29.88 | 26.32 | **26.33** |  |  |
+| 15 | Qwen3-8B qwix-int8 | ✗ | ✗ | ✗ | ✗ | 401.4 ᵛ | 381.7 ᵛ | 388.4 ᵛ | 265.3 ᵛ | **265.5** ᵛ |  |  |
+| 16 | SigLIP 2 (fwd ms) | 248 | 93.4 | 82.9 | 87.9 | 88.37 | 88.31 | 86.68 | 41.77 | **41.74** |  | 29.8 ᵗ |
+| 17 | SD3.5 (ms/step, 512² / 1024²) | ✗ | ✗ | 1389 / 5141 | 1234.8 / 5781.6 | 1231.3 / 5696.8 | 1234.7 / 4974.9 | 1249.3 / 4961.6 | 460.6 / 2090.4 | **457.2 / 2102.8** |  | 553 / 3078 ᵗ |
+| 18 | LoRA gemma4-E2B (ms/step) | 417 | 407 | 407 | 360.2 ᴾ²⁷ | 370.7 | 369.2 | 362.1 | 126.1 | **115.1** |  | 135.6 ᵗ |
+| 19 | Qwen3-0.6B maxtext train (ms/step) | ✗ | 440 | 440 | 469.7 ᴾ²⁷ | 460.2 | 463.4 | 444.6 | 362.8 | **362.6** |  | 818 ᵗ |
+| 20 | Qwen3-235B-A22B 3-bit (mlx quant) | ✗ | ✗ | ✗ | ✗ | ✗ | 66.3 ᴳ | 56.2 ᴳ | 45.2 ᴳ | excl. ᵉ |  | 28.0 ˣ |
+| 21 | Qwen3.8-27B bf16 | — | — | — | — | — | — | 154.9 | 142.3 | **142.6** |  | 98.2 ˡ |
 
 Notes:
 
@@ -55,10 +55,9 @@ Notes:
   lead over mlx-lm on rows 3 and 6.
 - ʰ = HEAD-column cells: rerun-first medians of ≥ 2 runs on a frozen build
   of main, token streams identical to the row's release record unless
-  stated. As of 2026-09-23 the column is empty: the 0.11.8 gate re-measured
-  every row on the release binary (notes/release-gates-0.11.8.md) after the
-  jax 0.11.2 pin, the XLA move and the shift fix, and no merge has landed
-  since.
+  stated. As of 2026-09-28 the column is empty: the 0.11.9 gate re-measured
+  every row on the release binary (notes/release-gates-0.11.9.md) and no merge
+  has landed since.
 - ᵇ **Row 13's cells through 0.11.7 measured a numerically broken model**:
   keras-hub's Gemma4 decoder block bypasses the int4 FFN layers' scale
   (its "HOTFIX" multiplies by the raw int4 codes), so every backend
@@ -67,14 +66,22 @@ Notes:
   (scripts/model_bench/int4_fix.py, from 2026-09-21; STATUS.md fn 8).  Those
   cells are timings of the broken graph and are NOT comparable to the
   HEAD cell; the jax-CPU history (340 → 67.8) is broken the same way.
-- ˢ (0.11.8 column) = standalone re-run: the row read high inside the gate's
-  sequence and resolved to this value alone (row 12: 73.3 in sequence).
-  Rows 3, 6 and 18 keep their in-battery cells (31.1, 38.6, 126.1) with the
-  standalone readings (28.2 / 28.2, 34.5 / 34.6, 113.3 / 113.9) in STATUS.md
-  fn 12, the 0.11.7 convention.
-  The 0.11.8 column was measured 2026-09-23 on jax 0.11.2 (the maxtext rows 10,
-  14, 15, 19 on jax 0.11.0: no released flax imports on 0.11.2); rows 8, 9, 12,
-  20 under the memory governor as before.
+- ˢ (0.11.8 and 0.11.9 columns) = standalone re-run: the row read high inside
+  the gate's sequence and resolved to this value alone. 0.11.8: row 12 (73.3 in
+  sequence). 0.11.9: row 7 (16.6 in the battery; 13.1-13.3 in ten standalone
+  and battery-protocol re-runs on the 0.11.8 and 0.11.9 binaries alike) and
+  row 12 (refused cleanly in sequence while a browser held ~7 GB of the
+  machine; 70.5 alone). Rows 3, 6 and 18 keep their in-battery cells with the
+  standalone readings in STATUS.md fn 12, the 0.11.7 convention.
+  The 0.11.8 column was measured 2026-09-23 and the 0.11.9 column 2026-09-27/28,
+  both on jax 0.11.2 (the maxtext rows 10, 14, 15, 19 on jax 0.11.0: no
+  released flax imports on 0.11.2); rows 8, 9, 12 under the memory governor.
+- ᵉ **Row 20 left the suite at 0.11.9** (Oleg, 2026-09-28): it needs ~104 GB
+  of its own under its approved 114 GB machine ceiling, which leaves ~10 GB for
+  everything else, and this machine no longer idles that low with the desktop
+  session open (11.5-14 GB, also after a reboot; the earlier cells started at
+  8.7-9.2 GB). Its cells through 0.11.8 stay as history
+  (notes/release-gates-0.11.9.md).
 - ᵐ **Row 11 changed benchmark implementation after 0.11.7** (the
   best-available-implementation rule): every cell through the 0.11.7 column
   is the maxtext decode harness and is NOT comparable to the keras-hub cells
